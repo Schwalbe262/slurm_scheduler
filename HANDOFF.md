@@ -9,7 +9,7 @@ Build a local PC/server web service that distributes Python Slurm jobs across mu
 - The scheduler checks account capacity and automatically submits to the account with the most free slots.
 - SQLite stores jobs, status, Slurm IDs, paths, inventory, and token usage records.
 - SSH key contents are never stored in the DB; config stores only key paths.
-- The initial web UI uses a single administrator login.
+- The web UI currently has no login page; deploy it only on a trusted network or behind a separate authenticated proxy.
 - Each account is capped by `max_total_jobs`, with the local deployment using a 10-job account limit.
 
 ## Current Implementation
@@ -19,7 +19,6 @@ Implemented in this repository:
 - FastAPI app factory in `slurm_scheduler/app.py`
 - SQLite schema and repository methods in `slurm_scheduler/db.py`
 - account/app YAML config loaders in `slurm_scheduler/config.py`
-- password hashing in `slurm_scheduler/security.py`
 - SSH and Slurm adapter in `slurm_scheduler/slurm.py`
 - cluster inventory parsing and partition ranking in `slurm_scheduler/inventory.py`
 - background scheduling loop in `slurm_scheduler/scheduler.py`
@@ -29,7 +28,6 @@ Implemented in this repository:
 
 The web UI supports:
 
-- login/logout
 - job submission
 - job list and detail pages
 - account capacity display
@@ -105,7 +103,7 @@ cp config/accounts.example.yaml config/accounts.yaml
 python3 -m slurm_scheduler.security '<admin-password>'
 ```
 
-Set `admin_username` and `admin_password_hash` only in ignored `config/app.yaml`. Put real accounts, hosts, and key paths into ignored `config/accounts.yaml`.
+Put real accounts, hosts, and key paths into ignored `config/accounts.yaml`.
 
 The helper below performs venv creation, dependency installation, and FastAPI route import smoke testing:
 
@@ -127,6 +125,7 @@ Autostart options:
 
 - `scripts/install_user_systemd.sh` installs a user systemd service when user systemd is available.
 - `scripts/install_windows_startup.ps1` installs a Windows logon scheduled task that starts WSL and runs the web service.
+- `scripts/install_windows_portproxy.ps1` must be run from Administrator PowerShell to expose the WSL web server to other internal-network machines.
 
 The current Codex sandbox could not access the user systemd bus, so service installation must be run from a normal terminal/PowerShell session.
 

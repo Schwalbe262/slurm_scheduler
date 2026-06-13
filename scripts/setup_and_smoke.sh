@@ -20,7 +20,7 @@ from slurm_scheduler.app import create_app
 
 app = create_app("config/app.yaml")
 routes = sorted(route.path for route in app.routes)
-required = {"/", "/login", "/jobs", "/api/jobs", "/api/accounts/status", "/api/token-usage"}
+required = {"/", "/jobs", "/api/jobs", "/api/accounts/status", "/api/token-usage"}
 missing = sorted(required.difference(routes))
 if missing:
     raise SystemExit(f"missing routes: {missing}")

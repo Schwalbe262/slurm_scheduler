@@ -18,10 +18,9 @@ Create local config from sanitized examples:
 ```bash
 cp config/app.example.yaml config/app.yaml
 cp config/accounts.example.yaml config/accounts.yaml
-python3 -m slurm_scheduler.security '<admin-password>'
 ```
 
-Set `admin_username` and `admin_password_hash` only in ignored `config/app.yaml`. Edit `config/accounts.yaml` with the real cluster accounts and key paths. `config/app.yaml`, `config/accounts.yaml`, `data/`, and `secrets/` are ignored by Git.
+Edit `config/accounts.yaml` with the real cluster accounts and key paths. `config/app.yaml`, `config/accounts.yaml`, `data/`, and `secrets/` are ignored by Git.
 
 You can run setup and a FastAPI route import smoke test with:
 
@@ -37,6 +36,8 @@ python3 -m slurm_scheduler
 ```
 
 Open the configured bind address, default `http://127.0.0.1:8000`.
+
+The web UI has no login page. Put it only on a trusted network, behind a VPN, or behind a reverse proxy if authentication is needed later.
 
 To use a non-default config path:
 
@@ -66,6 +67,20 @@ bash scripts/start_web.sh
 ```
 
 and writes logs to `logs/web.log` when started through the Windows task.
+
+To expose the web UI to other machines on the internal network, run PowerShell as Administrator:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_windows_portproxy.ps1
+```
+
+Then use the Windows LAN IP, for example:
+
+```text
+http://<windows-lan-ip>:8000
+```
+
+The WSL IP can change after reboot, so rerun the portproxy script if internal-network access stops working.
 
 ## Account Config
 

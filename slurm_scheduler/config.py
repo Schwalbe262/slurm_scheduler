@@ -28,8 +28,6 @@ class AppConfig:
     database_path: str = "data/slurm_scheduler.db"
     accounts_path: str = "config/accounts.yaml"
     poll_interval_seconds: int = 30
-    admin_username: str = ""
-    admin_password_hash: str = ""
     bind_host: str = "127.0.0.1"
     bind_port: int = 8000
 

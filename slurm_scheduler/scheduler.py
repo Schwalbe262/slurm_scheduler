@@ -65,6 +65,11 @@ class Scheduler:
         self._snapshot_cache = (now, snapshots)
         return snapshots
 
+    def cached_snapshots(self) -> list[AccountSnapshot]:
+        if not self._snapshot_cache:
+            return []
+        return self._snapshot_cache[1]
+
     def choose_account(self) -> AccountConfig | None:
         snapshots_by_name = {snapshot.account_name: snapshot for snapshot in self.snapshots()}
         candidates = [
