@@ -75,6 +75,7 @@ Inventory is refreshed by:
 
 ```bash
 python3 scripts/refresh_inventory.py --account account_a
+python3 scripts/refresh_pestat.py --account account_a
 ```
 
 It stores sanitized node inventory fields in SQLite:
@@ -93,6 +94,8 @@ When a job uses `partition=auto`, scheduler behavior is:
 - GPU job: choose the highest-ranked GPU partition from stored inventory.
 - If inventory is empty, fall back to generic CPU/GPU defaults.
 
+`dynamic_packed_srun` uses cached `pestat` rows to size each allocation dynamically. For each candidate node it computes available workers from free Slurm CPUs, CPU load, free memory, `cpus_per_simulation`, and `mem_per_simulation_gb`.
+
 GPU ranking is encoded in `slurm_scheduler/inventory.py`. CPU profiles should be updated in local code/config only with non-sensitive labels if the repository is public.
 
 ## Local Setup
@@ -100,7 +103,6 @@ GPU ranking is encoded in `slurm_scheduler/inventory.py`. CPU profiles should be
 ```bash
 cp config/app.example.yaml config/app.yaml
 cp config/accounts.example.yaml config/accounts.yaml
-python3 -m slurm_scheduler.security '<admin-password>'
 ```
 
 Put real accounts, hosts, and key paths into ignored `config/accounts.yaml`.

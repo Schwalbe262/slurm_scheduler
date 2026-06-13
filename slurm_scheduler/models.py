@@ -27,6 +27,18 @@ class JobCreate:
     memory: str = "4G"
     gpus: int = 0
     job_name: str = "web-job"
+    job_mode: str = "python_git"
+    remote_path: str = ""
+    simulations_per_job: int = 1
+    cpus_per_simulation: int = 1
+    simulation_start: int = 1
+    simulation_count: int = 1
+    node_name: str = ""
+    mem_per_simulation_gb: float = 1.0
+    max_workers_per_job: int = 32
+    initial_workers: int = 1
+    load_target: float = 0.75
+    ramp_interval_seconds: int = 900
 
 
 @dataclass(frozen=True)

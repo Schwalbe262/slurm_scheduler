@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from math import ceil
 
 from fastapi import FastAPI, Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -11,6 +12,7 @@ from .config import AppConfig, load_accounts, load_app_config
 from .db import Database
 from .models import JobCreate
 from .inventory import partition_rank
+from .pestat import PestatNode, plan_dynamic_allocations
 from .scheduler import Scheduler
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -86,7 +88,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
 
     @app.post("/jobs")
     def create_job(
-        repo_url: str = Form(...),
+        job_mode: str = Form("python_git"),
+        repo_url: str = Form(""),
         git_ref: str = Form("main"),
         entrypoint: str = Form(...),
         arguments: str = Form(""),
@@ -97,22 +100,141 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         memory: str = Form("4G"),
         gpus: int = Form(0),
         job_name: str = Form("web-job"),
+        remote_path: str = Form(""),
+        total_simulations: int = Form(1),
+        simulations_per_job: int = Form(1),
+        cpus_per_simulation: int = Form(1),
+        mem_per_simulation_gb: float = Form(1.0),
+        max_workers_per_job: int = Form(32),
+        max_new_jobs: int = Form(10),
+        oversubscribe_factor: float = Form(1.5),
+        load_target: float = Form(0.75),
+        ramp_interval_seconds: int = Form(900),
     ) -> Response:
-        db.create_job(
-            JobCreate(
-                repo_url=repo_url,
-                git_ref=git_ref,
-                entrypoint=entrypoint,
-                arguments=arguments,
-                env_setup=env_setup,
+        if job_mode == "dynamic_packed_srun":
+            nodes = [
+                PestatNode(
+                    hostname=row["hostname"],
+                    partition=row["partition"],
+                    state=row["state"],
+                    cpu_used=row["cpu_used"],
+                    cpu_total=row["cpu_total"],
+                    cpu_load=row["cpu_load"],
+                    memory_mb=row["memory_mb"],
+                    free_memory_mb=row["free_memory_mb"],
+                )
+                for row in db.list_pestat_nodes()
+            ]
+            plans = plan_dynamic_allocations(
+                nodes=nodes,
+                total_simulations=total_simulations,
+                cpus_per_simulation=cpus_per_simulation,
+                mem_per_simulation_gb=mem_per_simulation_gb,
+                max_workers_per_allocation=max_workers_per_job,
+                max_allocations=max_new_jobs,
                 partition=partition,
-                time_limit=time_limit,
-                cpus=cpus,
-                memory=memory,
-                gpus=gpus,
-                job_name=job_name,
+                oversubscribe_factor=oversubscribe_factor,
             )
-        )
+            if not plans:
+                plans = []
+                per_job = max(1, simulations_per_job)
+                for batch_index in range(max_new_jobs):
+                    start = batch_index * per_job + 1
+                    if start > total_simulations:
+                        break
+                    count = min(per_job, total_simulations - batch_index * per_job)
+                    plans.append(
+                        type(
+                            "FallbackPlan",
+                            (),
+                            {
+                                "partition": partition,
+                                "node_name": "",
+                                "workers": count,
+                                "initial_workers": min(count, max(1, count)),
+                                "cpus_per_worker": cpus_per_simulation,
+                                "total_cpus": count * cpus_per_simulation,
+                                "simulation_start": start,
+                                "simulation_count": count,
+                            },
+                        )()
+                    )
+            for plan in plans:
+                db.create_job(
+                    JobCreate(
+                        repo_url="",
+                        git_ref="",
+                        entrypoint=entrypoint,
+                        arguments=arguments,
+                        env_setup=env_setup,
+                        partition=plan.partition,
+                        time_limit=time_limit,
+                        cpus=plan.total_cpus,
+                        memory=memory,
+                        gpus=gpus,
+                        job_name=f"{job_name}-{plan.simulation_start}-{plan.simulation_start + plan.simulation_count - 1}",
+                        job_mode="packed_srun",
+                        remote_path=remote_path,
+                        simulations_per_job=plan.workers,
+                        cpus_per_simulation=plan.cpus_per_worker,
+                        simulation_start=plan.simulation_start,
+                        simulation_count=plan.simulation_count,
+                        node_name=plan.node_name,
+                        mem_per_simulation_gb=mem_per_simulation_gb,
+                        max_workers_per_job=max_workers_per_job,
+                        initial_workers=plan.initial_workers,
+                        load_target=load_target,
+                        ramp_interval_seconds=ramp_interval_seconds,
+                    )
+                )
+        elif job_mode == "packed_srun":
+            per_job = max(1, simulations_per_job)
+            total = max(1, total_simulations)
+            for batch_index in range(ceil(total / per_job)):
+                start = batch_index * per_job + 1
+                count = min(per_job, total - batch_index * per_job)
+                db.create_job(
+                    JobCreate(
+                        repo_url="",
+                        git_ref="",
+                        entrypoint=entrypoint,
+                        arguments=arguments,
+                        env_setup=env_setup,
+                        partition=partition,
+                        time_limit=time_limit,
+                        cpus=count * max(1, cpus_per_simulation),
+                        memory=memory,
+                        gpus=gpus,
+                        job_name=f"{job_name}-{start}-{start + count - 1}",
+                        job_mode=job_mode,
+                        remote_path=remote_path,
+                        simulations_per_job=per_job,
+                        cpus_per_simulation=cpus_per_simulation,
+                        simulation_start=start,
+                        simulation_count=count,
+                        mem_per_simulation_gb=mem_per_simulation_gb,
+                        max_workers_per_job=max_workers_per_job,
+                        initial_workers=min(count, max(1, cpus // max(1, cpus_per_simulation))),
+                        load_target=load_target,
+                        ramp_interval_seconds=ramp_interval_seconds,
+                    )
+                )
+        else:
+            db.create_job(
+                JobCreate(
+                    repo_url=repo_url,
+                    git_ref=git_ref,
+                    entrypoint=entrypoint,
+                    arguments=arguments,
+                    env_setup=env_setup,
+                    partition=partition,
+                    time_limit=time_limit,
+                    cpus=cpus,
+                    memory=memory,
+                    gpus=gpus,
+                    job_name=job_name,
+                )
+            )
         return RedirectResponse("/", status_code=303)
 
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)
@@ -125,7 +247,30 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     @app.post("/jobs/{job_id}/cancel")
     def cancel_job(job_id: int) -> Response:
         scheduler.cancel(job_id)
-        return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+        return RedirectResponse("/", status_code=303)
+
+    @app.post("/jobs/{job_id}/simulation-count")
+    def update_simulation_count(job_id: int, simulation_count: int = Form(...)) -> Response:
+        job = db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404)
+        if job["status"] != "queued":
+            raise HTTPException(status_code=409, detail="only queued jobs can be edited")
+        if job.get("job_mode") not in {"packed_srun", "dynamic_packed_srun"}:
+            raise HTTPException(status_code=409, detail="only packed jobs have a simulation count")
+        count = max(1, simulation_count)
+        cpus_per_sim = max(1, int(job.get("cpus_per_simulation") or 1))
+        initial_workers = max(1, min(count, int(job.get("initial_workers") or count)))
+        max_workers = max(initial_workers, min(count, int(job.get("max_workers_per_job") or count)))
+        db.update_job(
+            job_id,
+            simulation_count=count,
+            simulations_per_job=count,
+            cpus=initial_workers * cpus_per_sim,
+            initial_workers=initial_workers,
+            max_workers_per_job=max_workers,
+        )
+        return RedirectResponse("/", status_code=303)
 
     @app.post("/token-usage")
     def create_token_usage(
@@ -162,6 +307,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     @app.get("/api/accounts/status")
     def api_accounts() -> list[dict]:
         return [snapshot.__dict__ for snapshot in scheduler.cached_snapshots()]
+
+    @app.get("/api/accounts/status/live")
+    def api_accounts_live() -> list[dict]:
+        return [snapshot.__dict__ for snapshot in scheduler.snapshots()]
 
     @app.get("/api/token-usage")
     def api_token_usage() -> list[dict]:

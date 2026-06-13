@@ -12,6 +12,9 @@
       <tr><th>Git ref</th><td><code>{{ job.git_ref }}</code></td></tr>
       <tr><th>Entrypoint</th><td><code>{{ job.entrypoint }}</code></td></tr>
       <tr><th>Arguments</th><td><code>{{ job.arguments }}</code></td></tr>
+      <tr><th>Mode</th><td>{{ job.job_mode }}</td></tr>
+      <tr><th>Simulations</th><td>{{ job.simulation_start }}-{{ job.simulation_start + job.simulation_count - 1 }} ({{ job.simulation_count }})</td></tr>
+      <tr><th>Workers</th><td>initial {{ job.initial_workers }} / max {{ job.max_workers_per_job }}, {{ job.cpus_per_simulation }} CPUs each</td></tr>
       <tr><th>Account</th><td>{{ job.account_name or "" }}</td></tr>
       <tr><th>Slurm job ID</th><td>{{ job.slurm_job_id or "" }}</td></tr>
       <tr><th>Remote job dir</th><td><code>{{ job.remote_job_dir or "" }}</code></td></tr>

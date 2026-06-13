@@ -22,6 +22,18 @@ CREATE TABLE IF NOT EXISTS jobs (
     memory TEXT NOT NULL DEFAULT '4G',
     gpus INTEGER NOT NULL DEFAULT 0,
     job_name TEXT NOT NULL DEFAULT 'web-job',
+    job_mode TEXT NOT NULL DEFAULT 'python_git',
+    remote_path TEXT NOT NULL DEFAULT '',
+    simulations_per_job INTEGER NOT NULL DEFAULT 1,
+    cpus_per_simulation INTEGER NOT NULL DEFAULT 1,
+    simulation_start INTEGER NOT NULL DEFAULT 1,
+    simulation_count INTEGER NOT NULL DEFAULT 1,
+    node_name TEXT NOT NULL DEFAULT '',
+    mem_per_simulation_gb REAL NOT NULL DEFAULT 1,
+    max_workers_per_job INTEGER NOT NULL DEFAULT 32,
+    initial_workers INTEGER NOT NULL DEFAULT 1,
+    load_target REAL NOT NULL DEFAULT 0.75,
+    ramp_interval_seconds INTEGER NOT NULL DEFAULT 900,
     status TEXT NOT NULL,
     account_name TEXT,
     slurm_job_id TEXT,
@@ -70,6 +82,20 @@ CREATE TABLE IF NOT EXISTS node_inventory (
 );
 
 CREATE INDEX IF NOT EXISTS idx_node_inventory_partition ON node_inventory(partition);
+
+CREATE TABLE IF NOT EXISTS pestat_nodes (
+    hostname TEXT PRIMARY KEY,
+    partition TEXT NOT NULL,
+    state TEXT NOT NULL,
+    cpu_used INTEGER NOT NULL,
+    cpu_total INTEGER NOT NULL,
+    cpu_load REAL NOT NULL,
+    memory_mb INTEGER NOT NULL,
+    free_memory_mb INTEGER NOT NULL,
+    observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_pestat_nodes_partition ON pestat_nodes(partition);
 """
 
 
@@ -91,6 +117,27 @@ class Database:
     def init(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._ensure_job_columns(conn)
+
+    def _ensure_job_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        columns = {
+            "job_mode": "TEXT NOT NULL DEFAULT 'python_git'",
+            "remote_path": "TEXT NOT NULL DEFAULT ''",
+            "simulations_per_job": "INTEGER NOT NULL DEFAULT 1",
+            "cpus_per_simulation": "INTEGER NOT NULL DEFAULT 1",
+            "simulation_start": "INTEGER NOT NULL DEFAULT 1",
+            "simulation_count": "INTEGER NOT NULL DEFAULT 1",
+            "node_name": "TEXT NOT NULL DEFAULT ''",
+            "mem_per_simulation_gb": "REAL NOT NULL DEFAULT 1",
+            "max_workers_per_job": "INTEGER NOT NULL DEFAULT 32",
+            "initial_workers": "INTEGER NOT NULL DEFAULT 1",
+            "load_target": "REAL NOT NULL DEFAULT 0.75",
+            "ramp_interval_seconds": "INTEGER NOT NULL DEFAULT 900",
+        }
+        for name, ddl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {ddl}")
 
     def create_job(self, job: JobCreate) -> int:
         with self.connect() as conn:
@@ -98,8 +145,12 @@ class Database:
                 """
                 INSERT INTO jobs (
                     repo_url, git_ref, entrypoint, arguments, env_setup, partition,
-                    time_limit, cpus, memory, gpus, job_name, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    time_limit, cpus, memory, gpus, job_name, job_mode, remote_path,
+                    simulations_per_job, cpus_per_simulation, simulation_start,
+                    simulation_count, node_name, mem_per_simulation_gb,
+                    max_workers_per_job, initial_workers, load_target,
+                    ramp_interval_seconds, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.repo_url,
@@ -113,6 +164,18 @@ class Database:
                     job.memory,
                     job.gpus,
                     job.job_name,
+                    job.job_mode,
+                    job.remote_path,
+                    job.simulations_per_job,
+                    job.cpus_per_simulation,
+                    job.simulation_start,
+                    job.simulation_count,
+                    job.node_name,
+                    job.mem_per_simulation_gb,
+                    job.max_workers_per_job,
+                    job.initial_workers,
+                    job.load_target,
+                    job.ramp_interval_seconds,
                     JobStatus.QUEUED.value,
                 ),
             )
@@ -227,5 +290,37 @@ class Database:
         with self.connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM node_inventory ORDER BY partition, node_name"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def replace_pestat_nodes(self, nodes: list[Any]) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM pestat_nodes")
+            conn.executemany(
+                """
+                INSERT INTO pestat_nodes (
+                    hostname, partition, state, cpu_used, cpu_total, cpu_load,
+                    memory_mb, free_memory_mb
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        node.hostname,
+                        node.partition,
+                        node.state,
+                        node.cpu_used,
+                        node.cpu_total,
+                        node.cpu_load,
+                        node.memory_mb,
+                        node.free_memory_mb,
+                    )
+                    for node in nodes
+                ],
+            )
+
+    def list_pestat_nodes(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pestat_nodes ORDER BY partition, hostname"
             ).fetchall()
             return [dict(row) for row in rows]

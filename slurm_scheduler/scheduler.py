@@ -30,6 +30,8 @@ class Scheduler:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._snapshot_cache: tuple[float, list[AccountSnapshot]] | None = None
+        self._storage_cache: dict[str, tuple[float, float | None]] = {}
+        self._storage_refresh_interval_seconds = max(900, poll_interval_seconds * 20)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -61,9 +63,22 @@ class Scheduler:
             return self._snapshot_cache[1]
         snapshots = []
         for account in self.accounts:
-            snapshots.append(self.client_factory(account).snapshot())
+            client = self.client_factory(account)
+            storage_used = self.cached_storage(account, client, now)
+            snapshots.append(client.snapshot(storage_used_gb=storage_used))
         self._snapshot_cache = (now, snapshots)
         return snapshots
+
+    def cached_storage(self, account: AccountConfig, client: SlurmAccountClient, now: float) -> float | None:
+        cached = self._storage_cache.get(account.name)
+        if cached and now - cached[0] < self._storage_refresh_interval_seconds:
+            return cached[1]
+        try:
+            value = client.storage_used_gb()
+        except Exception:
+            value = cached[1] if cached else None
+        self._storage_cache[account.name] = (now, value)
+        return value
 
     def cached_snapshots(self) -> list[AccountSnapshot]:
         if not self._snapshot_cache:

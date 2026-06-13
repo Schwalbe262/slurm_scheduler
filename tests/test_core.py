@@ -8,6 +8,7 @@ from slurm_scheduler.db import Database
 from slurm_scheduler.models import AccountSnapshot, JobCreate, JobStatus
 from slurm_scheduler.scheduler import Scheduler
 from slurm_scheduler.inventory import parse_sinfo_nodes, partition_rank
+from slurm_scheduler.pestat import parse_pestat, plan_dynamic_allocations
 from slurm_scheduler.slurm import build_sbatch_script, parse_du_gb, parse_sbatch_job_id, parse_squeue_counts
 
 
@@ -54,6 +55,35 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("#SBATCH --output=slurm-%j.out", script)
         self.assertIn("cd repo", script)
 
+    def test_build_packed_script_uses_adaptive_manager(self) -> None:
+        job = {
+            "job_mode": "packed_srun",
+            "job_name": "packed",
+            "time_limit": "12:00:00",
+            "cpus": 44,
+            "memory": "128G",
+            "partition": "cpu1",
+            "gpus": 0,
+            "entrypoint": "run_simulation.py",
+            "arguments": "",
+            "env_setup": "module load app",
+            "remote_path": "~/project",
+            "simulation_count": 16,
+            "simulation_start": 1,
+            "cpus_per_simulation": 4,
+            "initial_workers": 11,
+            "max_workers_per_job": 16,
+            "mem_per_simulation_gb": 8,
+            "load_target": 0.75,
+            "ramp_interval_seconds": 900,
+        }
+        script = build_sbatch_script(job, "slurm_scheduler/job-1")
+        self.assertIn("#SBATCH --ntasks=1", script)
+        self.assertIn("#SBATCH --cpus-per-task=44", script)
+        self.assertIn("initial_limit = 11", script)
+        self.assertIn("max_limit = 16", script)
+        self.assertIn("[adaptive] increased worker limit", script)
+
     def test_partition_rank_uses_cpu_and_gpu_profiles(self) -> None:
         nodes = parse_sinfo_nodes(
             "n040|cpu1|48|768000|(null)|idle\n"
@@ -65,6 +95,27 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertEqual(partition_rank(rows, needs_gpu=False)[0]["partition"], "cpu2")
         self.assertEqual(partition_rank(rows, needs_gpu=True)[0]["partition"], "gpu3")
 
+    def test_parse_pestat_and_dynamic_plan(self) -> None:
+        nodes = parse_pestat(
+            "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+            "n001 cpu1 idle 0 48 0.25 768000 700000\n"
+            "n002 cpu1 mix 40 48 42.0 768000 700000 1 user\n"
+        )
+        self.assertEqual(len(nodes), 2)
+        plans = plan_dynamic_allocations(
+            nodes,
+            total_simulations=20,
+            cpus_per_simulation=4,
+            mem_per_simulation_gb=8,
+            max_workers_per_allocation=32,
+            max_allocations=2,
+            partition="auto",
+        )
+        self.assertEqual(plans[0].node_name, "n001")
+        self.assertEqual(plans[0].initial_workers, 11)
+        self.assertEqual(plans[0].workers, 16)
+        self.assertEqual(plans[0].total_cpus, 44)
+
 
 class FakeClient:
     snapshots: dict[str, AccountSnapshot] = {}
@@ -73,8 +124,11 @@ class FakeClient:
     def __init__(self, account: AccountConfig):
         self.account = account
 
-    def snapshot(self) -> AccountSnapshot:
+    def snapshot(self, storage_used_gb: float | None = None) -> AccountSnapshot:
         return self.snapshots[self.account.name]
+
+    def storage_used_gb(self) -> float | None:
+        return None
 
     def submit(self, job: dict) -> dict[str, str]:
         self.submitted.append(self.account.name)

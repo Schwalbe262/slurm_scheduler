@@ -103,7 +103,7 @@ accounts:
 
 `max_total_jobs: 10` caps open jobs per account. The scheduler treats `running + pending >= max_total_jobs` as full.
 
-Storage monitoring is optional. Set `storage_quota_gb` and `storage_path` if you want dashboard usage tracking. The scheduler uses `du -sk` on `storage_path` and caches snapshots for `poll_interval_seconds`, so avoid pointing it at a huge home directory unless a cluster quota command is integrated later.
+Storage monitoring is optional. Set `storage_quota_gb` and `storage_path` if you want dashboard usage tracking. The scheduler uses `du -sk` on `storage_path` and caches snapshots for at least 15 minutes, so avoid pointing it at a huge home directory unless a cluster quota command is integrated later.
 
 ## Job Model
 
@@ -117,6 +117,25 @@ Jobs are submitted from the web UI as:
 - Slurm resources such as partition, time, CPUs, memory, and GPUs
 
 When the partition field is `auto`, the scheduler uses stored node inventory to choose a partition. CPU jobs prefer the strongest CPU profile in the inventory. GPU jobs prefer the configured GPU ranking in `slurm_scheduler/inventory.py`.
+
+For ANSYS-style packed runs, use `dynamic_packed_srun`. Refresh live node load first:
+
+```bash
+python3 scripts/refresh_pestat.py --account account_a
+```
+
+Then submit:
+
+- `Job mode`: `Dynamic packed srun`
+- `Remote existing project path`: path to the project already present on the cluster account
+- `Python entrypoint`: simulation script
+- `Total simulations`: remaining simulation count
+- `CPUs per simulation`: expected cores per ANSYS instance
+- `Memory per simulation GB`: expected memory per instance
+- `Max workers per job`: upper bound for concurrent simulation subprocesses inside one allocation
+- `Max new jobs now`: upper bound for allocation jobs to open in this scheduling pass
+
+The scheduler uses `pestat` free CPU, CPU load, and free memory to choose node/partition and worker count per allocation. Each allocation starts conservatively from schedulable free cores, then the generated job script can increase concurrent workers when time-averaged CPU load and available memory show spare capacity.
 
 ## SFTP Helpers
 

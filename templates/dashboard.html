@@ -4,14 +4,24 @@
   <section class="panel">
     <h1>Submit Job</h1>
     <form method="post" action="/jobs">
+      <label for="job_mode">Job mode</label>
+      <select id="job_mode" name="job_mode">
+        <option value="dynamic_packed_srun">Dynamic packed srun</option>
+        <option value="packed_srun">Fixed packed srun</option>
+        <option value="python_git">Python Git checkout</option>
+      </select>
+
       <label for="repo_url">Git repository</label>
-      <input id="repo_url" name="repo_url" placeholder="git@github.com:org/project.git" required>
+      <input id="repo_url" name="repo_url" placeholder="git@github.com:org/project.git">
 
       <label for="git_ref">Branch, tag, or commit</label>
       <input id="git_ref" name="git_ref" value="main" required>
 
       <label for="entrypoint">Python entrypoint</label>
-      <input id="entrypoint" name="entrypoint" placeholder="train.py" required>
+      <input id="entrypoint" name="entrypoint" placeholder="run_simulation.py" required>
+
+      <label for="remote_path">Remote existing project path</label>
+      <input id="remote_path" name="remote_path" placeholder="~/project">
 
       <label for="arguments">Arguments</label>
       <input id="arguments" name="arguments" placeholder="--config configs/run.yaml">
@@ -31,6 +41,33 @@
       <label for="cpus">CPUs</label>
       <input id="cpus" name="cpus" type="number" min="1" value="1">
 
+      <label for="total_simulations">Total simulations</label>
+      <input id="total_simulations" name="total_simulations" type="number" min="1" value="100">
+
+      <label for="simulations_per_job">Fallback simulations per job</label>
+      <input id="simulations_per_job" name="simulations_per_job" type="number" min="1" value="10">
+
+      <label for="cpus_per_simulation">CPUs per simulation</label>
+      <input id="cpus_per_simulation" name="cpus_per_simulation" type="number" min="1" value="4">
+
+      <label for="mem_per_simulation_gb">Memory per simulation GB</label>
+      <input id="mem_per_simulation_gb" name="mem_per_simulation_gb" type="number" min="1" step="0.5" value="8">
+
+      <label for="max_workers_per_job">Max workers per job</label>
+      <input id="max_workers_per_job" name="max_workers_per_job" type="number" min="1" value="32">
+
+      <label for="oversubscribe_factor">Oversubscribe factor</label>
+      <input id="oversubscribe_factor" name="oversubscribe_factor" type="number" min="1" step="0.1" value="1.5">
+
+      <label for="load_target">Ramp load target</label>
+      <input id="load_target" name="load_target" type="number" min="0.1" max="1.5" step="0.05" value="0.75">
+
+      <label for="ramp_interval_seconds">Ramp interval seconds</label>
+      <input id="ramp_interval_seconds" name="ramp_interval_seconds" type="number" min="60" value="900">
+
+      <label for="max_new_jobs">Max new jobs now</label>
+      <input id="max_new_jobs" name="max_new_jobs" type="number" min="1" value="10">
+
       <label for="memory">Memory</label>
       <input id="memory" name="memory" value="4G">
 
@@ -44,17 +81,17 @@
   <div>
     <section class="panel">
       <h2>Accounts</h2>
+      <p><button type="button" onclick="refreshAccounts()">Refresh accounts</button></p>
       {% if snapshot_error %}<p class="error">{{ snapshot_error }}</p>{% endif %}
-      <table>
-        <thead><tr><th>Account</th><th>Running</th><th>Pending</th><th>Total</th><th>Limits</th><th>Storage</th><th>Available</th></tr></thead>
+      <table id="accounts-table">
+        <thead><tr><th>Account</th><th>Used / Limit</th><th>Running</th><th>Pending</th><th>Storage</th><th>Available</th></tr></thead>
         <tbody>
         {% for item in snapshots %}
           <tr>
             <td>{{ item.account_name }}</td>
+            <td>{{ item.running + item.pending }} / {{ item.max_total }}</td>
             <td>{{ item.running }}</td>
             <td>{{ item.pending }}</td>
-            <td>{{ item.running + item.pending }}</td>
-            <td>{{ item.max_running }} running / {{ item.max_pending }} pending / {{ item.max_total }} total</td>
             <td>
               {% if item.storage_used_gb is not none and item.storage_quota_gb %}
                 {{ "%.2f"|format(item.storage_used_gb) }} / {{ "%.2f"|format(item.storage_quota_gb) }} GB
@@ -68,21 +105,65 @@
         {% endfor %}
         </tbody>
       </table>
+      <script>
+        async function refreshAccounts() {
+          const res = await fetch('/api/accounts/status/live');
+          const rows = await res.json();
+          const tbody = document.querySelector('#accounts-table tbody');
+          tbody.innerHTML = '';
+          for (const item of rows) {
+            const used = item.running + item.pending;
+            const storage = item.storage_used_gb !== null && item.storage_quota_gb
+              ? `${item.storage_used_gb.toFixed(2)} / ${item.storage_quota_gb.toFixed(2)} GB`
+              : 'not configured';
+            tbody.insertAdjacentHTML('beforeend', `
+              <tr>
+                <td>${item.account_name}</td>
+                <td>${used} / ${item.max_total}</td>
+                <td>${item.running}</td>
+                <td>${item.pending}</td>
+                <td>${storage}</td>
+                <td>${item.available ? 'yes' : 'no'}</td>
+              </tr>
+            `);
+          }
+        }
+      </script>
     </section>
 
     <section class="panel" style="margin-top:20px">
       <h2>Jobs</h2>
       <table>
-        <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Account</th><th>Slurm ID</th><th>Created</th></tr></thead>
+        <thead><tr><th>ID</th><th>Name</th><th>Mode</th><th>Simulations</th><th>Status</th><th>Account</th><th>Slurm ID</th><th>Actions</th></tr></thead>
         <tbody>
         {% for job in jobs %}
           <tr>
             <td><a href="/jobs/{{ job.id }}">{{ job.id }}</a></td>
             <td>{{ job.job_name }}</td>
+            <td>{{ job.job_mode }}</td>
+            <td>
+              {% if job.job_mode in ["packed_srun", "dynamic_packed_srun"] %}
+                {{ job.simulation_start }}-{{ job.simulation_start + job.simulation_count - 1 }} ({{ job.simulation_count }})
+                {% if job.status == "queued" %}
+                  <form method="post" action="/jobs/{{ job.id }}/simulation-count" class="actions" style="margin-top:6px">
+                    <input name="simulation_count" type="number" min="1" value="{{ job.simulation_count }}" style="width:84px">
+                    <button type="submit" class="secondary">Update</button>
+                  </form>
+                {% endif %}
+              {% else %}
+                -
+              {% endif %}
+            </td>
             <td>{{ job.status }}</td>
             <td>{{ job.account_name or "" }}</td>
             <td>{{ job.slurm_job_id or "" }}</td>
-            <td>{{ job.created_at }}</td>
+            <td>
+              {% if job.status not in ["completed", "failed", "cancelled"] %}
+                <form method="post" action="/jobs/{{ job.id }}/cancel">
+                  <button class="danger" type="submit">Cancel</button>
+                </form>
+              {% endif %}
+            </td>
           </tr>
         {% endfor %}
         </tbody>
