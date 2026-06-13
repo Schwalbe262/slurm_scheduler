@@ -18,10 +18,10 @@ Create local config from sanitized examples:
 ```bash
 cp config/app.example.yaml config/app.yaml
 cp config/accounts.example.yaml config/accounts.yaml
-python3 -m slurm_scheduler.security 'change-this-password'
+python3 -m slurm_scheduler.security '<admin-password>'
 ```
 
-Paste the generated password hash into `config/app.yaml`. Edit `config/accounts.yaml` with the real cluster accounts and key paths. `config/app.yaml`, `config/accounts.yaml`, `data/`, and `secrets/` are ignored by Git.
+Set `admin_username` and `admin_password_hash` only in ignored `config/app.yaml`. Edit `config/accounts.yaml` with the real cluster accounts and key paths. `config/app.yaml`, `config/accounts.yaml`, `data/`, and `secrets/` are ignored by Git.
 
 You can run setup and a FastAPI route import smoke test with:
 
@@ -43,6 +43,29 @@ To use a non-default config path:
 ```bash
 SLURM_SCHEDULER_CONFIG=/path/to/app.yaml python3 -m slurm_scheduler
 ```
+
+## Autostart
+
+For Linux systems with user systemd:
+
+```bash
+bash scripts/install_user_systemd.sh
+systemctl --user status slurm-scheduler.service
+```
+
+For WSL on Windows, install a Windows logon task from PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_windows_startup.ps1
+```
+
+The startup task launches:
+
+```bash
+bash scripts/start_web.sh
+```
+
+and writes logs to `logs/web.log` when started through the Windows task.
 
 ## Account Config
 
@@ -87,22 +110,22 @@ SFTP helpers require real values through command-line arguments or environment v
 Check SFTP:
 
 ```bash
-SFTP_HOST=example.internal SFTP_PORT=22 SFTP_USER=user SFTP_PATHS=/path/a,/path/b \
+SFTP_HOST=<sftp-host> SFTP_PORT=<sftp-port> SFTP_USER=<sftp-user> SFTP_PATHS=<path-a>,<path-b> \
   python3 scripts/check_sftp.py
 ```
 
 Download selected PEM files:
 
 ```bash
-SFTP_HOST=example.internal SFTP_PORT=22 SFTP_USER=user SFTP_KEY_DIR=/remote/key/dir \
+SFTP_HOST=<sftp-host> SFTP_PORT=<sftp-port> SFTP_USER=<sftp-user> SFTP_KEY_DIR=<remote-key-dir> \
   python3 scripts/download_cluster_keys.py --key account_a.pem --key account_b.pem
 ```
 
 Mount SFTP shares through `sshfs`:
 
 ```bash
-SFTP_HOST=example.internal SFTP_PORT=22 SFTP_USER=user \
-SFTP_REMOTE_A=/remote/path/a SFTP_REMOTE_B=/remote/path/b \
+SFTP_HOST=<sftp-host> SFTP_PORT=<sftp-port> SFTP_USER=<sftp-user> \
+SFTP_REMOTE_A=<remote-path-a> SFTP_REMOTE_B=<remote-path-b> \
   bash scripts/mount_sftp_drives.sh
 ```
 

@@ -34,7 +34,7 @@ def main() -> None:
     if squeue.exit_code != 0:
         raise SystemExit("SSH works, but squeue was not found in PATH")
 
-    print(f"ssh_ok account={account.name} user={whoami.stdout.strip()} host={hostname.stdout.strip()}")
+    print(f"ssh_ok account={account.name}")
     print(f"squeue={squeue.stdout.strip()}")
 
 

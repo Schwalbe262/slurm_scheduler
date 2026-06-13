@@ -1,8 +1,7 @@
 database_path: "data/slurm_scheduler.db"
 accounts_path: "config/accounts.yaml"
 poll_interval_seconds: 30
-admin_username: "admin"
-# Generate with: python3 -m slurm_scheduler.security 'your-password'
+admin_username: ""
 admin_password_hash: ""
 bind_host: "127.0.0.1"
 bind_port: 8000

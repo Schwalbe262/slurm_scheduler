@@ -102,10 +102,10 @@ GPU ranking is encoded in `slurm_scheduler/inventory.py`. CPU profiles should be
 ```bash
 cp config/app.example.yaml config/app.yaml
 cp config/accounts.example.yaml config/accounts.yaml
-python3 -m slurm_scheduler.security 'change-this-password'
+python3 -m slurm_scheduler.security '<admin-password>'
 ```
 
-Paste the generated hash into `config/app.yaml` as `admin_password_hash`. Put real accounts, hosts, and key paths into ignored `config/accounts.yaml`.
+Set `admin_username` and `admin_password_hash` only in ignored `config/app.yaml`. Put real accounts, hosts, and key paths into ignored `config/accounts.yaml`.
 
 The helper below performs venv creation, dependency installation, and FastAPI route import smoke testing:
 
@@ -114,6 +114,21 @@ bash scripts/setup_and_smoke.sh
 ```
 
 It requires `python3.12-venv` and `python3-pip`.
+
+## Autostart
+
+Runtime entrypoint:
+
+```bash
+bash scripts/start_web.sh
+```
+
+Autostart options:
+
+- `scripts/install_user_systemd.sh` installs a user systemd service when user systemd is available.
+- `scripts/install_windows_startup.ps1` installs a Windows logon scheduled task that starts WSL and runs the web service.
+
+The current Codex sandbox could not access the user systemd bus, so service installation must be run from a normal terminal/PowerShell session.
 
 ## Verification So Far
 

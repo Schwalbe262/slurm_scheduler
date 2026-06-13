@@ -1,0 +1,15 @@
+[Unit]
+Description=Slurm Scheduler Web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/NEC/slurm_scheduler
+ExecStart=%h/NEC/slurm_scheduler/scripts/start_web.sh
+Restart=always
+RestartSec=5
+Environment=SLURM_SCHEDULER_CONFIG=config/app.yaml
+
+[Install]
+WantedBy=default.target
