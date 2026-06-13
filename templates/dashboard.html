@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="grid">
+  <section class="panel">
+    <h1>Submit Job</h1>
+    <form method="post" action="/jobs">
+      <label for="repo_url">Git repository</label>
+      <input id="repo_url" name="repo_url" placeholder="git@github.com:org/project.git" required>
+
+      <label for="git_ref">Branch, tag, or commit</label>
+      <input id="git_ref" name="git_ref" value="main" required>
+
+      <label for="entrypoint">Python entrypoint</label>
+      <input id="entrypoint" name="entrypoint" placeholder="train.py" required>
+
+      <label for="arguments">Arguments</label>
+      <input id="arguments" name="arguments" placeholder="--config configs/run.yaml">
+
+      <label for="env_setup">Environment setup</label>
+      <textarea id="env_setup" name="env_setup" placeholder="module load cuda&#10;conda activate myenv"></textarea>
+
+      <label for="job_name">Job name</label>
+      <input id="job_name" name="job_name" value="web-job">
+
+      <label for="partition">Partition</label>
+      <input id="partition" name="partition" value="auto">
+
+      <label for="time_limit">Time limit</label>
+      <input id="time_limit" name="time_limit" value="01:00:00">
+
+      <label for="cpus">CPUs</label>
+      <input id="cpus" name="cpus" type="number" min="1" value="1">
+
+      <label for="memory">Memory</label>
+      <input id="memory" name="memory" value="4G">
+
+      <label for="gpus">GPUs</label>
+      <input id="gpus" name="gpus" type="number" min="0" value="0">
+
+      <p><button type="submit">Queue job</button></p>
+    </form>
+  </section>
+
+  <div>
+    <section class="panel">
+      <h2>Accounts</h2>
+      {% if snapshot_error %}<p class="error">{{ snapshot_error }}</p>{% endif %}
+      <table>
+        <thead><tr><th>Account</th><th>Running</th><th>Pending</th><th>Total</th><th>Limits</th><th>Storage</th><th>Available</th></tr></thead>
+        <tbody>
+        {% for item in snapshots %}
+          <tr>
+            <td>{{ item.account_name }}</td>
+            <td>{{ item.running }}</td>
+            <td>{{ item.pending }}</td>
+            <td>{{ item.running + item.pending }}</td>
+            <td>{{ item.max_running }} running / {{ item.max_pending }} pending / {{ item.max_total }} total</td>
+            <td>
+              {% if item.storage_used_gb is not none and item.storage_quota_gb %}
+                {{ "%.2f"|format(item.storage_used_gb) }} / {{ "%.2f"|format(item.storage_quota_gb) }} GB
+                {% if item.storage_percent is not none %}({{ "%.1f"|format(item.storage_percent) }}%){% endif %}
+              {% else %}
+                <span class="muted">not configured</span>
+              {% endif %}
+            </td>
+            <td>{{ "yes" if item.available else "no" }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel" style="margin-top:20px">
+      <h2>Jobs</h2>
+      <table>
+        <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Account</th><th>Slurm ID</th><th>Created</th></tr></thead>
+        <tbody>
+        {% for job in jobs %}
+          <tr>
+            <td><a href="/jobs/{{ job.id }}">{{ job.id }}</a></td>
+            <td>{{ job.job_name }}</td>
+            <td>{{ job.status }}</td>
+            <td>{{ job.account_name or "" }}</td>
+            <td>{{ job.slurm_job_id or "" }}</td>
+            <td>{{ job.created_at }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </section>
+  </div>
+</div>
+
+<section class="panel" style="margin-top:20px">
+  <h2>Partition Ranking</h2>
+  <div class="grid">
+    <div>
+      <h2>CPU</h2>
+      <table>
+        <thead><tr><th>Partition</th><th>CPU</th><th>Nodes</th><th>Available</th><th>Max CPU</th><th>Max Mem</th></tr></thead>
+        <tbody>
+        {% for item in cpu_partitions %}
+          <tr><td>{{ item.partition }}</td><td>{{ item.cpu_model }}</td><td>{{ item.nodes }}</td><td>{{ item.available_nodes }}</td><td>{{ item.max_cpus }}</td><td>{{ (item.max_memory_mb / 1024)|round|int }} GB</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div>
+      <h2>GPU</h2>
+      <table>
+        <thead><tr><th>Partition</th><th>GPU</th><th>CPU</th><th>Nodes</th><th>Available</th><th>Max CPU</th></tr></thead>
+        <tbody>
+        {% for item in gpu_partitions %}
+          <tr><td>{{ item.partition }}</td><td>{{ item.gpu_model }} x{{ item.gpu_count_per_node }}</td><td>{{ item.cpu_model }}</td><td>{{ item.nodes }}</td><td>{{ item.available_nodes }}</td><td>{{ item.max_cpus }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="panel" style="margin-top:20px">
+  <h2>Token Usage</h2>
+  <form method="post" action="/token-usage" class="grid">
+    <div>
+      <label for="provider">Provider</label>
+      <input id="provider" name="provider" value="codex">
+      <label for="project">Project</label>
+      <input id="project" name="project" value="slurm_scheduler" required>
+      <label for="reset_cycle">Weekly reset cycle</label>
+      <input id="reset_cycle" name="reset_cycle" placeholder="2026-W24">
+    </div>
+    <div>
+      <label for="input_tokens">Input tokens</label>
+      <input id="input_tokens" name="input_tokens" type="number" min="0" value="0">
+      <label for="output_tokens">Output tokens</label>
+      <input id="output_tokens" name="output_tokens" type="number" min="0" value="0">
+      <label for="total_tokens">Total tokens</label>
+      <input id="total_tokens" name="total_tokens" type="number" min="0" value="0">
+      <label for="note">Note</label>
+      <input id="note" name="note">
+      <p><button type="submit">Record usage</button></p>
+    </div>
+  </form>
+  {% if token_chart %}
+    <div style="margin-top:16px">{{ token_chart | safe }}</div>
+  {% else %}
+    <p class="muted">No token usage records yet.</p>
+  {% endif %}
+  <table style="margin-top:16px">
+    <thead><tr><th>Provider</th><th>Project</th><th>Cycle</th><th>Total</th></tr></thead>
+    <tbody>
+    {% for item in token_summary %}
+      <tr>
+        <td>{{ item.provider }}</td>
+        <td>{{ item.project }}</td>
+        <td>{{ item.reset_cycle }}</td>
+        <td>{{ item.total_tokens }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Slurm Scheduler</title>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --line: #d7dce2;
+      --text: #1f2933;
+      --muted: #657181;
+      --accent: #1d6fb8;
+      --danger: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+    }
+    header {
+      height: 52px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      border-bottom: 1px solid var(--line);
+      background: #fff;
+    }
+    header a { color: var(--text); font-weight: 700; text-decoration: none; }
+    main { padding: 24px; max-width: 1280px; margin: 0 auto; }
+    h1, h2 { margin: 0 0 14px; }
+    h1 { font-size: 22px; }
+    h2 { font-size: 16px; }
+    .grid { display: grid; gap: 20px; grid-template-columns: 380px 1fr; align-items: start; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+    }
+    label { display: block; font-weight: 600; margin: 12px 0 5px; }
+    input, textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font: inherit;
+      background: #fff;
+    }
+    textarea { min-height: 78px; resize: vertical; }
+    button, .button {
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: #fff;
+      border-radius: 6px;
+      padding: 8px 12px;
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-block;
+    }
+    button.secondary { background: #fff; color: var(--accent); }
+    button.danger { background: var(--danger); border-color: var(--danger); }
+    table { width: 100%; border-collapse: collapse; background: #fff; }
+    th, td { border-bottom: 1px solid var(--line); padding: 9px 8px; text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0; }
+    code { background: #eef1f4; border-radius: 4px; padding: 2px 4px; }
+    .muted { color: var(--muted); }
+    .error { color: var(--danger); }
+    .actions { display: flex; gap: 8px; align-items: center; }
+    svg { width: 100%; height: 220px; background: #fff; border: 1px solid var(--line); border-radius: 8px; }
+    svg line { stroke: #9aa5b1; stroke-width: 1; }
+    svg polyline { fill: none; stroke: var(--accent); stroke-width: 2; }
+    svg circle { fill: var(--accent); }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } main { padding: 14px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <a href="/">Slurm Scheduler</a>
+    <form method="post" action="/logout"><button class="secondary" type="submit">Logout</button></form>
+  </header>
+  <main>{% block content %}{% endblock %}</main>
+</body>
+</html>

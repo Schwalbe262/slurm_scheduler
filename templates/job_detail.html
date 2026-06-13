@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <div class="actions">
+    <h1 style="margin-right:auto">Job {{ job.id }}: {{ job.job_name }}</h1>
+    <form method="post" action="/jobs/{{ job.id }}/cancel"><button class="danger" type="submit">Cancel</button></form>
+  </div>
+  <table>
+    <tbody>
+      <tr><th>Status</th><td>{{ job.status }}</td></tr>
+      <tr><th>Repository</th><td><code>{{ job.repo_url }}</code></td></tr>
+      <tr><th>Git ref</th><td><code>{{ job.git_ref }}</code></td></tr>
+      <tr><th>Entrypoint</th><td><code>{{ job.entrypoint }}</code></td></tr>
+      <tr><th>Arguments</th><td><code>{{ job.arguments }}</code></td></tr>
+      <tr><th>Account</th><td>{{ job.account_name or "" }}</td></tr>
+      <tr><th>Slurm job ID</th><td>{{ job.slurm_job_id or "" }}</td></tr>
+      <tr><th>Remote job dir</th><td><code>{{ job.remote_job_dir or "" }}</code></td></tr>
+      <tr><th>stdout</th><td><code>{{ job.stdout_path or "" }}</code></td></tr>
+      <tr><th>stderr</th><td><code>{{ job.stderr_path or "" }}</code></td></tr>
+      <tr><th>Failure</th><td class="error">{{ job.failure_message or "" }}</td></tr>
+    </tbody>
+  </table>
+</section>
+{% endblock %}

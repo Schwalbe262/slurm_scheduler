@@ -1,0 +1,25 @@
+accounts:
+  - name: account_a
+    host: login.example.edu
+    port: 22
+    username: account_a
+    private_key_path: "secrets/cluster/account_a.pem"
+    remote_workspace: "slurm_scheduler"
+    max_running_jobs: 10
+    max_pending_jobs: 10
+    max_total_jobs: 10
+    storage_path: "slurm_scheduler"
+    storage_quota_gb: 0
+    partition_allowlist: []
+  - name: account_b
+    host: login.example.edu
+    port: 22
+    username: account_b
+    private_key_path: "secrets/cluster/account_b.pem"
+    remote_workspace: "slurm_scheduler"
+    max_running_jobs: 10
+    max_pending_jobs: 10
+    max_total_jobs: 10
+    storage_path: "slurm_scheduler"
+    storage_quota_gb: 0
+    partition_allowlist: []

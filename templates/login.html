@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Login</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f6f7f9; font-family: system-ui, sans-serif; color: #1f2933; }
+    form { width: min(360px, calc(100vw - 28px)); background: #fff; border: 1px solid #d7dce2; border-radius: 8px; padding: 22px; }
+    h1 { margin: 0 0 16px; font-size: 22px; }
+    label { display: block; font-weight: 650; margin: 12px 0 5px; }
+    input { width: 100%; border: 1px solid #d7dce2; border-radius: 6px; padding: 9px 10px; font: inherit; box-sizing: border-box; }
+    button { width: 100%; margin-top: 16px; border: 1px solid #1d6fb8; background: #1d6fb8; color: #fff; border-radius: 6px; padding: 9px 12px; font: inherit; font-weight: 650; cursor: pointer; }
+    .error { color: #b42318; min-height: 20px; }
+  </style>
+</head>
+<body>
+  <form method="post" action="/login">
+    <h1>Slurm Scheduler</h1>
+    <div class="error">{{ error }}</div>
+    <label for="username">Username</label>
+    <input id="username" name="username" autocomplete="username" required>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <button type="submit">Login</button>
+  </form>
+</body>
+</html>
