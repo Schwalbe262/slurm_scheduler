@@ -337,3 +337,10 @@ Remaining verification:
 - Lowered `allocation_scale_out_usage_threshold` to `0.50`, so the scheduler starts preparing another pool when the existing pool is about half used rather than waiting until it is full.
 - Added regression tests for half-used prewarming and largest-available shared CPU pool sizing.
 - Verified `python3 -m unittest discover -s tests`.
+
+## 2026-06-16 07:27:42 KST
+
+- Verified after restart that older `16 CPU` queued-demand allocations could remain pending and count as spare capacity even after the large-pool policy was deployed.
+- Added scale-in logic that closes non-exclusive queued CPU demand allocations when the current inventory can provide a larger shared CPU pool.
+- Added a regression test for closing an undersized `16 CPU` pending demand allocation when a `256 CPU` pool candidate is available.
+- Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, and `git diff --check`.

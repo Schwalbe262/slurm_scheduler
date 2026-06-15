@@ -261,3 +261,9 @@
 - Problem: A single queued 16-core task can accidentally shape the next CPU allocation as a small one-task pool.
 - Discovery: Non-exclusive CPU demand reused task-level CPU and memory requests during allocation creation, while scale-out waited until pools were mostly full.
 - Improvement: Treat non-exclusive CPU demand as pool demand, choose the largest available shared CPU pool, and prewarm another pool once usage reaches 50%.
+
+## 2026-06-16 07:27:42 KST
+
+- Problem: Existing undersized pending CPU demand allocations can survive a policy fix and continue suppressing larger pool creation.
+- Discovery: A pending `16 CPU` allocation still counts as matching one queued 16-core task, so the scheduler may treat it as valid spare capacity.
+- Improvement: Close non-exclusive queued CPU demand allocations when current inventory can open a larger shared CPU pool, letting the next tick submit the larger shape.

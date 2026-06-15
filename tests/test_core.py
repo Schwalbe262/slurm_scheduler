@@ -1104,6 +1104,36 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(allocation["state"], AllocationStatus.CLOSED.value)
         self.assertIn("pending-demand", FakeClient.cancelled)
 
+    def test_undersized_shared_cpu_demand_allocation_closes_when_larger_pool_is_available(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "cpu-big cpu2 idle 0 256 0.0 1031519 1000000\n"
+                "cpu-small cpu1 idle 0 48 0.0 768000 700000\n"
+            )
+        )
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu2",
+            node_name="",
+            total_cpus=16,
+            total_memory_mb=32768,
+            resource_pool="cpu",
+            exclusive_node=False,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.PENDING.value,
+            slurm_job_id="small-pending-demand",
+            drain_reason="queued CPU demand",
+        )
+        self.db.create_task(TaskCreate("cpu-backlog", "~/case", "run", cpus=16, memory_mb=32768))
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, min_warm_allocations=0)
+        scheduler.scale_in_idle_allocations()
+        allocation = self.db.get_allocation(allocation_id)
+        self.assertEqual(allocation["state"], AllocationStatus.CLOSED.value)
+        self.assertIn("small-pending-demand", FakeClient.cancelled)
+
     def test_warm_demand_allocation_closes_when_no_queued_task_needs_it(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",

@@ -1129,6 +1129,8 @@ class Scheduler:
     def scale_in_unneeded_demand_allocations(self) -> None:
         queued_tasks = [task for task in self.db.list_tasks(limit=5000) if task["status"] == TaskStatus.QUEUED.value]
         reserved_task_ids: set[int] = set()
+        desired_cpu_shape = self.choose_allocation_shape(resource_pool="cpu")
+        desired_cpu_pool_cpus = int(desired_cpu_shape.get("cpus") or 0) if desired_cpu_shape else 0
         demand_allocations = [
             allocation
             for allocation in self.db.list_allocations(limit=500)
@@ -1137,6 +1139,14 @@ class Scheduler:
         ]
         demand_allocations.sort(key=lambda item: int(item.get("id") or 0))
         for allocation in demand_allocations:
+            if (
+                desired_cpu_pool_cpus
+                and (allocation.get("resource_pool") or "cpu") == "cpu"
+                and not int(allocation.get("exclusive_node") or 0)
+                and int(allocation.get("total_cpus") or 0) < desired_cpu_pool_cpus
+            ):
+                self.close_allocation(allocation, "undersized CPU demand allocation after pool sizing policy change")
+                continue
             matched_task = None
             for task in queued_tasks:
                 if int(task["id"]) in reserved_task_ids:
