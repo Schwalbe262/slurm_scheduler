@@ -216,6 +216,19 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("module load ansys", script)
         self.assertIn("ansys -b -i input.dat", script)
 
+    def test_task_script_writes_payload_json(self) -> None:
+        task = {
+            "remote_cwd": "~/case",
+            "env_setup": "",
+            "command": "python run.py",
+            "payload_json": '{"route":"ICN-SFO"}',
+            "payload_path": "/remote/task-1/payload.json",
+        }
+        script = build_task_script(task)
+        self.assertIn("SLURM_SCHEDULER_PAYLOAD_PATH=/remote/task-1/payload.json", script)
+        self.assertIn("path.write_text", script)
+        self.assertLess(script.index("path.write_text"), script.index("cd $HOME/case"))
+
     def test_srun_attach_command_targets_existing_allocation(self) -> None:
         task = {"cpus": 4, "memory_mb": 8192}
         allocation = {"slurm_job_id": "12345"}
@@ -388,6 +401,14 @@ class FakeClient:
 
     def task_state(self, task: dict) -> JobStatus:
         return self.task_states.get(task["id"], JobStatus.RUNNING)
+
+    def task_exit_code(self, task: dict) -> int | None:
+        state = self.task_states.get(task["id"])
+        if state == JobStatus.COMPLETED:
+            return 0
+        if state == JobStatus.FAILED:
+            return 1
+        return None
 
     def state(self, slurm_job_id: str) -> JobStatus:
         if slurm_job_id in self.allocation_states:
@@ -642,8 +663,31 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.db.get_task(second)["status"], TaskStatus.COMPLETED.value)
         self.assertEqual(self.db.get_task(third)["status"], TaskStatus.QUEUED.value)
 
+    def test_task_create_stores_api_operational_fields(self) -> None:
+        task_id = self.db.create_task(
+            TaskCreate(
+                "flight",
+                "~/flight",
+                "python worker.py",
+                required_capability="flight-crawl",
+                priority=7,
+                timeout_seconds=30,
+                dedupe_key="flight:ICN:SFO",
+                max_workers_per_node=200,
+                payload_json='{"from":"ICN","to":"SFO"}',
+            )
+        )
+        task = self.db.get_task(task_id)
+        self.assertEqual(task["required_capability"], "flight-crawl")
+        self.assertEqual(task["priority"], 7)
+        self.assertEqual(task["timeout_seconds"], 30)
+        self.assertEqual(task["dedupe_key"], "flight:ICN:SFO")
+        self.assertEqual(task["max_workers_per_node"], 200)
+        self.assertEqual(task["payload_json"], '{"from":"ICN","to":"SFO"}')
+        self.assertEqual(self.db.find_active_task_by_dedupe_key("flight:ICN:SFO")["id"], task_id)
+
     def test_maintains_minimum_warm_allocation(self) -> None:
-        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, allocation_cpus=8)
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, allocation_cpus=4)
         scheduler.maintain_allocation_pool()
         allocations = self.db.list_allocations()
         self.assertEqual(len(allocations), 1)
@@ -783,6 +827,26 @@ class SchedulerTests(unittest.TestCase):
         ready = self.db.get_task(ready_id)
         self.assertEqual(blocked["status"], TaskStatus.QUEUED.value)
         self.assertEqual(ready["status"], TaskStatus.RUNNING.value)
+
+    def test_assign_queued_tasks_prefers_higher_priority(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, allocation_cpus=4)
+        scheduler.maintain_allocation_pool()
+        scheduler.refresh_allocations()
+        low_id = self.db.create_task(TaskCreate("low", "~/case", "run", cpus=4, memory_mb=2048, priority=0))
+        high_id = self.db.create_task(TaskCreate("high", "~/case", "run", cpus=4, memory_mb=2048, priority=10))
+        scheduler.assign_queued_tasks()
+        self.assertEqual(self.db.get_task(high_id)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(self.db.get_task(low_id)["status"], TaskStatus.QUEUED.value)
+
+    def test_max_workers_per_node_limits_allocation_concurrency(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, allocation_cpus=8)
+        scheduler.maintain_allocation_pool()
+        scheduler.refresh_allocations()
+        first_id = self.db.create_task(TaskCreate("first", "~/case", "run", cpus=1, memory_mb=512, max_workers_per_node=1))
+        second_id = self.db.create_task(TaskCreate("second", "~/case", "run", cpus=1, memory_mb=512, max_workers_per_node=1))
+        scheduler.assign_queued_tasks()
+        self.assertEqual(self.db.get_task(first_id)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(self.db.get_task(second_id)["status"], TaskStatus.QUEUED.value)
 
     def test_high_usage_prewarms_spare_allocation(self) -> None:
         scheduler = Scheduler(
@@ -999,6 +1063,33 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(task["status"], TaskStatus.COMPLETED.value)
         self.assertEqual(allocation["state"], AllocationStatus.CLOSED.value)
         self.assertIn("exclusive-alloc", FakeClient.cancelled)
+
+    def test_running_task_timeout_marks_failed_with_exit_code(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="",
+            total_cpus=4,
+            total_memory_mb=8192,
+            resource_pool="cpu",
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="alloc-timeout")
+        task_id = self.db.create_task(TaskCreate("timeout", "~/case", "run", timeout_seconds=1))
+        self.db.update_task(
+            task_id,
+            status=TaskStatus.RUNNING.value,
+            allocation_id=allocation_id,
+            account_name="a",
+            wrapper_pid="1234",
+            started_at="2000-01-01 00:00:00",
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        scheduler.refresh_tasks()
+        task = self.db.get_task(task_id)
+        self.assertEqual(task["status"], TaskStatus.FAILED.value)
+        self.assertEqual(task["exit_code"], 124)
+        self.assertIn("timed out", task["failure_message"])
+        self.assertEqual(FakeClient.cancelled_tasks, [task_id])
 
     def test_task_required_capability_uses_matching_allocation_account(self) -> None:
         accounts = [

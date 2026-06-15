@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from math import ceil
@@ -7,7 +8,7 @@ import posixpath
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Form, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from .config import AppConfig, load_accounts, load_app_config
@@ -140,6 +141,34 @@ def allocation_usage_summary(allocations: list[dict]) -> dict[str, int]:
     }
 
 
+def task_state_for_api(status: str) -> str:
+    return "succeeded" if status == "completed" else status
+
+
+def task_result_urls(task_id: int) -> dict[str, str]:
+    return {
+        "status": f"/api/tasks/{task_id}",
+        "stdout": f"/api/tasks/{task_id}/stdout",
+        "stderr": f"/api/tasks/{task_id}/stderr",
+        "remote_file": f"/api/tasks/{task_id}/remote-file",
+    }
+
+
+def last_json_object(text: str) -> object | None:
+    decoder = json.JSONDecoder()
+    for index in range(len(text) - 1, -1, -1):
+        if text[index] not in "[{":
+            continue
+        try:
+            parsed, end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if text[index + end :].strip():
+            continue
+        return parsed
+    return None
+
+
 def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     config = load_app_config(config_path)
     accounts = load_accounts(config.accounts_path)
@@ -187,6 +216,96 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     app.state.config = config
     app.state.db = db
     app.state.scheduler = scheduler
+
+    def read_task_file_text(task: dict, field: str, limit: int = 65536) -> str:
+        path = task.get(field) or ""
+        if not path or not task.get("account_name"):
+            return ""
+        account = next((item for item in accounts if item.name == task["account_name"]), None)
+        if not account:
+            return ""
+        try:
+            text = SlurmAccountClient(account).read_text_file(path)
+        except Exception:
+            return ""
+        if limit > 0 and len(text) > limit:
+            return text[-limit:]
+        return text
+
+    def task_json(task: dict, include_output: bool = False, output_limit: int = 65536) -> dict:
+        allocation = db.get_allocation(int(task["allocation_id"])) if task.get("allocation_id") else None
+        payload = {
+            "task_id": task["id"],
+            "id": task["id"],
+            "name": task["name"],
+            "status": task["status"],
+            "state": task_state_for_api(task["status"]),
+            "exit_code": task.get("exit_code"),
+            "failure_message": task.get("failure_message") or "",
+            "created_at": task.get("created_at"),
+            "attached_at": task.get("attached_at"),
+            "started_at": task.get("started_at"),
+            "finished_at": task.get("finished_at"),
+            "assigned_allocation": task.get("allocation_id"),
+            "allocation_id": task.get("allocation_id"),
+            "account_name": task.get("account_name") or "",
+            "slurm_job_id": allocation.get("slurm_job_id") if allocation else "",
+            "remote_cwd": task.get("remote_cwd") or "",
+            "remote_dir": task.get("remote_dir") or "",
+            "stdout_path": task.get("stdout_path") or "",
+            "stderr_path": task.get("stderr_path") or "",
+            "exit_code_path": task.get("exit_code_path") or "",
+            "required_capability": task.get("required_capability") or "",
+            "priority": int(task.get("priority") or 0),
+            "timeout_seconds": int(task.get("timeout_seconds") or 0),
+            "dedupe_key": task.get("dedupe_key") or "",
+            "max_workers_per_node": int(task.get("max_workers_per_node") or 0),
+            "urls": task_result_urls(int(task["id"])),
+        }
+        if include_output:
+            stdout = read_task_file_text(task, "stdout_path", output_limit)
+            payload["stdout"] = stdout
+            payload["stderr"] = read_task_file_text(task, "stderr_path", output_limit)
+            payload["result_json"] = last_json_object(stdout)
+        return payload
+
+    def create_task_record(payload: dict) -> tuple[int, bool]:
+        dedupe_key = str(payload.get("dedupe_key") or "").strip()
+        if dedupe_key:
+            existing = db.find_active_task_by_dedupe_key(dedupe_key)
+            if existing:
+                return int(existing["id"]), True
+        raw_payload = payload.get("payload_json", "")
+        if isinstance(raw_payload, (dict, list)):
+            payload_json = json.dumps(raw_payload, ensure_ascii=False, separators=(",", ":"))
+        else:
+            payload_json = str(raw_payload or "")
+        task = TaskCreate(
+            name=str(payload.get("name") or "remote-task"),
+            remote_cwd=str(payload.get("remote_cwd") or ""),
+            command=str(payload.get("command") or ""),
+            env_setup=str(payload.get("env_setup") or ""),
+            required_capability=str(payload.get("required_capability") or ""),
+            env_profile=str(payload.get("env_profile") or ""),
+            account_name=str(payload.get("account_name") or ""),
+            cpus=max(1, int(payload.get("cpus") or 1)),
+            memory_mb=max(1, int(payload.get("memory_mb") or 4096)),
+            gpus=max(0, int(payload.get("gpus") or 0)),
+            gpu_model=str(payload.get("gpu_model") or ""),
+            partition=str(payload.get("partition") or "auto"),
+            node_name=str(payload.get("node_name") or ""),
+            exclusive_node=bool(payload.get("exclusive_node") or False),
+            priority=int(payload.get("priority") or 0),
+            timeout_seconds=max(0, int(payload.get("timeout_seconds") or payload.get("timeout") or 0)),
+            dedupe_key=dedupe_key,
+            max_workers_per_node=max(0, int(payload.get("max_workers_per_node") or 0)),
+            payload_json=payload_json,
+        )
+        if not task.remote_cwd:
+            raise HTTPException(status_code=422, detail="remote_cwd is required")
+        if not task.command:
+            raise HTTPException(status_code=422, detail="command is required")
+        return db.create_task(task), False
 
     @app.on_event("startup")
     def _startup() -> None:
@@ -557,7 +676,23 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
 
     @app.get("/api/tasks")
     def api_tasks() -> list[dict]:
-        return db.list_tasks()
+        return [task_json(task) for task in db.list_tasks()]
+
+    @app.post("/api/tasks")
+    async def api_create_task(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="request body must be JSON") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="request body must be a JSON object")
+        task_id, deduped = create_task_record(payload)
+        task = db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=500, detail="task was not created")
+        response = task_json(task)
+        response["deduped"] = deduped
+        return JSONResponse(response, status_code=200 if deduped else 201)
 
     @app.post("/api/tasks/cancel")
     def api_cancel_tasks(
@@ -624,11 +759,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         return Response(text, media_type="text/plain")
 
     @app.get("/api/tasks/{task_id}")
-    def api_task(task_id: int) -> dict:
+    def api_task(task_id: int, include_output: bool = False, output_limit: int = 65536) -> dict:
         task = db.get_task(task_id)
         if not task:
             raise HTTPException(status_code=404)
-        return task
+        return task_json(task, include_output=include_output, output_limit=max(0, output_limit))
 
     @app.post("/api/tasks/{task_id}/cancel")
     def api_cancel_task(task_id: int) -> dict:

@@ -81,6 +81,11 @@ class TaskCreate:
     partition: str = "auto"
     node_name: str = ""
     exclusive_node: bool = False
+    priority: int = 0
+    timeout_seconds: int = 0
+    dedupe_key: str = ""
+    max_workers_per_node: int = 0
+    payload_json: str = ""
 
 
 @dataclass(frozen=True)

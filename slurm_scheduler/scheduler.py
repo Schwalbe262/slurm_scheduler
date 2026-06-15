@@ -397,6 +397,9 @@ class Scheduler:
         for task in self.db.list_tasks(limit=1000):
             if task["status"] not in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
                 continue
+            if self.task_timed_out(task):
+                self.cancel_timed_out_task(task)
+                continue
             if not task.get("account_name"):
                 continue
             account = accounts_by_name.get(task["account_name"])
@@ -411,15 +414,42 @@ class Scheduler:
                 if task["status"] != TaskStatus.RUNNING.value:
                     self.db.update_task(task["id"], status=TaskStatus.RUNNING.value, started_at="CURRENT_TIMESTAMP")
                 continue
+            exit_code = self.client_factory(account).task_exit_code(task) if status in {JobStatus.COMPLETED, JobStatus.FAILED} else None
             if status == JobStatus.COMPLETED:
-                self.db.update_task(task["id"], status=TaskStatus.COMPLETED.value, finished_at="CURRENT_TIMESTAMP")
+                self.db.update_task(task["id"], status=TaskStatus.COMPLETED.value, exit_code=exit_code, finished_at="CURRENT_TIMESTAMP")
                 self.close_allocation_after_exclusive_task(task)
             elif status == JobStatus.CANCELLED:
                 self.db.update_task(task["id"], status=TaskStatus.CANCELLED.value, finished_at="CURRENT_TIMESTAMP")
                 self.close_allocation_after_exclusive_task(task)
             elif status == JobStatus.FAILED:
-                self.db.update_task(task["id"], status=TaskStatus.FAILED.value, finished_at="CURRENT_TIMESTAMP")
+                self.db.update_task(task["id"], status=TaskStatus.FAILED.value, exit_code=exit_code, finished_at="CURRENT_TIMESTAMP")
                 self.close_allocation_after_exclusive_task(task)
+        self.recalculate_allocation_capacity()
+
+    def task_timed_out(self, task: dict) -> bool:
+        timeout = int(task.get("timeout_seconds") or 0)
+        if timeout <= 0:
+            return False
+        started = self._timestamp(task.get("started_at") or task.get("attached_at") or task.get("created_at"))
+        if not started:
+            return False
+        return (self._now() - started).total_seconds() >= timeout
+
+    def cancel_timed_out_task(self, task: dict) -> None:
+        account = self.account_by_name(str(task.get("account_name") or ""))
+        if account:
+            try:
+                self.client_factory(account).cancel_task(task)
+            except Exception as exc:
+                LOGGER.warning("failed to cancel timed out task %s remotely: %s", task["id"], exc)
+        self.db.update_task(
+            task["id"],
+            status=TaskStatus.FAILED.value,
+            failure_message=f"task timed out after {int(task.get('timeout_seconds') or 0)}s",
+            exit_code=124,
+            finished_at="CURRENT_TIMESTAMP",
+        )
+        self.close_allocation_after_exclusive_task(task)
         self.recalculate_allocation_capacity()
 
     def close_allocation_after_exclusive_task(self, task: dict) -> None:
@@ -563,7 +593,7 @@ class Scheduler:
     def assign_queued_tasks(self) -> None:
         queued_tasks = sorted(
             [task for task in self.db.list_tasks(limit=5000) if task["status"] == TaskStatus.QUEUED.value],
-            key=lambda item: int(item["id"]),
+            key=lambda item: (-int(item.get("priority") or 0), int(item["id"])),
         )
         for task in queued_tasks:
             allocation = self.best_allocation_for_task(task)
@@ -632,6 +662,14 @@ class Scheduler:
                 self.borrowable_cpus(item) if not self.task_requires_gpu(task) else int(item["free_cpus"]),
                 int(item["free_memory_mb"]),
             ),
+        )
+
+    def allocation_worker_count(self, allocation_id: int) -> int:
+        return sum(
+            1
+            for task in self.db.list_tasks(limit=5000)
+            if int(task.get("allocation_id") or 0) == allocation_id
+            and task["status"] in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}
         )
 
     def allocation_accepts_new_tasks(self, allocation: dict) -> bool:
@@ -707,6 +745,9 @@ class Scheduler:
         ):
             return False
         if int(allocation["free_memory_mb"]) < int(task["memory_mb"]):
+            return False
+        max_workers = int(task.get("max_workers_per_node") or 0)
+        if max_workers > 0 and not include_pending and self.allocation_worker_count(int(allocation["id"])) >= max_workers:
             return False
         if int(task.get("exclusive_node") or 0):
             if not include_pending and self.allocation_has_active_task(int(allocation["id"])):

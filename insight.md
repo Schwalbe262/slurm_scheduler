@@ -207,3 +207,9 @@
 - Problem: Exclusive demand allocations can survive as `warm` after their triggering task fails or is cancelled, wasting job slots.
 - Discovery: The scale-in logic only checked unneeded demand allocations while they were still `pending`; once Slurm started them and they became `warm`, they fell through to normal warm-pool retention.
 - Improvement: Treat `queued ... demand` allocations as demand-owned in both `pending` and `warm` states, and close them whenever no queued task still matches.
+
+## 2026-06-16 06:38:31 KST
+
+- Problem: Service clients need a stable task-broker contract rather than browser redirects and scattered stdout/result retrieval.
+- Discovery: The existing task table and attach lifecycle already had most execution metadata, but lacked payload, dedupe, timeout, priority, worker-cap, and normalized polling response fields.
+- Improvement: Add JSON task submission, payload file injection, enriched task status JSON, stdout final-JSON parsing, and scheduling controls for Flight-style polling clients.

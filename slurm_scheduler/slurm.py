@@ -383,8 +383,20 @@ def build_task_script(task: dict) -> str:
     lines = [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
-        f"cd {shell_path(task['remote_cwd'])}",
     ]
+    if task.get("payload_json") and task.get("payload_path"):
+        lines.extend(
+            [
+                "python - <<'PY'",
+                "from pathlib import Path",
+                f"path = Path({str(task['payload_path'])!r})",
+                "path.parent.mkdir(parents=True, exist_ok=True)",
+                f"path.write_text({str(task['payload_json'])!r}, encoding='utf-8')",
+                "PY",
+                f"export SLURM_SCHEDULER_PAYLOAD_PATH={shlex.quote(str(task['payload_path']))}",
+            ]
+        )
+    lines.append(f"cd {shell_path(task['remote_cwd'])}")
     if task.get("env_setup"):
         lines.append(task["env_setup"])
     lines.append(task["command"])
@@ -576,6 +588,7 @@ class SlurmAccountClient:
             "exit_code_path": exit_code_path,
         }
         task = resolve_task_placeholders(apply_env_profile(task, self.account), self.account)
+        task = {**task, "payload_path": posixpath.join(remote_dir, "payload.json")}
         script = build_task_script(task)
         wrapper = build_srun_attach_command(
             task,
@@ -624,6 +637,16 @@ class SlurmAccountClient:
             return JobStatus.COMPLETED if int(text) == 0 else JobStatus.FAILED
         except ValueError:
             return JobStatus.RUNNING
+
+    def task_exit_code(self, task: dict) -> int | None:
+        exit_path = task.get("exit_code_path") or ""
+        if not exit_path:
+            return None
+        try:
+            text = self.read_text_file(exit_path).strip().splitlines()[0]
+            return int(text)
+        except Exception:
+            return None
 
     def state(self, slurm_job_id: str) -> JobStatus:
         command = f"squeue -h -j {shlex.quote(slurm_job_id)} -o \"%T\""

@@ -151,6 +151,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     partition TEXT NOT NULL DEFAULT 'auto',
     node_name TEXT NOT NULL DEFAULT '',
     exclusive_node INTEGER NOT NULL DEFAULT 0,
+    priority INTEGER NOT NULL DEFAULT 0,
+    timeout_seconds INTEGER NOT NULL DEFAULT 0,
+    dedupe_key TEXT NOT NULL DEFAULT '',
+    max_workers_per_node INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL DEFAULT '',
+    exit_code INTEGER,
     status TEXT NOT NULL,
     allocation_id INTEGER,
     account_name TEXT,
@@ -221,6 +227,12 @@ class Database:
                 "partition": "TEXT NOT NULL DEFAULT 'auto'",
                 "node_name": "TEXT NOT NULL DEFAULT ''",
                 "exclusive_node": "INTEGER NOT NULL DEFAULT 0",
+                "priority": "INTEGER NOT NULL DEFAULT 0",
+                "timeout_seconds": "INTEGER NOT NULL DEFAULT 0",
+                "dedupe_key": "TEXT NOT NULL DEFAULT ''",
+                "max_workers_per_node": "INTEGER NOT NULL DEFAULT 0",
+                "payload_json": "TEXT NOT NULL DEFAULT ''",
+                "exit_code": "INTEGER",
             },
             "allocations": {
                 "total_gpus": "INTEGER NOT NULL DEFAULT 0",
@@ -294,8 +306,9 @@ class Database:
                 """
                 INSERT INTO tasks (
                     name, remote_cwd, command, env_setup, required_capability, env_profile, account_name, cpus, memory_mb,
-                    gpus, gpu_model, partition, node_name, exclusive_node, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    gpus, gpu_model, partition, node_name, exclusive_node, priority, timeout_seconds, dedupe_key,
+                    max_workers_per_node, payload_json, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.name,
@@ -312,10 +325,31 @@ class Database:
                     task.partition,
                     task.node_name,
                     int(task.exclusive_node),
+                    task.priority,
+                    task.timeout_seconds,
+                    task.dedupe_key,
+                    task.max_workers_per_node,
+                    task.payload_json,
                     TaskStatus.QUEUED.value,
                 ),
             )
             return int(cursor.lastrowid)
+
+    def find_active_task_by_dedupe_key(self, dedupe_key: str) -> dict[str, Any] | None:
+        if not dedupe_key:
+            return None
+        terminal = (TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value)
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE dedupe_key = ? AND status NOT IN (?, ?, ?)
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (dedupe_key, *terminal),
+            ).fetchone()
+            return dict(row) if row else None
 
     def get_task(self, task_id: int) -> dict[str, Any] | None:
         with self.connect() as conn:

@@ -198,11 +198,64 @@ curl -sS "$SCHEDULER_URL/api/jobs/123/remote-file?base=remote_job_dir&path=submi
 curl -sS "$SCHEDULER_URL/api/tasks"
 ```
 
+### `POST /api/tasks`
+
+Creates an attached pool task from a JSON request and returns a polling-ready JSON response. Use this endpoint for service-to-service clients such as Flight.
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/tasks" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "flight-crawl-icn-sfo",
+    "remote_cwd": "/remote/flight-searcher",
+    "command": "python worker.py --payload \"$SLURM_SCHEDULER_PAYLOAD_PATH\"",
+    "payload_json": {"from": "ICN", "to": "SFO", "date": "2026-07-01"},
+    "required_capability": "flight-crawl",
+    "cpus": 1,
+    "memory_mb": 1024,
+    "priority": 10,
+    "timeout_seconds": 300,
+    "dedupe_key": "flight:ICN:SFO:2026-07-01",
+    "max_workers_per_node": 200
+  }'
+```
+
+Response:
+
+```json
+{
+  "task_id": 123,
+  "state": "queued",
+  "assigned_allocation": null,
+  "slurm_job_id": "",
+  "created_at": "2026-06-16 06:20:00",
+  "urls": {
+    "status": "/api/tasks/123",
+    "stdout": "/api/tasks/123/stdout",
+    "stderr": "/api/tasks/123/stderr",
+    "remote_file": "/api/tasks/123/remote-file"
+  },
+  "deduped": false
+}
+```
+
+Fields:
+
+- `payload_json`: optional JSON object, array, or string. The scheduler writes it to `payload.json` under the task remote directory and exports `SLURM_SCHEDULER_PAYLOAD_PATH`.
+- `required_capability`: account capability constraint, for example `flight-crawl`.
+- `priority`: higher values attach before lower values.
+- `timeout_seconds`: nonzero value marks a running task failed with exit code `124` after timeout.
+- `dedupe_key`: if another non-terminal task has the same key, the API returns that task instead of creating a duplicate.
+- `max_workers_per_node`: caps the number of attaching/running tasks on the chosen allocation for this task.
+
 ### `GET /api/tasks/{task_id}`
 
 ```bash
 curl -sS "$SCHEDULER_URL/api/tasks/123"
+curl -sS "$SCHEDULER_URL/api/tasks/123?include_output=true"
 ```
+
+The JSON includes `state`, `status`, `exit_code`, `failure_message`, `assigned_allocation`, `slurm_job_id`, stdout/stderr paths, and timestamps. With `include_output=true`, it also includes `stdout`, `stderr`, and `result_json`, where `result_json` is parsed from the final JSON object or array in stdout.
 
 ### `GET /api/tasks/{task_id}/stdout`
 

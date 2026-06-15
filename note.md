@@ -258,3 +258,12 @@ Remaining verification:
 - Cancelled Slurm jobs `680390`, `680397`, `680398`, `680399`, and `680405`, then marked allocation ids `29`, `36`, `37`, `38`, and `44` closed in the scheduler DB.
 - Changed adaptive scale-in so demand allocations with `drain_reason` starting with `queued ` are closed when no queued task still needs them, even after they have reached `warm`.
 - Verified there are now zero live 12-core allocations.
+
+## 2026-06-16 06:38:31 KST
+
+- Added service-client JSON task submission through `POST /api/tasks`.
+- The JSON response now includes `task_id`, `state`, `assigned_allocation`, `slurm_job_id`, timestamps, result URLs, and dedupe status.
+- Extended task records with `priority`, `timeout_seconds`, `dedupe_key`, `max_workers_per_node`, `payload_json`, and `exit_code`.
+- Added payload support: JSON payloads are written to `payload.json` under the task remote directory, and tasks receive `SLURM_SCHEDULER_PAYLOAD_PATH`.
+- Extended `GET /api/tasks/{id}` with normalized `state`, exit code, failure message, allocation/slurm metadata, stdout/stderr paths, and optional `include_output=true` stdout/stderr/result_json body.
+- Added priority queue ordering, task timeout failure with exit code `124`, dedupe-key reuse for non-terminal tasks, and per-allocation worker cap checks.

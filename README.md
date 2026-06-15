@@ -180,6 +180,28 @@ curl -sS -X POST "$SCHEDULER_URL/tasks" \
   -F gpus=0
 ```
 
+JSON pool task for service clients:
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/tasks" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "flight-crawl-icn-sfo",
+    "remote_cwd": "/remote/flight-searcher",
+    "command": "python worker.py --payload \"$SLURM_SCHEDULER_PAYLOAD_PATH\"",
+    "payload_json": {"from": "ICN", "to": "SFO"},
+    "required_capability": "flight-crawl",
+    "cpus": 1,
+    "memory_mb": 1024,
+    "priority": 10,
+    "timeout_seconds": 300,
+    "dedupe_key": "flight:ICN:SFO",
+    "max_workers_per_node": 200
+  }'
+
+curl -sS "$SCHEDULER_URL/api/tasks/<task_id>?include_output=true"
+```
+
 Git-based task:
 
 ```bash
