@@ -138,6 +138,7 @@ curl "$SCHEDULER_URL/api/token-usage"
 ## Rules For Agents
 
 - Prefer `/tasks` for existing remote directories and long-running iterative work.
+- Prefer `/tasks/git` for Git-backed work. `POST /jobs job_mode=python_git` is only a compatibility alias and will appear as an attached task.
 - Prefer `dynamic_packed_srun` jobs for FEA/RL batches with many simulations.
 - Check `/api/gpu-capacity` before GPU work.
 - Do not request `exclusive_node=true` unless a workload cannot share the node.

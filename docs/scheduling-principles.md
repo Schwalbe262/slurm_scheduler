@@ -12,7 +12,7 @@ The scheduler manages three practical pools:
 - GPU pool: warm allocations such as `resource_pool=gpu:a6000ada`.
 - Mixed capacity: spare CPU and memory inside GPU allocations that CPU-only tasks may borrow.
 
-Direct Slurm jobs still exist for compatibility, but attached tasks are preferred for iterative workloads.
+Direct Slurm jobs still exist for packed simulation compatibility, but attached tasks are the default for normal work. A client may submit a job-like request through `POST /jobs job_mode=python_git`; the scheduler still routes it into the attached-task pool.
 
 ## Policy Matrix
 
@@ -20,8 +20,8 @@ Direct Slurm jobs still exist for compatibility, but attached tasks are preferre
 | --- | --- | --- |
 | Existing remote CPU command | `POST /tasks` | CPU allocation first, then borrowable GPU-allocation CPU |
 | Existing remote GPU command | `POST /tasks` | Matching GPU allocation, model, partition, node, CPU, and memory |
-| Git command | `POST /tasks/git` | Same as attached task after repo setup in account workspace |
-| Many FEA/RL simulations | `POST /jobs` with `dynamic_packed_srun` | `pestat`-based allocation planning and worker ramping |
+| Git command | `POST /tasks/git`, or compatibility `POST /jobs job_mode=python_git` | Same as attached task after repo setup in account workspace |
+| Many FEA/RL simulations | `POST /jobs` with `dynamic_packed_srun` | Packed Slurm job planning and worker ramping |
 | Token accounting | `POST /token-usage` | Stored locally and shown in Web UI/API |
 
 ## Allocation Lifecycle

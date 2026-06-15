@@ -181,3 +181,18 @@ Remaining verification:
 - Added `AllocTRES` GPU parsing and refreshed inventory; GPU used counts now populate, for example A6000ADA `37/40` used and RTX3090 `42/56` used at verification time.
 - Added ordered candidate support for `gpu_model` and `account_name`, such as `gpu_model=a6000ada,a6000` and `account_name=account_a,account_b`.
 - Changed Finished jobs UI to show elapsed time in the final column instead of an empty Actions column.
+
+## 2026-06-16 05:03:13 KST
+
+- Changed the Allocation Pool dashboard columns from free capacity to used capacity.
+- The table now shows `CPU Used`, `GPU Used`, and `Mem Used` as `used / total`, computed from the stored total and free values.
+- This keeps the underlying scheduler capacity accounting unchanged while making the operational view match what users usually inspect first.
+
+## 2026-06-16 05:12:00 KST
+
+- Changed `POST /jobs` compatibility behavior for non-packed Git submissions.
+- `job_mode=python_git` now creates an attached task using the same Git wrapper as `/tasks/git` instead of creating a separate Slurm job.
+- Left `packed_srun` and `dynamic_packed_srun` as direct packed Slurm jobs because those modes currently launch multiple simulation workers inside their own batch allocation.
+- Retargeted the stale A6000 warm-pool request away from its old pending Slurm job.
+- The scheduler opened a new A6000 pool on `n104` as Slurm job `680367`, securing 2 A6000 GPUs. The node only had 3 CPU cores available for this allocation, so it is useful for holding GPU capacity but not for CPU-heavy attached GPU tasks.
+- Confirmed the A6000ADA warm request is still aimed at `n065`; it remains pending for Slurm priority reasons even though matching GPUs are visible there.

@@ -2,7 +2,7 @@
 
 Web-based Slurm scheduler for CPU FEA/RL batches, remote command tasks, and GPU/LLM work.
 
-This project keeps Slurm allocation jobs warm and attaches user work with `srun --jobid`, so lightweight jobs do not consume one account-limited Slurm job slot each. It also keeps compatibility with direct Git-based Slurm jobs and packed simulation batches.
+This project keeps Slurm allocation jobs warm and attaches user work with `srun --jobid`, so lightweight jobs do not consume one account-limited Slurm job slot each. Git-backed work is treated as an attached task by default, while packed simulation batches remain available for compatibility.
 
 This repository is public-safe by design. Real hostnames, account names, IP addresses, private key names, Slurm job IDs, passwords, and local `config/*.yaml` files must stay outside Git.
 
@@ -59,7 +59,8 @@ The web UI has no built-in login page. Keep it on a trusted private network or p
 
 - Use `POST /tasks` when the project already exists on the cluster filesystem.
 - Use `POST /tasks/git` when the scheduler should clone/update a Git repo before running a Python entrypoint.
-- Use `POST /jobs` with `job_mode=dynamic_packed_srun` for many simulation cases in one Slurm job.
+- Use `POST /jobs` with `job_mode=python_git` only as a compatibility alias for `/tasks/git`; it still creates an attached task.
+- Use `POST /jobs` with `job_mode=dynamic_packed_srun` for many simulation cases in one packed Slurm job.
 - Use the Web UI for interactive operation and quick status checks.
 
 ## How Clients Submit Work
@@ -70,12 +71,12 @@ Basic client flow:
 
 1. Set the scheduler URL.
 2. Check health and capacity.
-3. Choose `/tasks`, `/tasks/git`, or `/jobs`.
+3. Choose `/tasks` or `/tasks/git` for normal virtual jobs. Use `/jobs` only for compatibility or packed simulation batches.
 4. Include resource requests such as `cpus`, `memory_mb` or `memory`, `gpus`, and `gpu_model`.
 5. Include `account_name` only when the job must stay on a specific Slurm account. Use comma-separated values such as `account_a,account_b` when either account is acceptable in that preference order.
 6. Poll `/api/tasks`, `/api/jobs`, and `/api/allocations`.
 7. Read task output through `/api/tasks/{task_id}/stdout` or `/api/tasks/{task_id}/remote-file`.
-8. For direct `/jobs` clone or submission failures, read `submit.stderr.log` from the job remote directory.
+8. For attached task output, read `/api/tasks/{task_id}/stdout`, `/api/tasks/{task_id}/stderr`, or `/api/tasks/{task_id}/remote-file`.
 
 ```bash
 export SCHEDULER_URL=http://<scheduler-host>:8000
@@ -117,7 +118,7 @@ Private Git repos must be cloneable from the selected cluster account. Prefer a 
 
 GPU model constraints also accept comma-separated ordered candidates. For example, `gpu_model=a6000ada,a6000` tries A6000 ADA first and can fall back to A6000 if that is the available matching pool or node.
 
-If a Git-backed `/jobs` submission fails before Slurm starts, the scheduler records the pre-submit logs under the job remote directory. Use these to distinguish `Host key verification failed`, `Permission denied (publickey)`, and ordinary Git errors.
+`POST /jobs` with `job_mode=python_git` is kept for old clients, but it is routed into the attached-task scheduler and appears under Attached Tasks. This is the intended "virtual job" path: the client submits a job-like request, and the scheduler places it inside an existing warm allocation.
 
 Use `/jobs` with `dynamic_packed_srun` when the scheduler should split many simulation cases into packed Slurm jobs:
 
@@ -322,7 +323,7 @@ Give a remote LLM agent this repository link plus:
 Use the Slurm scheduler documented in this repository.
 Set SCHEDULER_URL to http://<scheduler-host>:8000.
 First call /api/health, /api/accounts/status, /api/allocations, and /api/gpu-capacity.
-Use /tasks for existing remote directories, /tasks/git for Git-based work, and /jobs dynamic_packed_srun for simulation batches.
+Use /tasks for existing remote directories, /tasks/git for Git-based work, and /jobs dynamic_packed_srun only for packed simulation batches.
 Do not assume direct Slurm access from the client machine.
 Do not submit GPU work until /api/gpu-capacity has been checked.
 ```

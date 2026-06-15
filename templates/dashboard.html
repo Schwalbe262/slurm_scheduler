@@ -422,7 +422,7 @@
     <h2>Allocation Pool</h2>
     <div class="table-scroll">
       <table>
-        <thead><tr><th>ID</th><th>State</th><th>Pool</th><th>Account</th><th>Node</th><th>CPU Free</th><th>GPU Free</th><th>Mem Free</th><th>Slurm ID</th><th>Reason</th></tr></thead>
+        <thead><tr><th>ID</th><th>State</th><th>Pool</th><th>Account</th><th>Node</th><th>CPU Used</th><th>GPU Used</th><th>Mem Used</th><th>Slurm ID</th><th>Reason</th></tr></thead>
         <tbody>
         {% for allocation in allocations %}
           <tr>
@@ -431,9 +431,9 @@
             <td>{{ allocation.resource_pool or "cpu" }}</td>
             <td>{{ allocation.account_name }}</td>
             <td>{{ allocation.node_name or allocation.partition }}</td>
-            <td>{{ allocation.free_cpus }} / {{ allocation.total_cpus }}</td>
-            <td>{{ allocation.free_gpus or 0 }} / {{ allocation.total_gpus or 0 }} {{ allocation.gpu_model }}</td>
-            <td>{{ allocation.free_memory_mb }} / {{ allocation.total_memory_mb }} MB</td>
+            <td>{{ allocation.total_cpus - allocation.free_cpus }} / {{ allocation.total_cpus }}</td>
+            <td>{{ (allocation.total_gpus or 0) - (allocation.free_gpus or 0) }} / {{ allocation.total_gpus or 0 }} {{ allocation.gpu_model }}</td>
+            <td>{{ allocation.total_memory_mb - allocation.free_memory_mb }} / {{ allocation.total_memory_mb }} MB</td>
             <td class="mono-cell">{{ allocation.slurm_job_id or "" }}</td>
             <td class="mono-cell">{{ allocation.pending_reason or allocation.drain_reason or allocation.failure_message or "" }}</td>
           </tr>

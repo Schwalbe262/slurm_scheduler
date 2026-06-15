@@ -126,13 +126,13 @@ curl -sS -X POST "$SCHEDULER_URL/tasks/git" \
 
 Additional fields match `/tasks`, except memory is supplied as `memory` with values such as `4096`, `4096M`, or `8G`.
 
-## Submit Direct Slurm Jobs
+## Submit Batch Jobs And Compatibility Jobs
 
 ### `POST /jobs`
 
-Use direct jobs for compatibility with the original Git-job and packed-FEA workflows. Attached `/tasks` are preferred for iterative remote commands.
+Use this endpoint for compatibility with older clients and packed-FEA workflows. Normal Git work submitted with `job_mode=python_git` is not launched as a separate Slurm job; it is converted into an attached task equivalent to `/tasks/git` and appears in `/api/tasks`.
 
-Minimal Git Python job:
+Compatibility Git Python job:
 
 ```bash
 curl -sS -X POST "$SCHEDULER_URL/jobs" \
@@ -145,8 +145,10 @@ curl -sS -X POST "$SCHEDULER_URL/jobs" \
   -F cpus=4 \
   -F memory=8G \
   -F gpus=0 \
-  -F job_name=git-direct-demo
+  -F job_name=git-attached-demo
 ```
+
+Use `/tasks/git` for new clients because the response and status model are clearer. Keep `/jobs job_mode=python_git` only when an existing integration already posts there.
 
 Dynamic packed FEA/RL job:
 
@@ -165,6 +167,8 @@ curl -sS -X POST "$SCHEDULER_URL/jobs" \
   -F max_new_jobs=10 \
   -F job_name=fea-rl
 ```
+
+`job_mode=packed_srun` and `job_mode=dynamic_packed_srun` still create packed Slurm jobs because they orchestrate many simulation workers inside a batch allocation. Porting these modes to attached-task execution is possible, but it requires moving the packed worker launcher into the warm allocation task wrapper.
 
 ## Job And Task Status
 

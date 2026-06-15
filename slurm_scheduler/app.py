@@ -347,23 +347,20 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                     )
                 )
         else:
-            db.create_job(
-                JobCreate(
-                    repo_url=repo_url,
-                    git_ref=git_ref,
-                    entrypoint=entrypoint,
-                    arguments=arguments,
+            db.create_task(
+                TaskCreate(
+                    name=job_name or "git-task",
+                    remote_cwd=ACCOUNT_WORKSPACE_PLACEHOLDER,
+                    command=build_git_task_command(repo_url, git_ref, entrypoint, arguments),
                     env_setup=env_setup,
                     required_capability=required_capability,
                     env_profile=env_profile,
                     account_name=account_name,
-                    partition=partition,
-                    time_limit=time_limit,
-                    cpus=cpus,
-                    memory=memory,
-                    gpus=gpus,
+                    cpus=max(1, cpus),
+                    memory_mb=max(1, parse_memory_mb(memory)),
+                    gpus=max(0, gpus),
                     gpu_model=gpu_model,
-                    job_name=job_name,
+                    partition=partition,
                     node_name=node_name,
                     exclusive_node=exclusive_node,
                 )

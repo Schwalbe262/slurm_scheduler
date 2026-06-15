@@ -153,3 +153,15 @@
 - Problem: GPU capacity and scheduling were overestimating free GPUs because cluster used GPUs were always parsed as zero.
 - Discovery: This cluster exposes GPU allocation in `AllocTRES` rather than `GresUsed`.
 - Improvement: Parse `AllocTRES` GPU counts and support ordered GPU/account candidates so placement can be both accurate and flexible.
+
+## 2026-06-16 05:03:13 KST
+
+- Problem: Free-capacity columns can make a running system look idle when users are trying to understand current utilization.
+- Discovery: Allocation Pool stores enough data to display either free or used capacity without changing scheduler behavior.
+- Improvement: Show used CPU/GPU/memory in the dashboard while preserving free-capacity fields for placement logic and APIs.
+
+## 2026-06-16 05:12:00 KST
+
+- Problem: Users think in terms of scheduler jobs, but creating a separate Slurm job for every Git request defeats the warm-pool design and consumes account job slots.
+- Discovery: The existing Git task wrapper can represent a `python_git` job request as an attached task without losing repo checkout, entrypoint, account, GPU, or node constraints.
+- Improvement: Route compatibility `POST /jobs job_mode=python_git` requests into the attached-task scheduler, preserving the virtual-job interface while keeping Slurm job count concentrated in warm allocations.
