@@ -255,3 +255,9 @@
 - Problem: Scheduler ticks and API reads can fail under task submission bursts because SQLite's default lock handling is too short for concurrent scheduler/UI/client traffic.
 - Discovery: The scale-out loop stopped before pool maintenance with `sqlite3.OperationalError: database is locked`, and `/api/tasks/{id}` also returned 500 during the same lock window.
 - Improvement: Open SQLite connections with a longer timeout, set `busy_timeout`, enable WAL mode, and use `synchronous=NORMAL` so readers and writers interfere less.
+
+## 2026-06-16 07:23:17 KST
+
+- Problem: A single queued 16-core task can accidentally shape the next CPU allocation as a small one-task pool.
+- Discovery: Non-exclusive CPU demand reused task-level CPU and memory requests during allocation creation, while scale-out waited until pools were mostly full.
+- Improvement: Treat non-exclusive CPU demand as pool demand, choose the largest available shared CPU pool, and prewarm another pool once usage reaches 50%.

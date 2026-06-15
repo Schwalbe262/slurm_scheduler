@@ -1084,15 +1084,16 @@ class Scheduler:
             )
         if self.allocation_pool_in_backoff("cpu"):
             return False
+        exclusive_node = bool(task.get("exclusive_node"))
         return self.open_allocation(
             "queued CPU demand",
             resource_pool="cpu",
-            exclusive_node=bool(task.get("exclusive_node")),
+            exclusive_node=exclusive_node,
             required_capability=str(task.get("required_capability") or ""),
             env_profile=str(task.get("env_profile") or ""),
             account_name=str(task.get("account_name") or ""),
-            requested_cpus=int(task.get("cpus") or 0),
-            requested_memory_mb=int(task.get("memory_mb") or 0),
+            requested_cpus=int(task.get("cpus") or 0) if exclusive_node else 0,
+            requested_memory_mb=int(task.get("memory_mb") or 0) if exclusive_node else 0,
         )
 
     def scale_in_idle_allocations(self) -> None:
@@ -1406,7 +1407,10 @@ class Scheduler:
                 continue
             if requested_cpus and available_cpus < requested_cpus:
                 continue
-            cpus = requested_cpus or self.allocation_cpus or available_cpus
+            if wants_gpu or exclusive_node:
+                cpus = requested_cpus or self.allocation_cpus or available_cpus
+            else:
+                cpus = available_cpus
             cpus = max(1, min(cpus, available_cpus))
             if requested_memory_mb and node.free_memory_mb < requested_memory_mb:
                 continue

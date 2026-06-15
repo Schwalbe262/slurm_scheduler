@@ -319,6 +319,7 @@ Example scheduler policy:
 ```yaml
 cluster_refresh_interval_seconds: 120
 allocation_cpus: 64
+allocation_scale_out_usage_threshold: 0.50
 allocation_pending_timeout_seconds: 1800
 allocation_pending_backoff_seconds: 1800
 cpu_pool_allow_gpu_partitions: true

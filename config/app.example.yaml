@@ -9,7 +9,7 @@ allocation_partition: "auto"
 allocation_cpus: 64
 allocation_memory: "0"
 allocation_time_limit: "48:00:00"
-allocation_scale_out_usage_threshold: 0.70
+allocation_scale_out_usage_threshold: 0.50
 allocation_scale_in_idle_seconds: 600
 allocation_drain_after_seconds: 129600
 allocation_attach_stop_before_drain_seconds: 1800

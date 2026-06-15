@@ -327,3 +327,13 @@ Remaining verification:
 - Found scheduler ticks were failing before `maintain_allocation_pool()` with `sqlite3.OperationalError: database is locked` during concurrent `/api/tasks` bursts, UI polling, and scheduler task assignment.
 - Increased SQLite connection timeout to 30 seconds and applied `PRAGMA busy_timeout = 30000`, `journal_mode = WAL`, and `synchronous = NORMAL` for better read/write concurrency.
 - Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, and `git diff --check`.
+
+## 2026-06-16 07:23:17 KST
+
+- Investigated why a large CPU backlog could create a small `16 CPU` demand allocation instead of a useful pool.
+- Found non-exclusive queued task demand was passing the task's own CPU and memory request into allocation shape selection, so a 16-core task could cause a 16-core pool request.
+- Changed non-exclusive CPU demand allocation to request a pool shape, not a task shape. Exclusive-node tasks still keep their own requested CPU and memory sizing.
+- Changed CPU pool shape selection to use the largest available CPU capacity from inventory/pestat for shared CPU pools instead of capping at the default `allocation_cpus`.
+- Lowered `allocation_scale_out_usage_threshold` to `0.50`, so the scheduler starts preparing another pool when the existing pool is about half used rather than waiting until it is full.
+- Added regression tests for half-used prewarming and largest-available shared CPU pool sizing.
+- Verified `python3 -m unittest discover -s tests`.

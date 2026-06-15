@@ -936,18 +936,18 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.db.get_task(first_id)["status"], TaskStatus.RUNNING.value)
         self.assertEqual(self.db.get_task(second_id)["status"], TaskStatus.QUEUED.value)
 
-    def test_high_usage_prewarms_spare_allocation(self) -> None:
+    def test_half_used_cpu_pool_prewarms_spare_allocation(self) -> None:
         scheduler = Scheduler(
             self.db,
             self.accounts,
             30,
             client_factory=FakeClient,
             allocation_cpus=8,
-            allocation_scale_out_usage_threshold=0.70,
+            allocation_scale_out_usage_threshold=0.50,
         )
         scheduler.maintain_allocation_pool()
         scheduler.refresh_allocations()
-        self.db.create_task(TaskCreate("heavy", "~/case", "run", cpus=6, memory_mb=2048))
+        self.db.create_task(TaskCreate("heavy", "~/case", "run", cpus=4, memory_mb=2048))
         scheduler.assign_queued_tasks()
         scheduler.maintain_allocation_pool()
         live = [
@@ -964,7 +964,7 @@ class SchedulerTests(unittest.TestCase):
             30,
             client_factory=FakeClient,
             allocation_cpus=8,
-            allocation_scale_out_usage_threshold=0.70,
+            allocation_scale_out_usage_threshold=0.50,
         )
         scheduler.maintain_allocation_pool()
         scheduler.refresh_allocations()
@@ -1024,6 +1024,30 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(allocation["exclusive_node"], 1)
         self.assertEqual(allocation["total_cpus"], 12)
         self.assertEqual(allocation["total_memory_mb"], 98304)
+
+    def test_non_exclusive_cpu_demand_uses_largest_available_cpu_pool(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "cpu-big cpu2 idle 0 256 0.0 1031519 1000000\n"
+                "cpu-small cpu1 idle 0 48 0.0 768000 700000\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            allocation_cpus=64,
+            allocation_memory="0",
+        )
+        self.db.create_task(TaskCreate("cpu-backlog", "~/case", "run", cpus=16, memory_mb=32768))
+        scheduler.maintain_allocation_pool()
+        allocation = self.db.list_allocations()[0]
+        self.assertEqual(allocation["exclusive_node"], 0)
+        self.assertEqual(allocation["total_cpus"], 256)
+        self.assertGreater(allocation["total_memory_mb"], 32768)
 
     def test_exclusive_cpu_demand_avoids_busy_single_job_partition(self) -> None:
         self.db.replace_pestat_nodes(
@@ -1279,7 +1303,7 @@ class SchedulerTests(unittest.TestCase):
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, allocation_partition="cpu2")
         shape = scheduler.choose_allocation_shape()
         self.assertEqual(shape["node_name"], "large")
-        self.assertEqual(shape["cpus"], 64)
+        self.assertEqual(shape["cpus"], 128)
 
     def test_cpu_pool_can_use_gpu_partition_when_cpu_is_better(self) -> None:
         inventory = parse_scontrol_nodes(

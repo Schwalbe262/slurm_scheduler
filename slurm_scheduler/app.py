@@ -283,7 +283,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         stderr = read_task_file_text(task, "stderr_path", limit=8192, tail_lines=3)
         return "\n".join(line for line in stderr.splitlines()[:3]).strip()
 
-    def task_json(task: dict, include_output: bool = False, output_limit: int = 65536) -> dict:
+    def task_json(task: dict, include_output: bool = False, output_limit: int = 65536, derive_failure_message: bool = True) -> dict:
         allocation = db.get_allocation(int(task["allocation_id"])) if task.get("allocation_id") else None
         payload = {
             "task_id": task["id"],
@@ -292,7 +292,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "status": task["status"],
             "state": task_state_for_api(task["status"]),
             "exit_code": task.get("exit_code"),
-            "failure_message": task_failure_message(task),
+            "failure_message": task_failure_message(task) if derive_failure_message else (task.get("failure_message") or ""),
             "created_at": task.get("created_at"),
             "attached_at": task.get("attached_at"),
             "started_at": task.get("started_at"),
@@ -734,7 +734,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
 
     @app.get("/api/tasks")
     def api_tasks() -> list[dict]:
-        return [task_json(task) for task in db.list_tasks()]
+        return [task_json(task, derive_failure_message=False) for task in db.list_tasks()]
 
     @app.post("/api/tasks")
     async def api_create_task(request: Request) -> JSONResponse:
