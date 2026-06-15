@@ -243,3 +243,4 @@ Remaining verification:
 - Added remote task wrapper termination through `SlurmAccountClient.cancel_task`.
 - Added `allocation_attach_stop_before_drain_seconds` and stopped assigning new tasks to allocations close to their drain threshold.
 - Documented task cancellation and `base=git_repo` result retrieval.
+- Deployed the API and cancelled 35 non-terminal `crypto-sweep` tasks through `POST /api/tasks/cancel`; the remaining 52 matching tasks were already failed.
