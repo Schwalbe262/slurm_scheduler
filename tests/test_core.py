@@ -22,6 +22,7 @@ from slurm_scheduler.slurm import (
     parse_squeue_counts,
     remote_execution_path,
     resolve_task_placeholders,
+    shell_command_path,
 )
 
 
@@ -236,6 +237,26 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertEqual(remote_execution_path("slurm_scheduler/task-1/task.sh"), "~/slurm_scheduler/task-1/task.sh")
         self.assertEqual(remote_execution_path("~/slurm_scheduler/task-1/task.sh"), "~/slurm_scheduler/task-1/task.sh")
         self.assertEqual(remote_execution_path("/tmp/task.sh"), "/tmp/task.sh")
+
+    def test_shell_command_path_keeps_home_prefix_expandable(self) -> None:
+        self.assertEqual(shell_command_path("~/slurm_scheduler/task-1/task.sh"), "~/slurm_scheduler/task-1/task.sh")
+        self.assertEqual(shell_command_path("~/dir with space/task.sh"), "~/'dir with space/task.sh'")
+        self.assertEqual(shell_command_path("/tmp/task.sh"), "/tmp/task.sh")
+
+    def test_srun_attach_command_leaves_home_script_path_expandable(self) -> None:
+        task = {"cpus": 4, "memory_mb": 8192}
+        allocation = {"slurm_job_id": "12345"}
+        command = build_srun_attach_command(
+            task,
+            allocation,
+            "~/slurm_scheduler/task-1/task.sh",
+            "~/slurm_scheduler/task-1/stdout.log",
+            "~/slurm_scheduler/task-1/stderr.log",
+            "~/slurm_scheduler/task-1/exit_code",
+        )
+        self.assertIn("bash ~/slurm_scheduler/task-1/task.sh", command)
+        self.assertNotIn("'~/slurm_scheduler/task-1/task.sh'", command)
+        self.assertIn("> ~/slurm_scheduler/task-1/stdout.log", command)
 
     def test_srun_attach_command_can_request_gpu(self) -> None:
         task = {"cpus": 8, "memory_mb": 16384, "gpus": 1, "gpu_model": "a6000"}

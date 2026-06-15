@@ -357,6 +357,19 @@ def remote_execution_path(path: str) -> str:
     return f"~/{value}"
 
 
+def shell_command_path(path: str) -> str:
+    value = (path or ".").strip() or "."
+    if value == "~":
+        return "~"
+    if value.startswith("~/"):
+        return "~/" + shlex.quote(value[2:])
+    if value == "$HOME":
+        return "$HOME"
+    if value.startswith("$HOME/"):
+        return "$HOME/" + shlex.quote(value[6:])
+    return shlex.quote(value)
+
+
 def resolve_task_placeholders(task: dict, account: AccountConfig) -> dict:
     workspace = account.remote_workspace or "."
     command = str(task.get("command") or "").replace(ACCOUNT_WORKSPACE_PLACEHOLDER, shell_path(workspace))
@@ -395,11 +408,11 @@ def build_srun_attach_command(
     gres = gpu_gres_value(str(allocation.get("gpu_model") or task.get("gpu_model") or ""), int(task.get("gpus") or 0))
     if gres:
         srun_parts.append(f"--gres={shlex.quote(gres)}")
-    srun_parts.extend(["--exclusive", "bash", shlex.quote(script_path)])
+    srun_parts.extend(["--exclusive", "bash", shell_command_path(script_path)])
     srun_command = " ".join(srun_parts)
     return (
-        f"{srun_command} > {shlex.quote(stdout_path)} 2> {shlex.quote(stderr_path)}; "
-        f"echo $? > {shlex.quote(exit_code_path)}"
+        f"{srun_command} > {shell_command_path(stdout_path)} 2> {shell_command_path(stderr_path)}; "
+        f"echo $? > {shell_command_path(exit_code_path)}"
     )
 
 
