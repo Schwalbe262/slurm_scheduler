@@ -11,6 +11,11 @@ accounts:
     storage_path: "slurm_scheduler"
     storage_quota_gb: 0
     partition_allowlist: []
+    capabilities: ["conda:pyaedt2026v1"]
+    env_profiles:
+      pyaedt2026v1: |
+        source ~/miniconda3/etc/profile.d/conda.sh
+        conda activate pyaedt2026v1
   - name: account_b
     host: login.example.edu
     port: 22
@@ -23,3 +28,5 @@ accounts:
     storage_path: "slurm_scheduler"
     storage_quota_gb: 0
     partition_allowlist: []
+    capabilities: []
+    env_profiles: {}

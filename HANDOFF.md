@@ -37,6 +37,29 @@ The web UI supports:
 - token usage recording by provider/project/reset cycle
 - token usage time-axis SVG chart
 
+## Latest Session Notes
+
+As of the latest handoff update:
+
+- The working tree was clean before editing this file.
+- The local web server was running through the smoke-test virtualenv with `python -m slurm_scheduler`.
+- The dashboard is served directly at `/`; `/login` is intentionally absent.
+- Local SQLite job history was checked and contained no scheduler-managed jobs at that time.
+- `scancel` is only reachable through the manual web cancel route:
+  - `POST /jobs/{job_id}/cancel`
+  - `Scheduler.cancel(...)`
+  - `SlurmAccountClient.cancel(...)`
+- The scheduler loop does not currently auto-cancel jobs based on age, walltime, account name, or queue pressure.
+- Periodic account refresh uses `squeue`; submitted job refresh uses `squeue`/`sacct`; optional storage refresh uses cached `du -sk`.
+
+If a cluster job is reported as cancelled externally, first check Slurm accounting from the affected account:
+
+```bash
+sacct -u "$USER" -X -o JobID,JobName,State,ExitCode,Reason,Submit,Start,End
+```
+
+Do not record the resulting real job IDs, account names, or hostnames in tracked files.
+
 ## Sensitive Data Policy
 
 The Git repository must remain sanitized. Do not commit:
@@ -96,6 +119,20 @@ When a job uses `partition=auto`, scheduler behavior is:
 
 `dynamic_packed_srun` uses cached `pestat` rows to size each allocation dynamically. For each candidate node it computes available workers from free Slurm CPUs, CPU load, free memory, `cpus_per_simulation`, and `mem_per_simulation_gb`.
 
+The generated packed allocation script starts with a conservative worker count and launches simulation subprocesses inside one Slurm allocation. It monitors `os.getloadavg()` and `/proc/meminfo`; if CPU load and memory leave room, it raises the worker limit up to `max_workers_per_job`.
+
+Persistent allocation lifecycle support is now implemented in the scheduler loop:
+
+- keep at least one warm allocation open
+- attach remote-command tasks with `srun --jobid`
+- prewarm another allocation when queued demand cannot fit or pool usage is high
+- stop assigning new work to allocations after about 36 hours
+- close empty draining allocations immediately so account job slots are released
+- force-clean stuck allocations around 39 hours old
+- scale in extra warm allocations after an idle interval
+
+The older packed job mode still exists. New persistent allocation work uses the `allocations` and `tasks` tables and the remote-command task form/API.
+
 GPU ranking is encoded in `slurm_scheduler/inventory.py`. CPU profiles should be updated in local code/config only with non-sensitive labels if the repository is public.
 
 ## Local Setup
@@ -142,6 +179,25 @@ bash -n scripts/setup_and_smoke.sh scripts/mount_sftp_drives.sh scripts/unmount_
 ```
 
 Live verification was performed in the local environment with ignored config and keys. Details are intentionally not recorded here because this file is tracked.
+
+Latest local checks that should be rerun after code edits:
+
+```bash
+python3 -m unittest discover -s tests
+python3 -m compileall slurm_scheduler scripts
+bash -n scripts/setup_and_smoke.sh scripts/mount_sftp_drives.sh scripts/unmount_sftp_drives.sh scripts/start_web.sh
+```
+
+Before committing, run a targeted sensitive-value scan using the real local values as patterns. Keep the command itself out of tracked docs if it contains real values.
+
+## Recommended Next Work
+
+- Live-test persistent allocations on the cluster with a harmless sleep command before running ANSYS workloads.
+- Add a config flag that disables manual `scancel` unless explicitly enabled, or require a stronger confirmation for manual cancellation.
+- Add richer task log browsing for remote-command tasks.
+- Add per-simulation status rows so the UI can show running/completed/failed simulation counts inside each packed allocation.
+- Add live log links for `slurm-%j.out`, `slurm-%j.err`, and `simul_log/*`.
+- Move `pestat` refresh into a background task instead of relying only on manual `scripts/refresh_pestat.py`.
 
 ## GitHub Hygiene
 

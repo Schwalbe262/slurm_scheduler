@@ -14,6 +14,25 @@ class JobStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class AllocationStatus(StrEnum):
+    PENDING = "pending"
+    WARM = "warm"
+    ACTIVE = "active"
+    DRAINING = "draining"
+    CLOSING = "closing"
+    CLOSED = "closed"
+    FAILED = "failed"
+
+
+class TaskStatus(StrEnum):
+    QUEUED = "queued"
+    ATTACHING = "attaching"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 @dataclass(frozen=True)
 class JobCreate:
     repo_url: str
@@ -21,11 +40,15 @@ class JobCreate:
     entrypoint: str
     arguments: str = ""
     env_setup: str = ""
+    required_capability: str = ""
+    env_profile: str = ""
+    account_name: str = ""
     partition: str = "auto"
     time_limit: str = "01:00:00"
     cpus: int = 1
     memory: str = "4G"
     gpus: int = 0
+    gpu_model: str = ""
     job_name: str = "web-job"
     job_mode: str = "python_git"
     remote_path: str = ""
@@ -34,11 +57,30 @@ class JobCreate:
     simulation_start: int = 1
     simulation_count: int = 1
     node_name: str = ""
+    exclusive_node: bool = False
     mem_per_simulation_gb: float = 1.0
     max_workers_per_job: int = 32
     initial_workers: int = 1
     load_target: float = 0.75
     ramp_interval_seconds: int = 900
+
+
+@dataclass(frozen=True)
+class TaskCreate:
+    name: str
+    remote_cwd: str
+    command: str
+    env_setup: str = ""
+    required_capability: str = ""
+    env_profile: str = ""
+    account_name: str = ""
+    cpus: int = 1
+    memory_mb: int = 4096
+    gpus: int = 0
+    gpu_model: str = ""
+    partition: str = "auto"
+    node_name: str = ""
+    exclusive_node: bool = False
 
 
 @dataclass(frozen=True)

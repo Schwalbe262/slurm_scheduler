@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from slurm_scheduler.config import load_accounts, load_app_config
 from slurm_scheduler.db import Database
-from slurm_scheduler.inventory import parse_sinfo_nodes, partition_rank
+from slurm_scheduler.inventory import parse_scontrol_nodes, parse_sinfo_nodes, partition_rank
 from slurm_scheduler.slurm import SSHSession
 
 
@@ -24,11 +24,14 @@ def main() -> None:
     account = next((item for item in accounts if item.name == args.account), accounts[0])
 
     with SSHSession(account) as ssh:
-        result = ssh.run('sinfo -N -h -o "%N|%P|%c|%m|%G|%t"')
-    if result.exit_code != 0:
-        raise SystemExit(result.stderr or result.stdout)
-
-    nodes = parse_sinfo_nodes(result.stdout)
+        result = ssh.run("scontrol -o show nodes")
+        if result.exit_code == 0 and result.stdout.strip():
+            nodes = parse_scontrol_nodes(result.stdout)
+        else:
+            result = ssh.run('sinfo -N -h -o "%N|%P|%c|%m|%G|%t"')
+            if result.exit_code != 0:
+                raise SystemExit(result.stderr or result.stdout)
+            nodes = parse_sinfo_nodes(result.stdout)
     db = Database(app_config.database_path)
     db.init()
     db.replace_node_inventory(nodes)

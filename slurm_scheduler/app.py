@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from math import ceil
 import posixpath
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -11,11 +12,12 @@ from fastapi.templating import Jinja2Templates
 
 from .config import AppConfig, load_accounts, load_app_config
 from .db import Database
-from .models import JobCreate
+from .models import JobCreate, TaskCreate
 from .inventory import partition_rank
 from .pestat import PestatNode, plan_dynamic_allocations
 from .scheduler import Scheduler
 from .slurm import SlurmAccountClient
+from .task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, build_git_task_command
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -49,12 +51,88 @@ def build_token_chart(points: list[dict]) -> str:
     """
 
 
+def parse_memory_mb(value: str) -> int:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return 4096
+    try:
+        if raw.endswith("gb") or raw.endswith("g"):
+            return int(float(raw.rstrip("gb")) * 1024)
+        if raw.endswith("mb") or raw.endswith("m"):
+            return int(float(raw.rstrip("mb")))
+        return int(float(raw))
+    except ValueError:
+        return 4096
+
+
+def parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=timezone.utc)
+    except ValueError:
+        try:
+            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+
+def format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def attach_task_elapsed(tasks: list[dict]) -> list[dict]:
+    now = datetime.now(timezone.utc)
+    hydrated: list[dict] = []
+    for task in tasks:
+        item = dict(task)
+        start = parse_timestamp(item.get("started_at") or item.get("attached_at") or item.get("created_at"))
+        end = parse_timestamp(item.get("finished_at")) or now
+        item["elapsed_text"] = format_elapsed((end - start).total_seconds()) if start else ""
+        item["log_path"] = item.get("stdout_path") or item.get("stderr_path") or ""
+        hydrated.append(item)
+    return hydrated
+
+
 def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     config = load_app_config(config_path)
     accounts = load_accounts(config.accounts_path)
     db = Database(config.database_path)
     db.init()
-    scheduler = Scheduler(db, accounts, config.poll_interval_seconds)
+    scheduler = Scheduler(
+        db,
+        accounts,
+        config.poll_interval_seconds,
+        cluster_refresh_interval_seconds=config.cluster_refresh_interval_seconds,
+        min_warm_allocations=config.min_warm_allocations,
+        allocation_partition=config.allocation_partition,
+        allocation_cpus=config.allocation_cpus,
+        allocation_memory=config.allocation_memory,
+        allocation_time_limit=config.allocation_time_limit,
+        allocation_scale_out_usage_threshold=config.allocation_scale_out_usage_threshold,
+        allocation_scale_in_idle_seconds=config.allocation_scale_in_idle_seconds,
+        allocation_drain_after_seconds=config.allocation_drain_after_seconds,
+        allocation_force_cancel_after_seconds=config.allocation_force_cancel_after_seconds,
+        allocation_pending_timeout_seconds=config.allocation_pending_timeout_seconds,
+        allocation_pending_backoff_seconds=config.allocation_pending_backoff_seconds,
+        allocation_reserved_job_slots=config.allocation_reserved_job_slots,
+        cpu_pool_allow_gpu_partitions=config.cpu_pool_allow_gpu_partitions,
+        warm_pool_preferred_accounts=config.warm_pool_preferred_accounts,
+        gpu_warm_pool_preferred_accounts=config.gpu_warm_pool_preferred_accounts,
+        single_job_per_node_partitions=config.single_job_per_node_partitions,
+        gpu_cpu_reserve=config.gpu_cpu_reserve,
+        gpu_prewarm_enabled=config.gpu_prewarm_enabled,
+        gpu_prewarm_preferred_models=config.gpu_prewarm_preferred_models,
+        gpu_prewarm_min_warm_allocations=config.gpu_prewarm_min_warm_allocations,
+        gpu_prewarm_max_warm_allocations=config.gpu_prewarm_max_warm_allocations,
+        gpu_prewarm_gpus_per_allocation=config.gpu_prewarm_gpus_per_allocation,
+        gpu_prewarm_cpu_reserve_per_free_gpu=config.gpu_prewarm_cpu_reserve_per_free_gpu,
+        gpu_prewarm_partition=config.gpu_prewarm_partition,
+        gpu_prewarm_time_limit=config.gpu_prewarm_time_limit,
+    )
 
     app = FastAPI(title="Slurm Scheduler")
     app.state.config = config
@@ -73,11 +151,23 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     def dashboard(request: Request) -> HTMLResponse:
         snapshots = scheduler.cached_snapshots()
         snapshot_error = "" if snapshots else "Account status will appear after the background scheduler refreshes."
+        allocations = db.list_allocations(limit=500)
+        active_allocations = [item for item in allocations if item["state"] != "closed"]
+        closed_allocations = [item for item in allocations if item["state"] == "closed"]
+        tasks = attach_task_elapsed(db.list_tasks())
+        active_tasks = [item for item in tasks if item["status"] not in {"completed", "failed", "cancelled"}]
+        finished_tasks = [item for item in tasks if item["status"] in {"completed", "failed", "cancelled"}]
         return templates.TemplateResponse(
             "dashboard.html",
             {
                 "request": request,
                 "jobs": db.list_jobs(),
+                "tasks": active_tasks,
+                "finished_tasks": finished_tasks[:50],
+                "finished_task_count": len(finished_tasks),
+                "allocations": active_allocations,
+                "closed_allocations": closed_allocations[:20],
+                "closed_allocation_count": len(closed_allocations),
                 "snapshots": snapshots,
                 "snapshot_error": snapshot_error,
                 "token_usage": db.list_token_usage(),
@@ -85,6 +175,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 "token_chart": build_token_chart(db.list_token_usage()),
                 "cpu_partitions": partition_rank(db.list_node_inventory(), needs_gpu=False),
                 "gpu_partitions": partition_rank(db.list_node_inventory(), needs_gpu=True),
+                "gpu_capacity": scheduler.gpu_capacity_summary(),
             },
         )
 
@@ -96,11 +187,17 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         entrypoint: str = Form(...),
         arguments: str = Form(""),
         env_setup: str = Form(""),
+        required_capability: str = Form(""),
+        env_profile: str = Form(""),
+        account_name: str = Form(""),
         partition: str = Form("auto"),
         time_limit: str = Form("01:00:00"),
         cpus: int = Form(1),
         memory: str = Form("4G"),
         gpus: int = Form(0),
+        gpu_model: str = Form(""),
+        node_name: str = Form(""),
+        exclusive_node: bool = Form(False),
         job_name: str = Form("web-job"),
         remote_path: str = Form(""),
         total_simulations: int = Form(1),
@@ -169,11 +266,15 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                         entrypoint=entrypoint,
                         arguments=arguments,
                         env_setup=env_setup,
+                        required_capability=required_capability,
+                        env_profile=env_profile,
+                        account_name=account_name,
                         partition=plan.partition,
                         time_limit=time_limit,
                         cpus=plan.total_cpus,
                         memory=memory,
                         gpus=gpus,
+                        gpu_model=gpu_model,
                         job_name=f"{job_name}-{plan.simulation_start}-{plan.simulation_start + plan.simulation_count - 1}",
                         job_mode="packed_srun",
                         remote_path=remote_path,
@@ -181,7 +282,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                         cpus_per_simulation=plan.cpus_per_worker,
                         simulation_start=plan.simulation_start,
                         simulation_count=plan.simulation_count,
-                        node_name=plan.node_name,
+                        node_name=node_name or plan.node_name,
+                        exclusive_node=exclusive_node,
                         mem_per_simulation_gb=mem_per_simulation_gb,
                         max_workers_per_job=max_workers_per_job,
                         initial_workers=plan.initial_workers,
@@ -202,11 +304,15 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                         entrypoint=entrypoint,
                         arguments=arguments,
                         env_setup=env_setup,
+                        required_capability=required_capability,
+                        env_profile=env_profile,
+                        account_name=account_name,
                         partition=partition,
                         time_limit=time_limit,
                         cpus=count * max(1, cpus_per_simulation),
                         memory=memory,
                         gpus=gpus,
+                        gpu_model=gpu_model,
                         job_name=f"{job_name}-{start}-{start + count - 1}",
                         job_mode=job_mode,
                         remote_path=remote_path,
@@ -214,6 +320,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                         cpus_per_simulation=cpus_per_simulation,
                         simulation_start=start,
                         simulation_count=count,
+                        node_name=node_name,
+                        exclusive_node=exclusive_node,
                         mem_per_simulation_gb=mem_per_simulation_gb,
                         max_workers_per_job=max_workers_per_job,
                         initial_workers=min(count, max(1, cpus // max(1, cpus_per_simulation))),
@@ -229,14 +337,96 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                     entrypoint=entrypoint,
                     arguments=arguments,
                     env_setup=env_setup,
+                    required_capability=required_capability,
+                    env_profile=env_profile,
+                    account_name=account_name,
                     partition=partition,
                     time_limit=time_limit,
                     cpus=cpus,
                     memory=memory,
                     gpus=gpus,
+                    gpu_model=gpu_model,
                     job_name=job_name,
+                    node_name=node_name,
+                    exclusive_node=exclusive_node,
                 )
             )
+        return RedirectResponse("/", status_code=303)
+
+    @app.post("/tasks")
+    def create_task(
+        name: str = Form("remote-task"),
+        remote_cwd: str = Form(...),
+        command: str = Form(...),
+        env_setup: str = Form(""),
+        required_capability: str = Form(""),
+        env_profile: str = Form(""),
+        account_name: str = Form(""),
+        cpus: int = Form(1),
+        memory_mb: int = Form(4096),
+        gpus: int = Form(0),
+        gpu_model: str = Form(""),
+        partition: str = Form("auto"),
+        node_name: str = Form(""),
+        exclusive_node: bool = Form(False),
+    ) -> Response:
+        db.create_task(
+            TaskCreate(
+                name=name,
+                remote_cwd=remote_cwd,
+                command=command,
+                env_setup=env_setup,
+                required_capability=required_capability,
+                env_profile=env_profile,
+                account_name=account_name,
+                cpus=max(1, cpus),
+                memory_mb=max(1, memory_mb),
+                gpus=max(0, gpus),
+                gpu_model=gpu_model,
+                partition=partition,
+                node_name=node_name,
+                exclusive_node=exclusive_node,
+            )
+        )
+        return RedirectResponse("/", status_code=303)
+
+    @app.post("/tasks/git")
+    def create_git_task(
+        job_name: str = Form("git-task"),
+        repo_url: str = Form(...),
+        git_ref: str = Form("main"),
+        entrypoint: str = Form(...),
+        arguments: str = Form(""),
+        env_setup: str = Form(""),
+        required_capability: str = Form(""),
+        env_profile: str = Form(""),
+        account_name: str = Form(""),
+        partition: str = Form("auto"),
+        cpus: int = Form(1),
+        memory: str = Form("4G"),
+        gpus: int = Form(0),
+        gpu_model: str = Form(""),
+        node_name: str = Form(""),
+        exclusive_node: bool = Form(False),
+    ) -> Response:
+        db.create_task(
+            TaskCreate(
+                name=job_name or "git-task",
+                remote_cwd=ACCOUNT_WORKSPACE_PLACEHOLDER,
+                command=build_git_task_command(repo_url, git_ref, entrypoint, arguments),
+                env_setup=env_setup,
+                required_capability=required_capability,
+                env_profile=env_profile,
+                account_name=account_name,
+                cpus=max(1, cpus),
+                memory_mb=max(1, parse_memory_mb(memory)),
+                gpus=max(0, gpus),
+                gpu_model=gpu_model,
+                partition=partition,
+                node_name=node_name,
+                exclusive_node=exclusive_node,
+            )
+        )
         return RedirectResponse("/", status_code=303)
 
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)
@@ -299,6 +489,28 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     def api_jobs() -> list[dict]:
         return db.list_jobs()
 
+    @app.get("/api/tasks")
+    def api_tasks() -> list[dict]:
+        return db.list_tasks()
+
+    @app.get("/api/allocations")
+    def api_allocations() -> list[dict]:
+        return db.list_allocations()
+
+    @app.get("/api/gpu-capacity")
+    def api_gpu_capacity() -> list[dict]:
+        return scheduler.gpu_capacity_summary()
+
+    @app.get("/api/health")
+    def api_health() -> dict:
+        return {
+            "ok": True,
+            "accounts": len(accounts),
+            "jobs": len(db.list_jobs()),
+            "tasks": len(db.list_tasks()),
+            "allocations": len(db.list_allocations()),
+        }
+
     @app.get("/api/jobs/{job_id}")
     def api_job(job_id: int) -> dict:
         job = db.get_job(job_id)
@@ -327,6 +539,78 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         remote_file = posixpath.join(root, path)
         try:
             text = SlurmAccountClient(account).read_text_file(remote_file)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return Response(text, media_type="text/plain")
+
+    @app.get("/api/tasks/{task_id}")
+    def api_task(task_id: int) -> dict:
+        task = db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404)
+        return task
+
+    @app.get("/api/tasks/{task_id}/remote-file")
+    def api_task_remote_file(task_id: int, path: str, base: str = "remote_cwd") -> Response:
+        task = db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404)
+        if not task["account_name"]:
+            raise HTTPException(status_code=409, detail="task has no account")
+        if path.startswith("/") or ".." in Path(path).parts:
+            raise HTTPException(status_code=400, detail="path must be a safe relative path")
+        account = next((item for item in accounts if item.name == task["account_name"]), None)
+        if not account:
+            raise HTTPException(status_code=404, detail="account not found")
+        if base == "remote_dir":
+            root = task.get("remote_dir") or ""
+        elif base == "stdout":
+            root = posixpath.dirname(task.get("stdout_path") or "")
+        elif base == "stderr":
+            root = posixpath.dirname(task.get("stderr_path") or "")
+        else:
+            root = task.get("remote_cwd") or task.get("remote_dir") or ""
+        if not root:
+            raise HTTPException(status_code=409, detail="task has no remote base path")
+        remote_file = posixpath.join(root, path)
+        try:
+            text = SlurmAccountClient(account).read_text_file(remote_file)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return Response(text, media_type="text/plain")
+
+    @app.get("/api/tasks/{task_id}/stdout")
+    def api_task_stdout(task_id: int) -> Response:
+        task = db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404)
+        if not task["account_name"]:
+            raise HTTPException(status_code=409, detail="task has no account")
+        if not task.get("stdout_path"):
+            raise HTTPException(status_code=409, detail="task has no stdout path")
+        account = next((item for item in accounts if item.name == task["account_name"]), None)
+        if not account:
+            raise HTTPException(status_code=404, detail="account not found")
+        try:
+            text = SlurmAccountClient(account).read_text_file(task["stdout_path"])
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return Response(text, media_type="text/plain")
+
+    @app.get("/api/tasks/{task_id}/stderr")
+    def api_task_stderr(task_id: int) -> Response:
+        task = db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404)
+        if not task["account_name"]:
+            raise HTTPException(status_code=409, detail="task has no account")
+        if not task.get("stderr_path"):
+            raise HTTPException(status_code=409, detail="task has no stderr path")
+        account = next((item for item in accounts if item.name == task["account_name"]), None)
+        if not account:
+            raise HTTPException(status_code=404, detail="account not found")
+        try:
+            text = SlurmAccountClient(account).read_text_file(task["stderr_path"])
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return Response(text, media_type="text/plain")

@@ -9,7 +9,9 @@ from dataclasses import dataclass
 import paramiko
 
 from .config import AccountConfig
+from .inventory import normalize_gpu_model
 from .models import AccountSnapshot, JobStatus
+from .task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,16 @@ def map_slurm_state(state: str) -> JobStatus:
     return JobStatus.SUBMITTED
 
 
+def gpu_gres_value(model: str, count: int) -> str:
+    gpus = int(count or 0)
+    if gpus <= 0:
+        return ""
+    normalized = normalize_gpu_model(model)
+    if normalized:
+        return f"gpu:{normalized}:{gpus}"
+    return f"gpu:{gpus}"
+
+
 def build_sbatch_script(job: dict, remote_job_dir: str) -> str:
     if job.get("job_mode") == "packed_srun":
         return build_packed_srun_script(job, remote_job_dir)
@@ -107,8 +119,11 @@ def build_sbatch_script(job: dict, remote_job_dir: str) -> str:
         lines.append(f"#SBATCH --partition={job['partition']}")
     if job.get("node_name"):
         lines.append(f"#SBATCH --nodelist={job['node_name']}")
-    if int(job.get("gpus") or 0) > 0:
-        lines.append(f"#SBATCH --gres=gpu:{int(job['gpus'])}")
+    gres = gpu_gres_value(str(job.get("gpu_model") or ""), int(job.get("gpus") or 0))
+    if gres:
+        lines.append(f"#SBATCH --gres={gres}")
+    if int(job.get("exclusive_node") or 0):
+        lines.append("#SBATCH --exclusive")
     lines.extend(
         [
             "",
@@ -154,8 +169,11 @@ def build_packed_srun_script(job: dict, remote_job_dir: str) -> str:
         lines.append(f"#SBATCH --partition={job['partition']}")
     if job.get("node_name"):
         lines.append(f"#SBATCH --nodelist={job['node_name']}")
-    if int(job.get("gpus") or 0) > 0:
-        lines.append(f"#SBATCH --gres=gpu:{int(job['gpus'])}")
+    gres = gpu_gres_value(str(job.get("gpu_model") or ""), int(job.get("gpus") or 0))
+    if gres:
+        lines.append(f"#SBATCH --gres={gres}")
+    if int(job.get("exclusive_node") or 0):
+        lines.append("#SBATCH --exclusive")
     lines.extend(
         [
             "",
@@ -243,6 +261,112 @@ def build_packed_srun_script(job: dict, remote_job_dir: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def build_allocation_script(allocation: dict, time_limit: str) -> str:
+    is_absolute = allocation["remote_dir"].startswith("/")
+    stdout_path = allocation["stdout_path"] if is_absolute else "allocation-%j.out"
+    stderr_path = allocation["stderr_path"] if is_absolute else "allocation-%j.err"
+    lines = [
+        "#!/usr/bin/env bash",
+        "#SBATCH --job-name=pool",
+        f"#SBATCH --time={time_limit}",
+        "#SBATCH --nodes=1",
+        "#SBATCH --ntasks=1",
+        f"#SBATCH --cpus-per-task={int(allocation['total_cpus'])}",
+        f"#SBATCH --output={stdout_path}",
+        f"#SBATCH --error={stderr_path}",
+    ]
+    if allocation.get("total_memory_mb"):
+        lines.append(f"#SBATCH --mem={int(allocation['total_memory_mb'])}M")
+    if allocation.get("partition"):
+        lines.append(f"#SBATCH --partition={allocation['partition']}")
+    if allocation.get("node_name"):
+        lines.append(f"#SBATCH --nodelist={allocation['node_name']}")
+    gres = gpu_gres_value(str(allocation.get("gpu_model") or ""), int(allocation.get("total_gpus") or 0))
+    if gres:
+        lines.append(f"#SBATCH --gres={gres}")
+    if int(allocation.get("exclusive_node") or 0):
+        lines.append("#SBATCH --exclusive")
+    lines.extend(
+        [
+            "",
+            "set -euo pipefail",
+            f"mkdir -p {shlex.quote(allocation['remote_dir'])}",
+            f"cd {shlex.quote(allocation['remote_dir'])}",
+            "echo ready > allocation.ready",
+            "trap 'echo closing > allocation.ready; exit 0' TERM INT",
+            "while true; do sleep 60 & wait $!; done",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def apply_env_profile(payload: dict, account: AccountConfig) -> dict:
+    profile = str(payload.get("env_profile") or "").strip()
+    if not profile:
+        return payload
+    setup = (account.env_profiles or {}).get(profile, "").strip()
+    if not setup:
+        return payload
+    existing = str(payload.get("env_setup") or "").strip()
+    merged = setup if not existing else f"{setup}\n{existing}"
+    return {**payload, "env_setup": merged}
+
+
+def shell_path(path: str) -> str:
+    value = (path or ".").strip() or "."
+    if value == "~":
+        return "$HOME"
+    if value.startswith("~/"):
+        return "$HOME/" + shlex.quote(value[2:])
+    return shlex.quote(value)
+
+
+def resolve_task_placeholders(task: dict, account: AccountConfig) -> dict:
+    workspace = account.remote_workspace or "."
+    command = str(task.get("command") or "").replace(ACCOUNT_WORKSPACE_PLACEHOLDER, shell_path(workspace))
+    remote_cwd = str(task.get("remote_cwd") or "").replace(ACCOUNT_WORKSPACE_PLACEHOLDER, workspace)
+    return {**task, "command": command, "remote_cwd": remote_cwd}
+
+
+def build_task_script(task: dict) -> str:
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        f"cd {shell_path(task['remote_cwd'])}",
+    ]
+    if task.get("env_setup"):
+        lines.append(task["env_setup"])
+    lines.append(task["command"])
+    return "\n".join(lines) + "\n"
+
+
+def build_srun_attach_command(
+    task: dict,
+    allocation: dict,
+    script_path: str,
+    stdout_path: str,
+    stderr_path: str,
+    exit_code_path: str,
+) -> str:
+    srun_parts = [
+        "srun",
+        f"--jobid={shlex.quote(str(allocation['slurm_job_id']))}",
+        "--nodes=1",
+        "--ntasks=1",
+        f"--cpus-per-task={int(task['cpus'])}",
+        f"--mem={int(task['memory_mb'])}M",
+    ]
+    gres = gpu_gres_value(str(task.get("gpu_model") or allocation.get("gpu_model") or ""), int(task.get("gpus") or 0))
+    if gres:
+        srun_parts.append(f"--gres={shlex.quote(gres)}")
+    srun_parts.extend(["--exclusive", "bash", shlex.quote(script_path)])
+    srun_command = " ".join(srun_parts)
+    return (
+        f"{srun_command} > {shlex.quote(stdout_path)} 2> {shlex.quote(stderr_path)}; "
+        f"echo $? > {shlex.quote(exit_code_path)}"
+    )
+
+
 class SlurmAccountClient:
     def __init__(self, account: AccountConfig):
         self.account = account
@@ -279,6 +403,7 @@ class SlurmAccountClient:
     def submit(self, job: dict) -> dict[str, str]:
         stamp = int(time.time())
         remote_job_dir = posixpath.join(self.account.remote_workspace, f"job-{job['id']}-{stamp}")
+        job = apply_env_profile(job, self.account)
         script = build_sbatch_script(job, remote_job_dir)
         quoted_script = shlex.quote(script)
         if job.get("job_mode") == "packed_srun":
@@ -309,6 +434,88 @@ class SlurmAccountClient:
             "stderr_path": posixpath.join(remote_job_dir, f"slurm-{slurm_job_id}.err"),
         }
 
+    def submit_allocation(self, allocation: dict, time_limit: str) -> dict[str, str]:
+        remote_dir = posixpath.join(self.account.remote_workspace, f"allocation-{allocation['id']}-{int(time.time())}")
+        allocation = {
+            **allocation,
+            "remote_dir": remote_dir,
+            "stdout_path": posixpath.join(remote_dir, "allocation-%j.out"),
+            "stderr_path": posixpath.join(remote_dir, "allocation-%j.err"),
+        }
+        script = build_allocation_script(allocation, time_limit)
+        quoted_script = shlex.quote(script)
+        commands = [
+            f"mkdir -p {shlex.quote(remote_dir)}",
+            f"printf %s {quoted_script} > {shlex.quote(posixpath.join(remote_dir, 'allocation.sbatch'))}",
+            f"cd {shlex.quote(remote_dir)} && sbatch allocation.sbatch",
+        ]
+        with SSHSession(self.account) as ssh:
+            result = ssh.run(" && ".join(commands))
+        if result.exit_code != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "allocation sbatch failed")
+        slurm_job_id = parse_sbatch_job_id(result.stdout)
+        return {
+            "slurm_job_id": slurm_job_id,
+            "remote_dir": remote_dir,
+            "stdout_path": posixpath.join(remote_dir, f"allocation-{slurm_job_id}.out"),
+            "stderr_path": posixpath.join(remote_dir, f"allocation-{slurm_job_id}.err"),
+        }
+
+    def attach_task(self, task: dict, allocation: dict) -> dict[str, str]:
+        stamp = int(time.time())
+        remote_dir = posixpath.join(self.account.remote_workspace, f"task-{task['id']}-{stamp}")
+        script_path = posixpath.join(remote_dir, "task.sh")
+        stdout_path = posixpath.join(remote_dir, "stdout.log")
+        stderr_path = posixpath.join(remote_dir, "stderr.log")
+        exit_code_path = posixpath.join(remote_dir, "exit_code")
+        wrapper_path = posixpath.join(remote_dir, "wrapper.log")
+        task = resolve_task_placeholders(apply_env_profile(task, self.account), self.account)
+        script = build_task_script(task)
+        wrapper = build_srun_attach_command(
+            task,
+            allocation,
+            script_path,
+            stdout_path,
+            stderr_path,
+            exit_code_path,
+        )
+        commands = [
+            f"mkdir -p {shlex.quote(remote_dir)}",
+            f"printf %s {shlex.quote(script)} > {shlex.quote(script_path)}",
+            f"chmod +x {shlex.quote(script_path)}",
+            f"bash -lc {shlex.quote(f'nohup bash -lc {shlex.quote(wrapper)} > {shlex.quote(wrapper_path)} 2>&1 & echo $!')}",
+        ]
+        with SSHSession(self.account) as ssh:
+            result = ssh.run(" && ".join(commands))
+        if result.exit_code != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "srun attach failed")
+        return {
+            "remote_dir": remote_dir,
+            "stdout_path": stdout_path,
+            "stderr_path": stderr_path,
+            "exit_code_path": exit_code_path,
+            "wrapper_pid": result.stdout.strip().splitlines()[-1],
+        }
+
+    def task_state(self, task: dict) -> JobStatus:
+        exit_path = task.get("exit_code_path") or ""
+        wrapper_pid = task.get("wrapper_pid") or ""
+        if not exit_path:
+            return JobStatus.RUNNING
+        checks = [f"if test -f {shlex.quote(exit_path)}; then cat {shlex.quote(exit_path)}; exit 0; fi"]
+        if wrapper_pid:
+            checks.append(f"if ps -p {shlex.quote(str(wrapper_pid))} >/dev/null 2>&1; then echo RUNNING; exit 0; fi")
+        checks.append("echo UNKNOWN")
+        with SSHSession(self.account) as ssh:
+            result = ssh.run("; ".join(checks))
+        text = result.stdout.strip().splitlines()[0] if result.stdout.strip() else "UNKNOWN"
+        if text == "RUNNING":
+            return JobStatus.RUNNING
+        try:
+            return JobStatus.COMPLETED if int(text) == 0 else JobStatus.FAILED
+        except ValueError:
+            return JobStatus.RUNNING
+
     def state(self, slurm_job_id: str) -> JobStatus:
         command = f"squeue -h -j {shlex.quote(slurm_job_id)} -o \"%T\""
         with SSHSession(self.account) as ssh:
@@ -319,6 +526,14 @@ class SlurmAccountClient:
         if sacct.exit_code == 0 and sacct.stdout.strip():
             return map_slurm_state(sacct.stdout.splitlines()[0].strip().split()[0])
         return JobStatus.SUBMITTED
+
+    def pending_reason(self, slurm_job_id: str) -> str:
+        command = f"squeue -h -j {shlex.quote(slurm_job_id)} -o \"%R\""
+        with SSHSession(self.account) as ssh:
+            result = ssh.run(command)
+        if result.exit_code != 0 or not result.stdout.strip():
+            return ""
+        return result.stdout.strip().splitlines()[0].strip()
 
     def cancel(self, slurm_job_id: str) -> None:
         with SSHSession(self.account) as ssh:

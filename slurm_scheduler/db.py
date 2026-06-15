@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from .models import JobCreate, JobStatus
+from .models import AllocationStatus, JobCreate, JobStatus, TaskCreate, TaskStatus
 
 
 SCHEMA = """
@@ -16,11 +16,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     entrypoint TEXT NOT NULL,
     arguments TEXT NOT NULL DEFAULT '',
     env_setup TEXT NOT NULL DEFAULT '',
+    required_capability TEXT NOT NULL DEFAULT '',
+    env_profile TEXT NOT NULL DEFAULT '',
     partition TEXT NOT NULL DEFAULT '',
     time_limit TEXT NOT NULL DEFAULT '01:00:00',
     cpus INTEGER NOT NULL DEFAULT 1,
     memory TEXT NOT NULL DEFAULT '4G',
     gpus INTEGER NOT NULL DEFAULT 0,
+    gpu_model TEXT NOT NULL DEFAULT '',
     job_name TEXT NOT NULL DEFAULT 'web-job',
     job_mode TEXT NOT NULL DEFAULT 'python_git',
     remote_path TEXT NOT NULL DEFAULT '',
@@ -29,6 +32,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     simulation_start INTEGER NOT NULL DEFAULT 1,
     simulation_count INTEGER NOT NULL DEFAULT 1,
     node_name TEXT NOT NULL DEFAULT '',
+    exclusive_node INTEGER NOT NULL DEFAULT 0,
     mem_per_simulation_gb REAL NOT NULL DEFAULT 1,
     max_workers_per_job INTEGER NOT NULL DEFAULT 32,
     initial_workers INTEGER NOT NULL DEFAULT 1,
@@ -72,6 +76,7 @@ CREATE TABLE IF NOT EXISTS node_inventory (
     memory_mb INTEGER NOT NULL,
     gpu_model TEXT NOT NULL DEFAULT '',
     gpu_count INTEGER NOT NULL DEFAULT 0,
+    gpu_used_count INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL,
     cpu_model TEXT NOT NULL DEFAULT '',
     sockets INTEGER NOT NULL DEFAULT 0,
@@ -96,6 +101,74 @@ CREATE TABLE IF NOT EXISTS pestat_nodes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pestat_nodes_partition ON pestat_nodes(partition);
+
+CREATE TABLE IF NOT EXISTS allocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_name TEXT NOT NULL,
+    partition TEXT NOT NULL DEFAULT '',
+    node_name TEXT NOT NULL DEFAULT '',
+    slurm_job_id TEXT,
+    state TEXT NOT NULL,
+    total_cpus INTEGER NOT NULL DEFAULT 1,
+    free_cpus INTEGER NOT NULL DEFAULT 1,
+    total_memory_mb INTEGER NOT NULL DEFAULT 0,
+    free_memory_mb INTEGER NOT NULL DEFAULT 0,
+    total_gpus INTEGER NOT NULL DEFAULT 0,
+    free_gpus INTEGER NOT NULL DEFAULT 0,
+    gpu_model TEXT NOT NULL DEFAULT '',
+    resource_pool TEXT NOT NULL DEFAULT 'cpu',
+    exclusive_node INTEGER NOT NULL DEFAULT 0,
+    remote_dir TEXT NOT NULL DEFAULT '',
+    stdout_path TEXT NOT NULL DEFAULT '',
+    stderr_path TEXT NOT NULL DEFAULT '',
+    failure_message TEXT NOT NULL DEFAULT '',
+    drain_reason TEXT NOT NULL DEFAULT '',
+    pending_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    submitted_at TEXT,
+    started_at TEXT,
+    last_active_at TEXT,
+    drain_at TEXT,
+    closed_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_allocations_state ON allocations(state);
+CREATE INDEX IF NOT EXISTS idx_allocations_slurm_job_id ON allocations(slurm_job_id);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    remote_cwd TEXT NOT NULL,
+    command TEXT NOT NULL,
+    env_setup TEXT NOT NULL DEFAULT '',
+    required_capability TEXT NOT NULL DEFAULT '',
+    env_profile TEXT NOT NULL DEFAULT '',
+    cpus INTEGER NOT NULL DEFAULT 1,
+    memory_mb INTEGER NOT NULL DEFAULT 4096,
+    gpus INTEGER NOT NULL DEFAULT 0,
+    gpu_model TEXT NOT NULL DEFAULT '',
+    partition TEXT NOT NULL DEFAULT 'auto',
+    node_name TEXT NOT NULL DEFAULT '',
+    exclusive_node INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    allocation_id INTEGER,
+    account_name TEXT,
+    remote_dir TEXT NOT NULL DEFAULT '',
+    stdout_path TEXT NOT NULL DEFAULT '',
+    stderr_path TEXT NOT NULL DEFAULT '',
+    exit_code_path TEXT NOT NULL DEFAULT '',
+    wrapper_pid TEXT NOT NULL DEFAULT '',
+    failure_message TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    attached_at TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_allocation_id ON tasks(allocation_id);
 """
 
 
@@ -117,40 +190,69 @@ class Database:
     def init(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
-            self._ensure_job_columns(conn)
+            self._ensure_columns(conn)
 
-    def _ensure_job_columns(self, conn: sqlite3.Connection) -> None:
-        existing = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
-        columns = {
-            "job_mode": "TEXT NOT NULL DEFAULT 'python_git'",
-            "remote_path": "TEXT NOT NULL DEFAULT ''",
-            "simulations_per_job": "INTEGER NOT NULL DEFAULT 1",
-            "cpus_per_simulation": "INTEGER NOT NULL DEFAULT 1",
-            "simulation_start": "INTEGER NOT NULL DEFAULT 1",
-            "simulation_count": "INTEGER NOT NULL DEFAULT 1",
-            "node_name": "TEXT NOT NULL DEFAULT ''",
-            "mem_per_simulation_gb": "REAL NOT NULL DEFAULT 1",
-            "max_workers_per_job": "INTEGER NOT NULL DEFAULT 32",
-            "initial_workers": "INTEGER NOT NULL DEFAULT 1",
-            "load_target": "REAL NOT NULL DEFAULT 0.75",
-            "ramp_interval_seconds": "INTEGER NOT NULL DEFAULT 900",
+    def _ensure_columns(self, conn: sqlite3.Connection) -> None:
+        table_columns = {
+            "jobs": {
+                "required_capability": "TEXT NOT NULL DEFAULT ''",
+                "env_profile": "TEXT NOT NULL DEFAULT ''",
+                "job_mode": "TEXT NOT NULL DEFAULT 'python_git'",
+                "remote_path": "TEXT NOT NULL DEFAULT ''",
+                "simulations_per_job": "INTEGER NOT NULL DEFAULT 1",
+                "cpus_per_simulation": "INTEGER NOT NULL DEFAULT 1",
+                "simulation_start": "INTEGER NOT NULL DEFAULT 1",
+                "simulation_count": "INTEGER NOT NULL DEFAULT 1",
+                "node_name": "TEXT NOT NULL DEFAULT ''",
+                "gpu_model": "TEXT NOT NULL DEFAULT ''",
+                "exclusive_node": "INTEGER NOT NULL DEFAULT 0",
+                "mem_per_simulation_gb": "REAL NOT NULL DEFAULT 1",
+                "max_workers_per_job": "INTEGER NOT NULL DEFAULT 32",
+                "initial_workers": "INTEGER NOT NULL DEFAULT 1",
+                "load_target": "REAL NOT NULL DEFAULT 0.75",
+                "ramp_interval_seconds": "INTEGER NOT NULL DEFAULT 900",
+            },
+            "tasks": {
+                "required_capability": "TEXT NOT NULL DEFAULT ''",
+                "env_profile": "TEXT NOT NULL DEFAULT ''",
+                "account_name": "TEXT NOT NULL DEFAULT ''",
+                "gpus": "INTEGER NOT NULL DEFAULT 0",
+                "gpu_model": "TEXT NOT NULL DEFAULT ''",
+                "partition": "TEXT NOT NULL DEFAULT 'auto'",
+                "node_name": "TEXT NOT NULL DEFAULT ''",
+                "exclusive_node": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "allocations": {
+                "total_gpus": "INTEGER NOT NULL DEFAULT 0",
+                "free_gpus": "INTEGER NOT NULL DEFAULT 0",
+                "gpu_model": "TEXT NOT NULL DEFAULT ''",
+                "resource_pool": "TEXT NOT NULL DEFAULT 'cpu'",
+                "exclusive_node": "INTEGER NOT NULL DEFAULT 0",
+                "pending_reason": "TEXT NOT NULL DEFAULT ''",
+            },
+            "node_inventory": {
+                "gpu_used_count": "INTEGER NOT NULL DEFAULT 0",
+            },
         }
-        for name, ddl in columns.items():
-            if name not in existing:
-                conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {ddl}")
+        for table, columns in table_columns.items():
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            for name, ddl in columns.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     def create_job(self, job: JobCreate) -> int:
         with self.connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO jobs (
-                    repo_url, git_ref, entrypoint, arguments, env_setup, partition,
-                    time_limit, cpus, memory, gpus, job_name, job_mode, remote_path,
+                    repo_url, git_ref, entrypoint, arguments, env_setup,
+                    required_capability, env_profile, account_name, partition,
+                    time_limit, cpus, memory, gpus, gpu_model, job_name, job_mode, remote_path,
                     simulations_per_job, cpus_per_simulation, simulation_start,
-                    simulation_count, node_name, mem_per_simulation_gb,
+                    simulation_count, node_name, exclusive_node, mem_per_simulation_gb,
                     max_workers_per_job, initial_workers, load_target,
                     ramp_interval_seconds, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.repo_url,
@@ -158,11 +260,15 @@ class Database:
                     job.entrypoint,
                     job.arguments,
                     job.env_setup,
+                    job.required_capability,
+                    job.env_profile,
+                    job.account_name,
                     job.partition,
                     job.time_limit,
                     job.cpus,
                     job.memory,
                     job.gpus,
+                    job.gpu_model,
                     job.job_name,
                     job.job_mode,
                     job.remote_path,
@@ -171,6 +277,7 @@ class Database:
                     job.simulation_start,
                     job.simulation_count,
                     job.node_name,
+                    int(job.exclusive_node),
                     job.mem_per_simulation_gb,
                     job.max_workers_per_job,
                     job.initial_workers,
@@ -180,6 +287,108 @@ class Database:
                 ),
             )
             return int(cursor.lastrowid)
+
+    def create_task(self, task: TaskCreate) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO tasks (
+                    name, remote_cwd, command, env_setup, required_capability, env_profile, account_name, cpus, memory_mb,
+                    gpus, gpu_model, partition, node_name, exclusive_node, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task.name,
+                    task.remote_cwd,
+                    task.command,
+                    task.env_setup,
+                    task.required_capability,
+                    task.env_profile,
+                    task.account_name,
+                    task.cpus,
+                    task.memory_mb,
+                    task.gpus,
+                    task.gpu_model,
+                    task.partition,
+                    task.node_name,
+                    int(task.exclusive_node),
+                    TaskStatus.QUEUED.value,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def get_task(self, task_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            return dict(row) if row else None
+
+    def list_tasks(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            return [dict(row) for row in rows]
+
+    def next_queued_task(self) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE status = ? ORDER BY id ASC LIMIT 1",
+                (TaskStatus.QUEUED.value,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def update_task(self, task_id: int, **fields: Any) -> None:
+        self._update_row("tasks", task_id, fields)
+
+    def create_allocation(
+        self,
+        account_name: str,
+        partition: str,
+        node_name: str,
+        total_cpus: int,
+        total_memory_mb: int,
+        total_gpus: int = 0,
+        gpu_model: str = "",
+        resource_pool: str = "cpu",
+        exclusive_node: bool = False,
+    ) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO allocations (
+                    account_name, partition, node_name, state, total_cpus, free_cpus,
+                    total_memory_mb, free_memory_mb, total_gpus, free_gpus,
+                    gpu_model, resource_pool, exclusive_node
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_name,
+                    partition,
+                    node_name,
+                    AllocationStatus.PENDING.value,
+                    total_cpus,
+                    total_cpus,
+                    total_memory_mb,
+                    total_memory_mb,
+                    total_gpus,
+                    total_gpus,
+                    gpu_model,
+                    resource_pool,
+                    int(exclusive_node),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def get_allocation(self, allocation_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM allocations WHERE id = ?", (allocation_id,)).fetchone()
+            return dict(row) if row else None
+
+    def list_allocations(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM allocations ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            return [dict(row) for row in rows]
+
+    def update_allocation(self, allocation_id: int, **fields: Any) -> None:
+        self._update_row("allocations", allocation_id, fields)
 
     def get_job(self, job_id: int) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -200,6 +409,9 @@ class Database:
             return dict(row) if row else None
 
     def update_job(self, job_id: int, **fields: Any) -> None:
+        self._update_row("jobs", job_id, fields)
+
+    def _update_row(self, table: str, row_id: int, fields: dict[str, Any]) -> None:
         if not fields:
             return
         fields["updated_at"] = fields.get("updated_at", "CURRENT_TIMESTAMP")
@@ -211,9 +423,9 @@ class Database:
             else:
                 assignments.append(f"{key} = ?")
                 values.append(value)
-        values.append(job_id)
+        values.append(row_id)
         with self.connect() as conn:
-            conn.execute(f"UPDATE jobs SET {', '.join(assignments)} WHERE id = ?", values)
+            conn.execute(f"UPDATE {table} SET {', '.join(assignments)} WHERE id = ?", values)
 
     def create_token_usage(
         self,
@@ -263,9 +475,9 @@ class Database:
             conn.executemany(
                 """
                 INSERT INTO node_inventory (
-                    node_name, partition, cpus, memory_mb, gpu_model, gpu_count, state,
+                    node_name, partition, cpus, memory_mb, gpu_model, gpu_count, gpu_used_count, state,
                     cpu_model, sockets, cores_per_socket, threads_per_core, cpu_score
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -275,6 +487,7 @@ class Database:
                         node.memory_mb,
                         node.gpu_model,
                         node.gpu_count,
+                        node.gpu_used_count,
                         node.state,
                         node.cpu_model,
                         node.sockets,

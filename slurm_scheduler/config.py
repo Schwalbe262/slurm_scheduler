@@ -21,6 +21,8 @@ class AccountConfig:
     storage_path: str = ""
     storage_quota_gb: float = 0.0
     partition_allowlist: list[str] = field(default_factory=list)
+    capabilities: list[str] = field(default_factory=list)
+    env_profiles: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,32 @@ class AppConfig:
     poll_interval_seconds: int = 30
     bind_host: str = "127.0.0.1"
     bind_port: int = 8000
+    cluster_refresh_interval_seconds: int = 120
+    min_warm_allocations: int = 1
+    allocation_partition: str = "auto"
+    allocation_cpus: int = 64
+    allocation_memory: str = "0"
+    allocation_time_limit: str = "48:00:00"
+    allocation_scale_out_usage_threshold: float = 0.70
+    allocation_scale_in_idle_seconds: int = 600
+    allocation_drain_after_seconds: int = 129600
+    allocation_force_cancel_after_seconds: int = 140400
+    allocation_pending_timeout_seconds: int = 1800
+    allocation_pending_backoff_seconds: int = 1800
+    allocation_reserved_job_slots: int = 0
+    cpu_pool_allow_gpu_partitions: bool = True
+    warm_pool_preferred_accounts: list[str] = field(default_factory=list)
+    gpu_warm_pool_preferred_accounts: list[str] = field(default_factory=list)
+    single_job_per_node_partitions: list[str] = field(default_factory=lambda: ["cpu2"])
+    gpu_cpu_reserve: int = 4
+    gpu_prewarm_enabled: bool = True
+    gpu_prewarm_preferred_models: list[str] = field(default_factory=lambda: ["a6000ada", "a6000"])
+    gpu_prewarm_min_warm_allocations: int = 1
+    gpu_prewarm_max_warm_allocations: int = 3
+    gpu_prewarm_gpus_per_allocation: int = 2
+    gpu_prewarm_cpu_reserve_per_free_gpu: int = 8
+    gpu_prewarm_partition: str = "auto"
+    gpu_prewarm_time_limit: str = "48:00:00"
 
 
 def _read_yaml(path: str | Path) -> dict[str, Any]:
@@ -45,6 +73,21 @@ def _read_yaml(path: str | Path) -> dict[str, Any]:
 
 def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
     data = _read_yaml(path)
+    gpu_prewarm = data.pop("gpu_prewarm", None)
+    if isinstance(gpu_prewarm, dict):
+        mapping = {
+            "enabled": "gpu_prewarm_enabled",
+            "preferred_models": "gpu_prewarm_preferred_models",
+            "min_warm_allocations": "gpu_prewarm_min_warm_allocations",
+            "max_warm_allocations": "gpu_prewarm_max_warm_allocations",
+            "gpus_per_allocation": "gpu_prewarm_gpus_per_allocation",
+            "cpu_reserve_per_free_gpu": "gpu_prewarm_cpu_reserve_per_free_gpu",
+            "partition": "gpu_prewarm_partition",
+            "time_limit": "gpu_prewarm_time_limit",
+        }
+        for source, target in mapping.items():
+            if source in gpu_prewarm:
+                data[target] = gpu_prewarm[source]
     return AppConfig(**{k: v for k, v in data.items() if k in AppConfig.__dataclass_fields__})
 
 

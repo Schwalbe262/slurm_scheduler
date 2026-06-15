@@ -1,88 +1,374 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="grid">
-  <section class="panel">
-    <h1>Submit Job</h1>
-    <form method="post" action="/jobs">
-      <label for="job_mode">Job mode</label>
-      <select id="job_mode" name="job_mode">
-        <option value="dynamic_packed_srun">Dynamic packed srun</option>
-        <option value="packed_srun">Fixed packed srun</option>
-        <option value="python_git">Python Git checkout</option>
-      </select>
+<div class="stack">
+<section class="panel">
+  <h1>작업 등록</h1>
+  <div class="mode-tabs" role="tablist" aria-label="작업 등록 방식">
+    <button type="button" class="mode-tab" data-submit-mode="task" aria-selected="true">원격 경로 실행</button>
+    <button type="button" class="mode-tab" data-submit-mode="git" aria-selected="false">Git에서 받아 실행</button>
+  </div>
+</section>
+<div class="forms-grid">
+  <section class="panel submit-panel" id="job-submit-panel" data-submit-panel="job" hidden>
+    <h1>Git에서 받아 실행</h1>
+    <form method="post" action="/tasks/git" id="job-submit-form">
+      <div class="form-grid">
+        <div class="full">
+          <label for="job_mode">Job mode</label>
+          <select id="job_mode" name="job_mode">
+            <option value="python_git">Python Git checkout</option>
+          </select>
+        </div>
 
-      <label for="repo_url">Git repository</label>
-      <input id="repo_url" name="repo_url" placeholder="git@github.com:org/project.git">
+        <div class="full">
+          <label for="entrypoint">Python entrypoint</label>
+          <input id="entrypoint" name="entrypoint" placeholder="run_simulation.py" required>
+        </div>
 
-      <label for="git_ref">Branch, tag, or commit</label>
-      <input id="git_ref" name="git_ref" value="main" required>
+        <div class="full">
+          <label for="remote_path">Remote existing project path</label>
+          <input id="remote_path" name="remote_path" placeholder="~/project">
+        </div>
 
-      <label for="entrypoint">Python entrypoint</label>
-      <input id="entrypoint" name="entrypoint" placeholder="run_simulation.py" required>
+        <div class="full">
+          <label for="arguments">Arguments</label>
+          <input id="arguments" name="arguments" placeholder="--config configs/run.yaml">
+        </div>
 
-      <label for="remote_path">Remote existing project path</label>
-      <input id="remote_path" name="remote_path" placeholder="~/project">
+        <div class="full">
+          <label for="env_setup">Environment setup</label>
+          <textarea id="env_setup" name="env_setup" placeholder="module load cuda&#10;conda activate myenv"></textarea>
+        </div>
 
-      <label for="arguments">Arguments</label>
-      <input id="arguments" name="arguments" placeholder="--config configs/run.yaml">
+        <div>
+          <label for="required_capability">Required capability</label>
+          <input id="required_capability" name="required_capability" placeholder="conda:pyaedt2026v1">
+        </div>
+        <div>
+          <label for="env_profile">Environment profile</label>
+          <input id="env_profile" name="env_profile" placeholder="pyaedt2026v1">
+        </div>
+        <div>
+          <label for="account_name">Account</label>
+          <input id="account_name" name="account_name" placeholder="optional exact account">
+        </div>
 
-      <label for="env_setup">Environment setup</label>
-      <textarea id="env_setup" name="env_setup" placeholder="module load cuda&#10;conda activate myenv"></textarea>
-
-      <label for="job_name">Job name</label>
-      <input id="job_name" name="job_name" value="web-job">
-
-      <label for="partition">Partition</label>
-      <input id="partition" name="partition" value="auto">
-
-      <label for="time_limit">Time limit</label>
-      <input id="time_limit" name="time_limit" value="01:00:00">
-
-      <label for="cpus">CPUs</label>
-      <input id="cpus" name="cpus" type="number" min="1" value="1">
-
-      <label for="total_simulations">Total simulations</label>
-      <input id="total_simulations" name="total_simulations" type="number" min="1" value="100">
-
-      <label for="simulations_per_job">Fallback simulations per job</label>
-      <input id="simulations_per_job" name="simulations_per_job" type="number" min="1" value="10">
-
-      <label for="cpus_per_simulation">CPUs per simulation</label>
-      <input id="cpus_per_simulation" name="cpus_per_simulation" type="number" min="1" value="4">
-
-      <label for="mem_per_simulation_gb">Memory per simulation GB</label>
-      <input id="mem_per_simulation_gb" name="mem_per_simulation_gb" type="number" min="1" step="0.5" value="8">
-
-      <label for="max_workers_per_job">Max workers per job</label>
-      <input id="max_workers_per_job" name="max_workers_per_job" type="number" min="1" value="32">
-
-      <label for="oversubscribe_factor">Oversubscribe factor</label>
-      <input id="oversubscribe_factor" name="oversubscribe_factor" type="number" min="1" step="0.1" value="1.5">
-
-      <label for="load_target">Ramp load target</label>
-      <input id="load_target" name="load_target" type="number" min="0.1" max="1.5" step="0.05" value="0.75">
-
-      <label for="ramp_interval_seconds">Ramp interval seconds</label>
-      <input id="ramp_interval_seconds" name="ramp_interval_seconds" type="number" min="60" value="900">
-
-      <label for="max_new_jobs">Max new jobs now</label>
-      <input id="max_new_jobs" name="max_new_jobs" type="number" min="1" value="10">
-
-      <label for="memory">Memory</label>
-      <input id="memory" name="memory" value="4G">
-
-      <label for="gpus">GPUs</label>
-      <input id="gpus" name="gpus" type="number" min="0" value="0">
-
-      <p><button type="submit">Queue job</button></p>
+        <div>
+          <label for="job_name">Job name</label>
+          <input id="job_name" name="job_name" value="web-job">
+        </div>
+        <div>
+          <label for="partition">Partition</label>
+          <input id="partition" name="partition" value="auto">
+        </div>
+        <div>
+          <label for="time_limit">Time limit</label>
+          <input id="time_limit" name="time_limit" value="01:00:00">
+        </div>
+        <div>
+          <label for="memory">Memory</label>
+          <input id="memory" name="memory" value="4G">
+        </div>
+        <div>
+          <label for="cpus">CPUs</label>
+          <input id="cpus" name="cpus" type="number" min="1" value="1">
+        </div>
+        <div>
+          <label for="gpus">GPUs</label>
+          <input id="gpus" name="gpus" type="number" min="0" value="0">
+        </div>
+        <div>
+          <label for="gpu_model">GPU model</label>
+          <input id="gpu_model" name="gpu_model" placeholder="a6000ada or a6000">
+        </div>
+        <div>
+          <label for="node_name">Node name</label>
+          <input id="node_name" name="node_name" placeholder="optional exact node">
+        </div>
+        <div>
+          <label for="exclusive_node">Exclusive node</label>
+          <select id="exclusive_node" name="exclusive_node">
+            <option value="false">No</option>
+            <option value="true">Yes</option>
+          </select>
+        </div>
+        <div>
+          <label for="total_simulations">Total simulations</label>
+          <input id="total_simulations" name="total_simulations" type="number" min="1" value="100">
+        </div>
+        <div>
+          <label for="simulations_per_job">Fallback simulations per job</label>
+          <input id="simulations_per_job" name="simulations_per_job" type="number" min="1" value="10">
+        </div>
+        <div>
+          <label for="cpus_per_simulation">CPUs per simulation</label>
+          <input id="cpus_per_simulation" name="cpus_per_simulation" type="number" min="1" value="4">
+        </div>
+        <div>
+          <label for="mem_per_simulation_gb">Memory per simulation GB</label>
+          <input id="mem_per_simulation_gb" name="mem_per_simulation_gb" type="number" min="1" step="0.5" value="8">
+        </div>
+        <div>
+          <label for="max_workers_per_job">Max workers per job</label>
+          <input id="max_workers_per_job" name="max_workers_per_job" type="number" min="1" value="32">
+        </div>
+        <div>
+          <label for="max_new_jobs">Max new jobs now</label>
+          <input id="max_new_jobs" name="max_new_jobs" type="number" min="1" value="10">
+        </div>
+        <div>
+          <label for="oversubscribe_factor">Oversubscribe factor</label>
+          <input id="oversubscribe_factor" name="oversubscribe_factor" type="number" min="1" step="0.1" value="1.5">
+        </div>
+        <div>
+          <label for="load_target">Ramp load target</label>
+          <input id="load_target" name="load_target" type="number" min="0.1" max="1.5" step="0.05" value="0.75">
+        </div>
+        <div>
+          <label for="ramp_interval_seconds">Ramp interval seconds</label>
+          <input id="ramp_interval_seconds" name="ramp_interval_seconds" type="number" min="60" value="900">
+        </div>
+        <div>
+          <label for="repo_url">Git repository</label>
+          <input id="repo_url" name="repo_url" placeholder="git@github.com:org/project.git">
+        </div>
+        <div>
+          <label for="git_ref">Branch, tag, or commit</label>
+          <input id="git_ref" name="git_ref" value="main" required>
+        </div>
+      </div>
+      <p><button type="submit">Job 등록</button></p>
     </form>
   </section>
 
-  <div>
-    <section class="panel">
+  <section class="panel submit-panel" id="task-submit-panel" data-submit-panel="task">
+    <h1>원격 경로 실행</h1>
+    <form method="post" action="/tasks">
+      <div class="form-grid">
+        <div>
+          <label for="task_name">Task name</label>
+          <input id="task_name" name="name" value="remote-task">
+        </div>
+
+        <div>
+          <label for="remote_cwd">Remote working directory</label>
+          <input id="remote_cwd" name="remote_cwd" placeholder="~/project" required>
+        </div>
+
+        <div class="full">
+          <label for="task_command">Command</label>
+          <textarea id="task_command" name="command" placeholder="ansys ... or python run.py" required></textarea>
+        </div>
+
+        <div class="full">
+          <label for="task_env_setup">Environment setup</label>
+          <textarea id="task_env_setup" name="env_setup" placeholder="module load ansys"></textarea>
+        </div>
+
+        <div>
+          <label for="task_required_capability">Required capability</label>
+          <input id="task_required_capability" name="required_capability" placeholder="conda:pyaedt2026v1">
+        </div>
+
+        <div>
+          <label for="task_env_profile">Environment profile</label>
+          <input id="task_env_profile" name="env_profile" placeholder="pyaedt2026v1">
+        </div>
+        <div>
+          <label for="task_account_name">Account</label>
+          <input id="task_account_name" name="account_name" placeholder="optional exact account">
+        </div>
+
+        <div>
+          <label for="task_cpus">CPUs</label>
+          <input id="task_cpus" name="cpus" type="number" min="1" value="4">
+        </div>
+
+        <div>
+          <label for="task_memory_mb">Memory MB</label>
+          <input id="task_memory_mb" name="memory_mb" type="number" min="1" value="8192">
+        </div>
+
+        <div>
+          <label for="task_gpus">GPUs</label>
+          <input id="task_gpus" name="gpus" type="number" min="0" value="0">
+        </div>
+
+        <div>
+          <label for="task_gpu_model">GPU model</label>
+          <input id="task_gpu_model" name="gpu_model" placeholder="a6000ada or a6000">
+        </div>
+
+        <div>
+          <label for="task_partition">Partition</label>
+          <input id="task_partition" name="partition" value="auto">
+        </div>
+
+        <div>
+          <label for="task_node_name">Node name</label>
+          <input id="task_node_name" name="node_name" placeholder="optional exact node">
+        </div>
+
+        <div>
+          <label for="task_exclusive_node">Exclusive node</label>
+          <select id="task_exclusive_node" name="exclusive_node">
+            <option value="false">No</option>
+            <option value="true">Yes</option>
+          </select>
+        </div>
+      </div>
+
+      <p><button type="submit">Task 등록</button></p>
+    </form>
+  </section>
+</div>
+
+  <script>
+    (() => {
+      const fieldMeta = {
+        job_mode: ["작업 모드", "고급 내부 모드입니다. 기본 UI에서는 직접 선택하지 않습니다."],
+        entrypoint: ["Python entrypoint", "Git에서 받아 실행할 때 clone된 레포 내부에서 실행할 Python 파일입니다."],
+        remote_path: ["원격 프로젝트 경로", "해당 계정에서 이미 존재하는 폴더입니다. packed 모드는 Git clone을 하지 않으므로 .py와 입력 파일이 이 경로에 있어야 합니다."],
+        arguments: ["인자", "entrypoint 뒤에 붙일 command-line arguments입니다."],
+        env_setup: ["환경 설정", "실행 전에 적용할 shell 명령입니다. module load, source conda.sh, conda activate 등을 줄 단위로 입력합니다."],
+        required_capability: ["필수 capability", "특정 계정에만 있는 환경이 필요할 때 입력합니다. 예: conda:pyaedt2026v1. 스케줄러는 이 capability가 있는 계정만 선택합니다."],
+        env_profile: ["환경 profile", "accounts.yaml에 정의된 env_profiles 키입니다. 선택된 profile의 환경 설정 명령을 자동으로 앞에 붙입니다."],
+        account_name: ["계정", "특정 Slurm 계정으로만 실행해야 할 때 입력합니다. 예: r1jae262. 비워두면 스케줄러가 선택합니다."],
+        job_name: ["작업 이름", "웹과 API에서 사람이 구분하기 위한 이름입니다. Git 작업도 내부적으로 warm pool task로 등록됩니다."],
+        partition: ["파티션", "auto이면 인벤토리를 보고 스케줄러가 고릅니다. 특정 파티션이 필요하면 cpu2, gpu3처럼 입력합니다."],
+        time_limit: ["시간 제한", "직접 Slurm job 제출용 고급 필드입니다. 기본 작업 등록에서는 사용하지 않습니다."],
+        memory: ["메모리", "Git 작업 task에 요청할 메모리입니다. 예: 4G, 32768M"],
+        cpus: ["CPU 수", "warm pool에 attach될 task의 CPU 수입니다."],
+        gpus: ["GPU 수", "0이면 GPU를 요청하지 않습니다. 1 이상이면 GPU partition 또는 GPU node가 필요합니다."],
+        gpu_model: ["GPU 모델", "특정 GPU가 필요할 때 a6000ada 또는 a6000처럼 입력합니다. 비워두면 모델을 고정하지 않습니다."],
+        node_name: ["노드 이름", "특정 노드에서만 실행해야 할 때만 입력합니다. 비워두면 스케줄러가 선택합니다."],
+        exclusive_node: ["노드 독점", "Yes이면 Slurm --exclusive를 요청합니다. 공유 가능한 작업이면 No를 유지합니다."],
+        total_simulations: ["전체 시뮬레이션 수", "등록할 simulation id 총 개수입니다."],
+        simulations_per_job: ["Job당 시뮬레이션 수", "직접 Slurm batch 제출용 고급 필드입니다. 기본 작업 등록에서는 사용하지 않습니다."],
+        cpus_per_simulation: ["시뮬레이션당 CPU", "개별 simulation subprocess에 줄 CPU thread 수입니다."],
+        mem_per_simulation_gb: ["시뮬레이션당 메모리 GB", "직접 Slurm batch 제출용 고급 필드입니다. 기본 작업 등록에서는 사용하지 않습니다."],
+        max_workers_per_job: ["Job당 최대 worker", "하나의 allocation 안에서 동시에 실행할 simulation subprocess의 상한입니다."],
+        max_new_jobs: ["이번에 열 최대 job 수", "직접 Slurm batch 제출용 고급 필드입니다. 기본 작업 등록에서는 사용하지 않습니다."],
+        oversubscribe_factor: ["Oversubscribe factor", "pestat의 여유 CPU 대비 계획 worker를 얼마나 공격적으로 잡을지 정하는 계수입니다."],
+        load_target: ["Ramp load target", "job 내부에서 worker를 늘릴 때 허용할 평균 load 비율입니다."],
+        ramp_interval_seconds: ["Ramp 간격 초", "worker 수를 다시 늘릴 수 있는 최소 시간 간격입니다."],
+        repo_url: ["Git 저장소", "선택된 warm pool 계정의 작업 디렉터리에 clone할 저장소입니다. 해당 계정에서 접근 권한이 있어야 합니다."],
+        git_ref: ["브랜치/태그/커밋", "clone 후 checkout할 Git ref입니다."],
+        task_name: ["작업 이름", "웹과 API에서 사람이 구분하기 위한 이름입니다. Slurm job id와는 별개입니다."],
+        remote_cwd: ["원격 작업 경로", "선택된 계정에서 이미 접근 가능한 폴더입니다. 이 모드는 해당 폴더에 .py 파일과 입력 파일이 미리 있어야 합니다."],
+        task_command: ["실행 명령", "원격 작업 경로에서 실행될 명령입니다. 예: python run.py 또는 ansys -b -i input.dat"],
+        task_env_setup: ["환경 설정", "명령 실행 전에 적용할 shell 명령입니다. module load, conda activate 등을 줄 단위로 넣습니다."],
+        task_required_capability: ["필수 capability", "특정 계정에만 있는 환경이 필요할 때 입력합니다. 예: conda:pyaedt2026v1"],
+        task_env_profile: ["환경 profile", "accounts.yaml에 정의된 env_profiles 키입니다. profile 명령이 task env_setup 앞에 붙습니다."],
+        task_account_name: ["계정", "특정 Slurm 계정으로만 실행해야 할 때 입력합니다. 예: r1jae262. 비워두면 스케줄러가 선택합니다."],
+        task_cpus: ["CPU 수", "srun --cpus-per-task 값입니다. warm pool의 남은 CPU 안에서 배정됩니다."],
+        task_memory_mb: ["메모리 MB", "srun --mem 값입니다. MB 단위로 입력합니다."],
+        task_gpus: ["GPU 수", "0이면 CPU 작업입니다. 1 이상이면 GPU warm pool 또는 새 GPU allocation이 필요합니다."],
+        task_gpu_model: ["GPU 모델", "특정 GPU가 필요하면 a6000ada 또는 a6000처럼 입력합니다. 비워두면 모델을 고정하지 않습니다."],
+        task_partition: ["파티션", "auto이면 스케줄러가 인벤토리를 보고 고릅니다. 특정 파티션이 필요하면 입력합니다."],
+        task_node_name: ["노드 이름", "특정 노드에서만 실행해야 할 때만 입력합니다. 비워두면 스케줄러가 선택합니다."],
+        task_exclusive_node: ["노드 독점", "Yes이면 빈 전용 allocation에만 붙습니다. 공유 가능한 작업이면 No를 유지합니다."]
+      };
+
+      for (const [id, [labelText, helpText]] of Object.entries(fieldMeta)) {
+        const label = document.querySelector(`label[for="${id}"]`);
+        if (!label || label.closest(".label-row")) continue;
+        label.textContent = labelText;
+        const help = document.createElement("button");
+        help.type = "button";
+        help.className = "help-dot";
+        help.textContent = "?";
+        help.dataset.help = helpText;
+        help.setAttribute("aria-label", `${labelText} 설명`);
+        const row = document.createElement("div");
+        row.className = "label-row";
+        label.before(row);
+        row.append(label, help);
+      }
+
+      const jobPanel = document.getElementById("job-submit-panel");
+      const taskPanel = document.getElementById("task-submit-panel");
+      const tabs = Array.from(document.querySelectorAll("[data-submit-mode]"));
+      const visibleGitFields = new Set([
+        "repo_url",
+        "git_ref",
+        "entrypoint",
+        "arguments",
+        "env_setup",
+        "required_capability",
+        "env_profile",
+        "account_name",
+        "job_name",
+        "partition",
+        "cpus",
+        "memory",
+        "gpus",
+        "gpu_model",
+        "node_name",
+        "exclusive_node"
+      ]);
+      const allGitFormFields = [
+        ...visibleGitFields,
+        "job_mode",
+        "remote_path",
+        "time_limit",
+        "total_simulations",
+        "simulations_per_job",
+        "cpus_per_simulation",
+        "mem_per_simulation_gb",
+        "max_workers_per_job",
+        "max_new_jobs",
+        "oversubscribe_factor",
+        "load_target",
+        "ramp_interval_seconds"
+      ];
+      const activeRequiredFields = new Set(["repo_url", "git_ref", "entrypoint"]);
+
+      function setFieldVisible(id, visible) {
+        const field = document.getElementById(id);
+        if (!field) return;
+        const wrapper = field.closest(".form-grid > div") || field.closest("div");
+        if (wrapper) wrapper.hidden = !visible;
+        for (const control of wrapper ? wrapper.querySelectorAll("input, textarea, select") : [field]) {
+          if (control.id !== "job_mode") {
+            control.disabled = !visible;
+          }
+          if (activeRequiredFields.has(control.id)) {
+            control.required = visible;
+          }
+        }
+      }
+
+      function updateGitFields() {
+        for (const id of allGitFormFields) {
+          setFieldVisible(id, visibleGitFields.has(id));
+        }
+      }
+
+      function setSubmitMode(mode) {
+        const taskMode = mode === "task";
+        taskPanel.hidden = !taskMode;
+        jobPanel.hidden = taskMode;
+        for (const tab of tabs) {
+          tab.setAttribute("aria-selected", tab.dataset.submitMode === mode ? "true" : "false");
+        }
+        if (!taskMode) updateGitFields();
+      }
+
+      for (const tab of tabs) {
+        tab.addEventListener("click", () => setSubmitMode(tab.dataset.submitMode));
+      }
+      setSubmitMode("task");
+    })();
+  </script>
+
+  <section class="panel">
+    <div class="title-row">
       <h2>Accounts</h2>
-      <p><button type="button" onclick="refreshAccounts()">Refresh accounts</button></p>
-      {% if snapshot_error %}<p class="error">{{ snapshot_error }}</p>{% endif %}
+      <button type="button" onclick="refreshAccounts()">Refresh accounts</button>
+    </div>
+    {% if snapshot_error %}<p class="error">{{ snapshot_error }}</p>{% endif %}
+    <div class="table-scroll">
       <table id="accounts-table">
         <thead><tr><th>Account</th><th>Used / Limit</th><th>Running</th><th>Pending</th><th>Storage</th><th>Available</th></tr></thead>
         <tbody>
@@ -105,48 +391,191 @@
         {% endfor %}
         </tbody>
       </table>
-      <script>
-        async function refreshAccounts() {
-          const res = await fetch('/api/accounts/status/live');
-          const rows = await res.json();
-          const tbody = document.querySelector('#accounts-table tbody');
-          tbody.innerHTML = '';
-          for (const item of rows) {
-            const used = item.running + item.pending;
-            const storage = item.storage_used_gb !== null && item.storage_quota_gb
-              ? `${item.storage_used_gb.toFixed(2)} / ${item.storage_quota_gb.toFixed(2)} GB`
-              : 'not configured';
-            tbody.insertAdjacentHTML('beforeend', `
-              <tr>
-                <td>${item.account_name}</td>
-                <td>${used} / ${item.max_total}</td>
-                <td>${item.running}</td>
-                <td>${item.pending}</td>
-                <td>${storage}</td>
-                <td>${item.available ? 'yes' : 'no'}</td>
-              </tr>
-            `);
-          }
+    </div>
+    <script>
+      async function refreshAccounts() {
+        const res = await fetch('/api/accounts/status/live');
+        const rows = await res.json();
+        const tbody = document.querySelector('#accounts-table tbody');
+        tbody.innerHTML = '';
+        for (const item of rows) {
+          const used = item.running + item.pending;
+          const storage = item.storage_used_gb !== null && item.storage_quota_gb
+            ? `${item.storage_used_gb.toFixed(2)} / ${item.storage_quota_gb.toFixed(2)} GB`
+            : 'not configured';
+          tbody.insertAdjacentHTML('beforeend', `
+            <tr>
+              <td>${item.account_name}</td>
+              <td>${used} / ${item.max_total}</td>
+              <td>${item.running}</td>
+              <td>${item.pending}</td>
+              <td>${storage}</td>
+              <td>${item.available ? 'yes' : 'no'}</td>
+            </tr>
+          `);
         }
-      </script>
-    </section>
+      }
+    </script>
+  </section>
 
-    <section class="panel" style="margin-top:20px">
-      <h2>Jobs</h2>
+  <section class="panel">
+    <h2>Allocation Pool</h2>
+    <div class="table-scroll">
       <table>
-        <thead><tr><th>ID</th><th>Name</th><th>Mode</th><th>Simulations</th><th>Status</th><th>Account</th><th>Slurm ID</th><th>Actions</th></tr></thead>
+        <thead><tr><th>ID</th><th>State</th><th>Pool</th><th>Account</th><th>Node</th><th>CPU Free</th><th>GPU Free</th><th>Mem Free</th><th>Slurm ID</th><th>Reason</th></tr></thead>
+        <tbody>
+        {% for allocation in allocations %}
+          <tr>
+            <td>{{ allocation.id }}</td>
+            <td>{{ allocation.state }}</td>
+            <td>{{ allocation.resource_pool or "cpu" }}</td>
+            <td>{{ allocation.account_name }}</td>
+            <td>{{ allocation.node_name or allocation.partition }}</td>
+            <td>{{ allocation.free_cpus }} / {{ allocation.total_cpus }}</td>
+            <td>{{ allocation.free_gpus or 0 }} / {{ allocation.total_gpus or 0 }} {{ allocation.gpu_model }}</td>
+            <td>{{ allocation.free_memory_mb }} / {{ allocation.total_memory_mb }} MB</td>
+            <td class="mono-cell">{{ allocation.slurm_job_id or "" }}</td>
+            <td class="mono-cell">{{ allocation.pending_reason or allocation.drain_reason or allocation.failure_message or "" }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="10" class="muted">No active allocations.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <details class="section-gap">
+      <summary>Closed allocations: recent {{ closed_allocations|length }}{% if closed_allocation_count > closed_allocations|length %} of {{ closed_allocation_count }}{% endif %}</summary>
+      <div class="table-scroll section-gap">
+        <table>
+          <thead><tr><th>ID</th><th>Pool</th><th>Account</th><th>Node</th><th>CPU</th><th>GPU</th><th>Slurm ID</th><th>Closed</th><th>Reason</th></tr></thead>
+          <tbody>
+          {% for allocation in closed_allocations %}
+            <tr>
+              <td>{{ allocation.id }}</td>
+              <td>{{ allocation.resource_pool or "cpu" }}</td>
+              <td>{{ allocation.account_name }}</td>
+              <td>{{ allocation.node_name or allocation.partition }}</td>
+              <td>{{ allocation.total_cpus }}</td>
+              <td>{{ allocation.total_gpus or 0 }} {{ allocation.gpu_model }}</td>
+              <td class="mono-cell">{{ allocation.slurm_job_id or "" }}</td>
+              <td class="mono-cell">{{ allocation.closed_at or "" }}</td>
+              <td class="mono-cell">{{ allocation.pending_reason or allocation.drain_reason or allocation.failure_message or "" }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="9" class="muted">No closed allocations.</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  </section>
+
+  <section class="panel">
+    <h2>Attached Tasks</h2>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Allocation</th><th>Capability</th><th>Profile</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Elapsed</th></tr></thead>
+        <tbody>
+        {% for task in tasks %}
+          <tr>
+            <td>{{ task.id }}</td>
+            <td>
+              {{ task.name }}
+              {% if task.log_path %}
+                <button
+                  type="button"
+                  class="help-dot log-copy"
+                  data-help="{{ task.log_path }}"
+                  data-copy-log="{{ task.log_path }}"
+                  aria-label="Copy stdout log path for {{ task.name }}"
+                >?</button>
+              {% endif %}
+            </td>
+            <td>{{ task.status }}</td>
+            <td>{{ task.allocation_id or "" }}</td>
+            <td>{{ task.required_capability or "" }}</td>
+            <td>{{ task.env_profile or "" }}</td>
+            <td>{{ task.cpus }}</td>
+            <td>{{ task.gpus or 0 }} {{ task.gpu_model }}</td>
+            <td>{{ task.memory_mb }} MB</td>
+            <td class="mono-cell">{{ task.elapsed_text or "" }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="10" class="muted">No active attached tasks.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <details class="section-gap">
+      <summary>Finished tasks: recent {{ finished_tasks|length }}{% if finished_task_count > finished_tasks|length %} of {{ finished_task_count }}{% endif %}</summary>
+      <div class="table-scroll section-gap">
+        <table>
+          <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Allocation</th><th>Capability</th><th>Profile</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Elapsed</th></tr></thead>
+          <tbody>
+          {% for task in finished_tasks %}
+            <tr>
+              <td>{{ task.id }}</td>
+              <td>
+                {{ task.name }}
+                {% if task.log_path %}
+                  <button
+                    type="button"
+                    class="help-dot log-copy"
+                    data-help="{{ task.log_path }}"
+                    data-copy-log="{{ task.log_path }}"
+                    aria-label="Copy stdout log path for {{ task.name }}"
+                  >?</button>
+                {% endif %}
+              </td>
+              <td>{{ task.status }}</td>
+              <td>{{ task.allocation_id or "" }}</td>
+              <td>{{ task.required_capability or "" }}</td>
+              <td>{{ task.env_profile or "" }}</td>
+              <td>{{ task.cpus }}</td>
+              <td>{{ task.gpus or 0 }} {{ task.gpu_model }}</td>
+              <td>{{ task.memory_mb }} MB</td>
+              <td class="mono-cell">{{ task.elapsed_text or "" }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="10" class="muted">No finished tasks.</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
+    <script>
+      for (const button of document.querySelectorAll("[data-copy-log]")) {
+        button.addEventListener("click", async () => {
+          const path = button.dataset.copyLog || "";
+          if (!path) return;
+          try {
+            await navigator.clipboard.writeText(path);
+            button.dataset.help = "Copied: " + path;
+          } catch {
+            button.dataset.help = path;
+          }
+        });
+      }
+    </script>
+  </section>
+
+  <section class="panel">
+    <h2>Jobs</h2>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>ID</th><th>Name</th><th>Mode</th><th>Simulations</th><th>Status</th><th>Capability</th><th>Profile</th><th>Account</th><th>Slurm ID</th><th>Actions</th></tr></thead>
         <tbody>
         {% for job in jobs %}
           <tr>
             <td><a href="/jobs/{{ job.id }}">{{ job.id }}</a></td>
-            <td>{{ job.job_name }}</td>
+            <td class="mono-cell">{{ job.job_name }}</td>
             <td>{{ job.job_mode }}</td>
             <td>
               {% if job.job_mode in ["packed_srun", "dynamic_packed_srun"] %}
                 {{ job.simulation_start }}-{{ job.simulation_start + job.simulation_count - 1 }} ({{ job.simulation_count }})
                 {% if job.status == "queued" %}
-                  <form method="post" action="/jobs/{{ job.id }}/simulation-count" class="actions" style="margin-top:6px">
-                    <input name="simulation_count" type="number" min="1" value="{{ job.simulation_count }}" style="width:84px">
+                  <form method="post" action="/jobs/{{ job.id }}/simulation-count" class="actions section-gap">
+                    <input class="compact-input" name="simulation_count" type="number" min="1" value="{{ job.simulation_count }}">
                     <button type="submit" class="secondary">Update</button>
                   </form>
                 {% endif %}
@@ -155,8 +584,10 @@
               {% endif %}
             </td>
             <td>{{ job.status }}</td>
+            <td>{{ job.required_capability or "" }}</td>
+            <td>{{ job.env_profile or "" }}</td>
             <td>{{ job.account_name or "" }}</td>
-            <td>{{ job.slurm_job_id or "" }}</td>
+            <td class="mono-cell">{{ job.slurm_job_id or "" }}</td>
             <td>
               {% if job.status not in ["completed", "failed", "cancelled"] %}
                 <form method="post" action="/jobs/{{ job.id }}/cancel">
@@ -168,15 +599,15 @@
         {% endfor %}
         </tbody>
       </table>
-    </section>
-  </div>
-</div>
+    </div>
+  </section>
 
-<section class="panel" style="margin-top:20px">
+<section class="panel">
   <h2>Partition Ranking</h2>
-  <div class="grid">
+  <div class="two-column-grid">
     <div>
       <h2>CPU</h2>
+      <div class="table-scroll">
       <table>
         <thead><tr><th>Partition</th><th>CPU</th><th>Nodes</th><th>Available</th><th>Max CPU</th><th>Max Mem</th></tr></thead>
         <tbody>
@@ -185,9 +616,11 @@
         {% endfor %}
         </tbody>
       </table>
+      </div>
     </div>
     <div>
       <h2>GPU</h2>
+      <div class="table-scroll">
       <table>
         <thead><tr><th>Partition</th><th>GPU</th><th>CPU</th><th>Nodes</th><th>Available</th><th>Max CPU</th></tr></thead>
         <tbody>
@@ -196,13 +629,37 @@
         {% endfor %}
         </tbody>
       </table>
+      </div>
     </div>
   </div>
 </section>
 
-<section class="panel" style="margin-top:20px">
+<section class="panel">
+  <h2>GPU Capacity</h2>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Model</th><th>Cluster Total</th><th>Cluster Used</th><th>Cluster Free</th><th>Scheduler Owned</th><th>Scheduler Free</th><th>Pending</th><th>Nodes</th></tr></thead>
+      <tbody>
+      {% for item in gpu_capacity %}
+        <tr>
+          <td>{{ item.gpu_model }}</td>
+          <td>{{ item.cluster_total_gpus }}</td>
+          <td>{{ item.cluster_used_gpus }}</td>
+          <td>{{ item.cluster_free_gpus }}</td>
+          <td>{{ item.scheduler_owned_gpus }}</td>
+          <td>{{ item.scheduler_free_gpus }}</td>
+          <td>{{ item.pending_gpu_tasks + item.pending_gpu_jobs }}</td>
+          <td>{{ item.available_nodes }} / {{ item.nodes }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel">
   <h2>Token Usage</h2>
-  <form method="post" action="/token-usage" class="grid">
+  <form method="post" action="/token-usage" class="two-column-grid">
     <div>
       <label for="provider">Provider</label>
       <input id="provider" name="provider" value="codex">
@@ -224,11 +681,12 @@
     </div>
   </form>
   {% if token_chart %}
-    <div style="margin-top:16px">{{ token_chart | safe }}</div>
+    <div class="section-gap">{{ token_chart | safe }}</div>
   {% else %}
     <p class="muted">No token usage records yet.</p>
   {% endif %}
-  <table style="margin-top:16px">
+  <div class="table-scroll section-gap">
+  <table>
     <thead><tr><th>Provider</th><th>Project</th><th>Cycle</th><th>Total</th></tr></thead>
     <tbody>
     {% for item in token_summary %}
@@ -241,5 +699,7 @@
     {% endfor %}
     </tbody>
   </table>
+  </div>
 </section>
+</div>
 {% endblock %}
