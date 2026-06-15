@@ -927,8 +927,13 @@ class Scheduler:
                     continue
             if target_partition != "auto" and node.partition != target_partition:
                 continue
-            reserve = self.gpu_cpu_reserve if node.partition.startswith("gpu") and not wants_gpu else 0
+            gpu_free = max(0, node_gpu_count - node_gpu_used)
+            requested_gpus = min(max(1, int(gpus or self.gpu_prewarm_gpus_per_allocation)), gpu_free) if wants_gpu else 0
+            leaves_unclaimed_gpus = wants_gpu and gpu_free > requested_gpus
+            reserve = self.gpu_cpu_reserve if node.partition.startswith("gpu") and (not wants_gpu or leaves_unclaimed_gpus) else 0
             available_cpus = node.effective_free_cpus - reserve
+            if wants_gpu and available_cpus <= 0 and node.effective_free_cpus > 0:
+                available_cpus = node.effective_free_cpus
             if available_cpus <= 0:
                 continue
             cpus = self.allocation_cpus or available_cpus
@@ -936,7 +941,6 @@ class Scheduler:
             memory_mb = self._memory_mb(self.allocation_memory) or node.free_memory_mb
             memory_mb = max(1024, min(memory_mb, node.free_memory_mb))
             if cpus > 0 and memory_mb > 0:
-                gpu_free = max(0, node_gpu_count - node_gpu_used)
                 cpu_profile = CPU_PROFILES_BY_PARTITION.get(node.partition, {})
                 cpu_score = int(inventory.get("cpu_score") or cpu_profile.get("cpu_score") or 0)
                 score = GPU_PRIORITY.get(node_gpu_model, 0) if wants_gpu else cpu_score

@@ -157,11 +157,16 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         tasks = attach_task_elapsed(db.list_tasks())
         active_tasks = [item for item in tasks if item["status"] not in {"completed", "failed", "cancelled"}]
         finished_tasks = [item for item in tasks if item["status"] in {"completed", "failed", "cancelled"}]
+        jobs = db.list_jobs()
+        active_jobs = [item for item in jobs if item["status"] not in {"completed", "failed", "cancelled"}]
+        finished_jobs = [item for item in jobs if item["status"] in {"completed", "failed", "cancelled"}]
         return templates.TemplateResponse(
             "dashboard.html",
             {
                 "request": request,
-                "jobs": db.list_jobs(),
+                "jobs": active_jobs,
+                "finished_jobs": finished_jobs[:50],
+                "finished_job_count": len(finished_jobs),
                 "tasks": active_tasks,
                 "finished_tasks": finished_tasks[:50],
                 "finished_task_count": len(finished_tasks),

@@ -119,3 +119,9 @@
 - Problem: Treating pending preferred GPU jobs as sufficient warm capacity can leave the scheduler with no immediately usable GPU.
 - Discovery: Preferred GPU queueing and ready fallback capacity are separate goals and should not block each other.
 - Improvement: Keep A6000-class requests queued while opening a lower-priority GPU fallback when no preferred GPU allocation is ready.
+
+## 2026-06-16 04:22:31 KST
+
+- Problem: A scheduler-owned allocation can make the remaining GPUs on a shared GPU node unusable if it consumes every CPU core while using only some GPUs.
+- Discovery: GPU warm allocations need a CPU reserve when they leave GPUs unclaimed, while still allowing low-CPU capture when that is the only way to hold a GPU.
+- Improvement: Reserve `gpu_cpu_reserve` CPU cores on partial-GPU warm allocations and fold terminal jobs in the dashboard to keep active work visible.

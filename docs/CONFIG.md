@@ -55,7 +55,7 @@ Field meanings:
 - `warm_pool_preferred_accounts`: preferred accounts for CPU pools. This is preference, not a hard lock.
 - `gpu_warm_pool_preferred_accounts`: preferred accounts for GPU pools.
 - `single_job_per_node_partitions`: partitions where the scheduler should pin an idle node and avoid more than one scheduler job per node.
-- `gpu_cpu_reserve`: CPU cores left unrequested when opening CPU pools on GPU nodes. GPU warm allocations ignore this reserve so they can hold GPUs even when only a few CPU cores are free.
+- `gpu_cpu_reserve`: CPU cores left unrequested on GPU nodes. CPU pools always apply this reserve. GPU warm allocations apply it when they leave some GPUs unclaimed, so the remaining GPUs still have CPU available for other users.
 
 ## GPU Prewarm Config
 

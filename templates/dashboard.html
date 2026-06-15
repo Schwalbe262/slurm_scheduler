@@ -596,10 +596,44 @@
               {% endif %}
             </td>
           </tr>
+        {% else %}
+          <tr><td colspan="10" class="muted">No active jobs.</td></tr>
         {% endfor %}
         </tbody>
       </table>
     </div>
+    <details class="section-gap">
+      <summary>Finished jobs: recent {{ finished_jobs|length }}{% if finished_job_count > finished_jobs|length %} of {{ finished_job_count }}{% endif %}</summary>
+      <div class="table-scroll section-gap">
+        <table>
+          <thead><tr><th>ID</th><th>Name</th><th>Mode</th><th>Simulations</th><th>Status</th><th>Capability</th><th>Profile</th><th>Account</th><th>Slurm ID</th><th>Actions</th></tr></thead>
+          <tbody>
+          {% for job in finished_jobs %}
+            <tr>
+              <td><a href="/jobs/{{ job.id }}">{{ job.id }}</a></td>
+              <td class="mono-cell">{{ job.job_name }}</td>
+              <td>{{ job.job_mode }}</td>
+              <td>
+                {% if job.job_mode in ["packed_srun", "dynamic_packed_srun"] %}
+                  {{ job.simulation_start }}-{{ job.simulation_start + job.simulation_count - 1 }} ({{ job.simulation_count }})
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+              <td>{{ job.status }}</td>
+              <td>{{ job.required_capability or "" }}</td>
+              <td>{{ job.env_profile or "" }}</td>
+              <td>{{ job.account_name or "" }}</td>
+              <td class="mono-cell">{{ job.slurm_job_id or "" }}</td>
+              <td></td>
+            </tr>
+          {% else %}
+            <tr><td colspan="10" class="muted">No finished jobs.</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
   </section>
 
 <section class="panel">

@@ -834,6 +834,35 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(allocation["total_cpus"], 4)
         self.assertEqual(allocation["total_gpus"], 2)
 
+    def test_gpu_prewarm_leaves_cpu_for_unclaimed_gpus(self) -> None:
+        inventory = parse_scontrol_nodes(
+            "NodeName=gpu-a6000 CPUTot=48 RealMemory=687626 Gres=gpu:a6000:4 GresUsed=gpu:a6000:0 State=IDLE Partitions=gpu5\n"
+        )
+        self.db.replace_node_inventory(inventory)
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "gpu-a6000 gpu5 idle 0 48 0.0 687626 680000\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            allocation_cpus=64,
+            gpu_cpu_reserve=4,
+            gpu_prewarm_enabled=True,
+            gpu_prewarm_min_warm_allocations=1,
+            gpu_prewarm_preferred_models=["a6000"],
+        )
+        scheduler.maintain_allocation_pool()
+        allocation = self.db.list_allocations()[0]
+        self.assertEqual(allocation["resource_pool"], "gpu:a6000")
+        self.assertEqual(allocation["total_gpus"], 2)
+        self.assertEqual(allocation["total_cpus"], 44)
+
     def test_gpu_prewarm_opens_lower_fallback_when_preferred_is_only_pending(self) -> None:
         for model in ["a6000ada", "a6000"]:
             allocation_id = self.db.create_allocation(

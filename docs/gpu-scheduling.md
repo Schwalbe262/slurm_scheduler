@@ -77,7 +77,9 @@ The scheduler keeps at least one preferred GPU allocation warm. By default each 
 
 This means the scheduler can keep an A6000-class request in the Slurm queue while still holding a lower GPU for immediate work.
 
-GPU warm placement prioritizes holding the GPU. If an A6000-class node has enough free GPUs but only four free CPU cores, the scheduler may still open the GPU warm allocation with those four CPU cores. `gpu_cpu_reserve` applies to CPU pools placed on GPU nodes, not to GPU warm allocations.
+GPU warm placement prioritizes holding the GPU, but it should not make the remaining GPUs unusable. If a GPU warm allocation requests only part of a node's free GPUs, the scheduler leaves `gpu_cpu_reserve` CPU cores unrequested for other users of the remaining GPUs. For example, on a 48-core, 4-GPU node, a 2-GPU warm allocation requests 44 CPU cores rather than all 48.
+
+If an A6000-class node has enough free GPUs but only four free CPU cores, the scheduler may still open the GPU warm allocation with those four CPU cores. This low-CPU exception keeps GPU capture possible when the node is otherwise nearly full.
 
 If a GPU warm allocation stays Slurm `PENDING` longer than `allocation_pending_timeout_seconds`, the scheduler cancels it and applies `allocation_pending_backoff_seconds` to that GPU pool before trying again. The dashboard Allocation Pool reason column shows the Slurm pending reason, such as `(Resources)` or `(Priority)`.
 

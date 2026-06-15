@@ -138,3 +138,9 @@ Remaining verification:
 
 - Expanded `README.md` with an explicit client submission flow for `/tasks`, `/tasks/git`, and `/jobs`.
 - Added copy-paste examples for health checks, account-constrained submissions, private Git repo submissions, packed jobs, polling, stdout retrieval, and remote result file reads.
+
+## 2026-06-16 04:22:31 KST
+
+- Updated GPU warm allocation CPU shaping so partial-GPU allocations leave `gpu_cpu_reserve` CPU cores for other users of the remaining GPUs.
+- Kept the low-CPU exception so an A6000-class GPU can still be captured when only a few CPU cores are free.
+- Changed the dashboard Jobs table so completed, failed, and cancelled jobs are folded by default and limited to the most recent 50.
