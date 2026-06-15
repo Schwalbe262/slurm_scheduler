@@ -287,3 +287,12 @@ Remaining verification:
 - Added a local `flight-searcher` env profile for r1jae262 that runs `conda activate flight-searcher`.
 - Kept the legacy `flight-crawl` capability locally so already queued tasks with that older label can still be placed after service restart.
 - Updated README/API/config examples to submit Flight JSON tasks with `required_capability=conda:flight-searcher` and `env_profile=flight-searcher`.
+
+## 2026-06-16 07:00:20 KST
+
+- Investigated why an A6000 task stayed queued even though allocation `40` on `n104` had `2 / 2` free A6000 GPUs and `3 / 3` free CPUs.
+- Found task `2329` (`factorio-layout-improvement-request-c4b98a30`) requested `1 x a6000`, `3 CPU`, and `32768 MB`, and `best_allocation_for_task()` correctly matched it to allocation `40`.
+- Found the queued task order put `2475` higher-priority `flight-crawl` CPU tasks before the GPU task. Those CPU tasks were not attachable because active CPU pools only had `12` free CPU each while each task requested `16`.
+- Changed `assign_queued_tasks()` ordering to inspect GPU tasks before CPU-only backlog, then preserve priority and id ordering inside each class.
+- Added a regression test proving a lower-priority GPU task attaches before a higher-priority CPU backlog when a matching GPU allocation is available.
+- Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, and `git diff --check`.

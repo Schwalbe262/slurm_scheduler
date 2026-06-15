@@ -225,3 +225,9 @@
 - Problem: Using an abstract `flight-crawl` capability for Flight tasks hides the real dependency and can keep tasks queued when operators only know the conda environment name.
 - Discovery: The scheduler treats `required_capability` as an exact account label and only `env_profile` performs shell setup, so a conda dependency should be expressed as both a capability and a profile.
 - Improvement: Prefer `required_capability=conda:flight-searcher` with `env_profile=flight-searcher`, while keeping `flight-crawl` locally for compatibility with already submitted tasks.
+
+## 2026-06-16 07:00:20 KST
+
+- Problem: A ready A6000 allocation can sit idle behind a large higher-priority CPU-only backlog.
+- Discovery: The GPU task was schedulable on `n104`, but queued after thousands of `flight-crawl` CPU tasks that could not fit into the remaining CPU slots.
+- Improvement: Order attached-task assignment by scarce GPU demand first, then by priority and id, so available GPUs are not starved by bulk CPU queues.

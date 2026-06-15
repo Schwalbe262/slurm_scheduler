@@ -610,7 +610,11 @@ class Scheduler:
     def assign_queued_tasks(self) -> None:
         queued_tasks = sorted(
             [task for task in self.db.list_tasks(limit=5000) if task["status"] == TaskStatus.QUEUED.value],
-            key=lambda item: (-int(item.get("priority") or 0), int(item["id"])),
+            key=lambda item: (
+                0 if self.task_requires_gpu(item) else 1,
+                -int(item.get("priority") or 0),
+                int(item["id"]),
+            ),
         )
         for task in queued_tasks:
             allocation = self.best_allocation_for_task(task)

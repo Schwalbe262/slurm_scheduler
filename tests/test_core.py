@@ -357,6 +357,7 @@ class FakeClient:
     allocation_submits: list[str] = []
     allocation_states: dict[str, JobStatus] = {}
     task_states: dict[int, JobStatus] = {}
+    attached_tasks: list[int] = []
     cancelled: list[str] = []
     cancelled_tasks: list[int] = []
     removed: list[str] = []
@@ -391,6 +392,7 @@ class FakeClient:
         }
 
     def attach_task(self, task: dict, allocation: dict) -> dict[str, str]:
+        self.attached_tasks.append(int(task["id"]))
         self.task_states[task["id"]] = JobStatus.RUNNING
         return {
             "remote_dir": f"/remote/task-{task['id']}",
@@ -468,6 +470,7 @@ class SchedulerTests(unittest.TestCase):
         FakeClient.allocation_states = {}
         FakeClient.pending_reasons = {}
         FakeClient.task_states = {}
+        FakeClient.attached_tasks = []
         FakeClient.cancelled = []
         FakeClient.cancelled_tasks = []
         FakeClient.removed = []
@@ -626,6 +629,41 @@ class SchedulerTests(unittest.TestCase):
         task = self.db.get_task(task_id)
         self.assertEqual(task["status"], TaskStatus.CANCELLED.value)
         self.assertEqual(FakeClient.cancelled_tasks, [])
+
+    def test_gpu_task_attaches_before_higher_priority_cpu_backlog(self) -> None:
+        self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=65536,
+        )
+        gpu_allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="gpu1",
+            node_name="g001",
+            total_cpus=3,
+            total_memory_mb=65536,
+            total_gpus=2,
+            gpu_model="a6000",
+        )
+        self.db.update_allocation(
+            gpu_allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="gpu-alloc-1",
+            free_cpus=3,
+            free_memory_mb=65536,
+            free_gpus=2,
+        )
+        cpu_task_id = self.db.create_task(TaskCreate("cpu-backlog", "~/cpu", "run", cpus=16, memory_mb=32768, priority=70))
+        gpu_task_id = self.db.create_task(
+            TaskCreate("gpu-work", "~/gpu", "run", cpus=3, memory_mb=32768, gpus=1, gpu_model="a6000")
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        scheduler.assign_queued_tasks()
+        self.assertEqual(FakeClient.attached_tasks[0], gpu_task_id)
+        self.assertEqual(self.db.get_task(gpu_task_id)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(self.db.get_task(cpu_task_id)["status"], TaskStatus.QUEUED.value)
 
     def test_cancel_task_kills_running_wrapper(self) -> None:
         allocation_id = self.db.create_allocation(
