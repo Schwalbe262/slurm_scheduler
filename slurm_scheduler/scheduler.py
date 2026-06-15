@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -8,7 +9,7 @@ from typing import Callable
 
 from .config import AccountConfig
 from .db import Database
-from .inventory import CPU_PROFILES_BY_PARTITION, GPU_PRIORITY, normalize_gpu_model, parse_scontrol_nodes, parse_sinfo_nodes, partition_rank
+from .inventory import CPU_PROFILES_BY_PARTITION, GPU_PRIORITY, gpu_model_candidates, normalize_gpu_model, parse_scontrol_nodes, parse_sinfo_nodes, partition_rank
 from .models import AccountSnapshot, AllocationStatus, JobStatus, TaskStatus
 from .pestat import PestatNode, parse_pestat
 from .slurm import RemoteExecutionError, SSHSession, SlurmAccountClient
@@ -504,6 +505,9 @@ class Scheduler:
     def task_requires_gpu(self, task: dict) -> bool:
         return int(task.get("gpus") or 0) > 0
 
+    def requested_accounts(self, account_name: str) -> list[str]:
+        return [part.strip() for part in re.split(r"[\s,;/|]+", account_name or "") if part.strip()]
+
     def allocation_model_score(self, allocation: dict) -> int:
         return GPU_PRIORITY.get(normalize_gpu_model(str(allocation.get("gpu_model") or "")), 0)
 
@@ -514,8 +518,8 @@ class Scheduler:
         return max(0, free_cpus - reserve)
 
     def allocation_can_run_task(self, allocation: dict, task: dict, include_pending: bool) -> bool:
-        requested_account = str(task.get("account_name") or "").strip()
-        if requested_account and allocation.get("account_name") != requested_account:
+        requested_accounts = self.requested_accounts(str(task.get("account_name") or ""))
+        if requested_accounts and allocation.get("account_name") not in requested_accounts:
             return False
         account = self.account_by_name(str(allocation.get("account_name") or ""))
         if not self.account_supports(
@@ -540,9 +544,9 @@ class Scheduler:
         if task.get("node_name") and allocation.get("node_name") != task.get("node_name"):
             return False
         if self.task_requires_gpu(task):
-            task_model = normalize_gpu_model(str(task.get("gpu_model") or ""))
+            task_models = gpu_model_candidates(str(task.get("gpu_model") or ""))
             allocation_model = normalize_gpu_model(str(allocation.get("gpu_model") or ""))
-            if task_model and task_model != allocation_model:
+            if task_models and allocation_model not in task_models:
                 return False
             if int(allocation.get("free_gpus") or 0) < int(task.get("gpus") or 0):
                 return False
@@ -635,7 +639,7 @@ class Scheduler:
         task = self.db.next_queued_task()
         if task and not self.has_inflight_capacity_for_task(task):
             if self.task_requires_gpu(task):
-                model = normalize_gpu_model(str(task.get("gpu_model") or "")) or self.choose_gpu_model_for_prewarm()
+                model = self.choose_gpu_model_for_task(task) or self.choose_gpu_model_for_prewarm()
                 resource_pool = f"gpu:{model}" if model else ""
                 if model and not self.allocation_pool_in_backoff(resource_pool):
                     self.open_allocation(
@@ -795,9 +799,9 @@ class Scheduler:
             }:
                 open_by_account[allocation["account_name"]] = open_by_account.get(allocation["account_name"], 0) + 1
         candidates = []
-        requested_account = account_name.strip()
+        requested_accounts = self.requested_accounts(account_name)
         for account in self.accounts:
-            if requested_account and account.name != requested_account:
+            if requested_accounts and account.name not in requested_accounts:
                 continue
             if not self.account_supports(account, required_capability, env_profile):
                 continue
@@ -812,7 +816,8 @@ class Scheduler:
             candidates.append(account)
         if not candidates:
             return None
-        preferred_index = {name: index for index, name in enumerate(preferred_accounts or [])}
+        ordered_preferences = preferred_accounts or self.requested_accounts(account_name)
+        preferred_index = {name: index for index, name in enumerate(ordered_preferences)}
         return min(
             candidates,
             key=lambda account: (
@@ -846,6 +851,20 @@ class Scheduler:
             if item and int(item["cluster_free_gpus"]) >= self.gpu_prewarm_gpus_per_allocation:
                 return model
         return self.gpu_prewarm_preferred_models[0] if self.gpu_prewarm_preferred_models else ""
+
+    def choose_gpu_model_for_task(self, task: dict) -> str:
+        candidates = gpu_model_candidates(str(task.get("gpu_model") or ""))
+        if not candidates:
+            return ""
+        if len(candidates) == 1:
+            return candidates[0]
+        capacity = {item["gpu_model"]: item for item in self.gpu_capacity_summary()}
+        requested_gpus = max(1, int(task.get("gpus") or self.gpu_prewarm_gpus_per_allocation))
+        for model in candidates:
+            item = capacity.get(model)
+            if item and int(item.get("cluster_free_gpus") or 0) >= requested_gpus:
+                return model
+        return candidates[0]
 
     def choose_gpu_model_for_fallback(self, excluded_models: set[str]) -> str:
         capacity = self.gpu_capacity_summary()
@@ -905,7 +924,7 @@ class Scheduler:
             ]
         candidates = []
         wants_gpu = resource_pool.startswith("gpu:") or int(gpus or 0) > 0
-        target_model = normalize_gpu_model(gpu_model)
+        target_models = gpu_model_candidates(gpu_model)
         target_partition = self.gpu_prewarm_partition if wants_gpu else self.allocation_partition
         occupied_by_partition: dict[str, set[str]] = {}
         for node in nodes:
@@ -925,7 +944,7 @@ class Scheduler:
             if wants_gpu:
                 if target_partition != "auto" and node.partition != target_partition:
                     continue
-                if target_model and node_gpu_model != target_model:
+                if target_models and node_gpu_model not in target_models:
                     continue
                 if node_gpu_count <= 0:
                     continue
@@ -986,7 +1005,7 @@ class Scheduler:
             "cpus": self.allocation_cpus or 4,
             "memory_mb": self._memory_mb(self.allocation_memory) or 16384,
             "gpus": max(1, int(gpus or self.gpu_prewarm_gpus_per_allocation)) if wants_gpu else 0,
-            "gpu_model": target_model if wants_gpu else "",
+            "gpu_model": (target_models[0] if target_models else "") if wants_gpu else "",
             "exclusive_node": exclusive_node,
         }
 
@@ -1137,17 +1156,24 @@ class Scheduler:
 
     def choose_account(self, required_capability: str = "", env_profile: str = "", account_name: str = "") -> AccountConfig | None:
         snapshots_by_name = {snapshot.account_name: snapshot for snapshot in self.snapshots()}
-        requested_account = account_name.strip()
+        requested_accounts = self.requested_accounts(account_name)
         candidates = [
             account
             for account in self.accounts
-            if (not requested_account or account.name == requested_account)
+            if (not requested_accounts or account.name in requested_accounts)
             and snapshots_by_name.get(account.name) and snapshots_by_name[account.name].available
             and self.account_supports(account, required_capability, env_profile)
         ]
         if not candidates:
             return None
-        return min(candidates, key=lambda account: snapshots_by_name[account.name].score)
+        requested_index = {name: index for index, name in enumerate(requested_accounts)}
+        return min(
+            candidates,
+            key=lambda account: (
+                requested_index.get(account.name, len(requested_index)),
+                snapshots_by_name[account.name].score,
+            ),
+        )
 
     def submit_next_queued_job(self) -> None:
         job = self.db.next_queued_job()
@@ -1160,6 +1186,11 @@ class Scheduler:
         )
         if not account:
             return
+        if int(job.get("gpus") or 0) > 0:
+            model = self.choose_gpu_model_for_task(job)
+            if model and job.get("gpu_model") != model:
+                job["gpu_model"] = model
+                self.db.update_job(job["id"], gpu_model=model)
         partition = self.choose_partition(job)
         if partition and job.get("partition") != partition:
             job["partition"] = partition
@@ -1198,9 +1229,9 @@ class Scheduler:
         if requested and requested.lower() != "auto":
             return requested
         rows = self.db.list_node_inventory()
-        requested_model = normalize_gpu_model(str(job.get("gpu_model") or ""))
-        if requested_model:
-            rows = [row for row in rows if normalize_gpu_model(str(row.get("gpu_model") or "")) == requested_model]
+        requested_models = gpu_model_candidates(str(job.get("gpu_model") or ""))
+        if requested_models:
+            rows = [row for row in rows if normalize_gpu_model(str(row.get("gpu_model") or "")) in requested_models]
         ranked = partition_rank(rows, needs_gpu=int(job.get("gpus") or 0) > 0)
         for item in ranked:
             partition = item["partition"]

@@ -72,7 +72,7 @@ Basic client flow:
 2. Check health and capacity.
 3. Choose `/tasks`, `/tasks/git`, or `/jobs`.
 4. Include resource requests such as `cpus`, `memory_mb` or `memory`, `gpus`, and `gpu_model`.
-5. Include `account_name` only when the job must stay on a specific Slurm account.
+5. Include `account_name` only when the job must stay on a specific Slurm account. Use comma-separated values such as `account_a,account_b` when either account is acceptable in that preference order.
 6. Poll `/api/tasks`, `/api/jobs`, and `/api/allocations`.
 7. Read task output through `/api/tasks/{task_id}/stdout` or `/api/tasks/{task_id}/remote-file`.
 8. For direct `/jobs` clone or submission failures, read `submit.stderr.log` from the job remote directory.
@@ -92,7 +92,7 @@ curl -sS -X POST "$SCHEDULER_URL/tasks" \
   -F name=case-001 \
   -F remote_cwd=/remote/project/path \
   -F command='python run.py --case case001 --out results/case001.json' \
-  -F account_name=account_a \
+  -F account_name=account_a,account_b \
   -F cpus=4 \
   -F memory_mb=8192 \
   -F gpus=0
@@ -107,13 +107,15 @@ curl -sS -X POST "$SCHEDULER_URL/tasks/git" \
   -F git_ref=main \
   -F entrypoint=scripts/run.py \
   -F arguments='--case case001' \
-  -F account_name=account_a \
+  -F account_name=account_a,account_b \
   -F cpus=4 \
   -F memory=8G \
   -F gpus=0
 ```
 
 Private Git repos must be cloneable from the selected cluster account. Prefer a read-only GitHub deploy key and an SSH alias in that account's `~/.ssh/config`; avoid putting personal access tokens in scheduler form fields.
+
+GPU model constraints also accept comma-separated ordered candidates. For example, `gpu_model=a6000ada,a6000` tries A6000 ADA first and can fall back to A6000 if that is the available matching pool or node.
 
 If a Git-backed `/jobs` submission fails before Slurm starts, the scheduler records the pre-submit logs under the job remote directory. Use these to distinguish `Host key verification failed`, `Permission denied (publickey)`, and ordinary Git errors.
 

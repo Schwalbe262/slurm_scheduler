@@ -96,6 +96,19 @@ def normalize_gpu_model(model: str) -> str:
     return raw
 
 
+def gpu_model_candidates(models: str) -> list[str]:
+    candidates = []
+    for part in re.split(r"[\s,;/|]+", models or ""):
+        model = normalize_gpu_model(part)
+        if model and model not in candidates:
+            candidates.append(model)
+    if not candidates:
+        model = normalize_gpu_model(models or "")
+        if model:
+            candidates.append(model)
+    return candidates
+
+
 def parse_gres(gres: str) -> tuple[str, int]:
     if not gres or gres == "(null)":
         return "", 0
@@ -123,6 +136,30 @@ def parse_gres_used(gres_used: str, default_model: str = "") -> int:
             continue
         used += int(match.group(2))
     return used
+
+
+def parse_alloc_tres_gpus(alloc_tres: str, default_model: str = "") -> int:
+    if not alloc_tres:
+        return 0
+    normalized_default = normalize_gpu_model(default_model)
+    generic = 0
+    specific = 0
+    for item in alloc_tres.split(","):
+        if "=" not in item:
+            continue
+        key, raw_value = item.split("=", 1)
+        try:
+            value = int(float(raw_value))
+        except ValueError:
+            continue
+        if key == "gres/gpu":
+            generic += value
+            continue
+        if key.startswith("gres/gpu:"):
+            model = normalize_gpu_model(key.split(":", 1)[1])
+            if not normalized_default or model == normalized_default:
+                specific += value
+    return specific or generic
 
 
 def parse_sinfo_nodes(output: str) -> list[NodeInventory]:
@@ -158,7 +195,7 @@ def parse_sinfo_nodes(output: str) -> list[NodeInventory]:
 def parse_scontrol_nodes(output: str) -> list[NodeInventory]:
     nodes = []
     for raw in output.splitlines():
-        fields = dict(re.findall(r"(\w+)=([^ ]*)", raw.strip()))
+        fields = dict(re.findall(r"([A-Za-z][A-Za-z0-9_]*)=([^ ]*)", raw.strip()))
         if not fields.get("NodeName"):
             continue
         partitions = fields.get("Partitions") or fields.get("PartitionName") or ""
@@ -173,7 +210,8 @@ def parse_scontrol_nodes(output: str) -> list[NodeInventory]:
                 memory_mb=int(fields.get("RealMemory") or fields.get("Memory") or 0),
                 gpu_model=gpu_model,
                 gpu_count=gpu_count,
-                gpu_used_count=parse_gres_used(fields.get("GresUsed", ""), gpu_model),
+                gpu_used_count=parse_gres_used(fields.get("GresUsed", ""), gpu_model)
+                or parse_alloc_tres_gpus(fields.get("AllocTRES", ""), gpu_model),
                 state=(fields.get("State") or "").split("+")[0].lower(),
                 cpu_model=str(profile.get("cpu_model", "")),
                 sockets=int(profile.get("sockets", 0)),

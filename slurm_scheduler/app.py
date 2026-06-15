@@ -97,6 +97,18 @@ def attach_task_elapsed(tasks: list[dict]) -> list[dict]:
     return hydrated
 
 
+def job_elapsed(jobs: list[dict]) -> list[dict]:
+    now = datetime.now(timezone.utc)
+    hydrated: list[dict] = []
+    for job in jobs:
+        item = dict(job)
+        start = parse_timestamp(item.get("submitted_at") or item.get("created_at"))
+        end = parse_timestamp(item.get("finished_at")) or now
+        item["elapsed_text"] = format_elapsed((end - start).total_seconds()) if start else ""
+        hydrated.append(item)
+    return hydrated
+
+
 def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     config = load_app_config(config_path)
     accounts = load_accounts(config.accounts_path)
@@ -157,7 +169,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         tasks = attach_task_elapsed(db.list_tasks())
         active_tasks = [item for item in tasks if item["status"] not in {"completed", "failed", "cancelled"}]
         finished_tasks = [item for item in tasks if item["status"] in {"completed", "failed", "cancelled"}]
-        jobs = db.list_jobs()
+        jobs = job_elapsed(db.list_jobs())
         active_jobs = [item for item in jobs if item["status"] not in {"completed", "failed", "cancelled"}]
         finished_jobs = [item for item in jobs if item["status"] in {"completed", "failed", "cancelled"}]
         return templates.TemplateResponse(

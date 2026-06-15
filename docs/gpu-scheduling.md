@@ -35,6 +35,8 @@ The scheduler normalizes common Slurm GPU names:
 
 If the cluster uses a new spelling, add it to `normalize_gpu_model()` in `slurm_scheduler/inventory.py`.
 
+Task and job submissions may pass one GPU model or an ordered candidate list. For example, `gpu_model=a6000ada,a6000` prefers A6000 ADA and allows A6000 when that is the available matching capacity.
+
 ## Inventory And Usage
 
 `scripts/refresh_inventory.py` first tries:

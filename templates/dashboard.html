@@ -176,7 +176,7 @@
         </div>
         <div>
           <label for="task_account_name">Account</label>
-          <input id="task_account_name" name="account_name" placeholder="optional exact account">
+          <input id="task_account_name" name="account_name" placeholder="account_a or account_a,account_b">
         </div>
 
         <div>
@@ -196,7 +196,7 @@
 
         <div>
           <label for="task_gpu_model">GPU model</label>
-          <input id="task_gpu_model" name="gpu_model" placeholder="a6000ada or a6000">
+          <input id="task_gpu_model" name="gpu_model" placeholder="a6000ada or a6000ada,a6000">
         </div>
 
         <div>
@@ -233,14 +233,14 @@
         env_setup: ["환경 설정", "실행 전에 적용할 shell 명령입니다. module load, source conda.sh, conda activate 등을 줄 단위로 입력합니다."],
         required_capability: ["필수 capability", "특정 계정에만 있는 환경이 필요할 때 입력합니다. 예: conda:pyaedt2026v1. 스케줄러는 이 capability가 있는 계정만 선택합니다."],
         env_profile: ["환경 profile", "accounts.yaml에 정의된 env_profiles 키입니다. 선택된 profile의 환경 설정 명령을 자동으로 앞에 붙입니다."],
-        account_name: ["계정", "특정 Slurm 계정으로만 실행해야 할 때 입력합니다. 예: r1jae262. 비워두면 스케줄러가 선택합니다."],
+        account_name: ["계정", "특정 Slurm 계정으로만 실행해야 할 때 입력합니다. 여러 후보는 account_a,account_b처럼 입력합니다. 비워두면 스케줄러가 선택합니다."],
         job_name: ["작업 이름", "웹과 API에서 사람이 구분하기 위한 이름입니다. Git 작업도 내부적으로 warm pool task로 등록됩니다."],
         partition: ["파티션", "auto이면 인벤토리를 보고 스케줄러가 고릅니다. 특정 파티션이 필요하면 cpu2, gpu3처럼 입력합니다."],
         time_limit: ["시간 제한", "직접 Slurm job 제출용 고급 필드입니다. 기본 작업 등록에서는 사용하지 않습니다."],
         memory: ["메모리", "Git 작업 task에 요청할 메모리입니다. 예: 4G, 32768M"],
         cpus: ["CPU 수", "warm pool에 attach될 task의 CPU 수입니다."],
         gpus: ["GPU 수", "0이면 GPU를 요청하지 않습니다. 1 이상이면 GPU partition 또는 GPU node가 필요합니다."],
-        gpu_model: ["GPU 모델", "특정 GPU가 필요할 때 a6000ada 또는 a6000처럼 입력합니다. 비워두면 모델을 고정하지 않습니다."],
+        gpu_model: ["GPU 모델", "특정 GPU가 필요할 때 a6000ada 또는 a6000처럼 입력합니다. 여러 후보는 a6000ada,a6000처럼 입력합니다. 비워두면 모델을 고정하지 않습니다."],
         node_name: ["노드 이름", "특정 노드에서만 실행해야 할 때만 입력합니다. 비워두면 스케줄러가 선택합니다."],
         exclusive_node: ["노드 독점", "Yes이면 Slurm --exclusive를 요청합니다. 공유 가능한 작업이면 No를 유지합니다."],
         total_simulations: ["전체 시뮬레이션 수", "등록할 simulation id 총 개수입니다."],
@@ -260,11 +260,11 @@
         task_env_setup: ["환경 설정", "명령 실행 전에 적용할 shell 명령입니다. module load, conda activate 등을 줄 단위로 넣습니다."],
         task_required_capability: ["필수 capability", "특정 계정에만 있는 환경이 필요할 때 입력합니다. 예: conda:pyaedt2026v1"],
         task_env_profile: ["환경 profile", "accounts.yaml에 정의된 env_profiles 키입니다. profile 명령이 task env_setup 앞에 붙습니다."],
-        task_account_name: ["계정", "특정 Slurm 계정으로만 실행해야 할 때 입력합니다. 예: r1jae262. 비워두면 스케줄러가 선택합니다."],
+        task_account_name: ["계정", "특정 Slurm 계정으로만 실행해야 할 때 입력합니다. 여러 후보는 account_a,account_b처럼 입력합니다. 비워두면 스케줄러가 선택합니다."],
         task_cpus: ["CPU 수", "srun --cpus-per-task 값입니다. warm pool의 남은 CPU 안에서 배정됩니다."],
         task_memory_mb: ["메모리 MB", "srun --mem 값입니다. MB 단위로 입력합니다."],
         task_gpus: ["GPU 수", "0이면 CPU 작업입니다. 1 이상이면 GPU warm pool 또는 새 GPU allocation이 필요합니다."],
-        task_gpu_model: ["GPU 모델", "특정 GPU가 필요하면 a6000ada 또는 a6000처럼 입력합니다. 비워두면 모델을 고정하지 않습니다."],
+        task_gpu_model: ["GPU 모델", "특정 GPU가 필요하면 a6000ada 또는 a6000처럼 입력합니다. 여러 후보는 a6000ada,a6000처럼 입력합니다. 비워두면 모델을 고정하지 않습니다."],
         task_partition: ["파티션", "auto이면 스케줄러가 인벤토리를 보고 고릅니다. 특정 파티션이 필요하면 입력합니다."],
         task_node_name: ["노드 이름", "특정 노드에서만 실행해야 할 때만 입력합니다. 비워두면 스케줄러가 선택합니다."],
         task_exclusive_node: ["노드 독점", "Yes이면 빈 전용 allocation에만 붙습니다. 공유 가능한 작업이면 No를 유지합니다."]
@@ -606,7 +606,7 @@
       <summary>Finished jobs: recent {{ finished_jobs|length }}{% if finished_job_count > finished_jobs|length %} of {{ finished_job_count }}{% endif %}</summary>
       <div class="table-scroll section-gap">
         <table>
-          <thead><tr><th>ID</th><th>Name</th><th>Mode</th><th>Simulations</th><th>Status</th><th>Capability</th><th>Profile</th><th>Account</th><th>Slurm ID</th><th>Actions</th></tr></thead>
+          <thead><tr><th>ID</th><th>Name</th><th>Mode</th><th>Simulations</th><th>Status</th><th>Capability</th><th>Profile</th><th>Account</th><th>Slurm ID</th><th>Elapsed</th></tr></thead>
           <tbody>
           {% for job in finished_jobs %}
             <tr>
@@ -625,7 +625,7 @@
               <td>{{ job.env_profile or "" }}</td>
               <td>{{ job.account_name or "" }}</td>
               <td class="mono-cell">{{ job.slurm_job_id or "" }}</td>
-              <td></td>
+              <td class="mono-cell">{{ job.elapsed_text or "" }}</td>
             </tr>
           {% else %}
             <tr><td colspan="10" class="muted">No finished jobs.</td></tr>

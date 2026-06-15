@@ -350,6 +350,13 @@ def shell_path(path: str) -> str:
     return shlex.quote(value)
 
 
+def remote_execution_path(path: str) -> str:
+    value = (path or ".").strip() or "."
+    if value.startswith("/") or value == "~" or value.startswith("~/"):
+        return value
+    return f"~/{value}"
+
+
 def resolve_task_placeholders(task: dict, account: AccountConfig) -> dict:
     workspace = account.remote_workspace or "."
     command = str(task.get("command") or "").replace(ACCOUNT_WORKSPACE_PLACEHOLDER, shell_path(workspace))
@@ -385,7 +392,7 @@ def build_srun_attach_command(
         f"--cpus-per-task={int(task['cpus'])}",
         f"--mem={int(task['memory_mb'])}M",
     ]
-    gres = gpu_gres_value(str(task.get("gpu_model") or allocation.get("gpu_model") or ""), int(task.get("gpus") or 0))
+    gres = gpu_gres_value(str(allocation.get("gpu_model") or task.get("gpu_model") or ""), int(task.get("gpus") or 0))
     if gres:
         srun_parts.append(f"--gres={shlex.quote(gres)}")
     srun_parts.extend(["--exclusive", "bash", shlex.quote(script_path)])
@@ -535,6 +542,7 @@ class SlurmAccountClient:
         stamp = int(time.time())
         remote_dir = posixpath.join(self.account.remote_workspace, f"task-{task['id']}-{stamp}")
         script_path = posixpath.join(remote_dir, "task.sh")
+        script_exec_path = remote_execution_path(script_path)
         stdout_path = posixpath.join(remote_dir, "stdout.log")
         stderr_path = posixpath.join(remote_dir, "stderr.log")
         exit_code_path = posixpath.join(remote_dir, "exit_code")
@@ -550,7 +558,7 @@ class SlurmAccountClient:
         wrapper = build_srun_attach_command(
             task,
             allocation,
-            script_path,
+            script_exec_path,
             stdout_path,
             stderr_path,
             exit_code_path,

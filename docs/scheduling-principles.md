@@ -45,7 +45,7 @@ Warm allocation account selection can use preferred account lists:
 
 The preference is not absolute. If the preferred account is at its job limit, lacks a required capability, or is otherwise unavailable, the scheduler chooses another eligible account.
 
-For an exact account constraint, submit the task or job with `account_name`. For example, `account_name=account_a` means the request will only use existing allocations from `account_a` or open a new allocation under `account_a`; it will remain queued if that account has no job slot.
+For an exact account constraint, submit the task or job with `account_name`. For example, `account_name=account_a` means the request will only use existing allocations from `account_a` or open a new allocation under `account_a`; it will remain queued if that account has no job slot. Ordered account candidates are also accepted, for example `account_name=account_a,account_b`.
 
 ## Account Capabilities
 

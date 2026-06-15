@@ -20,6 +20,7 @@ from slurm_scheduler.slurm import (
     parse_du_gb,
     parse_sbatch_job_id,
     parse_squeue_counts,
+    remote_execution_path,
     resolve_task_placeholders,
 )
 
@@ -231,6 +232,11 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("--mem=8192M", command)
         self.assertIn("--exclusive", command)
 
+    def test_remote_execution_path_promotes_relative_path_under_home(self) -> None:
+        self.assertEqual(remote_execution_path("slurm_scheduler/task-1/task.sh"), "~/slurm_scheduler/task-1/task.sh")
+        self.assertEqual(remote_execution_path("~/slurm_scheduler/task-1/task.sh"), "~/slurm_scheduler/task-1/task.sh")
+        self.assertEqual(remote_execution_path("/tmp/task.sh"), "/tmp/task.sh")
+
     def test_srun_attach_command_can_request_gpu(self) -> None:
         task = {"cpus": 8, "memory_mb": 16384, "gpus": 1, "gpu_model": "a6000"}
         allocation = {"slurm_job_id": "12345", "gpu_model": "a6000"}
@@ -264,6 +270,17 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertEqual(nodes[0].gpu_model, "a6000ada")
         self.assertEqual(nodes[0].gpu_count, 4)
         self.assertEqual(nodes[0].gpu_used_count, 3)
+
+    def test_parse_scontrol_nodes_tracks_alloc_tres_gpus(self) -> None:
+        nodes = parse_scontrol_nodes(
+            "NodeName=n002 Arch=x86_64 CPUTot=48 RealMemory=768000 "
+            "Gres=gpu:rtx3090:4 State=ALLOCATED Partitions=gpu1 "
+            "CfgTRES=cpu=48,mem=750G,billing=48,gres/gpu=4,gres/gpu:rtx3090=4 "
+            "AllocTRES=cpu=48,gres/gpu=2,gres/gpu:rtx3090=2\n"
+        )
+        self.assertEqual(nodes[0].gpu_model, "rtx3090")
+        self.assertEqual(nodes[0].gpu_count, 4)
+        self.assertEqual(nodes[0].gpu_used_count, 2)
 
     def test_parse_pestat_and_dynamic_plan(self) -> None:
         nodes = parse_pestat(
@@ -413,6 +430,11 @@ class SchedulerTests(unittest.TestCase):
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
         self.assertEqual(scheduler.choose_account(account_name="a").name, "a")
 
+    def test_choose_account_accepts_ordered_account_candidates(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        self.assertEqual(scheduler.choose_account(account_name="a,b").name, "a")
+        self.assertEqual(scheduler.choose_account(account_name="b,a").name, "b")
+
     def test_submit_next_queued_job_updates_database(self) -> None:
         job_id = self.db.create_job(JobCreate("git@example.com:repo.git", "main", "run.py"))
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
@@ -550,6 +572,27 @@ class SchedulerTests(unittest.TestCase):
         allocation = self.db.get_allocation(task["allocation_id"])
         self.assertEqual(task["status"], TaskStatus.RUNNING.value)
         self.assertEqual(allocation["free_cpus"], 4)
+
+    def test_gpu_task_accepts_ordered_gpu_model_candidates(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="gpu4",
+            node_name="gpu-a6000",
+            total_cpus=16,
+            total_memory_mb=65536,
+            total_gpus=2,
+            gpu_model="a6000",
+            resource_pool="gpu:a6000",
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.WARM.value, slurm_job_id="gpu-job")
+        task_id = self.db.create_task(
+            TaskCreate("gpu-task", "~/case", "run", cpus=4, memory_mb=2048, gpus=1, gpu_model="a6000ada,a6000")
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        scheduler.assign_queued_tasks()
+        task = self.db.get_task(task_id)
+        self.assertEqual(task["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(task["allocation_id"], allocation_id)
 
     def test_attach_failure_keeps_remote_log_paths(self) -> None:
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=AttachFailureClient, allocation_cpus=8)

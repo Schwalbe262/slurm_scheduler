@@ -184,7 +184,7 @@ Common blockers:
 
 - `required_capability` does not exist on any account.
 - `env_profile` name is missing from the selected account config.
-- Requested `gpu_model`, `partition`, or `node_name` is too narrow.
+- Requested `gpu_model`, `partition`, or `node_name` is too narrow. If multiple GPU models are acceptable, use an ordered list such as `gpu_model=a6000ada,a6000`.
 - Requested `cpus` or `memory_mb` is larger than free allocation capacity.
 - Account job limits prevent scale-out.
 

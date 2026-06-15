@@ -26,7 +26,7 @@ curl -sS -X POST "$SCHEDULER_URL/tasks" \
   -F name=fea-case-001 \
   -F remote_cwd=/remote/project/path \
   -F command='python run_fea.py --case case001 --out results/case001.json' \
-  -F account_name=account_a \
+  -F account_name=account_a,account_b \
   -F cpus=4 \
   -F memory_mb=8192 \
   -F gpus=0
@@ -96,7 +96,7 @@ curl -sS -X POST "$SCHEDULER_URL/tasks" \
   -F cpus=8 \
   -F memory_mb=32768 \
   -F gpus=1 \
-  -F gpu_model=a6000ada \
+  -F gpu_model=a6000ada,a6000 \
   -F partition=auto
 ```
 
@@ -119,7 +119,7 @@ curl -sS -X POST "$SCHEDULER_URL/tasks" \
   -F cpus=8 \
   -F memory_mb=32768 \
   -F gpus=1 \
-  -F gpu_model=a6000ada \
+  -F gpu_model=a6000ada,a6000 \
   -F partition=gpu3 \
   -F node_name=n071
 ```

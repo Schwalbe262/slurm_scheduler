@@ -169,3 +169,15 @@ Remaining verification:
 - Found the failure was caused by the new submit-log implementation joining clone, checkout, and sbatch commands with `&&` in one shell while `remote_job_dir` is relative.
 - The checkout step attempted to `cd slurm_scheduler/job-52-.../repo` from inside the job directory, producing a duplicated relative path and `No such file or directory`.
 - Changed direct job submission to execute each pre-submit step in a fresh SSH exec command so relative workspace paths do not compound across `cd` commands.
+
+## 2026-06-16 04:56:00 KST
+
+- Investigated attached task 25 failure.
+- Confirmed attach succeeded and the task exited with code 1 inside `task.sh`; stderr showed `cd: slurm_scheduler/task-25-...: No such file or directory`.
+- Found the scheduler passed a relative `task.sh` path to `srun`; task code using `dirname "$0"` then resolved the relative path after `cd slurm_scheduler`, producing a duplicated path.
+- Changed attached task execution to pass a home-rooted script path such as `~/slurm_scheduler/task-.../task.sh` to `srun`.
+- Investigated GPU Capacity showing zero cluster used GPUs.
+- Found this Slurm cluster reports allocated GPUs through `AllocTRES=...gres/gpu...` rather than `GresUsed=...`.
+- Added `AllocTRES` GPU parsing and refreshed inventory; GPU used counts now populate, for example A6000ADA `37/40` used and RTX3090 `42/56` used at verification time.
+- Added ordered candidate support for `gpu_model` and `account_name`, such as `gpu_model=a6000ada,a6000` and `account_name=account_a,account_b`.
+- Changed Finished jobs UI to show elapsed time in the final column instead of an empty Actions column.

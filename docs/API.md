@@ -96,11 +96,11 @@ Form fields:
 - `env_setup`: optional commands inserted before `command`.
 - `required_capability`: optional account capability, such as `conda:pyaedt2026v1`.
 - `env_profile`: optional named account profile to prepend before `env_setup`.
-- `account_name`: optional exact account constraint. If set, the task only attaches to or opens allocations owned by that account.
+- `account_name`: optional exact account constraint. Use one account such as `account_a`, or ordered candidates such as `account_a,account_b`.
 - `cpus`: CPU cores requested from an allocation.
 - `memory_mb`: memory requested from an allocation. This is a scheduling/reservation and possible Slurm enforcement limit; it does not physically allocate RAM before the process uses it.
 - `gpus`: GPU count, normally `0` or `1`.
-- `gpu_model`: optional normalized model such as `a6000ada` or `a6000`.
+- `gpu_model`: optional normalized model such as `a6000ada` or `a6000`. Ordered candidates such as `a6000ada,a6000` are accepted.
 - `partition`: `auto` or a specific Slurm partition.
 - `node_name`: optional specific node constraint.
 - `exclusive_node`: use only when a task cannot share a node.

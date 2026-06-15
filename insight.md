@@ -143,3 +143,13 @@
 - Problem: Relative remote workspaces break when multiple `cd <relative-path> && ...` steps are chained in a single remote shell.
 - Discovery: Job 52 cloned successfully, but the later checkout tried to resolve the same relative job path from inside the job directory.
 - Improvement: Run direct-job pre-submit steps as separate SSH exec calls after uploading `run.sbatch`, keeping each command's starting directory predictable.
+
+## 2026-06-16 04:56:00 KST
+
+- Problem: Attached tasks can fail if user code relies on `dirname "$0"` while the scheduler invokes `task.sh` through a relative path.
+- Discovery: Task 25 attached correctly but failed inside the script because `cd slurm_scheduler` changed the base for `$0=slurm_scheduler/task-.../task.sh`.
+- Improvement: Invoke task scripts via home-rooted paths for stable `$0` resolution.
+
+- Problem: GPU capacity and scheduling were overestimating free GPUs because cluster used GPUs were always parsed as zero.
+- Discovery: This cluster exposes GPU allocation in `AllocTRES` rather than `GresUsed`.
+- Improvement: Parse `AllocTRES` GPU counts and support ordered GPU/account candidates so placement can be both accurate and flexible.
