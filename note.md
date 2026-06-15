@@ -320,3 +320,10 @@ Remaining verification:
 - Changed the dashboard to always fetch all `running`/`attaching` tasks up to 5000 rows and only cap `queued` display to the latest 50 rows. Finished tasks remain capped to the latest 50 rows.
 - Added a regression test showing a running task remains retrievable by status even after many newer terminal rows push it out of the generic recent list.
 - Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, and `git diff --check`.
+
+## 2026-06-16 07:15:14 KST
+
+- Investigated why CPU demand did not open a new pool even though dashboard utilization reached `131 / 131` CPU and 16-core `flight-crawl` tasks were still queued.
+- Found scheduler ticks were failing before `maintain_allocation_pool()` with `sqlite3.OperationalError: database is locked` during concurrent `/api/tasks` bursts, UI polling, and scheduler task assignment.
+- Increased SQLite connection timeout to 30 seconds and applied `PRAGMA busy_timeout = 30000`, `journal_mode = WAL`, and `synchronous = NORMAL` for better read/write concurrency.
+- Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, and `git diff --check`.

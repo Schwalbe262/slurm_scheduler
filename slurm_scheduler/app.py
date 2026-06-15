@@ -91,7 +91,10 @@ def attach_task_elapsed(tasks: list[dict]) -> list[dict]:
     for task in tasks:
         item = dict(task)
         start = parse_timestamp(item.get("started_at") or item.get("attached_at") or item.get("created_at"))
-        end = parse_timestamp(item.get("finished_at")) or now
+        if item.get("status") in {"completed", "failed", "cancelled"}:
+            end = parse_timestamp(item.get("finished_at")) or now
+        else:
+            end = now
         item["elapsed_text"] = format_elapsed((end - start).total_seconds()) if start else ""
         item["log_path"] = item.get("stdout_path") or item.get("stderr_path") or ""
         hydrated.append(item)

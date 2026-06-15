@@ -249,3 +249,9 @@
 - Problem: Dashboard recent-row limits can hide older long-running tasks behind a flood of newer queued or finished tasks.
 - Discovery: Active and finished task sections were split after fetching only the latest generic task rows.
 - Improvement: Fetch `running`/`attaching` tasks by status so they are always displayed, while limiting only queued and finished task rows for UI size.
+
+## 2026-06-16 07:15:14 KST
+
+- Problem: Scheduler ticks and API reads can fail under task submission bursts because SQLite's default lock handling is too short for concurrent scheduler/UI/client traffic.
+- Discovery: The scale-out loop stopped before pool maintenance with `sqlite3.OperationalError: database is locked`, and `/api/tasks/{id}` also returned 500 during the same lock window.
+- Improvement: Open SQLite connections with a longer timeout, set `busy_timeout`, enable WAL mode, and use `synchronous=NORMAL` so readers and writers interfere less.
