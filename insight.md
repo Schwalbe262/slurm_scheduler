@@ -183,3 +183,9 @@
 - Problem: Scheduler-created remote directories can accumulate indefinitely, while GPU work can remain queued even when the matching GPU is available but free CPU is slightly below the request.
 - Discovery: Task, job, and allocation rows already store enough account and remote path metadata to safely remove only scheduler-owned artifacts; for GPU tasks, the GPU is the scarce resource and strict CPU matching can be counterproductive.
 - Improvement: Add TTL-based cleanup for safe scheduler artifact paths, exclude pending allocations from dashboard utilization totals, and allow matching GPU tasks to attach to tight-CPU GPU allocations when memory and at least one CPU core remain.
+
+## 2026-06-16 06:00:24 KST
+
+- Problem: The dashboard can show stale allocation/task/job state while the scheduler loop is actively moving work.
+- Discovery: A full-page refresh is sufficient for the current server-rendered UI, but it must not interrupt users filling out submission forms.
+- Improvement: Add 15-second dashboard auto-refresh with guards for focused or edited form fields.

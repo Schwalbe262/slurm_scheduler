@@ -228,3 +228,9 @@ Remaining verification:
 - Added `.gitignore` coverage for Windows `Zone.Identifier` metadata and removed existing untracked Zone.Identifier files.
 - Changed attached GPU task placement so a matching GPU allocation can accept a GPU task even when CPU free is below the requested core count, provided at least one CPU core and enough memory remain.
 - Changed Allocation Pool top summary to exclude `pending` allocations from total used CPU/GPU/memory.
+
+## 2026-06-16 06:00:24 KST
+
+- Added dashboard auto-refresh every 15 seconds.
+- Auto-refresh is skipped while an input, textarea, or select is focused.
+- Auto-refresh is also skipped after a form has been edited, so partially entered job/task submissions are not lost.

@@ -750,4 +750,37 @@
   </div>
 </section>
 </div>
+<script>
+  (() => {
+    const refreshMs = 15000;
+    let formDirty = false;
+    const editableSelector = "input, textarea, select";
+
+    for (const field of document.querySelectorAll(editableSelector)) {
+      field.addEventListener("input", () => {
+        formDirty = true;
+      });
+      field.addEventListener("change", () => {
+        formDirty = true;
+      });
+    }
+
+    for (const form of document.querySelectorAll("form")) {
+      form.addEventListener("submit", () => {
+        formDirty = false;
+      });
+    }
+
+    window.setInterval(() => {
+      const active = document.activeElement;
+      if (active && active.matches && active.matches(editableSelector)) {
+        return;
+      }
+      if (formDirty) {
+        return;
+      }
+      window.location.reload();
+    }, refreshMs);
+  })();
+</script>
 {% endblock %}
