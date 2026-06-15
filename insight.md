@@ -201,3 +201,9 @@
 - Problem: GPU tasks can remain queued while a matching GPU is idle because scheduler-owned CPU capacity is fully reserved by other attached steps.
 - Discovery: For small GPU tasks, the GPU is the scarce resource and a 4-core CPU request is often a soft companion requirement.
 - Improvement: Allow matching GPU tasks with 4 CPU cores or fewer to attach despite zero scheduler-free CPU, using `srun --overlap` for the shared-CPU step.
+
+## 2026-06-16 06:16:06 KST
+
+- Problem: Exclusive demand allocations can survive as `warm` after their triggering task fails or is cancelled, wasting job slots.
+- Discovery: The scale-in logic only checked unneeded demand allocations while they were still `pending`; once Slurm started them and they became `warm`, they fell through to normal warm-pool retention.
+- Improvement: Treat `queued ... demand` allocations as demand-owned in both `pending` and `warm` states, and close them whenever no queued task still matches.

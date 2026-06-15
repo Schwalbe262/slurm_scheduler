@@ -953,7 +953,7 @@ class Scheduler:
         )
 
     def scale_in_idle_allocations(self) -> None:
-        self.scale_in_unneeded_pending_demand_allocations()
+        self.scale_in_unneeded_demand_allocations()
         warm_allocations = [
             item
             for item in self.db.list_allocations(limit=500)
@@ -982,17 +982,17 @@ class Scheduler:
             if (self._now() - last_active).total_seconds() >= idle_seconds:
                 self.close_allocation(allocation, "idle scale-in")
 
-    def scale_in_unneeded_pending_demand_allocations(self) -> None:
+    def scale_in_unneeded_demand_allocations(self) -> None:
         queued_tasks = [task for task in self.db.list_tasks(limit=5000) if task["status"] == TaskStatus.QUEUED.value]
         reserved_task_ids: set[int] = set()
-        pending_demand = [
+        demand_allocations = [
             allocation
             for allocation in self.db.list_allocations(limit=500)
-            if allocation["state"] == AllocationStatus.PENDING.value
+            if allocation["state"] in {AllocationStatus.PENDING.value, AllocationStatus.WARM.value}
             and str(allocation.get("drain_reason") or "").startswith("queued ")
         ]
-        pending_demand.sort(key=lambda item: int(item.get("id") or 0))
-        for allocation in pending_demand:
+        demand_allocations.sort(key=lambda item: int(item.get("id") or 0))
+        for allocation in demand_allocations:
             matched_task = None
             for task in queued_tasks:
                 if int(task["id"]) in reserved_task_ids:
@@ -1003,7 +1003,7 @@ class Scheduler:
             if matched_task:
                 reserved_task_ids.add(int(matched_task["id"]))
             else:
-                self.close_allocation(allocation, "pending demand no longer needed")
+                self.close_allocation(allocation, "demand allocation no longer needed")
 
     def open_allocation(
         self,

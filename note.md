@@ -250,3 +250,11 @@ Remaining verification:
 - Relaxed attached GPU task CPU placement for scarce-GPU cases.
 - If a task requests a matching GPU and requests 4 CPU cores or fewer, the scheduler may attach it even when the allocation has 0 free CPU cores.
 - Added `srun --overlap` for these tight-CPU small GPU tasks so the Slurm step can share already allocated CPU capacity.
+
+## 2026-06-16 06:16:06 KST
+
+- Investigated stale 12-core warm allocations.
+- Found five 12-core demand allocations left live after `crypto-sweep` tasks failed or were cancelled; four were `exclusive_node=1`, and one was a non-exclusive queued-demand allocation.
+- Cancelled Slurm jobs `680390`, `680397`, `680398`, `680399`, and `680405`, then marked allocation ids `29`, `36`, `37`, `38`, and `44` closed in the scheduler DB.
+- Changed adaptive scale-in so demand allocations with `drain_reason` starting with `queued ` are closed when no queued task still needs them, even after they have reached `warm`.
+- Verified there are now zero live 12-core allocations.
