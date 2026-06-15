@@ -296,3 +296,11 @@ Remaining verification:
 - Changed `assign_queued_tasks()` ordering to inspect GPU tasks before CPU-only backlog, then preserve priority and id ordering inside each class.
 - Added a regression test proving a lower-priority GPU task attaches before a higher-priority CPU backlog when a matching GPU allocation is available.
 - Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, and `git diff --check`.
+
+## 2026-06-16 07:04:35 KST
+
+- Investigated why CPU demand did not open another pool while `flight-crawl` had thousands of queued `16 CPU` tasks and the active CPU pools had only `12` free CPU each.
+- Found the demand prewarm logic used a binary `has_inflight_capacity_for_task()` check. Pending allocation `46` (`a6000ada`, `48 CPU`) could fit three 16-core CPU tasks, but the scheduler treated that as enough capacity for every queued CPU task.
+- Changed `next_queued_task_without_inflight_capacity()` to reserve finite CPU, memory, and GPU capacity across pending/warm/active allocations while scanning queued tasks.
+- Added a regression test where two active CPU pools have only `12` free CPU and one pending GPU pool has three CPU-task slots; the fourth queued 16-core task now triggers demand prewarm.
+- Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, and `git diff --check`.

@@ -971,12 +971,48 @@ class Scheduler:
             [task for task in self.db.list_tasks(limit=5000) if task["status"] == TaskStatus.QUEUED.value],
             key=lambda item: int(item["id"]),
         )
+        remaining_allocations = [
+            dict(allocation)
+            for allocation in self.db.list_allocations(limit=500)
+            if allocation["state"]
+            in {
+                AllocationStatus.PENDING.value,
+                AllocationStatus.WARM.value,
+                AllocationStatus.ACTIVE.value,
+            }
+        ]
         for task in queued_tasks:
             if int(task.get("exclusive_node") or 0):
                 continue
-            if not self.has_inflight_capacity_for_task(task):
+            allocation = self.reserve_inflight_capacity_for_task(remaining_allocations, task)
+            if not allocation:
                 return task
         return None
+
+    def reserve_inflight_capacity_for_task(self, allocations: list[dict], task: dict) -> dict | None:
+        candidates = []
+        for allocation in allocations:
+            if not self.allocation_can_run_task(allocation, task, include_pending=True):
+                continue
+            if self.fit_slots_for_allocation(allocation, task) <= 0:
+                continue
+            candidates.append(allocation)
+        if not candidates:
+            return None
+        allocation = max(
+            candidates,
+            key=lambda item: (
+                self.allocation_model_score(item),
+                int(item.get("free_gpus") or 0),
+                self.borrowable_cpus(item) if not self.task_requires_gpu(task) else int(item.get("free_cpus") or 0),
+                int(item.get("free_memory_mb") or 0),
+            ),
+        )
+        allocation["free_memory_mb"] = max(0, int(allocation.get("free_memory_mb") or 0) - int(task.get("memory_mb") or 0))
+        allocation["free_cpus"] = max(0, int(allocation.get("free_cpus") or 0) - int(task.get("cpus") or 0))
+        if self.task_requires_gpu(task):
+            allocation["free_gpus"] = max(0, int(allocation.get("free_gpus") or 0) - int(task.get("gpus") or 0))
+        return allocation
 
     def prewarm_exclusive_demand(self) -> bool:
         queued_tasks = sorted(

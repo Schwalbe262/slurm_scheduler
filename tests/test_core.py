@@ -1609,6 +1609,49 @@ class SchedulerTests(unittest.TestCase):
         capacity = scheduler.task_fit_capacity(task)
         self.assertEqual(capacity["fit_slots"], 1)
 
+    def test_demand_prewarm_counts_inflight_slots_instead_of_binary_capacity(self) -> None:
+        for name in ("n001", "n002"):
+            allocation_id = self.db.create_allocation(
+                account_name="a",
+                partition="cpu1",
+                node_name=name,
+                total_cpus=64,
+                total_memory_mb=65536,
+            )
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.ACTIVE.value,
+                slurm_job_id=f"alloc-{name}",
+                free_cpus=12,
+                free_memory_mb=65536,
+            )
+        pending_id = self.db.create_allocation(
+            account_name="a",
+            partition="gpu1",
+            node_name="g001",
+            total_cpus=48,
+            total_memory_mb=196608,
+            total_gpus=2,
+            gpu_model="a6000ada",
+            resource_pool="gpu:a6000ada",
+        )
+        self.db.update_allocation(
+            pending_id,
+            state=AllocationStatus.PENDING.value,
+            slurm_job_id="pending-gpu",
+            free_cpus=48,
+            free_memory_mb=196608,
+            free_gpus=2,
+        )
+        task_ids = [
+            self.db.create_task(TaskCreate(f"cpu-{index}", "~/case", "run", cpus=16, memory_mb=32768))
+            for index in range(4)
+        ]
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        task = scheduler.next_queued_task_without_inflight_capacity()
+        self.assertIsNotNone(task)
+        self.assertEqual(task["id"], task_ids[3])
+
     def test_near_drain_allocation_does_not_accept_new_tasks(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",

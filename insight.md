@@ -231,3 +231,9 @@
 - Problem: A ready A6000 allocation can sit idle behind a large higher-priority CPU-only backlog.
 - Discovery: The GPU task was schedulable on `n104`, but queued after thousands of `flight-crawl` CPU tasks that could not fit into the remaining CPU slots.
 - Improvement: Order attached-task assignment by scarce GPU demand first, then by priority and id, so available GPUs are not starved by bulk CPU queues.
+
+## 2026-06-16 07:04:35 KST
+
+- Problem: Demand scale-out can stop after finding one pending allocation that fits a task, even when that allocation has only a few finite slots and the queue is much larger.
+- Discovery: A pending 48-core GPU warm pool was counted as inflight capacity for thousands of 16-core CPU tasks, so no additional CPU pool was opened.
+- Improvement: Reserve finite inflight CPU, memory, and GPU slots while scanning queued tasks; once queued demand exceeds reserved capacity, open another demand allocation.
