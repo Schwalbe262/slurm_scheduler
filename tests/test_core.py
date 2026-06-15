@@ -38,6 +38,7 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("#SBATCH --cpus-per-task=4", script)
         self.assertIn("module load python", script)
         self.assertIn("python scripts/run.py --x 1", script)
+        self.assertLess(script.index("#SBATCH --job-name"), script.index("set -euo pipefail"))
 
     def test_build_sbatch_script_with_relative_remote_dir(self) -> None:
         job = {
@@ -83,6 +84,31 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("initial_limit = 11", script)
         self.assertIn("max_limit = 16", script)
         self.assertIn("[adaptive] increased worker limit", script)
+        self.assertLess(script.index("#SBATCH --job-name"), script.index("set -euo pipefail"))
+
+    def test_build_packed_script_includes_requested_node(self) -> None:
+        job = {
+            "job_mode": "packed_srun",
+            "job_name": "packed",
+            "time_limit": "12:00:00",
+            "cpus": 4,
+            "memory": "8G",
+            "partition": "cpu2",
+            "gpus": 0,
+            "entrypoint": "run.py",
+            "arguments": "",
+            "env_setup": "",
+            "remote_path": "~/project",
+            "simulation_count": 1,
+            "simulation_start": 1,
+            "cpus_per_simulation": 4,
+            "initial_workers": 1,
+            "max_workers_per_job": 1,
+            "node_name": "n110",
+        }
+        script = build_sbatch_script(job, "slurm_scheduler/job-1")
+        self.assertIn("#SBATCH --partition=cpu2", script)
+        self.assertIn("#SBATCH --nodelist=n110", script)
 
     def test_partition_rank_uses_cpu_and_gpu_profiles(self) -> None:
         nodes = parse_sinfo_nodes(

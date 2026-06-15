@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from math import ceil
+import posixpath
 
 from fastapi import FastAPI, Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -14,6 +15,7 @@ from .models import JobCreate
 from .inventory import partition_rank
 from .pestat import PestatNode, plan_dynamic_allocations
 from .scheduler import Scheduler
+from .slurm import SlurmAccountClient
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -303,6 +305,31 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         if not job:
             raise HTTPException(status_code=404)
         return job
+
+    @app.get("/api/jobs/{job_id}/remote-file")
+    def api_job_remote_file(job_id: int, path: str, base: str = "remote_path") -> Response:
+        job = db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404)
+        if not job["account_name"]:
+            raise HTTPException(status_code=409, detail="job has no account")
+        if path.startswith("/") or ".." in Path(path).parts:
+            raise HTTPException(status_code=400, detail="path must be a safe relative path")
+        account = next((item for item in accounts if item.name == job["account_name"]), None)
+        if not account:
+            raise HTTPException(status_code=404, detail="account not found")
+        if base == "remote_job_dir":
+            root = job.get("remote_job_dir") or ""
+        else:
+            root = job.get("remote_path") or job.get("remote_job_dir") or ""
+        if not root:
+            raise HTTPException(status_code=409, detail="job has no remote base path")
+        remote_file = posixpath.join(root, path)
+        try:
+            text = SlurmAccountClient(account).read_text_file(remote_file)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return Response(text, media_type="text/plain")
 
     @app.get("/api/accounts/status")
     def api_accounts() -> list[dict]:

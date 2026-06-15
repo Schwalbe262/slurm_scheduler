@@ -96,7 +96,6 @@ def build_sbatch_script(job: dict, remote_job_dir: str) -> str:
     repo_path = posixpath.join(remote_job_dir, "repo") if is_absolute else "repo"
     lines = [
         "#!/usr/bin/env bash",
-        "set -euo pipefail",
         f"#SBATCH --job-name={job['job_name']}",
         f"#SBATCH --time={job['time_limit']}",
         f"#SBATCH --cpus-per-task={int(job['cpus'])}",
@@ -113,6 +112,7 @@ def build_sbatch_script(job: dict, remote_job_dir: str) -> str:
     lines.extend(
         [
             "",
+            "set -euo pipefail",
             f"cd {shlex.quote(repo_path)}",
         ]
     )
@@ -142,7 +142,6 @@ def build_packed_srun_script(job: dict, remote_job_dir: str) -> str:
     ramp_interval = max(60, int(job.get("ramp_interval_seconds") or 900))
     lines = [
         "#!/usr/bin/env bash",
-        "set -euo pipefail",
         f"#SBATCH --job-name={job['job_name']}",
         f"#SBATCH --time={job['time_limit']}",
         "#SBATCH --ntasks=1",
@@ -153,11 +152,14 @@ def build_packed_srun_script(job: dict, remote_job_dir: str) -> str:
     ]
     if job.get("partition"):
         lines.append(f"#SBATCH --partition={job['partition']}")
+    if job.get("node_name"):
+        lines.append(f"#SBATCH --nodelist={job['node_name']}")
     if int(job.get("gpus") or 0) > 0:
         lines.append(f"#SBATCH --gres=gpu:{int(job['gpus'])}")
     lines.extend(
         [
             "",
+            "set -euo pipefail",
             f"cd {shlex.quote(remote_path)}",
             "mkdir -p simul_log log",
             f"export OMP_NUM_THREADS={cpus_per_sim}",
@@ -323,3 +325,10 @@ class SlurmAccountClient:
             result = ssh.run(f"scancel {shlex.quote(slurm_job_id)}")
         if result.exit_code != 0:
             raise RuntimeError(result.stderr.strip() or "scancel failed")
+
+    def read_text_file(self, path: str) -> str:
+        with SSHSession(self.account) as ssh:
+            result = ssh.run(f"test -f {shlex.quote(path)} && cat {shlex.quote(path)}")
+        if result.exit_code != 0:
+            raise FileNotFoundError(result.stderr.strip() or f"remote file not found: {path}")
+        return result.stdout
