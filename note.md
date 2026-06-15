@@ -344,3 +344,12 @@ Remaining verification:
 - Added scale-in logic that closes non-exclusive queued CPU demand allocations when the current inventory can provide a larger shared CPU pool.
 - Added a regression test for closing an undersized `16 CPU` pending demand allocation when a `256 CPU` pool candidate is available.
 - Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, and `git diff --check`.
+
+## 2026-06-16 07:33:12 KST
+
+- Found the live CPU pool shape still selected `gpu3 / 48 CPU` because `cpu2` mixed nodes were excluded by single-job partition handling.
+- Refined shared CPU pool selection so non-exclusive CPU pools can use mixed `cpu2` nodes with remaining capacity, while exclusive-node requests still avoid busy nodes.
+- Kept CPU pool size at the configured pool size (`allocation_cpus=64`) instead of using the queued task's `16 CPU` size or consuming every free core on a mixed node.
+- Changed CPU pool ranking to prefer CPU partitions first and only use GPU partitions as fallback CPU capacity.
+- Verified current live shape selection returns `cpu2 / n111 / 64 CPU`.
+- Verified `python3 -m unittest discover -s tests` and `git diff --check`.

@@ -1046,7 +1046,7 @@ class SchedulerTests(unittest.TestCase):
         scheduler.maintain_allocation_pool()
         allocation = self.db.list_allocations()[0]
         self.assertEqual(allocation["exclusive_node"], 0)
-        self.assertEqual(allocation["total_cpus"], 256)
+        self.assertEqual(allocation["total_cpus"], 64)
         self.assertGreater(allocation["total_memory_mb"], 32768)
 
     def test_exclusive_cpu_demand_avoids_busy_single_job_partition(self) -> None:
@@ -1333,9 +1333,22 @@ class SchedulerTests(unittest.TestCase):
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, allocation_partition="cpu2")
         shape = scheduler.choose_allocation_shape()
         self.assertEqual(shape["node_name"], "large")
-        self.assertEqual(shape["cpus"], 128)
+        self.assertEqual(shape["cpus"], 64)
 
-    def test_cpu_pool_can_use_gpu_partition_when_cpu_is_better(self) -> None:
+    def test_shared_cpu_pool_can_use_mixed_single_job_partition_capacity(self) -> None:
+        nodes = parse_pestat(
+            "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+            "mixed-cpu cpu2 mix 4 256 0.0 1031519 1000000\n"
+            "idle-gpu gpu3 mix 4 56 0.0 876000 800000\n"
+        )
+        self.db.replace_pestat_nodes(nodes)
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, allocation_partition="auto")
+        shape = scheduler.choose_allocation_shape(resource_pool="cpu")
+        self.assertEqual(shape["partition"], "cpu2")
+        self.assertEqual(shape["node_name"], "mixed-cpu")
+        self.assertEqual(shape["cpus"], 64)
+
+    def test_cpu_pool_can_use_gpu_partition_when_no_cpu_candidate_exists(self) -> None:
         inventory = parse_scontrol_nodes(
             "NodeName=cpu-old CPUTot=48 RealMemory=768000 Gres=(null) State=IDLE Partitions=cpu1\n"
             "NodeName=gpu-fast CPUTot=64 RealMemory=1024000 Gres=gpu:a6000:4 GresUsed=gpu:a6000:0 State=IDLE Partitions=gpu5\n"
@@ -1344,7 +1357,6 @@ class SchedulerTests(unittest.TestCase):
         self.db.replace_pestat_nodes(
             parse_pestat(
                 "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
-                "cpu-old cpu1 idle 0 48 0.0 768000 700000\n"
                 "gpu-fast gpu5 idle 0 64 0.0 1024000 900000\n"
             )
         )

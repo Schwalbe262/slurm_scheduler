@@ -1384,12 +1384,15 @@ class Scheduler:
                     node.partition,
                     self.occupied_single_job_nodes(node.partition, include_queued_jobs=True),
                 )
-                if node.hostname in occupied or int(node.cpu_used) > 0:
+                if node.hostname in occupied:
+                    continue
+                if exclusive_node and int(node.cpu_used) > 0:
                     continue
             inventory = inventory_by_node.get(node.hostname, {})
             node_gpu_count = int(inventory.get("gpu_count") or 0)
             node_gpu_used = int(inventory.get("gpu_used_count") or 0)
             node_gpu_model = normalize_gpu_model(str(inventory.get("gpu_model") or ""))
+            node_is_gpu_partition = node.partition.startswith("gpu") or node_gpu_count > 0
             if wants_gpu:
                 if target_partition != "auto" and node.partition != target_partition:
                     continue
@@ -1420,7 +1423,7 @@ class Scheduler:
             if wants_gpu or exclusive_node:
                 cpus = requested_cpus or self.allocation_cpus or available_cpus
             else:
-                cpus = available_cpus
+                cpus = self.allocation_cpus or available_cpus
             cpus = max(1, min(cpus, available_cpus))
             if requested_memory_mb and node.free_memory_mb < requested_memory_mb:
                 continue
@@ -1430,7 +1433,7 @@ class Scheduler:
                 cpu_profile = CPU_PROFILES_BY_PARTITION.get(node.partition, {})
                 cpu_score = int(inventory.get("cpu_score") or cpu_profile.get("cpu_score") or 0)
                 score = GPU_PRIORITY.get(node_gpu_model, 0) if wants_gpu else cpu_score
-                candidates.append((node, cpus, memory_mb, node_gpu_model, gpu_free, score, cpu_score))
+                candidates.append((node, cpus, memory_mb, node_gpu_model, gpu_free, score, cpu_score, node_is_gpu_partition))
         if candidates:
             if wants_gpu:
                 candidates.sort(key=lambda item: (item[5], item[4], item[1], item[2], item[0].effective_free_cpus), reverse=True)
@@ -1446,8 +1449,17 @@ class Scheduler:
                     reverse=True,
                 )
             else:
-                candidates.sort(key=lambda item: (item[6], item[0].effective_free_cpus, item[1], item[2]), reverse=True)
-            node, cpus, memory_mb, chosen_gpu_model, gpu_free, _score, _cpu_score = candidates[0]
+                candidates.sort(
+                    key=lambda item: (
+                        0 if item[7] else 1,
+                        item[6],
+                        item[0].effective_free_cpus,
+                        item[1],
+                        item[2],
+                    ),
+                    reverse=True,
+                )
+            node, cpus, memory_mb, chosen_gpu_model, gpu_free, _score, _cpu_score, _node_is_gpu_partition = candidates[0]
             chosen_gpus = min(max(1, int(gpus or self.gpu_prewarm_gpus_per_allocation)), gpu_free) if wants_gpu else 0
             node_name = node.hostname
             if not wants_gpu and not self.is_single_job_partition(node.partition):

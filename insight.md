@@ -267,3 +267,9 @@
 - Problem: Existing undersized pending CPU demand allocations can survive a policy fix and continue suppressing larger pool creation.
 - Discovery: A pending `16 CPU` allocation still counts as matching one queued 16-core task, so the scheduler may treat it as valid spare capacity.
 - Improvement: Close non-exclusive queued CPU demand allocations when current inventory can open a larger shared CPU pool, letting the next tick submit the larger shape.
+
+## 2026-06-16 07:33:12 KST
+
+- Problem: Shared CPU pool selection can fall back to GPU partitions even when CPU partitions have mixed nodes with enough free cores.
+- Discovery: The single-job partition guard excluded any `cpu2` node with nonzero `cpu_used`, so the best remaining candidate became a 48-core GPU node.
+- Improvement: Allow non-exclusive CPU pools onto mixed CPU nodes, keep the request at configured pool size, and rank CPU partitions ahead of GPU fallback capacity.
