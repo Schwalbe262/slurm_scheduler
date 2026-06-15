@@ -514,6 +514,20 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(task["status"], TaskStatus.RUNNING.value)
         self.assertEqual(allocation["free_cpus"], 4)
 
+    def test_assign_queued_tasks_skips_blocked_head_task(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, allocation_cpus=8)
+        scheduler.maintain_allocation_pool()
+        scheduler.refresh_allocations()
+        blocked_id = self.db.create_task(
+            TaskCreate("blocked-gpu", "~/case", "run-gpu", cpus=4, memory_mb=2048, gpus=1, gpu_model="a6000ada")
+        )
+        ready_id = self.db.create_task(TaskCreate("ready-cpu", "~/case", "run-cpu", cpus=4, memory_mb=2048))
+        scheduler.assign_queued_tasks()
+        blocked = self.db.get_task(blocked_id)
+        ready = self.db.get_task(ready_id)
+        self.assertEqual(blocked["status"], TaskStatus.QUEUED.value)
+        self.assertEqual(ready["status"], TaskStatus.RUNNING.value)
+
     def test_high_usage_prewarms_spare_allocation(self) -> None:
         scheduler = Scheduler(
             self.db,

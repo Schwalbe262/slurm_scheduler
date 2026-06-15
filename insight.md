@@ -125,3 +125,9 @@
 - Problem: A scheduler-owned allocation can make the remaining GPUs on a shared GPU node unusable if it consumes every CPU core while using only some GPUs.
 - Discovery: GPU warm allocations need a CPU reserve when they leave GPUs unclaimed, while still allowing low-CPU capture when that is the only way to hold a GPU.
 - Improvement: Reserve `gpu_cpu_reserve` CPU cores on partial-GPU warm allocations and fold terminal jobs in the dashboard to keep active work visible.
+
+## 2026-06-16 04:28:58 KST
+
+- Problem: One queued task waiting for a pending A6000 allocation can block unrelated ready tasks behind it.
+- Discovery: `assign_queued_tasks()` only inspected the oldest queued task and returned when it could not attach.
+- Improvement: Iterate across queued tasks in order and skip currently blocked tasks, so available CPU and fallback-GPU capacity is used immediately.

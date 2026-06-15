@@ -144,3 +144,9 @@ Remaining verification:
 - Updated GPU warm allocation CPU shaping so partial-GPU allocations leave `gpu_cpu_reserve` CPU cores for other users of the remaining GPUs.
 - Kept the low-CPU exception so an A6000-class GPU can still be captured when only a few CPU cores are free.
 - Changed the dashboard Jobs table so completed, failed, and cancelled jobs are folded by default and limited to the most recent 50.
+
+## 2026-06-16 04:28:58 KST
+
+- Fixed queued attached-task head-of-line blocking.
+- The scheduler now scans all queued tasks and skips tasks that are waiting for unavailable capacity, allowing later CPU or fallback-GPU tasks to attach immediately.
+- Added a regression test where a blocked A6000ADA task no longer prevents a ready CPU task from running.

@@ -418,16 +418,17 @@ class Scheduler:
         return True
 
     def assign_queued_tasks(self) -> None:
-        while True:
-            task = self.db.next_queued_task()
-            if not task:
-                return
+        queued_tasks = sorted(
+            [task for task in self.db.list_tasks(limit=5000) if task["status"] == TaskStatus.QUEUED.value],
+            key=lambda item: int(item["id"]),
+        )
+        for task in queued_tasks:
             allocation = self.best_allocation_for_task(task)
             if not allocation:
-                return
+                continue
             account = next((item for item in self.accounts if item.name == allocation["account_name"]), None)
             if not account:
-                return
+                continue
             self.db.update_task(
                 task["id"],
                 status=TaskStatus.ATTACHING.value,
