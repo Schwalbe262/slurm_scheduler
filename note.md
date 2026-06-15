@@ -311,3 +311,12 @@ Remaining verification:
 - Changed snapshot refresh to isolate failures per account and keep usable snapshots for the accounts that respond.
 - Added a regression test where account `b` snapshot fails but account `a` remains usable for scheduling decisions.
 - Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, and `git diff --check`.
+
+## 2026-06-16 07:13:35 KST
+
+- Investigated why Attached Tasks could appear empty while tasks were still running.
+- Found the dashboard used `db.list_tasks()` with the default latest 200 rows before splitting active and finished tasks, so large bursts of newer queued/finished rows could hide older `running` tasks.
+- Added status-filtered task listing/count helpers in the database layer.
+- Changed the dashboard to always fetch all `running`/`attaching` tasks up to 5000 rows and only cap `queued` display to the latest 50 rows. Finished tasks remain capped to the latest 50 rows.
+- Added a regression test showing a running task remains retrievable by status even after many newer terminal rows push it out of the generic recent list.
+- Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, and `git diff --check`.

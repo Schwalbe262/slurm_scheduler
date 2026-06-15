@@ -361,6 +361,28 @@ class Database:
             rows = conn.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
             return [dict(row) for row in rows]
 
+    def list_tasks_by_statuses(self, statuses: list[str], limit: int = 200) -> list[dict[str, Any]]:
+        if not statuses:
+            return []
+        placeholders = ",".join("?" for _ in statuses)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM tasks WHERE status IN ({placeholders}) ORDER BY id DESC LIMIT ?",
+                (*statuses, limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def count_tasks_by_statuses(self, statuses: list[str]) -> int:
+        if not statuses:
+            return 0
+        placeholders = ",".join("?" for _ in statuses)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM tasks WHERE status IN ({placeholders})",
+                tuple(statuses),
+            ).fetchone()
+            return int(row["count"]) if row else 0
+
     def next_queued_task(self) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute(

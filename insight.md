@@ -243,3 +243,9 @@
 - Problem: Pool creation depends on account snapshots, so one unreachable account can block allocation decisions for otherwise healthy accounts.
 - Discovery: Snapshot collection raised out of the whole refresh loop instead of skipping only the failing account.
 - Improvement: Treat account snapshot failures independently and continue scheduling with the accounts that still report status.
+
+## 2026-06-16 07:13:35 KST
+
+- Problem: Dashboard recent-row limits can hide older long-running tasks behind a flood of newer queued or finished tasks.
+- Discovery: Active and finished task sections were split after fetching only the latest generic task rows.
+- Improvement: Fetch `running`/`attaching` tasks by status so they are always displayed, while limiting only queued and finished task rows for UI size.

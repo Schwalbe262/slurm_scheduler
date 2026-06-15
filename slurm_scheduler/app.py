@@ -145,6 +145,15 @@ def task_state_for_api(status: str) -> str:
     return "succeeded" if status == "completed" else status
 
 
+def task_display_sort_key(task: dict) -> tuple[int, int]:
+    rank = {
+        "running": 0,
+        "attaching": 1,
+        "queued": 2,
+    }.get(str(task.get("status") or ""), 9)
+    return (rank, -int(task.get("id") or 0))
+
+
 def task_result_urls(task_id: int) -> dict[str, str]:
     return {
         "status": f"/api/tasks/{task_id}",
@@ -367,9 +376,16 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         ]
         allocation_summary = allocation_usage_summary(allocated_summary_rows)
         closed_allocations = [item for item in allocations if item["state"] == "closed"]
-        tasks = attach_task_elapsed(db.list_tasks())
-        active_tasks = [item for item in tasks if item["status"] not in {"completed", "failed", "cancelled"}]
-        finished_tasks = [item for item in tasks if item["status"] in {"completed", "failed", "cancelled"}]
+        active_task_rows = {
+            int(task["id"]): task
+            for task in (
+                db.list_tasks_by_statuses(["running", "attaching"], limit=5000)
+                + db.list_tasks_by_statuses(["queued"], limit=50)
+            )
+        }
+        active_tasks = sorted(attach_task_elapsed(list(active_task_rows.values())), key=task_display_sort_key)
+        finished_tasks = attach_task_elapsed(db.list_tasks_by_statuses(["completed", "failed", "cancelled"], limit=50))
+        finished_task_count = db.count_tasks_by_statuses(["completed", "failed", "cancelled"])
         jobs = job_elapsed(db.list_jobs())
         active_jobs = [item for item in jobs if item["status"] not in {"completed", "failed", "cancelled"}]
         finished_jobs = [item for item in jobs if item["status"] in {"completed", "failed", "cancelled"}]
@@ -381,8 +397,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 "finished_jobs": finished_jobs[:50],
                 "finished_job_count": len(finished_jobs),
                 "tasks": active_tasks,
-                "finished_tasks": finished_tasks[:50],
-                "finished_task_count": len(finished_tasks),
+                "finished_tasks": finished_tasks,
+                "finished_task_count": finished_task_count,
                 "allocations": active_allocations,
                 "allocation_summary": allocation_summary,
                 "closed_allocations": closed_allocations[:20],

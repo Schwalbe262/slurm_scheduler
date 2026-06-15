@@ -637,6 +637,18 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(task["status"], TaskStatus.CANCELLED.value)
         self.assertEqual(FakeClient.cancelled_tasks, [])
 
+    def test_list_tasks_by_statuses_keeps_running_visible_independent_of_recent_rows(self) -> None:
+        running_id = self.db.create_task(TaskCreate("running", "~/case", "run"))
+        self.db.update_task(running_id, status=TaskStatus.RUNNING.value)
+        for index in range(20):
+            done_id = self.db.create_task(TaskCreate(f"done-{index}", "~/case", "run"))
+            self.db.update_task(done_id, status=TaskStatus.FAILED.value)
+        recent = self.db.list_tasks(limit=5)
+        self.assertNotIn(running_id, [int(task["id"]) for task in recent])
+        running = self.db.list_tasks_by_statuses([TaskStatus.RUNNING.value], limit=5000)
+        self.assertEqual([int(task["id"]) for task in running], [running_id])
+        self.assertEqual(self.db.count_tasks_by_statuses([TaskStatus.FAILED.value]), 20)
+
     def test_gpu_task_attaches_before_higher_priority_cpu_backlog(self) -> None:
         self.db.create_allocation(
             account_name="a",
