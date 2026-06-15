@@ -62,6 +62,86 @@ The web UI has no built-in login page. Keep it on a trusted private network or p
 - Use `POST /jobs` with `job_mode=dynamic_packed_srun` for many simulation cases in one Slurm job.
 - Use the Web UI for interactive operation and quick status checks.
 
+## How Clients Submit Work
+
+Clients do not call Slurm directly. They send `multipart/form-data` HTTP requests to the scheduler, then poll the scheduler APIs for placement and result paths.
+
+Basic client flow:
+
+1. Set the scheduler URL.
+2. Check health and capacity.
+3. Choose `/tasks`, `/tasks/git`, or `/jobs`.
+4. Include resource requests such as `cpus`, `memory_mb` or `memory`, `gpus`, and `gpu_model`.
+5. Include `account_name` only when the job must stay on a specific Slurm account.
+6. Poll `/api/tasks`, `/api/jobs`, and `/api/allocations`.
+7. Read task output through `/api/tasks/{task_id}/stdout` or `/api/tasks/{task_id}/remote-file`.
+
+```bash
+export SCHEDULER_URL=http://<scheduler-host>:8000
+curl -sS "$SCHEDULER_URL/api/health"
+curl -sS "$SCHEDULER_URL/api/accounts/status"
+curl -sS "$SCHEDULER_URL/api/allocations"
+curl -sS "$SCHEDULER_URL/api/gpu-capacity"
+```
+
+Use `/tasks` for a project that already exists on the cluster account:
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/tasks" \
+  -F name=case-001 \
+  -F remote_cwd=/remote/project/path \
+  -F command='python run.py --case case001 --out results/case001.json' \
+  -F account_name=account_a \
+  -F cpus=4 \
+  -F memory_mb=8192 \
+  -F gpus=0
+```
+
+Use `/tasks/git` when the scheduler should clone or update a Git repo before running a Python entrypoint:
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/tasks/git" \
+  -F job_name=git-case-001 \
+  -F repo_url=git@github.com-project:org/private-repo.git \
+  -F git_ref=main \
+  -F entrypoint=scripts/run.py \
+  -F arguments='--case case001' \
+  -F account_name=account_a \
+  -F cpus=4 \
+  -F memory=8G \
+  -F gpus=0
+```
+
+Private Git repos must be cloneable from the selected cluster account. Prefer a read-only GitHub deploy key and an SSH alias in that account's `~/.ssh/config`; avoid putting personal access tokens in scheduler form fields.
+
+Use `/jobs` with `dynamic_packed_srun` when the scheduler should split many simulation cases into packed Slurm jobs:
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/jobs" \
+  -F job_mode=dynamic_packed_srun \
+  -F remote_path=/remote/project/path \
+  -F entrypoint=scripts/run_fea.py \
+  -F arguments='--campaign sweep-001' \
+  -F account_name=account_a \
+  -F total_simulations=20 \
+  -F cpus_per_simulation=4 \
+  -F mem_per_simulation_gb=8 \
+  -F max_workers_per_job=20 \
+  -F max_new_jobs=10 \
+  -F time_limit=48:00:00 \
+  -F partition=auto
+```
+
+Useful polling commands:
+
+```bash
+curl -sS "$SCHEDULER_URL/api/tasks"
+curl -sS "$SCHEDULER_URL/api/jobs"
+curl -sS "$SCHEDULER_URL/api/allocations"
+curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/stdout"
+curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/remote-file?base=remote_cwd&path=results/case001.json"
+```
+
 ## CPU And Memory Requests
 
 `cpus` and `memory_mb` are scheduling requests for an attached task. They are not a Python virtual environment or a preallocated RAM block. The process uses physical memory only when it actually allocates memory, but the scheduler reserves that amount from the warm allocation's available capacity and Slurm may enforce the limit with cgroups/OOM handling depending on cluster configuration.

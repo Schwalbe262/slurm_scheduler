@@ -133,3 +133,8 @@ Remaining verification:
 - Changed GPU prewarm policy so preferred A6000-class allocations can remain queued while a lower-priority GPU allocation is opened as ready fallback capacity.
 - Changed the dashboard so completed, failed, and cancelled attached tasks are folded by default under a finished-tasks details section.
 - Added regression tests for preferred GPU queue preservation and lower-GPU fallback behavior.
+
+## 2026-06-16 04:11:59 KST
+
+- Expanded `README.md` with an explicit client submission flow for `/tasks`, `/tasks/git`, and `/jobs`.
+- Added copy-paste examples for health checks, account-constrained submissions, private Git repo submissions, packed jobs, polling, stdout retrieval, and remote result file reads.
