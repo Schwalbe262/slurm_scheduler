@@ -177,3 +177,9 @@
 - Problem: GPU warm allocations could sit with idle CPU while CPU-only tasks remained queued, and quoted `~/.../task.sh` paths failed on compute nodes before user code started.
 - Discovery: The scheduler reserved CPU for free GPUs even when no GPU task was running, and `shlex.quote("~/...")` prevented tilde expansion inside `srun`.
 - Improvement: Let idle GPU pools lend their CPU to CPU-only tasks, preserve `$HOME` expansion for task script paths, order allocation rows by operational state, and cancel pending demand pools that no queued task can use.
+
+## 2026-06-16 05:55:25 KST
+
+- Problem: Scheduler-created remote directories can accumulate indefinitely, while GPU work can remain queued even when the matching GPU is available but free CPU is slightly below the request.
+- Discovery: Task, job, and allocation rows already store enough account and remote path metadata to safely remove only scheduler-owned artifacts; for GPU tasks, the GPU is the scarce resource and strict CPU matching can be counterproductive.
+- Improvement: Add TTL-based cleanup for safe scheduler artifact paths, exclude pending allocations from dashboard utilization totals, and allow matching GPU tasks to attach to tight-CPU GPU allocations when memory and at least one CPU core remain.

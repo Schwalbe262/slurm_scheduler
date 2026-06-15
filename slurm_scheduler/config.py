@@ -58,6 +58,11 @@ class AppConfig:
     gpu_prewarm_cpu_reserve_per_free_gpu: int = 8
     gpu_prewarm_partition: str = "auto"
     gpu_prewarm_time_limit: str = "48:00:00"
+    cleanup_enabled: bool = True
+    cleanup_interval_seconds: int = 3600
+    cleanup_finished_task_ttl_seconds: int = 604800
+    cleanup_finished_job_ttl_seconds: int = 604800
+    cleanup_closed_allocation_ttl_seconds: int = 86400
 
 
 def _read_yaml(path: str | Path) -> dict[str, Any]:
@@ -88,6 +93,18 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
         for source, target in mapping.items():
             if source in gpu_prewarm:
                 data[target] = gpu_prewarm[source]
+    cleanup = data.pop("cleanup", None)
+    if isinstance(cleanup, dict):
+        mapping = {
+            "enabled": "cleanup_enabled",
+            "interval_seconds": "cleanup_interval_seconds",
+            "finished_task_ttl_seconds": "cleanup_finished_task_ttl_seconds",
+            "finished_job_ttl_seconds": "cleanup_finished_job_ttl_seconds",
+            "closed_allocation_ttl_seconds": "cleanup_closed_allocation_ttl_seconds",
+        }
+        for source, target in mapping.items():
+            if source in cleanup:
+                data[target] = cleanup[source]
     return AppConfig(**{k: v for k, v in data.items() if k in AppConfig.__dataclass_fields__})
 
 

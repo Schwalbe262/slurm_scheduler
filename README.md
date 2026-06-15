@@ -149,6 +149,8 @@ curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/remote-file?base=remote_cwd&path=re
 curl -sS "$SCHEDULER_URL/api/jobs/<job_id>/remote-file?base=remote_job_dir&path=submit.stderr.log"
 ```
 
+The scheduler automatically cleans old scheduler-created remote directories such as `task-*`, `job-*`, and `allocation-*` under each account's `remote_workspace`. By default, finished task/job artifacts are kept for 7 days and closed allocation artifacts for 1 day. Read stdout, stderr, and result files through the API before the cleanup TTL expires.
+
 ## CPU And Memory Requests
 
 `cpus` and `memory_mb` are scheduling requests for an attached task. They are not a Python virtual environment or a preallocated RAM block. The process uses physical memory only when it actually allocates memory, but the scheduler reserves that amount from the warm allocation's available capacity and Slurm may enforce the limit with cgroups/OOM handling depending on cluster configuration.
@@ -299,6 +301,12 @@ gpu_prewarm:
   min_warm_allocations: 1
   max_warm_allocations: 3
   gpus_per_allocation: 2
+cleanup:
+  enabled: true
+  interval_seconds: 3600
+  finished_task_ttl_seconds: 604800
+  finished_job_ttl_seconds: 604800
+  closed_allocation_ttl_seconds: 86400
 ```
 
 Read [docs/CONFIG.md](docs/CONFIG.md) before changing scheduling policy.

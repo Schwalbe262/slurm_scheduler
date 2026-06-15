@@ -30,3 +30,9 @@ gpu_prewarm:
   cpu_reserve_per_free_gpu: 8
   partition: "auto"
   time_limit: "48:00:00"
+cleanup:
+  enabled: true
+  interval_seconds: 3600
+  finished_task_ttl_seconds: 604800
+  finished_job_ttl_seconds: 604800
+  closed_allocation_ttl_seconds: 86400

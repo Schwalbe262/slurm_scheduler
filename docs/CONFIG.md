@@ -40,6 +40,12 @@ warm_pool_preferred_accounts: ["account_a"]
 gpu_warm_pool_preferred_accounts: ["account_a"]
 single_job_per_node_partitions: ["cpu2"]
 gpu_cpu_reserve: 4
+cleanup:
+  enabled: true
+  interval_seconds: 3600
+  finished_task_ttl_seconds: 604800
+  finished_job_ttl_seconds: 604800
+  closed_allocation_ttl_seconds: 86400
 ```
 
 Field meanings:
@@ -56,6 +62,28 @@ Field meanings:
 - `gpu_warm_pool_preferred_accounts`: preferred accounts for GPU pools.
 - `single_job_per_node_partitions`: partitions where the scheduler should pin an idle node and avoid more than one scheduler job per node.
 - `gpu_cpu_reserve`: CPU cores left unrequested on GPU nodes. CPU pools always apply this reserve. GPU warm allocations apply it when they leave some GPUs unclaimed, so the remaining GPUs still have CPU available for other users.
+- `cleanup`: automatic removal of scheduler-created remote artifact directories. Only paths under each account's `remote_workspace` whose basename starts with `task-`, `job-`, or `allocation-` are deleted.
+
+## Cleanup Config
+
+```yaml
+cleanup:
+  enabled: true
+  interval_seconds: 3600
+  finished_task_ttl_seconds: 604800
+  finished_job_ttl_seconds: 604800
+  closed_allocation_ttl_seconds: 86400
+```
+
+Meanings:
+
+- `enabled`: turns automatic cleanup on or off.
+- `interval_seconds`: how often the scheduler scans for old artifacts.
+- `finished_task_ttl_seconds`: how long completed, failed, or cancelled attached-task directories are kept. Default is 7 days.
+- `finished_job_ttl_seconds`: how long completed, failed, or cancelled direct-job directories are kept. Default is 7 days.
+- `closed_allocation_ttl_seconds`: how long closed allocation directories are kept. Default is 1 day.
+
+Cleanup clears the DB log path fields after deleting the remote directory. If a client needs stdout, stderr, or result files, read them through the API before the TTL expires.
 
 ## GPU Prewarm Config
 

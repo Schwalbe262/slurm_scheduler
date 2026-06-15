@@ -328,6 +328,7 @@ class FakeClient:
     allocation_states: dict[str, JobStatus] = {}
     task_states: dict[int, JobStatus] = {}
     cancelled: list[str] = []
+    removed: list[str] = []
 
     def __init__(self, account: AccountConfig):
         self.account = account
@@ -382,6 +383,9 @@ class FakeClient:
     def cancel(self, slurm_job_id: str) -> None:
         self.cancelled.append(slurm_job_id)
 
+    def remove_tree(self, remote_path: str) -> None:
+        self.removed.append(remote_path)
+
 
 class AttachFailureClient(FakeClient):
     def attach_task(self, task: dict, allocation: dict) -> dict[str, str]:
@@ -423,6 +427,7 @@ class SchedulerTests(unittest.TestCase):
         FakeClient.pending_reasons = {}
         FakeClient.task_states = {}
         FakeClient.cancelled = []
+        FakeClient.removed = []
         FakeClient.snapshots = {
             "a": AccountSnapshot("a", running=3, pending=0, max_running=4, max_pending=10, max_total=10),
             "b": AccountSnapshot("b", running=1, pending=1, max_running=4, max_pending=10, max_total=10),
@@ -495,6 +500,81 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(summary[0]["provider"], "codex")
         self.assertEqual(summary[0]["project"], "slurm_scheduler")
         self.assertEqual(summary[0]["total_tokens"], 35)
+
+    def test_cleanup_removes_only_safe_finished_task_artifacts(self) -> None:
+        safe_id = self.db.create_task(TaskCreate("safe", "/case", "run"))
+        unsafe_id = self.db.create_task(TaskCreate("unsafe", "/case", "run"))
+        self.db.update_task(
+            safe_id,
+            status=TaskStatus.COMPLETED.value,
+            account_name="a",
+            remote_dir="/work/task-1-1000",
+            stdout_path="/work/task-1-1000/stdout.log",
+            stderr_path="/work/task-1-1000/stderr.log",
+            exit_code_path="/work/task-1-1000/exit_code",
+            wrapper_pid="123",
+            finished_at="2000-01-01 00:00:00",
+        )
+        self.db.update_task(
+            unsafe_id,
+            status=TaskStatus.FAILED.value,
+            account_name="a",
+            remote_dir="/work/project",
+            stdout_path="/work/project/stdout.log",
+            stderr_path="/work/project/stderr.log",
+            finished_at="2000-01-01 00:00:00",
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            cleanup_interval_seconds=0,
+            cleanup_finished_task_ttl_seconds=0,
+        )
+        scheduler.cleanup_remote_artifacts_if_due()
+        self.assertEqual(FakeClient.removed, ["/work/task-1-1000"])
+        self.assertEqual(self.db.get_task(safe_id)["remote_dir"], "")
+        self.assertEqual(self.db.get_task(unsafe_id)["remote_dir"], "/work/project")
+
+    def test_cleanup_removes_finished_job_and_closed_allocation_artifacts(self) -> None:
+        job_id = self.db.create_job(JobCreate("git@example.com:repo.git", "main", "run.py", account_name="a"))
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=8,
+            total_memory_mb=65536,
+        )
+        self.db.update_job(
+            job_id,
+            status=JobStatus.FAILED.value,
+            remote_job_dir="/work/job-1-1000",
+            stdout_path="/work/job-1-1000/out",
+            stderr_path="/work/job-1-1000/err",
+            finished_at="2000-01-01 00:00:00",
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.CLOSED.value,
+            remote_dir="/work/allocation-1-1000",
+            stdout_path="/work/allocation-1-1000/out",
+            stderr_path="/work/allocation-1-1000/err",
+            closed_at="2000-01-01 00:00:00",
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            cleanup_interval_seconds=0,
+            cleanup_finished_job_ttl_seconds=0,
+            cleanup_closed_allocation_ttl_seconds=0,
+        )
+        scheduler.cleanup_remote_artifacts_if_due()
+        self.assertEqual(FakeClient.removed, ["/work/job-1-1000", "/work/allocation-1-1000"])
+        self.assertEqual(self.db.get_job(job_id)["remote_job_dir"], "")
+        self.assertEqual(self.db.get_allocation(allocation_id)["remote_dir"], "")
 
     def test_maintains_minimum_warm_allocation(self) -> None:
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, allocation_cpus=8)
@@ -1237,6 +1317,28 @@ class SchedulerTests(unittest.TestCase):
         self.assertIsNotNone(scheduler.best_allocation_for_task(fitting))
         self.assertIsNone(scheduler.best_allocation_for_task(too_large))
 
+    def test_gpu_task_can_attach_when_gpu_matches_but_cpu_is_tight(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="gpu5",
+            node_name="gpu-a6000",
+            total_cpus=4,
+            total_memory_mb=65536,
+            total_gpus=1,
+            gpu_model="a6000",
+            resource_pool="gpu:a6000",
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="alloc-1",
+            free_cpus=2,
+            free_gpus=1,
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        task = {"cpus": 4, "memory_mb": 2048, "gpus": 1, "gpu_model": "a6000", "partition": "auto", "node_name": ""}
+        self.assertEqual(scheduler.best_allocation_for_task(task)["id"], allocation_id)
+
     def test_gpu_task_requires_matching_model(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",
@@ -1252,6 +1354,17 @@ class SchedulerTests(unittest.TestCase):
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
         task = {"cpus": 8, "memory_mb": 2048, "gpus": 1, "gpu_model": "a6000ada", "partition": "auto", "node_name": ""}
         self.assertIsNone(scheduler.best_allocation_for_task(task))
+
+    def test_allocation_usage_summary_excludes_pending_when_filtered(self) -> None:
+        allocations = [
+            {"state": "active", "total_cpus": 8, "free_cpus": 4, "total_gpus": 1, "free_gpus": 0, "total_memory_mb": 8192, "free_memory_mb": 4096},
+            {"state": "pending", "total_cpus": 64, "free_cpus": 64, "total_gpus": 2, "free_gpus": 2, "total_memory_mb": 65536, "free_memory_mb": 65536},
+        ]
+        ready = [item for item in allocations if item["state"] in {"active", "warm", "draining", "closing"}]
+        self.assertEqual(sum(item["total_cpus"] - item["free_cpus"] for item in ready), 4)
+        self.assertEqual(sum(item["total_cpus"] for item in ready), 8)
+        self.assertEqual(sum(item["total_gpus"] - item["free_gpus"] for item in ready), 1)
+        self.assertEqual(sum(item["total_gpus"] for item in ready), 1)
 
     def test_gpu_capacity_summary_separates_cluster_and_scheduler_capacity(self) -> None:
         inventory = parse_scontrol_nodes(

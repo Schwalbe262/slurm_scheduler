@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import posixpath
 import re
 import threading
 import time
@@ -51,6 +52,11 @@ class Scheduler:
         gpu_prewarm_cpu_reserve_per_free_gpu: int = 8,
         gpu_prewarm_partition: str = "auto",
         gpu_prewarm_time_limit: str = "48:00:00",
+        cleanup_enabled: bool = True,
+        cleanup_interval_seconds: int = 3600,
+        cleanup_finished_task_ttl_seconds: int = 604800,
+        cleanup_finished_job_ttl_seconds: int = 604800,
+        cleanup_closed_allocation_ttl_seconds: int = 86400,
     ):
         self.db = db
         self.accounts = accounts
@@ -93,6 +99,12 @@ class Scheduler:
         self.gpu_prewarm_partition = gpu_prewarm_partition
         self.gpu_prewarm_time_limit = gpu_prewarm_time_limit
         self._allocation_backoff_until_by_pool: dict[str, float] = {}
+        self.cleanup_enabled = cleanup_enabled
+        self.cleanup_interval_seconds = cleanup_interval_seconds
+        self.cleanup_finished_task_ttl_seconds = cleanup_finished_task_ttl_seconds
+        self.cleanup_finished_job_ttl_seconds = cleanup_finished_job_ttl_seconds
+        self.cleanup_closed_allocation_ttl_seconds = cleanup_closed_allocation_ttl_seconds
+        self._last_cleanup_at = 0.0
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -123,6 +135,7 @@ class Scheduler:
         self.maintain_allocation_pool()
         self.refresh_submitted_jobs()
         self.submit_next_queued_job()
+        self.cleanup_remote_artifacts_if_due()
 
     def _now(self) -> datetime:
         return datetime.now(timezone.utc)
@@ -143,6 +156,101 @@ class Scheduler:
         if not started:
             return 0
         return max(0.0, (self._now() - started).total_seconds())
+
+    def _finished_age_seconds(self, row: dict, field: str) -> float | None:
+        finished = self._timestamp(row.get(field))
+        if not finished:
+            return None
+        return max(0.0, (self._now() - finished).total_seconds())
+
+    def cleanup_remote_artifacts_if_due(self) -> None:
+        if not self.cleanup_enabled:
+            return
+        now = time.time()
+        if self.cleanup_interval_seconds > 0 and now - self._last_cleanup_at < self.cleanup_interval_seconds:
+            return
+        self._last_cleanup_at = now
+        self.cleanup_finished_tasks()
+        self.cleanup_finished_jobs()
+        self.cleanup_closed_allocations()
+
+    def cleanup_finished_tasks(self) -> None:
+        terminal = {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}
+        for task in self.db.list_tasks(limit=5000):
+            if task["status"] not in terminal or not task.get("remote_dir"):
+                continue
+            age = self._finished_age_seconds(task, "finished_at")
+            if age is None or age < self.cleanup_finished_task_ttl_seconds:
+                continue
+            account = self.account_by_name(str(task.get("account_name") or ""))
+            if not self.remove_scheduler_artifact(account, str(task.get("remote_dir") or ""), ("task-",)):
+                continue
+            self.db.update_task(
+                task["id"],
+                remote_dir="",
+                stdout_path="",
+                stderr_path="",
+                exit_code_path="",
+                wrapper_pid="",
+            )
+
+    def cleanup_finished_jobs(self) -> None:
+        terminal = {JobStatus.COMPLETED.value, JobStatus.FAILED.value, JobStatus.CANCELLED.value}
+        for job in self.db.list_jobs(limit=5000):
+            if job["status"] not in terminal or not job.get("remote_job_dir"):
+                continue
+            age = self._finished_age_seconds(job, "finished_at")
+            if age is None or age < self.cleanup_finished_job_ttl_seconds:
+                continue
+            account = self.account_by_name(str(job.get("account_name") or ""))
+            if not self.remove_scheduler_artifact(account, str(job.get("remote_job_dir") or ""), ("job-",)):
+                continue
+            self.db.update_job(job["id"], remote_job_dir="", stdout_path="", stderr_path="")
+
+    def cleanup_closed_allocations(self) -> None:
+        terminal = {AllocationStatus.CLOSED.value, AllocationStatus.FAILED.value}
+        for allocation in self.db.list_allocations(limit=5000):
+            if allocation["state"] not in terminal or not allocation.get("remote_dir"):
+                continue
+            age = self._finished_age_seconds(allocation, "closed_at")
+            if age is None or age < self.cleanup_closed_allocation_ttl_seconds:
+                continue
+            account = self.account_by_name(str(allocation.get("account_name") or ""))
+            if not self.remove_scheduler_artifact(account, str(allocation.get("remote_dir") or ""), ("allocation-",)):
+                continue
+            self.db.update_allocation(allocation["id"], remote_dir="", stdout_path="", stderr_path="")
+
+    def remove_scheduler_artifact(self, account: AccountConfig | None, remote_path: str, prefixes: tuple[str, ...]) -> bool:
+        if not account or not self.is_safe_scheduler_artifact_path(account, remote_path, prefixes):
+            return False
+        try:
+            self.client_factory(account).remove_tree(remote_path)
+        except Exception as exc:
+            LOGGER.warning("failed to clean remote artifact %s on %s: %s", remote_path, account.name, exc)
+            return False
+        return True
+
+    def is_safe_scheduler_artifact_path(self, account: AccountConfig, remote_path: str, prefixes: tuple[str, ...]) -> bool:
+        artifact = self._normalize_remote_path(remote_path)
+        workspace = self._normalize_remote_path(account.remote_workspace)
+        if not artifact or not workspace or workspace in {".", "/"}:
+            return False
+        artifact_parts = [part for part in artifact.split("/") if part]
+        workspace_parts = [part for part in workspace.split("/") if part]
+        if ".." in artifact_parts or ".." in workspace_parts:
+            return False
+        basename = posixpath.basename(artifact.rstrip("/"))
+        if not any(basename.startswith(prefix) for prefix in prefixes):
+            return False
+        workspace_prefix = workspace.rstrip("/") + "/"
+        return artifact.startswith(workspace_prefix)
+
+    def _normalize_remote_path(self, value: str) -> str:
+        path = (value or "").strip()
+        for prefix in ("$HOME/", "~/"):
+            if path.startswith(prefix):
+                path = path[len(prefix):]
+        return posixpath.normpath(path)
 
     def refresh_cluster_state_if_due(self) -> None:
         if self.cluster_refresh_interval_seconds <= 0:
@@ -611,7 +719,9 @@ class Scheduler:
                 return False
             if int(allocation.get("free_gpus") or 0) < int(task.get("gpus") or 0):
                 return False
-            return int(allocation["free_cpus"]) >= int(task["cpus"])
+            if int(allocation["free_cpus"]) >= int(task["cpus"]):
+                return True
+            return not include_pending and int(allocation.get("free_cpus") or 0) > 0
         if int(allocation.get("total_gpus") or 0) > 0:
             return self.borrowable_cpus(allocation) >= int(task["cpus"])
         return int(allocation["free_cpus"]) >= int(task["cpus"])

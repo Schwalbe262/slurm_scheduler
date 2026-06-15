@@ -217,3 +217,14 @@ Remaining verification:
 - Allowed exclusive attached tasks to use a completely idle existing allocation, including GPU warm pools such as `n002`, while blocking other tasks from sharing an allocation that currently has an exclusive task running.
 - Limited exclusive demand prewarm so it does not keep submitting new allocations while another exclusive demand allocation is still pending.
 - Added adaptive scale-in for pending demand allocations: if no queued task still needs a pending demand pool, the scheduler cancels and closes it instead of waiting for the pending timeout.
+
+## 2026-06-16 05:55:25 KST
+
+- Added automatic cleanup for scheduler-created remote artifact directories.
+- Cleanup deletes only safe paths under each account's `remote_workspace` whose basename starts with `task-`, `job-`, or `allocation-`.
+- Finished attached tasks and direct jobs keep artifacts for 7 days by default; closed allocations keep artifacts for 1 day by default.
+- After cleanup, the scheduler clears the DB log/path fields so it does not repeatedly delete the same directory.
+- Added `cleanup:` config fields to the example config and documentation.
+- Added `.gitignore` coverage for Windows `Zone.Identifier` metadata and removed existing untracked Zone.Identifier files.
+- Changed attached GPU task placement so a matching GPU allocation can accept a GPU task even when CPU free is below the requested core count, provided at least one CPU core and enough memory remain.
+- Changed Allocation Pool top summary to exclude `pending` allocations from total used CPU/GPU/memory.

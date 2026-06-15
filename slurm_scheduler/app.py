@@ -175,6 +175,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         gpu_prewarm_cpu_reserve_per_free_gpu=config.gpu_prewarm_cpu_reserve_per_free_gpu,
         gpu_prewarm_partition=config.gpu_prewarm_partition,
         gpu_prewarm_time_limit=config.gpu_prewarm_time_limit,
+        cleanup_enabled=config.cleanup_enabled,
+        cleanup_interval_seconds=config.cleanup_interval_seconds,
+        cleanup_finished_task_ttl_seconds=config.cleanup_finished_task_ttl_seconds,
+        cleanup_finished_job_ttl_seconds=config.cleanup_finished_job_ttl_seconds,
+        cleanup_closed_allocation_ttl_seconds=config.cleanup_closed_allocation_ttl_seconds,
     )
 
     app = FastAPI(title="Slurm Scheduler")
@@ -196,7 +201,12 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         snapshot_error = "" if snapshots else "Account status will appear after the background scheduler refreshes."
         allocations = db.list_allocations(limit=500)
         active_allocations = sorted([item for item in allocations if item["state"] != "closed"], key=allocation_sort_key)
-        allocation_summary = allocation_usage_summary(active_allocations)
+        allocated_summary_rows = [
+            item
+            for item in active_allocations
+            if item["state"] in {"active", "warm", "draining", "closing"}
+        ]
+        allocation_summary = allocation_usage_summary(allocated_summary_rows)
         closed_allocations = [item for item in allocations if item["state"] == "closed"]
         tasks = attach_task_elapsed(db.list_tasks())
         active_tasks = [item for item in tasks if item["status"] not in {"completed", "failed", "cancelled"}]

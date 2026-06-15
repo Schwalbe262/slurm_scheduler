@@ -638,6 +638,12 @@ class SlurmAccountClient:
         if result.exit_code != 0:
             raise RuntimeError(result.stderr.strip() or "scancel failed")
 
+    def remove_tree(self, remote_path: str) -> None:
+        with SSHSession(self.account) as ssh:
+            result = ssh.run(f"rm -rf -- {shlex.quote(remote_path)}")
+        if result.exit_code != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"failed to remove {remote_path}")
+
     def read_text_file(self, path: str) -> str:
         with SSHSession(self.account) as ssh:
             result = ssh.run(f"test -f {shlex.quote(path)} && cat {shlex.quote(path)}")
