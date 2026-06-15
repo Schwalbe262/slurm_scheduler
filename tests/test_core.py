@@ -234,6 +234,20 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("--mem=8192M", command)
         self.assertIn("--exclusive", command)
 
+    def test_srun_attach_command_overlaps_small_gpu_task_when_cpu_is_tight(self) -> None:
+        task = {"cpus": 4, "memory_mb": 8192, "gpus": 1}
+        allocation = {"slurm_job_id": "12345", "free_cpus": 0, "gpu_model": "a6000"}
+        command = build_srun_attach_command(
+            task,
+            allocation,
+            "/remote/task.sh",
+            "/remote/stdout.log",
+            "/remote/stderr.log",
+            "/remote/exit_code",
+        )
+        self.assertIn("--gres=gpu:a6000:1", command)
+        self.assertIn("--overlap", command)
+
     def test_allocation_script_does_not_request_slurm_exclusive_for_scheduler_exclusive_pool(self) -> None:
         allocation = {
             "total_cpus": 12,
@@ -1384,12 +1398,14 @@ class SchedulerTests(unittest.TestCase):
             allocation_id,
             state=AllocationStatus.WARM.value,
             slurm_job_id="alloc-1",
-            free_cpus=2,
+            free_cpus=0,
             free_gpus=1,
         )
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
         task = {"cpus": 4, "memory_mb": 2048, "gpus": 1, "gpu_model": "a6000", "partition": "auto", "node_name": ""}
         self.assertEqual(scheduler.best_allocation_for_task(task)["id"], allocation_id)
+        too_large = {"cpus": 5, "memory_mb": 2048, "gpus": 1, "gpu_model": "a6000", "partition": "auto", "node_name": ""}
+        self.assertIsNone(scheduler.best_allocation_for_task(too_large))
 
     def test_near_drain_allocation_does_not_accept_new_tasks(self) -> None:
         allocation_id = self.db.create_allocation(

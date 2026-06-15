@@ -244,3 +244,9 @@ Remaining verification:
 - Added `allocation_attach_stop_before_drain_seconds` and stopped assigning new tasks to allocations close to their drain threshold.
 - Documented task cancellation and `base=git_repo` result retrieval.
 - Deployed the API and cancelled 35 non-terminal `crypto-sweep` tasks through `POST /api/tasks/cancel`; the remaining 52 matching tasks were already failed.
+
+## 2026-06-16 06:11:09 KST
+
+- Relaxed attached GPU task CPU placement for scarce-GPU cases.
+- If a task requests a matching GPU and requests 4 CPU cores or fewer, the scheduler may attach it even when the allocation has 0 free CPU cores.
+- Added `srun --overlap` for these tight-CPU small GPU tasks so the Slurm step can share already allocated CPU capacity.

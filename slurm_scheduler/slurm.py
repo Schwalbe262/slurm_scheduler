@@ -410,6 +410,13 @@ def build_srun_attach_command(
     gres = gpu_gres_value(str(allocation.get("gpu_model") or task.get("gpu_model") or ""), int(task.get("gpus") or 0))
     if gres:
         srun_parts.append(f"--gres={shlex.quote(gres)}")
+    cpu_shortage_gpu_task = (
+        int(task.get("gpus") or 0) > 0
+        and int(task.get("cpus") or 0) <= 4
+        and int(allocation.get("free_cpus") or 0) < int(task.get("cpus") or 0)
+    )
+    if cpu_shortage_gpu_task:
+        srun_parts.append("--overlap")
     srun_parts.extend(["--exclusive", "bash", shell_expandable_path(script_path)])
     srun_command = " ".join(srun_parts)
     return (

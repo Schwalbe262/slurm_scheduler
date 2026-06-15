@@ -732,7 +732,7 @@ class Scheduler:
                 return False
             if int(allocation["free_cpus"]) >= int(task["cpus"]):
                 return True
-            return not include_pending and int(allocation.get("free_cpus") or 0) > 0
+            return not include_pending and int(task.get("cpus") or 0) <= 4
         if int(allocation.get("total_gpus") or 0) > 0:
             return self.borrowable_cpus(allocation) >= int(task["cpus"])
         return int(allocation["free_cpus"]) >= int(task["cpus"])

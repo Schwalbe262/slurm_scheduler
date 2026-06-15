@@ -83,7 +83,7 @@ GPU warm placement prioritizes holding the GPU, but it should not make the remai
 
 If an A6000-class node has enough free GPUs but only four free CPU cores, the scheduler may still open the GPU warm allocation with those four CPU cores. This low-CPU exception keeps GPU capture possible when the node is otherwise nearly full.
 
-For attached GPU tasks, GPU availability is treated as the scarce resource. If the requested GPU model and count match an already owned allocation, the scheduler may attach the task even when the allocation has fewer free CPU cores than requested, as long as at least one CPU core is still free and memory fits. This is a narrow GPU-task exception; CPU-only tasks still require enough borrowable CPU.
+For attached GPU tasks, GPU availability is treated as the scarce resource. If the requested GPU model and count match an already owned allocation, the scheduler may attach the task even when the allocation has fewer free CPU cores than requested. This exception is limited to GPU tasks requesting 4 CPU cores or fewer, and the attached `srun` step uses `--overlap` when it must share already allocated CPU capacity. CPU-only tasks still require enough borrowable CPU.
 
 If a GPU warm allocation stays Slurm `PENDING` longer than `allocation_pending_timeout_seconds`, the scheduler cancels it and applies `allocation_pending_backoff_seconds` to that GPU pool before trying again. The dashboard Allocation Pool reason column shows the Slurm pending reason, such as `(Resources)` or `(Priority)`.
 

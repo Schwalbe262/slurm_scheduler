@@ -195,3 +195,9 @@
 - Problem: After `python_git` became an attached task, external agents lost reliable result-file retrieval and had no API to clean up accidentally duplicated tasks.
 - Discovery: Random `mktemp` git task directories are invisible to the task model, and near-drain allocations can accept work shortly before the scheduler closes them.
 - Improvement: Make git task workdirs deterministic from task id, expose `git_repo`/`git_workdir` remote-file bases, add task cancel and bulk-cancel APIs, and stop attaching new tasks to allocations near their drain threshold.
+
+## 2026-06-16 06:11:09 KST
+
+- Problem: GPU tasks can remain queued while a matching GPU is idle because scheduler-owned CPU capacity is fully reserved by other attached steps.
+- Discovery: For small GPU tasks, the GPU is the scarce resource and a 4-core CPU request is often a soft companion requirement.
+- Improvement: Allow matching GPU tasks with 4 CPU cores or fewer to attach despite zero scheduler-free CPU, using `srun --overlap` for the shared-CPU step.
