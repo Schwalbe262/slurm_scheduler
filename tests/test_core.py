@@ -260,6 +260,7 @@ class SlurmParsingTests(unittest.TestCase):
         )
         self.assertIn("--gres=gpu:a6000:1", command)
         self.assertIn("--overlap", command)
+        self.assertNotIn("--exclusive", command)
 
     def test_allocation_script_does_not_request_slurm_exclusive_for_scheduler_exclusive_pool(self) -> None:
         allocation = {
@@ -650,6 +651,31 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(task["status"], TaskStatus.CANCELLED.value)
         self.assertEqual(FakeClient.cancelled_tasks, [task_id])
         self.assertEqual(allocation["free_cpus"], allocation["total_cpus"])
+
+    def test_request_cancel_task_returns_fast_status_shape(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=8,
+            total_memory_mb=65536,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="alloc-1")
+        task_id = self.db.create_task(TaskCreate("running", "~/case", "run"))
+        self.db.update_task(
+            task_id,
+            status=TaskStatus.RUNNING.value,
+            account_name="a",
+            allocation_id=allocation_id,
+            wrapper_pid="1234",
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        response = scheduler.request_cancel_task(task_id)
+        self.assertEqual(response["ok"], True)
+        self.assertEqual(response["id"], task_id)
+        self.assertEqual(response["previous_status"], TaskStatus.RUNNING.value)
+        self.assertEqual(response["status"], TaskStatus.CANCELLED.value)
+        self.assertEqual(self.db.get_task(task_id)["status"], TaskStatus.CANCELLED.value)
 
     def test_cancel_tasks_filters_by_name_and_status(self) -> None:
         first = self.db.create_task(TaskCreate("crypto-sweep-a", "~/case", "run"))
@@ -1542,6 +1568,8 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(scheduler.best_allocation_for_task(task)["id"], allocation_id)
         too_large = {"cpus": 5, "memory_mb": 2048, "gpus": 1, "gpu_model": "a6000", "partition": "auto", "node_name": ""}
         self.assertIsNone(scheduler.best_allocation_for_task(too_large))
+        capacity = scheduler.task_fit_capacity(task)
+        self.assertEqual(capacity["fit_slots"], 1)
 
     def test_near_drain_allocation_does_not_accept_new_tasks(self) -> None:
         allocation_id = self.db.create_allocation(

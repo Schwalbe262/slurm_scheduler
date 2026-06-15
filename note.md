@@ -267,3 +267,23 @@ Remaining verification:
 - Added payload support: JSON payloads are written to `payload.json` under the task remote directory, and tasks receive `SLURM_SCHEDULER_PAYLOAD_PATH`.
 - Extended `GET /api/tasks/{id}` with normalized `state`, exit code, failure message, allocation/slurm metadata, stdout/stderr paths, and optional `include_output=true` stdout/stderr/result_json body.
 - Added priority queue ordering, task timeout failure with exit code `124`, dedupe-key reuse for non-terminal tasks, and per-allocation worker cap checks.
+
+## 2026-06-16 06:48:11 KST
+
+- Fixed small GPU task wrapper generation so `srun --overlap` is not combined with `--exclusive`.
+- Added `tail_lines` and `max_bytes` support to task stdout, stderr, and remote-file APIs.
+- Changed task stdout/stderr/remote-file reads to return an empty body when the task log file is not present yet.
+- Added `GET /api/tasks/{id}/remote-files` for glob-based remote log discovery.
+- Changed task cancel API to mark DB state first and return `{ok, id, previous_status, status}` quickly, while remote wrapper termination runs best-effort in the background.
+- Added stderr-derived failure messages for failed tasks when `failure_message` is otherwise empty.
+- Added `GET /api/task-capacity` to estimate fit slots from free CPU, memory, GPU, and task constraints.
+- Investigated queued `flight-crawl` tasks and found the blocker was missing `flight-crawl` capability on all accounts, not CPU capacity. Added `flight-crawl` to the local r1jae262 account config.
+- Added `factorio_vllm` profile guidance with `VLLM_USE_FLASHINFER_SAMPLER=0`.
+
+## 2026-06-16 06:51:39 KST
+
+- Clarified the Flight scheduler contract: `capability` is only a placement label, while `env_profile` is what activates conda or exports environment variables.
+- Added `conda:flight-searcher` as the preferred capability label for Flight tasks that require the `flight-searcher` conda environment.
+- Added a local `flight-searcher` env profile for r1jae262 that runs `conda activate flight-searcher`.
+- Kept the legacy `flight-crawl` capability locally so already queued tasks with that older label can still be placed after service restart.
+- Updated README/API/config examples to submit Flight JSON tasks with `required_capability=conda:flight-searcher` and `env_profile=flight-searcher`.

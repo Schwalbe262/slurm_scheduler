@@ -422,9 +422,26 @@ class Scheduler:
                 self.db.update_task(task["id"], status=TaskStatus.CANCELLED.value, finished_at="CURRENT_TIMESTAMP")
                 self.close_allocation_after_exclusive_task(task)
             elif status == JobStatus.FAILED:
-                self.db.update_task(task["id"], status=TaskStatus.FAILED.value, exit_code=exit_code, finished_at="CURRENT_TIMESTAMP")
+                self.db.update_task(
+                    task["id"],
+                    status=TaskStatus.FAILED.value,
+                    exit_code=exit_code,
+                    failure_message=task.get("failure_message") or self.task_stderr_failure_message(task, self.client_factory(account)),
+                    finished_at="CURRENT_TIMESTAMP",
+                )
                 self.close_allocation_after_exclusive_task(task)
         self.recalculate_allocation_capacity()
+
+    def task_stderr_failure_message(self, task: dict, client: SlurmAccountClient) -> str:
+        stderr_path = task.get("stderr_path") or ""
+        if not stderr_path:
+            return ""
+        try:
+            text = client.read_text_file(stderr_path)
+        except Exception:
+            return ""
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return "\n".join(lines[:3])
 
     def task_timed_out(self, task: dict) -> bool:
         timeout = int(task.get("timeout_seconds") or 0)
@@ -671,6 +688,51 @@ class Scheduler:
             if int(task.get("allocation_id") or 0) == allocation_id
             and task["status"] in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}
         )
+
+    def task_fit_capacity(self, task: dict) -> dict:
+        allocations = []
+        total_slots = 0
+        for allocation in self.db.list_allocations(limit=500):
+            if allocation["state"] not in {AllocationStatus.WARM.value, AllocationStatus.ACTIVE.value}:
+                continue
+            if not self.allocation_accepts_new_tasks(allocation):
+                continue
+            if not allocation.get("slurm_job_id"):
+                continue
+            if not self.allocation_can_run_task(allocation, task, include_pending=False):
+                continue
+            slots = self.fit_slots_for_allocation(allocation, task)
+            if slots <= 0:
+                continue
+            total_slots += slots
+            allocations.append(
+                {
+                    "allocation_id": allocation["id"],
+                    "account_name": allocation.get("account_name") or "",
+                    "slurm_job_id": allocation.get("slurm_job_id") or "",
+                    "state": allocation.get("state") or "",
+                    "partition": allocation.get("partition") or "",
+                    "node_name": allocation.get("node_name") or "",
+                    "free_cpus": int(allocation.get("free_cpus") or 0),
+                    "free_memory_mb": int(allocation.get("free_memory_mb") or 0),
+                    "free_gpus": int(allocation.get("free_gpus") or 0),
+                    "gpu_model": allocation.get("gpu_model") or "",
+                    "fit_slots": slots,
+                }
+            )
+        return {"fit_slots": total_slots, "allocations": allocations}
+
+    def fit_slots_for_allocation(self, allocation: dict, task: dict) -> int:
+        memory_slots = int(allocation.get("free_memory_mb") or 0) // max(1, int(task.get("memory_mb") or 1))
+        if self.task_requires_gpu(task):
+            gpu_slots = int(allocation.get("free_gpus") or 0) // max(1, int(task.get("gpus") or 1))
+            if int(task.get("cpus") or 0) <= 4 and gpu_slots > 0:
+                cpu_slots = gpu_slots
+            else:
+                cpu_slots = int(allocation.get("free_cpus") or 0) // max(1, int(task.get("cpus") or 1))
+            return max(0, min(memory_slots, gpu_slots, cpu_slots))
+        cpu_slots = self.borrowable_cpus(allocation) // max(1, int(task.get("cpus") or 1))
+        return max(0, min(memory_slots, cpu_slots))
 
     def allocation_accepts_new_tasks(self, allocation: dict) -> bool:
         if self.allocation_drain_after_seconds <= 0:
@@ -1709,6 +1771,30 @@ class Scheduler:
         if task.get("allocation_id"):
             self.recalculate_allocation_capacity()
 
+    def request_cancel_task(self, task_id: int) -> dict:
+        task = self.db.get_task(task_id)
+        if not task:
+            raise ValueError("task not found")
+        previous_status = task["status"]
+        if previous_status in {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}:
+            return {"ok": True, "id": task_id, "previous_status": previous_status, "status": previous_status}
+        self.db.update_task(task_id, status=TaskStatus.CANCELLED.value, finished_at="CURRENT_TIMESTAMP")
+        if task.get("allocation_id"):
+            self.recalculate_allocation_capacity()
+        if previous_status in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
+            thread = threading.Thread(target=self._cancel_task_remote_best_effort, args=(task,), daemon=True)
+            thread.start()
+        return {"ok": True, "id": task_id, "previous_status": previous_status, "status": TaskStatus.CANCELLED.value}
+
+    def _cancel_task_remote_best_effort(self, task: dict) -> None:
+        account = self.account_by_name(str(task.get("account_name") or ""))
+        if not account:
+            return
+        try:
+            self.client_factory(account).cancel_task(task)
+        except Exception as exc:
+            LOGGER.warning("failed to cancel task %s remotely: %s", task.get("id"), exc)
+
     def cancel_tasks(
         self,
         name_contains: str = "",
@@ -1723,6 +1809,6 @@ class Scheduler:
                 continue
             if needle and needle not in str(task.get("name") or "").lower():
                 continue
-            self.cancel_task(int(task["id"]))
+            self.request_cancel_task(int(task["id"]))
             cancelled.append(int(task["id"]))
         return sorted(cancelled)

@@ -4,6 +4,7 @@ import posixpath
 import re
 import shlex
 import time
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -429,7 +430,9 @@ def build_srun_attach_command(
     )
     if cpu_shortage_gpu_task:
         srun_parts.append("--overlap")
-    srun_parts.extend(["--exclusive", "bash", shell_expandable_path(script_path)])
+    else:
+        srun_parts.append("--exclusive")
+    srun_parts.extend(["bash", shell_expandable_path(script_path)])
     srun_command = " ".join(srun_parts)
     return (
         f"{srun_command} > {shlex.quote(stdout_path)} 2> {shlex.quote(stderr_path)}; "
@@ -698,3 +701,26 @@ class SlurmAccountClient:
         if result.exit_code != 0:
             raise FileNotFoundError(result.stderr.strip() or f"remote file not found: {path}")
         return result.stdout
+
+    def list_files(self, root: str, pattern: str) -> list[str]:
+        script = (
+            "python - <<'PY'\n"
+            "import glob, json, os\n"
+            f"root = {root!r}\n"
+            f"pattern = {pattern!r}\n"
+            "matches = []\n"
+            "for path in glob.glob(os.path.join(root, pattern), recursive=True):\n"
+            "    if os.path.isfile(path):\n"
+            "        matches.append(os.path.relpath(path, root))\n"
+            "print(json.dumps(sorted(matches)))\n"
+            "PY"
+        )
+        with SSHSession(self.account) as ssh:
+            result = ssh.run(script)
+        if result.exit_code != 0:
+            raise FileNotFoundError(result.stderr.strip() or f"remote files not found: {root}/{pattern}")
+        try:
+            loaded = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError:
+            return []
+        return [str(item) for item in loaded]

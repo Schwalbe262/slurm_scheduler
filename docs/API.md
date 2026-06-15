@@ -65,6 +65,17 @@ Lists cluster and scheduler GPU capacity grouped by partition/model.
 curl -sS "$SCHEDULER_URL/api/gpu-capacity"
 ```
 
+### `GET /api/task-capacity`
+
+Estimates how many currently owned allocation slots can run a task shape.
+
+```bash
+curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=16&memory_mb=32768&gpus=0&required_capability=conda:flight-searcher"
+curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=4&memory_mb=32768&gpus=1&gpu_model=a6000"
+```
+
+The response includes total `fit_slots` and per-allocation free CPU, memory, GPU, and fit slots.
+
 Use:
 
 - `scheduler_free_gpus` for immediate placement.
@@ -210,7 +221,8 @@ curl -sS -X POST "$SCHEDULER_URL/api/tasks" \
     "remote_cwd": "/remote/flight-searcher",
     "command": "python worker.py --payload \"$SLURM_SCHEDULER_PAYLOAD_PATH\"",
     "payload_json": {"from": "ICN", "to": "SFO", "date": "2026-07-01"},
-    "required_capability": "flight-crawl",
+    "required_capability": "conda:flight-searcher",
+    "env_profile": "flight-searcher",
     "cpus": 1,
     "memory_mb": 1024,
     "priority": 10,
@@ -242,7 +254,8 @@ Response:
 Fields:
 
 - `payload_json`: optional JSON object, array, or string. The scheduler writes it to `payload.json` under the task remote directory and exports `SLURM_SCHEDULER_PAYLOAD_PATH`.
-- `required_capability`: account capability constraint, for example `flight-crawl`.
+- `required_capability`: account capability constraint, for example `conda:flight-searcher`.
+- `env_profile`: optional shell setup profile, for example `flight-searcher` to activate the matching conda environment.
 - `priority`: higher values attach before lower values.
 - `timeout_seconds`: nonzero value marks a running task failed with exit code `124` after timeout.
 - `dedupe_key`: if another non-terminal task has the same key, the API returns that task instead of creating a duplicate.
@@ -271,10 +284,16 @@ curl -sS "$SCHEDULER_URL/api/tasks/123/stderr"
 
 ### `POST /api/tasks/{task_id}/cancel`
 
-Cancels a queued, attaching, or running attached task. Running tasks are marked cancelled and the scheduler asks the remote account to terminate the task wrapper process.
+Cancels a queued, attaching, or running attached task. The API marks the task cancelled first and returns quickly; remote wrapper termination is best-effort in the background.
 
 ```bash
 curl -sS -X POST "$SCHEDULER_URL/api/tasks/123/cancel"
+```
+
+Response:
+
+```json
+{"ok": true, "id": 123, "previous_status": "running", "status": "cancelled"}
 ```
 
 ### `POST /api/tasks/cancel`
@@ -292,6 +311,23 @@ Reads a safe relative file path from the task account over SSH. `base` can be `r
 ```bash
 curl -sS "$SCHEDULER_URL/api/tasks/123/remote-file?base=remote_cwd&path=result.json"
 curl -sS "$SCHEDULER_URL/api/tasks/123/remote-file?base=git_repo&path=results/best.json"
+curl -sS "$SCHEDULER_URL/api/tasks/123/remote-file?base=remote_cwd&path=logs/vllm.err&tail_lines=100"
+curl -sS "$SCHEDULER_URL/api/tasks/123/remote-file?base=remote_cwd&path=logs/vllm.err&max_bytes=20000"
+```
+
+If the file does not exist yet, task file endpoints return an empty body instead of failing. `stdout` and `stderr` endpoints support the same tail parameters:
+
+```bash
+curl -sS "$SCHEDULER_URL/api/tasks/123/stdout?tail_lines=100"
+curl -sS "$SCHEDULER_URL/api/tasks/123/stderr?max_bytes=20000"
+```
+
+### `GET /api/tasks/{task_id}/remote-files`
+
+Lists matching files below a task base path. Use this when the exact log filename is unknown.
+
+```bash
+curl -sS "$SCHEDULER_URL/api/tasks/123/remote-files?base=remote_cwd&glob=logs/vllm-scheduler*.err"
 ```
 
 For `/tasks/git` and `POST /jobs job_mode=python_git`, the scheduler clones into:

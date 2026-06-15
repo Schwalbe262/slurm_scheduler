@@ -11,11 +11,18 @@ accounts:
     storage_path: "slurm_scheduler"
     storage_quota_gb: 0
     partition_allowlist: []
-    capabilities: ["conda:pyaedt2026v1"]
+    capabilities: ["conda:pyaedt2026v1", "conda:flight-searcher"]
     env_profiles:
       pyaedt2026v1: |
         source ~/miniconda3/etc/profile.d/conda.sh
         conda activate pyaedt2026v1
+      flight-searcher: |
+        source ~/miniconda3/etc/profile.d/conda.sh
+        conda activate flight-searcher
+      factorio_vllm: |
+        source ~/miniconda3/etc/profile.d/conda.sh
+        conda activate pytorch_cuda118
+        export VLLM_USE_FLASHINFER_SAMPLER=0
   - name: account_b
     host: login.example.edu
     port: 22

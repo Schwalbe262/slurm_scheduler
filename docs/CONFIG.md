@@ -155,6 +155,7 @@ Use profiles when one account has a prepared environment and other accounts do n
 capabilities:
   - "conda:pyaedt2026v1"
   - "conda:pytorch_cuda118"
+  - "conda:flight-searcher"
 env_profiles:
   pyaedt2026v1: |
     source ~/miniconda3/etc/profile.d/conda.sh
@@ -162,6 +163,13 @@ env_profiles:
   pytorch_cuda118: |
     source ~/miniconda3/etc/profile.d/conda.sh
     conda activate pytorch_cuda118
+  flight-searcher: |
+    source ~/miniconda3/etc/profile.d/conda.sh
+    conda activate flight-searcher
+  factorio_vllm: |
+    source ~/miniconda3/etc/profile.d/conda.sh
+    conda activate pytorch_cuda118
+    export VLLM_USE_FLASHINFER_SAMPLER=0
 ```
 
 Then submit with:

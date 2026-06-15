@@ -213,3 +213,15 @@
 - Problem: Service clients need a stable task-broker contract rather than browser redirects and scattered stdout/result retrieval.
 - Discovery: The existing task table and attach lifecycle already had most execution metadata, but lacked payload, dedupe, timeout, priority, worker-cap, and normalized polling response fields.
 - Improvement: Add JSON task submission, payload file injection, enriched task status JSON, stdout final-JSON parsing, and scheduling controls for Flight-style polling clients.
+
+## 2026-06-16 06:48:11 KST
+
+- Problem: Operators had to launch extra diagnostic tasks to inspect logs, cancel could block on remote SSH, and CPU-tight GPU tasks failed because `--exclusive` and `--overlap` were emitted together.
+- Discovery: Log reads should be tolerant while files are being created, cancel state can be recorded before remote cleanup, and capability labels are hard placement gates independent of visible CPU capacity.
+- Improvement: Add log tailing and remote glob APIs, fast cancel responses, stderr-derived failure messages, task fit-capacity reporting, mutually exclusive `srun` flags, and local `flight-crawl`/Factorio vLLM capability/profile configuration.
+
+## 2026-06-16 06:51:39 KST
+
+- Problem: Using an abstract `flight-crawl` capability for Flight tasks hides the real dependency and can keep tasks queued when operators only know the conda environment name.
+- Discovery: The scheduler treats `required_capability` as an exact account label and only `env_profile` performs shell setup, so a conda dependency should be expressed as both a capability and a profile.
+- Improvement: Prefer `required_capability=conda:flight-searcher` with `env_profile=flight-searcher`, while keeping `flight-crawl` locally for compatibility with already submitted tasks.

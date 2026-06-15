@@ -217,7 +217,18 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     app.state.db = db
     app.state.scheduler = scheduler
 
-    def read_task_file_text(task: dict, field: str, limit: int = 65536) -> str:
+    def apply_text_window(text: str, tail_lines: int = 0, max_bytes: int = 0) -> str:
+        if tail_lines > 0:
+            text = "\n".join(text.splitlines()[-tail_lines:])
+            if text:
+                text += "\n"
+        if max_bytes > 0:
+            data = text.encode("utf-8", errors="replace")
+            if len(data) > max_bytes:
+                text = data[-max_bytes:].decode("utf-8", errors="replace")
+        return text
+
+    def read_task_file_text(task: dict, field: str, limit: int = 65536, tail_lines: int = 0, max_bytes: int = 0) -> str:
         path = task.get(field) or ""
         if not path or not task.get("account_name"):
             return ""
@@ -228,9 +239,37 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             text = SlurmAccountClient(account).read_text_file(path)
         except Exception:
             return ""
-        if limit > 0 and len(text) > limit:
-            return text[-limit:]
-        return text
+        if limit > 0 and not max_bytes and len(text) > limit:
+            text = text[-limit:]
+        return apply_text_window(text, tail_lines=tail_lines, max_bytes=max_bytes)
+
+    def account_for_task(task: dict):
+        return next((item for item in accounts if item.name == task.get("account_name")), None)
+
+    def task_remote_root(task: dict, account, base: str) -> str:
+        if base == "remote_dir":
+            return task.get("remote_dir") or ""
+        if base == "git_workdir":
+            return posixpath.join(account.remote_workspace, "git_tasks", f"task-{task['id']}")
+        if base == "git_repo":
+            return posixpath.join(account.remote_workspace, "git_tasks", f"task-{task['id']}", "repo")
+        if base == "stdout":
+            return posixpath.dirname(task.get("stdout_path") or "")
+        if base == "stderr":
+            return posixpath.dirname(task.get("stderr_path") or "")
+        return (task.get("remote_cwd") or task.get("remote_dir") or "").replace(
+            ACCOUNT_WORKSPACE_PLACEHOLDER,
+            account.remote_workspace,
+        )
+
+    def task_failure_message(task: dict) -> str:
+        existing = task.get("failure_message") or ""
+        if existing:
+            return existing
+        if task.get("status") != "failed":
+            return ""
+        stderr = read_task_file_text(task, "stderr_path", limit=8192, tail_lines=3)
+        return "\n".join(line for line in stderr.splitlines()[:3]).strip()
 
     def task_json(task: dict, include_output: bool = False, output_limit: int = 65536) -> dict:
         allocation = db.get_allocation(int(task["allocation_id"])) if task.get("allocation_id") else None
@@ -241,7 +280,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "status": task["status"],
             "state": task_state_for_api(task["status"]),
             "exit_code": task.get("exit_code"),
-            "failure_message": task.get("failure_message") or "",
+            "failure_message": task_failure_message(task),
             "created_at": task.get("created_at"),
             "attached_at": task.get("attached_at"),
             "started_at": task.get("started_at"),
@@ -716,6 +755,34 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     def api_gpu_capacity() -> list[dict]:
         return scheduler.gpu_capacity_summary()
 
+    @app.get("/api/task-capacity")
+    def api_task_capacity(
+        cpus: int = 1,
+        memory_mb: int = 4096,
+        gpus: int = 0,
+        gpu_model: str = "",
+        required_capability: str = "",
+        env_profile: str = "",
+        account_name: str = "",
+        partition: str = "auto",
+        node_name: str = "",
+        max_workers_per_node: int = 0,
+    ) -> dict:
+        task = {
+            "cpus": max(1, cpus),
+            "memory_mb": max(1, memory_mb),
+            "gpus": max(0, gpus),
+            "gpu_model": gpu_model,
+            "required_capability": required_capability,
+            "env_profile": env_profile,
+            "account_name": account_name,
+            "partition": partition,
+            "node_name": node_name,
+            "exclusive_node": 0,
+            "max_workers_per_node": max(0, max_workers_per_node),
+        }
+        return scheduler.task_fit_capacity(task)
+
     @app.get("/api/health")
     def api_health() -> dict:
         return {
@@ -768,13 +835,18 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     @app.post("/api/tasks/{task_id}/cancel")
     def api_cancel_task(task_id: int) -> dict:
         try:
-            scheduler.cancel_task(task_id)
+            return scheduler.request_cancel_task(task_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return {"cancelled": [task_id], "count": 1}
 
     @app.get("/api/tasks/{task_id}/remote-file")
-    def api_task_remote_file(task_id: int, path: str, base: str = "remote_cwd") -> Response:
+    def api_task_remote_file(
+        task_id: int,
+        path: str,
+        base: str = "remote_cwd",
+        tail_lines: int = 0,
+        max_bytes: int = 0,
+    ) -> Response:
         task = db.get_task(task_id)
         if not task:
             raise HTTPException(status_code=404)
@@ -782,68 +854,75 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             raise HTTPException(status_code=409, detail="task has no account")
         if path.startswith("/") or ".." in Path(path).parts:
             raise HTTPException(status_code=400, detail="path must be a safe relative path")
-        account = next((item for item in accounts if item.name == task["account_name"]), None)
+        account = account_for_task(task)
         if not account:
             raise HTTPException(status_code=404, detail="account not found")
-        if base == "remote_dir":
-            root = task.get("remote_dir") or ""
-        elif base == "git_workdir":
-            root = posixpath.join(account.remote_workspace, "git_tasks", f"task-{task_id}")
-        elif base == "git_repo":
-            root = posixpath.join(account.remote_workspace, "git_tasks", f"task-{task_id}", "repo")
-        elif base == "stdout":
-            root = posixpath.dirname(task.get("stdout_path") or "")
-        elif base == "stderr":
-            root = posixpath.dirname(task.get("stderr_path") or "")
-        else:
-            root = (task.get("remote_cwd") or task.get("remote_dir") or "").replace(
-                ACCOUNT_WORKSPACE_PLACEHOLDER,
-                account.remote_workspace,
-            )
+        root = task_remote_root(task, account, base)
         if not root:
             raise HTTPException(status_code=409, detail="task has no remote base path")
         remote_file = posixpath.join(root, path)
         try:
             text = SlurmAccountClient(account).read_text_file(remote_file)
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return Response(text, media_type="text/plain")
+        except FileNotFoundError:
+            text = ""
+        return Response(apply_text_window(text, tail_lines=max(0, tail_lines), max_bytes=max(0, max_bytes)), media_type="text/plain")
+
+    @app.get("/api/tasks/{task_id}/remote-files")
+    def api_task_remote_files(task_id: int, glob: str, base: str = "remote_cwd") -> dict:
+        task = db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404)
+        if not task["account_name"]:
+            raise HTTPException(status_code=409, detail="task has no account")
+        if glob.startswith("/") or ".." in Path(glob).parts:
+            raise HTTPException(status_code=400, detail="glob must be a safe relative pattern")
+        account = account_for_task(task)
+        if not account:
+            raise HTTPException(status_code=404, detail="account not found")
+        root = task_remote_root(task, account, base)
+        if not root:
+            raise HTTPException(status_code=409, detail="task has no remote base path")
+        try:
+            files = SlurmAccountClient(account).list_files(root, glob)
+        except FileNotFoundError:
+            files = []
+        return {"base": base, "glob": glob, "files": files}
 
     @app.get("/api/tasks/{task_id}/stdout")
-    def api_task_stdout(task_id: int) -> Response:
+    def api_task_stdout(task_id: int, tail_lines: int = 0, max_bytes: int = 0) -> Response:
         task = db.get_task(task_id)
         if not task:
             raise HTTPException(status_code=404)
         if not task["account_name"]:
-            raise HTTPException(status_code=409, detail="task has no account")
+            return Response("", media_type="text/plain")
         if not task.get("stdout_path"):
-            raise HTTPException(status_code=409, detail="task has no stdout path")
-        account = next((item for item in accounts if item.name == task["account_name"]), None)
+            return Response("", media_type="text/plain")
+        account = account_for_task(task)
         if not account:
-            raise HTTPException(status_code=404, detail="account not found")
+            return Response("", media_type="text/plain")
         try:
             text = SlurmAccountClient(account).read_text_file(task["stdout_path"])
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return Response(text, media_type="text/plain")
+        except FileNotFoundError:
+            text = ""
+        return Response(apply_text_window(text, tail_lines=max(0, tail_lines), max_bytes=max(0, max_bytes)), media_type="text/plain")
 
     @app.get("/api/tasks/{task_id}/stderr")
-    def api_task_stderr(task_id: int) -> Response:
+    def api_task_stderr(task_id: int, tail_lines: int = 0, max_bytes: int = 0) -> Response:
         task = db.get_task(task_id)
         if not task:
             raise HTTPException(status_code=404)
         if not task["account_name"]:
-            raise HTTPException(status_code=409, detail="task has no account")
+            return Response("", media_type="text/plain")
         if not task.get("stderr_path"):
-            raise HTTPException(status_code=409, detail="task has no stderr path")
-        account = next((item for item in accounts if item.name == task["account_name"]), None)
+            return Response("", media_type="text/plain")
+        account = account_for_task(task)
         if not account:
-            raise HTTPException(status_code=404, detail="account not found")
+            return Response("", media_type="text/plain")
         try:
             text = SlurmAccountClient(account).read_text_file(task["stderr_path"])
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return Response(text, media_type="text/plain")
+        except FileNotFoundError:
+            text = ""
+        return Response(apply_text_window(text, tail_lines=max(0, tail_lines), max_bytes=max(0, max_bytes)), media_type="text/plain")
 
     @app.get("/api/accounts/status")
     def api_accounts() -> list[dict]:
