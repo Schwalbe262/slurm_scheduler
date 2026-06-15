@@ -206,3 +206,14 @@ Remaining verification:
 - Cancelled and closed oversized pending exclusive allocations `680371`, `680372`, `680373`, `680375`, `680376`, and `680377`.
 - Verified new exclusive demand allocations are task-sized, for example `680382` through `680386` request `12 CPU` and `98304 MB`.
 - Clarified that `POST /jobs job_mode=python_git` now creates task records, so clients must watch `/api/tasks`; `/api/jobs` max id staying fixed is expected for this compatibility path.
+
+## 2026-06-16 05:34:30 KST
+
+- Cancelled attached tasks 6 and 7 at the user's request.
+- Sorted Allocation Pool rows as `active`, `warm`, `pending`, then other states.
+- Added Allocation Pool summary totals for CPU/GPU/memory used so current pool utilization is visible before reading the table.
+- Fixed attached task script execution paths by converting `~/.../task.sh` to `$HOME/.../task.sh` and preserving `$HOME` expansion in the `srun bash` command.
+- Changed GPU pool CPU borrowing so an idle GPU allocation can lend all free CPU to CPU-only tasks. CPU reserve is applied only after some GPUs in that allocation are actually in use.
+- Allowed exclusive attached tasks to use a completely idle existing allocation, including GPU warm pools such as `n002`, while blocking other tasks from sharing an allocation that currently has an exclusive task running.
+- Limited exclusive demand prewarm so it does not keep submitting new allocations while another exclusive demand allocation is still pending.
+- Added adaptive scale-in for pending demand allocations: if no queued task still needs a pending demand pool, the scheduler cancels and closes it instead of waiting for the pending timeout.

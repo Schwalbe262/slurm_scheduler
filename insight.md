@@ -171,3 +171,9 @@
 - Problem: Exclusive attached tasks were either blocked by shared warm pools or could make oversized 64-core demand allocations for 12-core work.
 - Discovery: Existing inflight-capacity checks treated one pending exclusive allocation as reusable for every queued exclusive task, and allocation shape selection used the global warm-pool size instead of the task request.
 - Improvement: Treat exclusive demand as one allocation per queued task and size demand allocations from the task's CPU/memory request, preserving special-purpose isolation without wasting account job slots or triggering avoidable QOS limits.
+
+## 2026-06-16 05:34:30 KST
+
+- Problem: GPU warm allocations could sit with idle CPU while CPU-only tasks remained queued, and quoted `~/.../task.sh` paths failed on compute nodes before user code started.
+- Discovery: The scheduler reserved CPU for free GPUs even when no GPU task was running, and `shlex.quote("~/...")` prevented tilde expansion inside `srun`.
+- Improvement: Let idle GPU pools lend their CPU to CPU-only tasks, preserve `$HOME` expansion for task script paths, order allocation rows by operational state, and cancel pending demand pools that no queued task can use.

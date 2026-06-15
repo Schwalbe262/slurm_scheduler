@@ -420,6 +420,20 @@
 
   <section class="panel">
     <h2>Allocation Pool</h2>
+    <div class="summary-row" aria-label="Allocation pool usage summary">
+      <div class="summary-item">
+        <span class="summary-label">CPU Used</span>
+        <span class="summary-value">{{ allocation_summary.cpu_used }} / {{ allocation_summary.cpu_total }}</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">GPU Used</span>
+        <span class="summary-value">{{ allocation_summary.gpu_used }} / {{ allocation_summary.gpu_total }}</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Mem Used</span>
+        <span class="summary-value">{{ allocation_summary.memory_used_gb }} / {{ allocation_summary.memory_total_gb }} GB</span>
+      </div>
+    </div>
     <div class="table-scroll">
       <table>
         <thead><tr><th>ID</th><th>State</th><th>Pool</th><th>Account</th><th>Node</th><th>CPU Used</th><th>GPU Used</th><th>Mem Used</th><th>Slurm ID</th><th>Reason</th></tr></thead>

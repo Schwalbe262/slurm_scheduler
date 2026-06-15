@@ -313,8 +313,6 @@ def build_allocation_script(allocation: dict, time_limit: str) -> str:
     gres = gpu_gres_value(str(allocation.get("gpu_model") or ""), int(allocation.get("total_gpus") or 0))
     if gres:
         lines.append(f"#SBATCH --gres={gres}")
-    if int(allocation.get("exclusive_node") or 0):
-        lines.append("#SBATCH --exclusive")
     lines.extend(
         [
             "",
@@ -352,9 +350,21 @@ def shell_path(path: str) -> str:
 
 def remote_execution_path(path: str) -> str:
     value = (path or ".").strip() or "."
-    if value.startswith("/") or value == "~" or value.startswith("~/"):
+    if value.startswith("/"):
         return value
-    return f"~/{value}"
+    if value == "~":
+        return "$HOME"
+    if value.startswith("~/"):
+        return f"$HOME/{value[2:]}"
+    return f"$HOME/{value}"
+
+
+def shell_expandable_path(path: str) -> str:
+    if path == "$HOME":
+        return '"$HOME"'
+    if path.startswith("$HOME/"):
+        return "\"$HOME\"/" + shlex.quote(path[len("$HOME/") :])
+    return shlex.quote(path)
 
 
 def resolve_task_placeholders(task: dict, account: AccountConfig) -> dict:
@@ -395,7 +405,7 @@ def build_srun_attach_command(
     gres = gpu_gres_value(str(allocation.get("gpu_model") or task.get("gpu_model") or ""), int(task.get("gpus") or 0))
     if gres:
         srun_parts.append(f"--gres={shlex.quote(gres)}")
-    srun_parts.extend(["--exclusive", "bash", shlex.quote(script_path)])
+    srun_parts.extend(["--exclusive", "bash", shell_expandable_path(script_path)])
     srun_command = " ".join(srun_parts)
     return (
         f"{srun_command} > {shlex.quote(stdout_path)} 2> {shlex.quote(stderr_path)}; "

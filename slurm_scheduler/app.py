@@ -109,6 +109,37 @@ def job_elapsed(jobs: list[dict]) -> list[dict]:
     return hydrated
 
 
+def allocation_sort_key(allocation: dict) -> tuple[int, int]:
+    state_rank = {
+        "active": 0,
+        "warm": 1,
+        "pending": 2,
+        "draining": 3,
+        "closing": 4,
+        "failed": 5,
+    }
+    return (state_rank.get(str(allocation.get("state") or ""), 9), -int(allocation.get("id") or 0))
+
+
+def allocation_usage_summary(allocations: list[dict]) -> dict[str, int]:
+    total_cpus = sum(int(item.get("total_cpus") or 0) for item in allocations)
+    free_cpus = sum(int(item.get("free_cpus") or 0) for item in allocations)
+    total_gpus = sum(int(item.get("total_gpus") or 0) for item in allocations)
+    free_gpus = sum(int(item.get("free_gpus") or 0) for item in allocations)
+    total_memory_mb = sum(int(item.get("total_memory_mb") or 0) for item in allocations)
+    free_memory_mb = sum(int(item.get("free_memory_mb") or 0) for item in allocations)
+    return {
+        "cpu_used": max(0, total_cpus - free_cpus),
+        "cpu_total": total_cpus,
+        "gpu_used": max(0, total_gpus - free_gpus),
+        "gpu_total": total_gpus,
+        "memory_used_mb": max(0, total_memory_mb - free_memory_mb),
+        "memory_total_mb": total_memory_mb,
+        "memory_used_gb": round(max(0, total_memory_mb - free_memory_mb) / 1024),
+        "memory_total_gb": round(total_memory_mb / 1024),
+    }
+
+
 def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     config = load_app_config(config_path)
     accounts = load_accounts(config.accounts_path)
@@ -164,7 +195,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         snapshots = scheduler.cached_snapshots()
         snapshot_error = "" if snapshots else "Account status will appear after the background scheduler refreshes."
         allocations = db.list_allocations(limit=500)
-        active_allocations = [item for item in allocations if item["state"] != "closed"]
+        active_allocations = sorted([item for item in allocations if item["state"] != "closed"], key=allocation_sort_key)
+        allocation_summary = allocation_usage_summary(active_allocations)
         closed_allocations = [item for item in allocations if item["state"] == "closed"]
         tasks = attach_task_elapsed(db.list_tasks())
         active_tasks = [item for item in tasks if item["status"] not in {"completed", "failed", "cancelled"}]
@@ -183,6 +215,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 "finished_tasks": finished_tasks[:50],
                 "finished_task_count": len(finished_tasks),
                 "allocations": active_allocations,
+                "allocation_summary": allocation_summary,
                 "closed_allocations": closed_allocations[:20],
                 "closed_allocation_count": len(closed_allocations),
                 "snapshots": snapshots,

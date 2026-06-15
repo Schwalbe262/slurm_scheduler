@@ -232,9 +232,26 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("--mem=8192M", command)
         self.assertIn("--exclusive", command)
 
+    def test_allocation_script_does_not_request_slurm_exclusive_for_scheduler_exclusive_pool(self) -> None:
+        allocation = {
+            "total_cpus": 12,
+            "total_memory_mb": 98304,
+            "partition": "cpu1",
+            "node_name": "",
+            "total_gpus": 0,
+            "gpu_model": "",
+            "exclusive_node": 1,
+            "remote_dir": "/remote/allocation",
+            "stdout_path": "/remote/allocation/out",
+            "stderr_path": "/remote/allocation/err",
+        }
+        script = build_allocation_script(allocation, "48:00:00")
+        self.assertIn("#SBATCH --cpus-per-task=12", script)
+        self.assertNotIn("#SBATCH --exclusive", script)
+
     def test_remote_execution_path_promotes_relative_path_under_home(self) -> None:
-        self.assertEqual(remote_execution_path("slurm_scheduler/task-1/task.sh"), "~/slurm_scheduler/task-1/task.sh")
-        self.assertEqual(remote_execution_path("~/slurm_scheduler/task-1/task.sh"), "~/slurm_scheduler/task-1/task.sh")
+        self.assertEqual(remote_execution_path("slurm_scheduler/task-1/task.sh"), "$HOME/slurm_scheduler/task-1/task.sh")
+        self.assertEqual(remote_execution_path("~/slurm_scheduler/task-1/task.sh"), "$HOME/slurm_scheduler/task-1/task.sh")
         self.assertEqual(remote_execution_path("/tmp/task.sh"), "/tmp/task.sh")
 
     def test_srun_attach_command_can_request_gpu(self) -> None:
@@ -675,7 +692,7 @@ class SchedulerTests(unittest.TestCase):
         allocation = self.db.list_allocations()[0]
         self.assertEqual(allocation["exclusive_node"], 1)
 
-    def test_multiple_exclusive_tasks_open_dedicated_allocations(self) -> None:
+    def test_multiple_exclusive_tasks_wait_when_one_allocation_is_pending(self) -> None:
         scheduler = Scheduler(
             self.db,
             self.accounts,
@@ -688,8 +705,11 @@ class SchedulerTests(unittest.TestCase):
         self.db.create_task(TaskCreate("exclusive-2", "~/case", "run", cpus=4, memory_mb=2048, exclusive_node=True))
         scheduler.maintain_allocation_pool()
         allocations = self.db.list_allocations()
-        self.assertEqual(len(allocations), 2)
+        self.assertEqual(len(allocations), 1)
         self.assertTrue(all(allocation["exclusive_node"] == 1 for allocation in allocations))
+        scheduler.refresh_allocations()
+        scheduler.maintain_allocation_pool()
+        self.assertEqual(len(self.db.list_allocations()), 2)
 
     def test_exclusive_demand_allocation_uses_task_size(self) -> None:
         scheduler = Scheduler(
@@ -706,6 +726,88 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(allocation["exclusive_node"], 1)
         self.assertEqual(allocation["total_cpus"], 12)
         self.assertEqual(allocation["total_memory_mb"], 98304)
+
+    def test_exclusive_cpu_demand_avoids_busy_single_job_partition(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "cpu-free cpu1 idle 0 48 0.0 768000 700000\n"
+                "cpu2-free cpu2 idle 0 256 0.0 1031519 1000000\n"
+                "gpu-free gpu3 mix 4 56 0.0 1024000 900000\n"
+            )
+        )
+        existing_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu2",
+            node_name="cpu2-used",
+            total_cpus=64,
+            total_memory_mb=65536,
+            resource_pool="cpu",
+        )
+        self.db.update_allocation(existing_id, state=AllocationStatus.WARM.value, slurm_job_id="cpu2-pool")
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            allocation_cpus=64,
+        )
+        self.db.create_task(TaskCreate("exclusive", "~/case", "run", cpus=12, memory_mb=98304, exclusive_node=True))
+        scheduler.maintain_allocation_pool()
+        allocations = [allocation for allocation in self.db.list_allocations() if allocation["id"] != existing_id]
+        self.assertEqual(len(allocations), 1)
+        self.assertEqual(allocations[0]["partition"], "cpu1")
+        self.assertEqual(allocations[0]["total_cpus"], 12)
+
+    def test_pending_demand_allocation_closes_when_no_queued_task_needs_it(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="",
+            total_cpus=12,
+            total_memory_mb=98304,
+            resource_pool="cpu",
+            exclusive_node=True,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.PENDING.value,
+            slurm_job_id="pending-demand",
+            drain_reason="queued CPU demand",
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, min_warm_allocations=0)
+        scheduler.scale_in_idle_allocations()
+        allocation = self.db.get_allocation(allocation_id)
+        self.assertEqual(allocation["state"], AllocationStatus.CLOSED.value)
+        self.assertIn("pending-demand", FakeClient.cancelled)
+
+    def test_exclusive_task_closes_allocation_after_finish(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="",
+            total_cpus=12,
+            total_memory_mb=98304,
+            resource_pool="cpu",
+            exclusive_node=True,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="exclusive-alloc")
+        task_id = self.db.create_task(TaskCreate("exclusive", "~/case", "run", cpus=12, memory_mb=2048, exclusive_node=True))
+        self.db.update_task(
+            task_id,
+            status=TaskStatus.RUNNING.value,
+            allocation_id=allocation_id,
+            account_name="a",
+        )
+        FakeClient.task_states[task_id] = JobStatus.COMPLETED
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, min_warm_allocations=0)
+        scheduler.refresh_tasks()
+        task = self.db.get_task(task_id)
+        allocation = self.db.get_allocation(allocation_id)
+        self.assertEqual(task["status"], TaskStatus.COMPLETED.value)
+        self.assertEqual(allocation["state"], AllocationStatus.CLOSED.value)
+        self.assertIn("exclusive-alloc", FakeClient.cancelled)
 
     def test_task_required_capability_uses_matching_allocation_account(self) -> None:
         accounts = [
@@ -1081,7 +1183,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(len(gpu_allocations), 2)
         self.assertTrue(any(item["gpu_model"] == "a6000ada" and item["state"] == AllocationStatus.PENDING.value for item in gpu_allocations))
 
-    def test_cpu_task_can_borrow_gpu_allocation_after_gpu_cpu_reserve(self) -> None:
+    def test_cpu_task_can_borrow_idle_gpu_allocation_without_gpu_cpu_reserve(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",
             partition="gpu3",
@@ -1100,8 +1202,38 @@ class SchedulerTests(unittest.TestCase):
             client_factory=FakeClient,
             gpu_prewarm_cpu_reserve_per_free_gpu=8,
         )
-        fitting = {"cpus": 24, "memory_mb": 2048, "gpus": 0, "partition": "auto", "node_name": ""}
-        too_large = {"cpus": 25, "memory_mb": 2048, "gpus": 0, "partition": "auto", "node_name": ""}
+        fitting = {"cpus": 32, "memory_mb": 2048, "gpus": 0, "partition": "auto", "node_name": ""}
+        too_large = {"cpus": 33, "memory_mb": 2048, "gpus": 0, "partition": "auto", "node_name": ""}
+        self.assertIsNotNone(scheduler.best_allocation_for_task(fitting))
+        self.assertIsNone(scheduler.best_allocation_for_task(too_large))
+
+    def test_cpu_task_reserves_cpu_when_gpu_allocation_has_gpu_work(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="gpu3",
+            node_name="gpu-ada",
+            total_cpus=32,
+            total_memory_mb=65536,
+            total_gpus=2,
+            gpu_model="a6000ada",
+            resource_pool="gpu:a6000ada",
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="alloc-1",
+            free_cpus=24,
+            free_gpus=1,
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            gpu_prewarm_cpu_reserve_per_free_gpu=8,
+        )
+        fitting = {"cpus": 16, "memory_mb": 2048, "gpus": 0, "partition": "auto", "node_name": ""}
+        too_large = {"cpus": 17, "memory_mb": 2048, "gpus": 0, "partition": "auto", "node_name": ""}
         self.assertIsNotNone(scheduler.best_allocation_for_task(fitting))
         self.assertIsNone(scheduler.best_allocation_for_task(too_large))
 
