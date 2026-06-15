@@ -196,3 +196,13 @@ Remaining verification:
 - Retargeted the stale A6000 warm-pool request away from its old pending Slurm job.
 - The scheduler opened a new A6000 pool on `n104` as Slurm job `680367`, securing 2 A6000 GPUs. The node only had 3 CPU cores available for this allocation, so it is useful for holding GPU capacity but not for CPU-heavy attached GPU tasks.
 - Confirmed the A6000ADA warm request is still aimed at `n065`; it remains pending for Slurm priority reasons even though matching GPUs are visible there.
+
+## 2026-06-16 05:18:42 KST
+
+- Revisited `exclusive_node=1` semantics for attached tasks.
+- Confirmed it should mean a special-purpose task that gets a dedicated scheduler allocation instead of sharing an existing warm pool.
+- Changed demand prewarm to scan all queued exclusive tasks and reserve at most one pending/warm exclusive allocation per task, so one pending allocation is not counted as capacity for multiple exclusive tasks.
+- Changed demand allocations opened for queued tasks to use the task's requested CPU and memory size instead of the default warm-pool size. This prevents a 12-core exclusive task from opening a 64-core allocation and hitting `QOSMaxCpuPerNode`.
+- Cancelled and closed oversized pending exclusive allocations `680371`, `680372`, `680373`, `680375`, `680376`, and `680377`.
+- Verified new exclusive demand allocations are task-sized, for example `680382` through `680386` request `12 CPU` and `98304 MB`.
+- Clarified that `POST /jobs job_mode=python_git` now creates task records, so clients must watch `/api/tasks`; `/api/jobs` max id staying fixed is expected for this compatibility path.

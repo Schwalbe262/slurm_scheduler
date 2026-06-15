@@ -636,31 +636,11 @@ class Scheduler:
         return False
 
     def prewarm_for_demand(self) -> None:
-        task = self.db.next_queued_task()
-        if task and not self.has_inflight_capacity_for_task(task):
-            if self.task_requires_gpu(task):
-                model = self.choose_gpu_model_for_task(task) or self.choose_gpu_model_for_prewarm()
-                resource_pool = f"gpu:{model}" if model else ""
-                if model and not self.allocation_pool_in_backoff(resource_pool):
-                    self.open_allocation(
-                        f"queued GPU demand {model}",
-                        resource_pool=resource_pool,
-                        gpu_model=model,
-                        gpus=max(1, int(task.get("gpus") or self.gpu_prewarm_gpus_per_allocation)),
-                        exclusive_node=bool(task.get("exclusive_node")),
-                        required_capability=str(task.get("required_capability") or ""),
-                        env_profile=str(task.get("env_profile") or ""),
-                        account_name=str(task.get("account_name") or ""),
-                    )
-            elif not self.allocation_pool_in_backoff("cpu"):
-                self.open_allocation(
-                    "queued CPU demand",
-                    resource_pool="cpu",
-                    exclusive_node=bool(task.get("exclusive_node")),
-                    required_capability=str(task.get("required_capability") or ""),
-                    env_profile=str(task.get("env_profile") or ""),
-                    account_name=str(task.get("account_name") or ""),
-                )
+        if self.prewarm_exclusive_demand():
+            return
+        task = self.next_queued_task_without_inflight_capacity()
+        if task:
+            self.open_allocation_for_task(task)
             return
         allocations = [
             item
@@ -688,6 +668,92 @@ class Scheduler:
                 resource_pool="cpu",
                 preferred_accounts=self.warm_pool_preferred_accounts,
             )
+
+    def next_queued_task_without_inflight_capacity(self) -> dict | None:
+        queued_tasks = sorted(
+            [task for task in self.db.list_tasks(limit=5000) if task["status"] == TaskStatus.QUEUED.value],
+            key=lambda item: int(item["id"]),
+        )
+        for task in queued_tasks:
+            if int(task.get("exclusive_node") or 0):
+                continue
+            if not self.has_inflight_capacity_for_task(task):
+                return task
+        return None
+
+    def prewarm_exclusive_demand(self) -> bool:
+        queued_tasks = sorted(
+            [
+                task
+                for task in self.db.list_tasks(limit=5000)
+                if task["status"] == TaskStatus.QUEUED.value and int(task.get("exclusive_node") or 0)
+            ],
+            key=lambda item: int(item["id"]),
+        )
+        if not queued_tasks:
+            return False
+        reserved_allocation_ids: set[int] = set()
+        opened = False
+        for task in queued_tasks:
+            allocation = self.find_unreserved_exclusive_capacity(task, reserved_allocation_ids)
+            if allocation:
+                reserved_allocation_ids.add(int(allocation["id"]))
+                continue
+            if self.open_allocation_for_task(task):
+                opened = True
+                allocation = self.find_unreserved_exclusive_capacity(task, reserved_allocation_ids)
+                if allocation:
+                    reserved_allocation_ids.add(int(allocation["id"]))
+            else:
+                break
+        return opened
+
+    def find_unreserved_exclusive_capacity(self, task: dict, reserved_allocation_ids: set[int]) -> dict | None:
+        for allocation in self.db.list_allocations(limit=500):
+            if int(allocation["id"]) in reserved_allocation_ids:
+                continue
+            if allocation["state"] not in {
+                AllocationStatus.PENDING.value,
+                AllocationStatus.WARM.value,
+                AllocationStatus.ACTIVE.value,
+            }:
+                continue
+            if not int(allocation.get("exclusive_node") or 0):
+                continue
+            if self.allocation_can_run_task(allocation, task, include_pending=True):
+                return allocation
+        return None
+
+    def open_allocation_for_task(self, task: dict) -> bool:
+        if self.task_requires_gpu(task):
+            model = self.choose_gpu_model_for_task(task) or self.choose_gpu_model_for_prewarm()
+            resource_pool = f"gpu:{model}" if model else ""
+            if not model or self.allocation_pool_in_backoff(resource_pool):
+                return False
+            return self.open_allocation(
+                f"queued GPU demand {model}",
+                resource_pool=resource_pool,
+                gpu_model=model,
+                gpus=max(1, int(task.get("gpus") or self.gpu_prewarm_gpus_per_allocation)),
+                exclusive_node=bool(task.get("exclusive_node")),
+                required_capability=str(task.get("required_capability") or ""),
+                env_profile=str(task.get("env_profile") or ""),
+                account_name=str(task.get("account_name") or ""),
+                requested_cpus=int(task.get("cpus") or 0),
+                requested_memory_mb=int(task.get("memory_mb") or 0),
+            )
+        if self.allocation_pool_in_backoff("cpu"):
+            return False
+        return self.open_allocation(
+            "queued CPU demand",
+            resource_pool="cpu",
+            exclusive_node=bool(task.get("exclusive_node")),
+            required_capability=str(task.get("required_capability") or ""),
+            env_profile=str(task.get("env_profile") or ""),
+            account_name=str(task.get("account_name") or ""),
+            requested_cpus=int(task.get("cpus") or 0),
+            requested_memory_mb=int(task.get("memory_mb") or 0),
+        )
 
     def scale_in_idle_allocations(self) -> None:
         warm_allocations = [
@@ -729,6 +795,8 @@ class Scheduler:
         required_capability: str = "",
         env_profile: str = "",
         account_name: str = "",
+        requested_cpus: int = 0,
+        requested_memory_mb: int = 0,
     ) -> bool:
         account = self.choose_account_for_allocation(
             preferred_accounts=preferred_accounts,
@@ -743,6 +811,8 @@ class Scheduler:
             gpu_model=gpu_model,
             gpus=gpus,
             exclusive_node=exclusive_node,
+            requested_cpus=requested_cpus,
+            requested_memory_mb=requested_memory_mb,
         )
         if not shape:
             return False
@@ -893,6 +963,8 @@ class Scheduler:
         gpu_model: str = "",
         gpus: int = 0,
         exclusive_node: bool = False,
+        requested_cpus: int = 0,
+        requested_memory_mb: int = 0,
     ) -> dict | None:
         inventory_by_node = {row["node_name"]: row for row in self.db.list_node_inventory()}
         nodes = [
@@ -966,9 +1038,13 @@ class Scheduler:
                 available_cpus = node.effective_free_cpus
             if available_cpus <= 0:
                 continue
-            cpus = self.allocation_cpus or available_cpus
+            if requested_cpus and available_cpus < requested_cpus:
+                continue
+            cpus = requested_cpus or self.allocation_cpus or available_cpus
             cpus = max(1, min(cpus, available_cpus))
-            memory_mb = self._memory_mb(self.allocation_memory) or node.free_memory_mb
+            if requested_memory_mb and node.free_memory_mb < requested_memory_mb:
+                continue
+            memory_mb = requested_memory_mb or self._memory_mb(self.allocation_memory) or node.free_memory_mb
             memory_mb = max(1024, min(memory_mb, node.free_memory_mb))
             if cpus > 0 and memory_mb > 0:
                 cpu_profile = CPU_PROFILES_BY_PARTITION.get(node.partition, {})
@@ -1002,8 +1078,8 @@ class Scheduler:
         return {
             "partition": partition,
             "node_name": "",
-            "cpus": self.allocation_cpus or 4,
-            "memory_mb": self._memory_mb(self.allocation_memory) or 16384,
+            "cpus": requested_cpus or self.allocation_cpus or 4,
+            "memory_mb": requested_memory_mb or self._memory_mb(self.allocation_memory) or 16384,
             "gpus": max(1, int(gpus or self.gpu_prewarm_gpus_per_allocation)) if wants_gpu else 0,
             "gpu_model": (target_models[0] if target_models else "") if wants_gpu else "",
             "exclusive_node": exclusive_node,

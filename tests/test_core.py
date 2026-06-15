@@ -675,6 +675,38 @@ class SchedulerTests(unittest.TestCase):
         allocation = self.db.list_allocations()[0]
         self.assertEqual(allocation["exclusive_node"], 1)
 
+    def test_multiple_exclusive_tasks_open_dedicated_allocations(self) -> None:
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            allocation_cpus=8,
+        )
+        self.db.create_task(TaskCreate("exclusive-1", "~/case", "run", cpus=4, memory_mb=2048, exclusive_node=True))
+        self.db.create_task(TaskCreate("exclusive-2", "~/case", "run", cpus=4, memory_mb=2048, exclusive_node=True))
+        scheduler.maintain_allocation_pool()
+        allocations = self.db.list_allocations()
+        self.assertEqual(len(allocations), 2)
+        self.assertTrue(all(allocation["exclusive_node"] == 1 for allocation in allocations))
+
+    def test_exclusive_demand_allocation_uses_task_size(self) -> None:
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            allocation_cpus=64,
+        )
+        self.db.create_task(TaskCreate("exclusive", "~/case", "run", cpus=12, memory_mb=98304, exclusive_node=True))
+        scheduler.maintain_allocation_pool()
+        allocation = self.db.list_allocations()[0]
+        self.assertEqual(allocation["exclusive_node"], 1)
+        self.assertEqual(allocation["total_cpus"], 12)
+        self.assertEqual(allocation["total_memory_mb"], 98304)
+
     def test_task_required_capability_uses_matching_allocation_account(self) -> None:
         accounts = [
             AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10, capabilities=["conda:pyaedt"]),

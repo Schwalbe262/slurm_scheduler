@@ -165,3 +165,9 @@
 - Problem: Users think in terms of scheduler jobs, but creating a separate Slurm job for every Git request defeats the warm-pool design and consumes account job slots.
 - Discovery: The existing Git task wrapper can represent a `python_git` job request as an attached task without losing repo checkout, entrypoint, account, GPU, or node constraints.
 - Improvement: Route compatibility `POST /jobs job_mode=python_git` requests into the attached-task scheduler, preserving the virtual-job interface while keeping Slurm job count concentrated in warm allocations.
+
+## 2026-06-16 05:18:42 KST
+
+- Problem: Exclusive attached tasks were either blocked by shared warm pools or could make oversized 64-core demand allocations for 12-core work.
+- Discovery: Existing inflight-capacity checks treated one pending exclusive allocation as reusable for every queued exclusive task, and allocation shape selection used the global warm-pool size instead of the task request.
+- Improvement: Treat exclusive demand as one allocation per queued task and size demand allocations from the task's CPU/memory request, preserving special-purpose isolation without wasting account job slots or triggering avoidable QOS limits.
