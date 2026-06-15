@@ -1586,8 +1586,11 @@ class Scheduler:
         snapshots = []
         for account in self.accounts:
             client = self.client_factory(account)
-            storage_used = self.cached_storage(account, client, now)
-            snapshots.append(client.snapshot(storage_used_gb=storage_used))
+            try:
+                storage_used = self.cached_storage(account, client, now)
+                snapshots.append(client.snapshot(storage_used_gb=storage_used))
+            except Exception as exc:
+                LOGGER.warning("failed to refresh account snapshot for %s: %s", account.name, exc)
         self._snapshot_cache = (now, snapshots)
         return snapshots
 

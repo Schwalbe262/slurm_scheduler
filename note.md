@@ -304,3 +304,10 @@ Remaining verification:
 - Changed `next_queued_task_without_inflight_capacity()` to reserve finite CPU, memory, and GPU capacity across pending/warm/active allocations while scanning queued tasks.
 - Added a regression test where two active CPU pools have only `12` free CPU and one pending GPU pool has three CPU-task slots; the fourth queued 16-core task now triggers demand prewarm.
 - Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, and `git diff --check`.
+
+## 2026-06-16 07:09:00 KST
+
+- Found a second scale-out blocker: account snapshot refresh could abort on one failed SSH/squeue account and prevent later account candidates from being considered.
+- Changed snapshot refresh to isolate failures per account and keep usable snapshots for the accounts that respond.
+- Added a regression test where account `b` snapshot fails but account `a` remains usable for scheduling decisions.
+- Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, and `git diff --check`.

@@ -456,6 +456,13 @@ class SubmitFailureClient(FakeClient):
         )
 
 
+class PartialSnapshotFailureClient(FakeClient):
+    def snapshot(self, storage_used_gb: float | None = None) -> AccountSnapshot:
+        if self.account.name == "b":
+            raise RuntimeError("squeue unavailable")
+        return super().snapshot(storage_used_gb=storage_used_gb)
+
+
 class SchedulerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -664,6 +671,11 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(FakeClient.attached_tasks[0], gpu_task_id)
         self.assertEqual(self.db.get_task(gpu_task_id)["status"], TaskStatus.RUNNING.value)
         self.assertEqual(self.db.get_task(cpu_task_id)["status"], TaskStatus.QUEUED.value)
+
+    def test_snapshot_failure_for_one_account_does_not_block_other_accounts(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=PartialSnapshotFailureClient)
+        snapshots = scheduler.snapshots()
+        self.assertEqual([snapshot.account_name for snapshot in snapshots], ["a"])
 
     def test_cancel_task_kills_running_wrapper(self) -> None:
         allocation_id = self.db.create_allocation(

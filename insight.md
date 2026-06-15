@@ -237,3 +237,9 @@
 - Problem: Demand scale-out can stop after finding one pending allocation that fits a task, even when that allocation has only a few finite slots and the queue is much larger.
 - Discovery: A pending 48-core GPU warm pool was counted as inflight capacity for thousands of 16-core CPU tasks, so no additional CPU pool was opened.
 - Improvement: Reserve finite inflight CPU, memory, and GPU slots while scanning queued tasks; once queued demand exceeds reserved capacity, open another demand allocation.
+
+## 2026-06-16 07:09:00 KST
+
+- Problem: Pool creation depends on account snapshots, so one unreachable account can block allocation decisions for otherwise healthy accounts.
+- Discovery: Snapshot collection raised out of the whole refresh loop instead of skipping only the failing account.
+- Improvement: Treat account snapshot failures independently and continue scheduling with the accounts that still report status.
