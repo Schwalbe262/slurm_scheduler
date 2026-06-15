@@ -146,6 +146,8 @@ curl -sS "$SCHEDULER_URL/api/jobs"
 curl -sS "$SCHEDULER_URL/api/allocations"
 curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/stdout"
 curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/remote-file?base=remote_cwd&path=results/case001.json"
+curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/remote-file?base=git_repo&path=results/best.json"
+curl -sS -X POST "$SCHEDULER_URL/api/tasks/cancel?name_contains=crypto-sweep&statuses=queued,attaching,running"
 curl -sS "$SCHEDULER_URL/api/jobs/<job_id>/remote-file?base=remote_job_dir&path=submit.stderr.log"
 ```
 

@@ -32,6 +32,7 @@ allocation_partition: "auto"
 allocation_cpus: 64
 allocation_memory: "0"
 allocation_time_limit: "48:00:00"
+allocation_attach_stop_before_drain_seconds: 1800
 allocation_pending_timeout_seconds: 1800
 allocation_pending_backoff_seconds: 1800
 allocation_reserved_job_slots: 0
@@ -55,6 +56,7 @@ Field meanings:
 - `allocation_partition`: `auto` lets the scheduler rank partitions from inventory.
 - `allocation_cpus`: CPU cores requested by CPU warm pool allocations. Keep this at or below the per-node cluster/QOS limit.
 - `allocation_memory`: memory for CPU warm pool allocations. `0` means Slurm partition default/all available behavior depending on cluster policy.
+- `allocation_attach_stop_before_drain_seconds`: stop attaching new tasks to an allocation this many seconds before `allocation_drain_after_seconds`.
 - `allocation_pending_timeout_seconds`: how long an allocation job may stay Slurm `PENDING` before the scheduler cancels it.
 - `allocation_pending_backoff_seconds`: cooldown before the same resource pool is submitted again after a pending timeout.
 - `cpu_pool_allow_gpu_partitions`: allows CPU pools to use GPU partitions when their CPU profile is stronger.

@@ -41,6 +41,7 @@ class AppConfig:
     allocation_scale_out_usage_threshold: float = 0.70
     allocation_scale_in_idle_seconds: int = 600
     allocation_drain_after_seconds: int = 129600
+    allocation_attach_stop_before_drain_seconds: int = 1800
     allocation_force_cancel_after_seconds: int = 140400
     allocation_pending_timeout_seconds: int = 1800
     allocation_pending_backoff_seconds: int = 1800

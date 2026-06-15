@@ -189,3 +189,9 @@
 - Problem: The dashboard can show stale allocation/task/job state while the scheduler loop is actively moving work.
 - Discovery: A full-page refresh is sufficient for the current server-rendered UI, but it must not interrupt users filling out submission forms.
 - Improvement: Add 15-second dashboard auto-refresh with guards for focused or edited form fields.
+
+## 2026-06-16 06:06:08 KST
+
+- Problem: After `python_git` became an attached task, external agents lost reliable result-file retrieval and had no API to clean up accidentally duplicated tasks.
+- Discovery: Random `mktemp` git task directories are invisible to the task model, and near-drain allocations can accept work shortly before the scheduler closes them.
+- Improvement: Make git task workdirs deterministic from task id, expose `git_repo`/`git_workdir` remote-file bases, add task cancel and bulk-cancel APIs, and stop attaching new tasks to allocations near their drain threshold.

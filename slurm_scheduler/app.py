@@ -158,6 +158,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         allocation_scale_out_usage_threshold=config.allocation_scale_out_usage_threshold,
         allocation_scale_in_idle_seconds=config.allocation_scale_in_idle_seconds,
         allocation_drain_after_seconds=config.allocation_drain_after_seconds,
+        allocation_attach_stop_before_drain_seconds=config.allocation_attach_stop_before_drain_seconds,
         allocation_force_cancel_after_seconds=config.allocation_force_cancel_after_seconds,
         allocation_pending_timeout_seconds=config.allocation_pending_timeout_seconds,
         allocation_pending_backoff_seconds=config.allocation_pending_backoff_seconds,
@@ -498,6 +499,14 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         scheduler.cancel(job_id)
         return RedirectResponse("/", status_code=303)
 
+    @app.post("/tasks/{task_id}/cancel")
+    def cancel_task(task_id: int) -> Response:
+        try:
+            scheduler.cancel_task(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return RedirectResponse("/", status_code=303)
+
     @app.post("/jobs/{job_id}/simulation-count")
     def update_simulation_count(job_id: int, simulation_count: int = Form(...)) -> Response:
         job = db.get_job(job_id)
@@ -549,6 +558,20 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     @app.get("/api/tasks")
     def api_tasks() -> list[dict]:
         return db.list_tasks()
+
+    @app.post("/api/tasks/cancel")
+    def api_cancel_tasks(
+        name_contains: str = "",
+        statuses: str = "queued,attaching,running",
+        limit: int = 5000,
+    ) -> dict:
+        requested_statuses = {part.strip() for part in statuses.split(",") if part.strip()}
+        valid_statuses = {"queued", "attaching", "running", "completed", "failed", "cancelled"}
+        unknown = sorted(requested_statuses - valid_statuses)
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"unknown task status: {', '.join(unknown)}")
+        cancelled = scheduler.cancel_tasks(name_contains=name_contains, statuses=requested_statuses, limit=max(1, limit))
+        return {"cancelled": cancelled, "count": len(cancelled)}
 
     @app.get("/api/allocations")
     def api_allocations() -> list[dict]:
@@ -607,6 +630,14 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             raise HTTPException(status_code=404)
         return task
 
+    @app.post("/api/tasks/{task_id}/cancel")
+    def api_cancel_task(task_id: int) -> dict:
+        try:
+            scheduler.cancel_task(task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"cancelled": [task_id], "count": 1}
+
     @app.get("/api/tasks/{task_id}/remote-file")
     def api_task_remote_file(task_id: int, path: str, base: str = "remote_cwd") -> Response:
         task = db.get_task(task_id)
@@ -621,12 +652,19 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             raise HTTPException(status_code=404, detail="account not found")
         if base == "remote_dir":
             root = task.get("remote_dir") or ""
+        elif base == "git_workdir":
+            root = posixpath.join(account.remote_workspace, "git_tasks", f"task-{task_id}")
+        elif base == "git_repo":
+            root = posixpath.join(account.remote_workspace, "git_tasks", f"task-{task_id}", "repo")
         elif base == "stdout":
             root = posixpath.dirname(task.get("stdout_path") or "")
         elif base == "stderr":
             root = posixpath.dirname(task.get("stderr_path") or "")
         else:
-            root = task.get("remote_cwd") or task.get("remote_dir") or ""
+            root = (task.get("remote_cwd") or task.get("remote_dir") or "").replace(
+                ACCOUNT_WORKSPACE_PLACEHOLDER,
+                account.remote_workspace,
+            )
         if not root:
             raise HTTPException(status_code=409, detail="task has no remote base path")
         remote_file = posixpath.join(root, path)

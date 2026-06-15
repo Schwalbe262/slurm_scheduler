@@ -12,7 +12,7 @@ import paramiko
 from .config import AccountConfig
 from .inventory import normalize_gpu_model
 from .models import AccountSnapshot, JobStatus
-from .task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER
+from .task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, TASK_ID_PLACEHOLDER
 
 
 @dataclass(frozen=True)
@@ -369,7 +369,12 @@ def shell_expandable_path(path: str) -> str:
 
 def resolve_task_placeholders(task: dict, account: AccountConfig) -> dict:
     workspace = account.remote_workspace or "."
-    command = str(task.get("command") or "").replace(ACCOUNT_WORKSPACE_PLACEHOLDER, shell_path(workspace))
+    task_id = str(task.get("id") or "")
+    command = (
+        str(task.get("command") or "")
+        .replace(ACCOUNT_WORKSPACE_PLACEHOLDER, shell_path(workspace))
+        .replace(TASK_ID_PLACEHOLDER, shlex.quote(task_id))
+    )
     remote_cwd = str(task.get("remote_cwd") or "").replace(ACCOUNT_WORKSPACE_PLACEHOLDER, workspace)
     return {**task, "command": command, "remote_cwd": remote_cwd}
 
@@ -637,6 +642,19 @@ class SlurmAccountClient:
             result = ssh.run(f"scancel {shlex.quote(slurm_job_id)}")
         if result.exit_code != 0:
             raise RuntimeError(result.stderr.strip() or "scancel failed")
+
+    def cancel_task(self, task: dict) -> None:
+        wrapper_pid = str(task.get("wrapper_pid") or "").strip()
+        if not wrapper_pid:
+            return
+        command = (
+            f"pkill -TERM -P {shlex.quote(wrapper_pid)} >/dev/null 2>&1 || true; "
+            f"kill -TERM {shlex.quote(wrapper_pid)} >/dev/null 2>&1 || true"
+        )
+        with SSHSession(self.account) as ssh:
+            result = ssh.run(command)
+        if result.exit_code != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "task cancel failed")
 
     def remove_tree(self, remote_path: str) -> None:
         with SSHSession(self.account) as ssh:

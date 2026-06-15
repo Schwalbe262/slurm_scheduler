@@ -234,3 +234,12 @@ Remaining verification:
 - Added dashboard auto-refresh every 15 seconds.
 - Auto-refresh is skipped while an input, textarea, or select is focused.
 - Auto-refresh is also skipped after a form has been edited, so partially entered job/task submissions are not lost.
+
+## 2026-06-16 06:06:08 KST
+
+- Changed `/tasks/git` and `POST /jobs job_mode=python_git` task wrappers to clone into deterministic directories: `<remote_workspace>/git_tasks/task-<task_id>/repo`.
+- Added task remote-file bases `git_workdir` and `git_repo`, so external agents can retrieve result files written by git-based tasks.
+- Added `POST /api/tasks/{task_id}/cancel` and `POST /api/tasks/cancel` for individual and filtered bulk task cancellation.
+- Added remote task wrapper termination through `SlurmAccountClient.cancel_task`.
+- Added `allocation_attach_stop_before_drain_seconds` and stopped assigning new tasks to allocations close to their drain threshold.
+- Documented task cancellation and `base=git_repo` result retrieval.

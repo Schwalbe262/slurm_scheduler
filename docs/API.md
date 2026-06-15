@@ -216,13 +216,38 @@ curl -sS "$SCHEDULER_URL/api/tasks/123/stdout"
 curl -sS "$SCHEDULER_URL/api/tasks/123/stderr"
 ```
 
+### `POST /api/tasks/{task_id}/cancel`
+
+Cancels a queued, attaching, or running attached task. Running tasks are marked cancelled and the scheduler asks the remote account to terminate the task wrapper process.
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/tasks/123/cancel"
+```
+
+### `POST /api/tasks/cancel`
+
+Bulk-cancels tasks matching a name substring and status list. This is intended for external agents that accidentally submitted duplicate task batches.
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/tasks/cancel?name_contains=crypto-sweep&statuses=queued,attaching,running"
+```
+
 ### `GET /api/tasks/{task_id}/remote-file`
 
-Reads a safe relative file path from the task account over SSH. `base` can be `remote_cwd`, `remote_dir`, `stdout`, or `stderr`.
+Reads a safe relative file path from the task account over SSH. `base` can be `remote_cwd`, `remote_dir`, `stdout`, `stderr`, `git_workdir`, or `git_repo`.
 
 ```bash
 curl -sS "$SCHEDULER_URL/api/tasks/123/remote-file?base=remote_cwd&path=result.json"
+curl -sS "$SCHEDULER_URL/api/tasks/123/remote-file?base=git_repo&path=results/best.json"
 ```
+
+For `/tasks/git` and `POST /jobs job_mode=python_git`, the scheduler clones into:
+
+```text
+<account remote_workspace>/git_tasks/task-<task_id>/repo
+```
+
+Use `base=git_repo` to read result files written inside the cloned repository.
 
 Task states:
 

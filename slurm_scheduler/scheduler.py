@@ -35,6 +35,7 @@ class Scheduler:
         allocation_scale_out_usage_threshold: float = 0.70,
         allocation_scale_in_idle_seconds: int = 600,
         allocation_drain_after_seconds: int = 129600,
+        allocation_attach_stop_before_drain_seconds: int = 1800,
         allocation_force_cancel_after_seconds: int = 140400,
         allocation_pending_timeout_seconds: int = 1800,
         allocation_pending_backoff_seconds: int = 1800,
@@ -77,6 +78,7 @@ class Scheduler:
         self.allocation_scale_out_usage_threshold = allocation_scale_out_usage_threshold
         self.allocation_scale_in_idle_seconds = allocation_scale_in_idle_seconds
         self.allocation_drain_after_seconds = allocation_drain_after_seconds
+        self.allocation_attach_stop_before_drain_seconds = allocation_attach_stop_before_drain_seconds
         self.allocation_force_cancel_after_seconds = allocation_force_cancel_after_seconds
         self.allocation_pending_timeout_seconds = allocation_pending_timeout_seconds
         self.allocation_pending_backoff_seconds = allocation_pending_backoff_seconds
@@ -607,6 +609,8 @@ class Scheduler:
         for allocation in self.db.list_allocations(limit=500):
             if allocation["state"] not in {AllocationStatus.WARM.value, AllocationStatus.ACTIVE.value}:
                 continue
+            if not self.allocation_accepts_new_tasks(allocation):
+                continue
             if not allocation.get("slurm_job_id"):
                 continue
             if not self.allocation_can_run_task(allocation, task, include_pending=False):
@@ -629,6 +633,13 @@ class Scheduler:
                 int(item["free_memory_mb"]),
             ),
         )
+
+    def allocation_accepts_new_tasks(self, allocation: dict) -> bool:
+        if self.allocation_drain_after_seconds <= 0:
+            return True
+        stop_before = max(0, self.allocation_attach_stop_before_drain_seconds)
+        cutoff = max(0, self.allocation_drain_after_seconds - stop_before)
+        return self._age_seconds(allocation) < cutoff
 
     def has_inflight_capacity_for_task(self, task: dict) -> bool:
         for allocation in self.db.list_allocations(limit=500):
@@ -1640,3 +1651,37 @@ class Scheduler:
             raise ValueError("account not found")
         self.client_factory(account).cancel(job["slurm_job_id"])
         self.db.update_job(job_id, status=JobStatus.CANCELLED.value, finished_at="CURRENT_TIMESTAMP")
+
+    def cancel_task(self, task_id: int) -> None:
+        task = self.db.get_task(task_id)
+        if not task:
+            raise ValueError("task not found")
+        if task["status"] in {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}:
+            return
+        account = self.account_by_name(str(task.get("account_name") or ""))
+        if account and task["status"] in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
+            try:
+                self.client_factory(account).cancel_task(task)
+            except Exception as exc:
+                LOGGER.warning("failed to cancel task %s remotely: %s", task_id, exc)
+        self.db.update_task(task_id, status=TaskStatus.CANCELLED.value, finished_at="CURRENT_TIMESTAMP")
+        if task.get("allocation_id"):
+            self.recalculate_allocation_capacity()
+
+    def cancel_tasks(
+        self,
+        name_contains: str = "",
+        statuses: set[str] | None = None,
+        limit: int = 5000,
+    ) -> list[int]:
+        wanted_statuses = statuses or {TaskStatus.QUEUED.value, TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}
+        needle = name_contains.strip().lower()
+        cancelled: list[int] = []
+        for task in self.db.list_tasks(limit=limit):
+            if task["status"] not in wanted_statuses:
+                continue
+            if needle and needle not in str(task.get("name") or "").lower():
+                continue
+            self.cancel_task(int(task["id"]))
+            cancelled.append(int(task["id"]))
+        return sorted(cancelled)

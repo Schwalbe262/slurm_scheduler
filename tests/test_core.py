@@ -9,7 +9,7 @@ from slurm_scheduler.models import AccountSnapshot, AllocationStatus, JobCreate,
 from slurm_scheduler.scheduler import Scheduler
 from slurm_scheduler.inventory import parse_scontrol_nodes, parse_sinfo_nodes, partition_rank
 from slurm_scheduler.pestat import parse_pestat, plan_dynamic_allocations
-from slurm_scheduler.task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, build_git_task_command
+from slurm_scheduler.task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, TASK_ID_PLACEHOLDER, build_git_task_command
 from slurm_scheduler.slurm import (
     RemoteExecutionError,
     apply_env_profile,
@@ -195,13 +195,15 @@ class SlurmParsingTests(unittest.TestCase):
     def test_git_task_command_uses_account_workspace_placeholder(self) -> None:
         command = build_git_task_command("git@example.com:repo.git", "main", "run.py", "--x 1")
         self.assertIn(ACCOUNT_WORKSPACE_PLACEHOLDER, command)
+        self.assertIn(TASK_ID_PLACEHOLDER, command)
         self.assertIn("git clone git@example.com:repo.git", command)
         self.assertIn("git checkout main", command)
         self.assertIn("python run.py --x 1", command)
         account = AccountConfig("a", "host", 22, "a", "key", "~/scheduler")
-        task = resolve_task_placeholders({"remote_cwd": ACCOUNT_WORKSPACE_PLACEHOLDER, "command": command}, account)
+        task = resolve_task_placeholders({"id": 42, "remote_cwd": ACCOUNT_WORKSPACE_PLACEHOLDER, "command": command}, account)
         self.assertEqual(task["remote_cwd"], "~/scheduler")
         self.assertIn("$HOME/scheduler/git_tasks", task["command"])
+        self.assertIn("task-42", task["command"])
 
     def test_task_script_uses_remote_cwd_and_command(self) -> None:
         task = {
@@ -328,6 +330,7 @@ class FakeClient:
     allocation_states: dict[str, JobStatus] = {}
     task_states: dict[int, JobStatus] = {}
     cancelled: list[str] = []
+    cancelled_tasks: list[int] = []
     removed: list[str] = []
 
     def __init__(self, account: AccountConfig):
@@ -383,6 +386,9 @@ class FakeClient:
     def cancel(self, slurm_job_id: str) -> None:
         self.cancelled.append(slurm_job_id)
 
+    def cancel_task(self, task: dict) -> None:
+        self.cancelled_tasks.append(int(task["id"]))
+
     def remove_tree(self, remote_path: str) -> None:
         self.removed.append(remote_path)
 
@@ -427,6 +433,7 @@ class SchedulerTests(unittest.TestCase):
         FakeClient.pending_reasons = {}
         FakeClient.task_states = {}
         FakeClient.cancelled = []
+        FakeClient.cancelled_tasks = []
         FakeClient.removed = []
         FakeClient.snapshots = {
             "a": AccountSnapshot("a", running=3, pending=0, max_running=4, max_pending=10, max_total=10),
@@ -575,6 +582,51 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(FakeClient.removed, ["/work/job-1-1000", "/work/allocation-1-1000"])
         self.assertEqual(self.db.get_job(job_id)["remote_job_dir"], "")
         self.assertEqual(self.db.get_allocation(allocation_id)["remote_dir"], "")
+
+    def test_cancel_task_marks_queued_task_cancelled(self) -> None:
+        task_id = self.db.create_task(TaskCreate("queued", "~/case", "run"))
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        scheduler.cancel_task(task_id)
+        task = self.db.get_task(task_id)
+        self.assertEqual(task["status"], TaskStatus.CANCELLED.value)
+        self.assertEqual(FakeClient.cancelled_tasks, [])
+
+    def test_cancel_task_kills_running_wrapper(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=8,
+            total_memory_mb=65536,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="alloc-1")
+        task_id = self.db.create_task(TaskCreate("running", "~/case", "run"))
+        self.db.update_task(
+            task_id,
+            status=TaskStatus.RUNNING.value,
+            account_name="a",
+            allocation_id=allocation_id,
+            wrapper_pid="1234",
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        scheduler.cancel_task(task_id)
+        task = self.db.get_task(task_id)
+        allocation = self.db.get_allocation(allocation_id)
+        self.assertEqual(task["status"], TaskStatus.CANCELLED.value)
+        self.assertEqual(FakeClient.cancelled_tasks, [task_id])
+        self.assertEqual(allocation["free_cpus"], allocation["total_cpus"])
+
+    def test_cancel_tasks_filters_by_name_and_status(self) -> None:
+        first = self.db.create_task(TaskCreate("crypto-sweep-a", "~/case", "run"))
+        second = self.db.create_task(TaskCreate("crypto-sweep-b", "~/case", "run"))
+        third = self.db.create_task(TaskCreate("other", "~/case", "run"))
+        self.db.update_task(second, status=TaskStatus.COMPLETED.value, finished_at="2000-01-01 00:00:00")
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        cancelled = scheduler.cancel_tasks(name_contains="crypto-sweep")
+        self.assertEqual(cancelled, [first])
+        self.assertEqual(self.db.get_task(first)["status"], TaskStatus.CANCELLED.value)
+        self.assertEqual(self.db.get_task(second)["status"], TaskStatus.COMPLETED.value)
+        self.assertEqual(self.db.get_task(third)["status"], TaskStatus.QUEUED.value)
 
     def test_maintains_minimum_warm_allocation(self) -> None:
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, allocation_cpus=8)
@@ -1338,6 +1390,31 @@ class SchedulerTests(unittest.TestCase):
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
         task = {"cpus": 4, "memory_mb": 2048, "gpus": 1, "gpu_model": "a6000", "partition": "auto", "node_name": ""}
         self.assertEqual(scheduler.best_allocation_for_task(task)["id"], allocation_id)
+
+    def test_near_drain_allocation_does_not_accept_new_tasks(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=8,
+            total_memory_mb=65536,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="alloc-1",
+            started_at="2000-01-01 00:00:00",
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            allocation_drain_after_seconds=3600,
+            allocation_attach_stop_before_drain_seconds=1800,
+        )
+        task = {"cpus": 1, "memory_mb": 2048, "gpus": 0, "partition": "auto", "node_name": ""}
+        self.assertIsNone(scheduler.best_allocation_for_task(task))
 
     def test_gpu_task_requires_matching_model(self) -> None:
         allocation_id = self.db.create_allocation(
