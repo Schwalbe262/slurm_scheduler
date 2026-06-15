@@ -141,6 +141,22 @@ If pending reason repeatedly shows `(Resources)`, the two-GPU shape may not fit 
 
 When preferred A6000-class warm jobs are pending, the scheduler can still open a lower-priority GPU allocation if `gpu_prewarm.max_warm_allocations` has spare room. This keeps some GPU capacity ready while the preferred request remains queued.
 
+## Git Clone Fails Before Slurm Starts
+
+Direct `/jobs` submissions clone and check out the repo before `sbatch`. If this pre-submit phase fails, Slurm stdout/stderr may not exist yet. Read the scheduler's submit logs instead:
+
+```bash
+curl -sS "$SCHEDULER_URL/api/jobs/<job_id>"
+curl -sS "$SCHEDULER_URL/api/jobs/<job_id>/remote-file?base=remote_job_dir&path=submit.stderr.log"
+curl -sS "$SCHEDULER_URL/api/jobs/<job_id>/remote-file?base=remote_job_dir&path=submit.stdout.log"
+```
+
+Common causes:
+
+- `Host key verification failed`: add the Git host to the selected account's `~/.ssh/known_hosts` or use `StrictHostKeyChecking accept-new` for the SSH alias.
+- `Permission denied (publickey)`: the scheduler account cannot read the expected SSH alias or deploy key.
+- `Repository not found`: the deploy key is installed on the wrong repository or does not have read access.
+
 ## GPU Capacity Looks Wrong
 
 GPU capacity is not just physical GPU count. It must account for GPUs already allocated by other users.

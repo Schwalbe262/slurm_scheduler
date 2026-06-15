@@ -75,6 +75,7 @@ Basic client flow:
 5. Include `account_name` only when the job must stay on a specific Slurm account.
 6. Poll `/api/tasks`, `/api/jobs`, and `/api/allocations`.
 7. Read task output through `/api/tasks/{task_id}/stdout` or `/api/tasks/{task_id}/remote-file`.
+8. For direct `/jobs` clone or submission failures, read `submit.stderr.log` from the job remote directory.
 
 ```bash
 export SCHEDULER_URL=http://<scheduler-host>:8000
@@ -114,6 +115,8 @@ curl -sS -X POST "$SCHEDULER_URL/tasks/git" \
 
 Private Git repos must be cloneable from the selected cluster account. Prefer a read-only GitHub deploy key and an SSH alias in that account's `~/.ssh/config`; avoid putting personal access tokens in scheduler form fields.
 
+If a Git-backed `/jobs` submission fails before Slurm starts, the scheduler records the pre-submit logs under the job remote directory. Use these to distinguish `Host key verification failed`, `Permission denied (publickey)`, and ordinary Git errors.
+
 Use `/jobs` with `dynamic_packed_srun` when the scheduler should split many simulation cases into packed Slurm jobs:
 
 ```bash
@@ -140,6 +143,7 @@ curl -sS "$SCHEDULER_URL/api/jobs"
 curl -sS "$SCHEDULER_URL/api/allocations"
 curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/stdout"
 curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/remote-file?base=remote_cwd&path=results/case001.json"
+curl -sS "$SCHEDULER_URL/api/jobs/<job_id>/remote-file?base=remote_job_dir&path=submit.stderr.log"
 ```
 
 ## CPU And Memory Requests

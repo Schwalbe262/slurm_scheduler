@@ -150,3 +150,14 @@ Remaining verification:
 - Fixed queued attached-task head-of-line blocking.
 - The scheduler now scans all queued tasks and skips tasks that are waiting for unavailable capacity, allowing later CPU or fallback-GPU tasks to attach immediately.
 - Added a regression test where a blocked A6000ADA task no longer prevents a ready CPU task from running.
+
+## 2026-06-16 04:37:28 KST
+
+- Investigated RTX3090 attached task failures.
+- Confirmed the RTX3090 allocation itself was healthy by manually attaching a small `srun` step to Slurm job 680352 on n002 and running `nvidia-smi -L`.
+- Found failed task commands were about 935 KB each, and the scheduler was writing `task.sh` through a single SSH exec command with `printf`.
+- Changed remote script creation for jobs, allocations, and attached tasks to use SFTP instead of embedding large scripts in the SSH command line.
+- Added remote execution errors that carry log paths back to the scheduler, so failed task attach attempts can still expose `remote_dir`, `stdout_path`, and `stderr_path`.
+- Added pre-submit logs for direct jobs: `submit.stdout.log` and `submit.stderr.log` under `remote_job_dir`.
+- Documented how to read submit logs through `/api/jobs/{job_id}/remote-file`.
+- Restarted the scheduler service and confirmed a new 939 KB RTX3090 task attached to allocation 11 with populated `remote_dir`, `stdout_path`, `stderr_path`, and `wrapper_pid`.

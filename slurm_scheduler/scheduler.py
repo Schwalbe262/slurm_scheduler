@@ -11,7 +11,7 @@ from .db import Database
 from .inventory import CPU_PROFILES_BY_PARTITION, GPU_PRIORITY, normalize_gpu_model, parse_scontrol_nodes, parse_sinfo_nodes, partition_rank
 from .models import AccountSnapshot, AllocationStatus, JobStatus, TaskStatus
 from .pestat import PestatNode, parse_pestat
-from .slurm import SSHSession, SlurmAccountClient
+from .slurm import RemoteExecutionError, SSHSession, SlurmAccountClient
 
 LOGGER = logging.getLogger(__name__)
 ClientFactory = Callable[[AccountConfig], SlurmAccountClient]
@@ -438,6 +438,16 @@ class Scheduler:
             )
             try:
                 result = self.client_factory(account).attach_task(task, allocation)
+            except RemoteExecutionError as exc:
+                self.db.update_task(
+                    task["id"],
+                    status=TaskStatus.FAILED.value,
+                    failure_message=str(exc),
+                    finished_at="CURRENT_TIMESTAMP",
+                    **exc.result_fields,
+                )
+                self.recalculate_allocation_capacity()
+                continue
             except Exception as exc:
                 self.db.update_task(
                     task["id"],
@@ -1159,6 +1169,15 @@ class Scheduler:
         self.db.update_job(job["id"], status=JobStatus.SUBMITTING.value, account_name=account.name)
         try:
             result = self.client_factory(account).submit(job)
+        except RemoteExecutionError as exc:
+            self.db.update_job(
+                job["id"],
+                status=JobStatus.FAILED.value,
+                failure_message=str(exc),
+                finished_at="CURRENT_TIMESTAMP",
+                **exc.result_fields,
+            )
+            return
         except Exception as exc:
             self.db.update_job(
                 job["id"],

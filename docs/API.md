@@ -180,6 +180,14 @@ curl -sS "$SCHEDULER_URL/api/jobs"
 curl -sS "$SCHEDULER_URL/api/jobs/123"
 ```
 
+### `GET /api/jobs/{job_id}/remote-file`
+
+Reads a safe relative file path from the job account over SSH. `base=remote_job_dir` is useful for submission diagnostics such as Git clone stderr.
+
+```bash
+curl -sS "$SCHEDULER_URL/api/jobs/123/remote-file?base=remote_job_dir&path=submit.stderr.log"
+```
+
 ### `GET /api/tasks`
 
 ```bash

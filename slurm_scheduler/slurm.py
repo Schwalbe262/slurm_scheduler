@@ -5,6 +5,7 @@ import re
 import shlex
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import paramiko
 
@@ -19,6 +20,12 @@ class CommandResult:
     stdout: str
     stderr: str
     exit_code: int
+
+
+class RemoteExecutionError(RuntimeError):
+    def __init__(self, message: str, result_fields: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.result_fields = result_fields or {}
 
 
 class SSHSession:
@@ -49,6 +56,28 @@ class SSHSession:
             stderr=stderr.read().decode("utf-8", errors="replace"),
             exit_code=exit_code,
         )
+
+    def write_text_file(self, path: str, text: str) -> None:
+        sftp = self.client.open_sftp()
+        try:
+            with sftp.file(path, "wb") as remote_file:
+                remote_file.write(text.encode("utf-8"))
+        finally:
+            sftp.close()
+
+    def read_text_file(self, path: str) -> str:
+        sftp = self.client.open_sftp()
+        try:
+            with sftp.file(path, "rb") as remote_file:
+                data = remote_file.read()
+        finally:
+            sftp.close()
+        return data.decode("utf-8", errors="replace")
+
+
+def command_failure_message(result: CommandResult, fallback: str) -> str:
+    message = result.stderr.strip() or result.stdout.strip()
+    return message or fallback
 
 
 def parse_squeue_counts(output: str) -> tuple[int, int]:
@@ -403,30 +432,57 @@ class SlurmAccountClient:
     def submit(self, job: dict) -> dict[str, str]:
         stamp = int(time.time())
         remote_job_dir = posixpath.join(self.account.remote_workspace, f"job-{job['id']}-{stamp}")
+        run_script_path = posixpath.join(remote_job_dir, "run.sbatch")
+        submit_stdout_path = posixpath.join(remote_job_dir, "submit.stdout.log")
+        submit_stderr_path = posixpath.join(remote_job_dir, "submit.stderr.log")
+        submit_stdout_file = "submit.stdout.log"
+        submit_stderr_file = "submit.stderr.log"
         job = apply_env_profile(job, self.account)
         script = build_sbatch_script(job, remote_job_dir)
-        quoted_script = shlex.quote(script)
         if job.get("job_mode") == "packed_srun":
             commands = [
                 f"mkdir -p {shlex.quote(remote_job_dir)}",
-                f"printf %s {quoted_script} > {shlex.quote(posixpath.join(remote_job_dir, 'run.sbatch'))}",
-                f"cd {shlex.quote(remote_job_dir)} && sbatch run.sbatch",
+                f"cd {shlex.quote(remote_job_dir)} && sbatch run.sbatch > {shlex.quote(submit_stdout_file)} 2> {shlex.quote(submit_stderr_file)}",
             ]
         else:
             repo_url = shlex.quote(job["repo_url"])
             git_ref = shlex.quote(job["git_ref"])
             commands = [
                 f"mkdir -p {shlex.quote(remote_job_dir)}",
-                f"cd {shlex.quote(remote_job_dir)} && git clone {repo_url} repo",
-                f"cd {shlex.quote(posixpath.join(remote_job_dir, 'repo'))} && git checkout {git_ref}",
-                f"printf %s {quoted_script} > {shlex.quote(posixpath.join(remote_job_dir, 'run.sbatch'))}",
-                f"cd {shlex.quote(remote_job_dir)} && sbatch run.sbatch",
+                (
+                    f"cd {shlex.quote(remote_job_dir)} "
+                    f"&& git clone {repo_url} repo >> {shlex.quote(submit_stdout_file)} 2>> {shlex.quote(submit_stderr_file)}"
+                ),
+                (
+                    f"cd {shlex.quote(posixpath.join(remote_job_dir, 'repo'))} "
+                    f"&& git checkout {git_ref} >> {shlex.quote(posixpath.join('..', submit_stdout_file))} 2>> {shlex.quote(posixpath.join('..', submit_stderr_file))}"
+                ),
+                f"cd {shlex.quote(remote_job_dir)} && sbatch run.sbatch >> {shlex.quote(submit_stdout_file)} 2>> {shlex.quote(submit_stderr_file)}",
             ]
         with SSHSession(self.account) as ssh:
-            result = ssh.run(" && ".join(commands))
+            mkdir = ssh.run(commands[0])
+            if mkdir.exit_code != 0:
+                raise RemoteExecutionError(
+                    command_failure_message(mkdir, "failed to create remote job directory"),
+                    {
+                        "remote_job_dir": remote_job_dir,
+                        "stdout_path": submit_stdout_path,
+                        "stderr_path": submit_stderr_path,
+                    },
+                )
+            ssh.write_text_file(run_script_path, script)
+            result = ssh.run(" && ".join(commands[1:]))
+            submit_stdout = ssh.read_text_file(submit_stdout_path) if result.exit_code == 0 else ""
         if result.exit_code != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "sbatch failed")
-        slurm_job_id = parse_sbatch_job_id(result.stdout)
+            raise RemoteExecutionError(
+                command_failure_message(result, "sbatch submission failed"),
+                {
+                    "remote_job_dir": remote_job_dir,
+                    "stdout_path": submit_stdout_path,
+                    "stderr_path": submit_stderr_path,
+                },
+            )
+        slurm_job_id = parse_sbatch_job_id(result.stdout or submit_stdout)
         return {
             "slurm_job_id": slurm_job_id,
             "remote_job_dir": remote_job_dir,
@@ -443,14 +499,23 @@ class SlurmAccountClient:
             "stderr_path": posixpath.join(remote_dir, "allocation-%j.err"),
         }
         script = build_allocation_script(allocation, time_limit)
-        quoted_script = shlex.quote(script)
         commands = [
             f"mkdir -p {shlex.quote(remote_dir)}",
-            f"printf %s {quoted_script} > {shlex.quote(posixpath.join(remote_dir, 'allocation.sbatch'))}",
             f"cd {shlex.quote(remote_dir)} && sbatch allocation.sbatch",
         ]
         with SSHSession(self.account) as ssh:
-            result = ssh.run(" && ".join(commands))
+            result = ssh.run(commands[0])
+            if result.exit_code != 0:
+                raise RemoteExecutionError(
+                    command_failure_message(result, "failed to create remote allocation directory"),
+                    {
+                        "remote_dir": remote_dir,
+                        "stdout_path": allocation["stdout_path"],
+                        "stderr_path": allocation["stderr_path"],
+                    },
+                )
+            ssh.write_text_file(posixpath.join(remote_dir, "allocation.sbatch"), script)
+            result = ssh.run(commands[1])
         if result.exit_code != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "allocation sbatch failed")
         slurm_job_id = parse_sbatch_job_id(result.stdout)
@@ -469,6 +534,12 @@ class SlurmAccountClient:
         stderr_path = posixpath.join(remote_dir, "stderr.log")
         exit_code_path = posixpath.join(remote_dir, "exit_code")
         wrapper_path = posixpath.join(remote_dir, "wrapper.log")
+        result_fields = {
+            "remote_dir": remote_dir,
+            "stdout_path": stdout_path,
+            "stderr_path": stderr_path,
+            "exit_code_path": exit_code_path,
+        }
         task = resolve_task_placeholders(apply_env_profile(task, self.account), self.account)
         script = build_task_script(task)
         wrapper = build_srun_attach_command(
@@ -481,14 +552,17 @@ class SlurmAccountClient:
         )
         commands = [
             f"mkdir -p {shlex.quote(remote_dir)}",
-            f"printf %s {shlex.quote(script)} > {shlex.quote(script_path)}",
             f"chmod +x {shlex.quote(script_path)}",
             f"bash -lc {shlex.quote(f'nohup bash -lc {shlex.quote(wrapper)} > {shlex.quote(wrapper_path)} 2>&1 & echo $!')}",
         ]
         with SSHSession(self.account) as ssh:
-            result = ssh.run(" && ".join(commands))
+            result = ssh.run(commands[0])
+            if result.exit_code != 0:
+                raise RemoteExecutionError(command_failure_message(result, "failed to create remote task directory"), result_fields)
+            ssh.write_text_file(script_path, script)
+            result = ssh.run(" && ".join(commands[1:]))
         if result.exit_code != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "srun attach failed")
+            raise RemoteExecutionError(command_failure_message(result, "srun attach failed"), result_fields)
         return {
             "remote_dir": remote_dir,
             "stdout_path": stdout_path,

@@ -11,6 +11,7 @@ from slurm_scheduler.inventory import parse_scontrol_nodes, parse_sinfo_nodes, p
 from slurm_scheduler.pestat import parse_pestat, plan_dynamic_allocations
 from slurm_scheduler.task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, build_git_task_command
 from slurm_scheduler.slurm import (
+    RemoteExecutionError,
     apply_env_profile,
     build_allocation_script,
     build_sbatch_script,
@@ -348,6 +349,31 @@ class FakeClient:
         self.cancelled.append(slurm_job_id)
 
 
+class AttachFailureClient(FakeClient):
+    def attach_task(self, task: dict, allocation: dict) -> dict[str, str]:
+        raise RemoteExecutionError(
+            "ssh exec failed",
+            {
+                "remote_dir": f"/remote/task-{task['id']}",
+                "stdout_path": f"/remote/task-{task['id']}/stdout.log",
+                "stderr_path": f"/remote/task-{task['id']}/stderr.log",
+                "exit_code_path": f"/remote/task-{task['id']}/exit_code",
+            },
+        )
+
+
+class SubmitFailureClient(FakeClient):
+    def submit(self, job: dict) -> dict[str, str]:
+        raise RemoteExecutionError(
+            "git clone failed",
+            {
+                "remote_job_dir": f"/remote/job-{job['id']}",
+                "stdout_path": f"/remote/job-{job['id']}/submit.stdout.log",
+                "stderr_path": f"/remote/job-{job['id']}/submit.stderr.log",
+            },
+        )
+
+
 class SchedulerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -403,6 +429,17 @@ class SchedulerTests(unittest.TestCase):
         job = self.db.get_job(job_id)
         self.assertEqual(job["status"], JobStatus.SUBMITTED.value)
         self.assertEqual(job["account_name"], "a")
+
+    def test_submit_failure_keeps_remote_submit_log_paths(self) -> None:
+        job_id = self.db.create_job(JobCreate("git@example.com:repo.git", "main", "run.py", account_name="a"))
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=SubmitFailureClient)
+        scheduler.submit_next_queued_job()
+        job = self.db.get_job(job_id)
+        self.assertEqual(job["status"], JobStatus.FAILED.value)
+        self.assertEqual(job["failure_message"], "git clone failed")
+        self.assertEqual(job["remote_job_dir"], f"/remote/job-{job_id}")
+        self.assertEqual(job["stdout_path"], f"/remote/job-{job_id}/submit.stdout.log")
+        self.assertEqual(job["stderr_path"], f"/remote/job-{job_id}/submit.stderr.log")
 
     def test_choose_account_respects_total_job_limit(self) -> None:
         FakeClient.snapshots = {
@@ -513,6 +550,19 @@ class SchedulerTests(unittest.TestCase):
         allocation = self.db.get_allocation(task["allocation_id"])
         self.assertEqual(task["status"], TaskStatus.RUNNING.value)
         self.assertEqual(allocation["free_cpus"], 4)
+
+    def test_attach_failure_keeps_remote_log_paths(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=AttachFailureClient, allocation_cpus=8)
+        scheduler.maintain_allocation_pool()
+        scheduler.refresh_allocations()
+        task_id = self.db.create_task(TaskCreate("large-payload", "~/case", "x" * 900_000, cpus=4, memory_mb=2048))
+        scheduler.assign_queued_tasks()
+        task = self.db.get_task(task_id)
+        self.assertEqual(task["status"], TaskStatus.FAILED.value)
+        self.assertEqual(task["failure_message"], "ssh exec failed")
+        self.assertEqual(task["remote_dir"], f"/remote/task-{task_id}")
+        self.assertEqual(task["stdout_path"], f"/remote/task-{task_id}/stdout.log")
+        self.assertEqual(task["stderr_path"], f"/remote/task-{task_id}/stderr.log")
 
     def test_assign_queued_tasks_skips_blocked_head_task(self) -> None:
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, allocation_cpus=8)

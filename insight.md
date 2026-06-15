@@ -131,3 +131,9 @@
 - Problem: One queued task waiting for a pending A6000 allocation can block unrelated ready tasks behind it.
 - Discovery: `assign_queued_tasks()` only inspected the oldest queued task and returned when it could not attach.
 - Improvement: Iterate across queued tasks in order and skip currently blocked tasks, so available CPU and fallback-GPU capacity is used immediately.
+
+## 2026-06-16 04:37:28 KST
+
+- Problem: Large attached-task payloads can fail before `srun` starts if the scheduler writes the generated script through an SSH command-line `printf`.
+- Discovery: The RTX3090 allocation accepted a small manual `srun` step, while failed RTX3090 tasks had about 935 KB commands and no stdout/stderr/wrapper paths in the DB.
+- Improvement: Upload generated scripts through SFTP and persist pre-submit/attach log paths on failure, so payload size no longer depends on SSH argument limits and clone stderr can be inspected through the API.
