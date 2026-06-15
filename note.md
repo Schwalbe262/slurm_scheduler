@@ -161,3 +161,11 @@ Remaining verification:
 - Added pre-submit logs for direct jobs: `submit.stdout.log` and `submit.stderr.log` under `remote_job_dir`.
 - Documented how to read submit logs through `/api/jobs/{job_id}/remote-file`.
 - Restarted the scheduler service and confirmed a new 939 KB RTX3090 task attached to allocation 11 with populated `remote_dir`, `stdout_path`, `stderr_path`, and `wrapper_pid`.
+
+## 2026-06-16 04:46:20 KST
+
+- Investigated failed job 52 (`crypto-smoke-ssh3`).
+- Confirmed the private Git clone succeeded: `repo/` existed under the remote job directory and contained the expected project files.
+- Found the failure was caused by the new submit-log implementation joining clone, checkout, and sbatch commands with `&&` in one shell while `remote_job_dir` is relative.
+- The checkout step attempted to `cd slurm_scheduler/job-52-.../repo` from inside the job directory, producing a duplicated relative path and `No such file or directory`.
+- Changed direct job submission to execute each pre-submit step in a fresh SSH exec command so relative workspace paths do not compound across `cd` commands.

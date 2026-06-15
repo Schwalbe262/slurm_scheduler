@@ -471,8 +471,13 @@ class SlurmAccountClient:
                     },
                 )
             ssh.write_text_file(run_script_path, script)
-            result = ssh.run(" && ".join(commands[1:]))
-            submit_stdout = ssh.read_text_file(submit_stdout_path) if result.exit_code == 0 else ""
+            submit_stdout = ""
+            for command in commands[1:]:
+                result = ssh.run(command)
+                if result.exit_code != 0:
+                    break
+            else:
+                submit_stdout = ssh.read_text_file(submit_stdout_path)
         if result.exit_code != 0:
             raise RemoteExecutionError(
                 command_failure_message(result, "sbatch submission failed"),

@@ -137,3 +137,9 @@
 - Problem: Large attached-task payloads can fail before `srun` starts if the scheduler writes the generated script through an SSH command-line `printf`.
 - Discovery: The RTX3090 allocation accepted a small manual `srun` step, while failed RTX3090 tasks had about 935 KB commands and no stdout/stderr/wrapper paths in the DB.
 - Improvement: Upload generated scripts through SFTP and persist pre-submit/attach log paths on failure, so payload size no longer depends on SSH argument limits and clone stderr can be inspected through the API.
+
+## 2026-06-16 04:46:20 KST
+
+- Problem: Relative remote workspaces break when multiple `cd <relative-path> && ...` steps are chained in a single remote shell.
+- Discovery: Job 52 cloned successfully, but the later checkout tried to resolve the same relative job path from inside the job directory.
+- Improvement: Run direct-job pre-submit steps as separate SSH exec calls after uploading `run.sbatch`, keeping each command's starting directory predictable.
