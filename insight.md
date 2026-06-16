@@ -299,3 +299,6 @@
 
 - Private repo access should be attached to the scheduler's task execution context, not to each Slurm account's home directory. A master-account deploy key plus per-task temporary `GIT_SSH_COMMAND` keeps capacity scheduling account-independent while avoiding long-lived key copies in every account.
 - SSH aliases are convenient for humans but brittle for distributed scheduler tasks. Rewriting matched repo URLs to canonical `git@github.com:org/repo.git` removes dependency on per-account `~/.ssh/config`.
+## 2026-06-16 19:19:17 KST
+
+- Capability labels are scheduling constraints, so they need first-class observability. Showing capability -> account/profile/source mappings directly in the dashboard prevents users from mistaking idle CPU in an ineligible account for usable capacity.

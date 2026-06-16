@@ -424,6 +424,48 @@
   </section>
 
   <section class="panel">
+    <h2>Capabilities</h2>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>CAPABILITY</th><th>ACCOUNTS</th><th>ENV PROFILES</th><th>SOURCE</th><th>CONDITION</th></tr></thead>
+        <tbody>
+        {% for capability in capabilities %}
+          <tr>
+            <td class="mono-cell">{{ capability.capability }}</td>
+            <td>{{ capability.accounts|join(", ") }}</td>
+            <td class="mono-cell">{{ capability.profiles|join(", ") if capability.profiles else "-" }}</td>
+            <td>{{ capability.sources|join(", ") }}</td>
+            <td>
+              <details>
+                <summary>{{ capability.details|length }} account rule{{ "" if capability.details|length == 1 else "s" }}</summary>
+                <div class="table-scroll section-gap">
+                  <table>
+                    <thead><tr><th>ACCOUNT</th><th>PROFILES</th><th>SOURCE</th><th>CONDITION</th><th>PREFIX</th></tr></thead>
+                    <tbody>
+                    {% for detail in capability.details %}
+                      <tr>
+                        <td>{{ detail.account }}</td>
+                        <td class="mono-cell">{{ detail.profiles|join(", ") if detail.profiles else "-" }}</td>
+                        <td>{{ detail.source }}</td>
+                        <td>{{ detail.condition }}</td>
+                        <td class="mono-cell">{{ detail.installed_prefix or "" }}</td>
+                      </tr>
+                    {% endfor %}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="5" class="muted">No capabilities configured.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
     <h2>Conda Env Sync</h2>
     <form method="post" action="/conda-env-sync" class="two-column-grid">
       <div>

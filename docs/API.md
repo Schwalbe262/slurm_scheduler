@@ -40,6 +40,16 @@ Refreshes account status immediately through SSH. Use sparingly because it touch
 curl -sS "$SCHEDULER_URL/api/accounts/status/live"
 ```
 
+### `GET /api/capabilities`
+
+Lists scheduler placement capabilities, eligible accounts, matching env profiles, and whether each rule came from `accounts.yaml` or a conda sync overlay.
+
+```bash
+curl -sS "$SCHEDULER_URL/api/capabilities"
+```
+
+Use this before submitting a task with `required_capability` or `env_profile`. A task can only attach to allocations owned by an account listed for that capability.
+
 ### `POST /api/conda-env-sync`
 
 Clones a conda environment from a reference account to explicit target accounts with `conda-pack`. Existing target environments with the same name are moved aside with a timestamp backup suffix before the packed environment is installed.

@@ -184,6 +184,7 @@ curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/remote-file?base=remote_cwd&path=re
 curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/remote-files?base=remote_cwd&glob=logs/vllm-scheduler*.err"
 curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/remote-file?base=git_repo&path=results/best.json"
 curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=16&memory_mb=32768&required_capability=conda:flight-searcher"
+curl -sS "$SCHEDULER_URL/api/capabilities"
 curl -sS -X POST "$SCHEDULER_URL/api/tasks/cancel?name_contains=crypto-sweep&statuses=queued,attaching,running"
 curl -sS "$SCHEDULER_URL/api/jobs/<job_id>/remote-file?base=remote_job_dir&path=submit.stderr.log"
 ```
@@ -191,6 +192,8 @@ curl -sS "$SCHEDULER_URL/api/jobs/<job_id>/remote-file?base=remote_job_dir&path=
 The scheduler automatically cleans old scheduler-created remote directories such as `task-*`, `job-*`, and `allocation-*` under each account's `remote_workspace`. By default, finished task/job artifacts are kept for 7 days and closed allocation artifacts for 1 day. Read stdout, stderr, and result files through the API before the cleanup TTL expires.
 
 ## CPU And Memory Requests
+
+The Web UI has a `Capabilities` section that shows each usable `required_capability`, eligible accounts, matching env profiles, and whether the rule came from `accounts.yaml` or a conda sync overlay. The same data is available from `/api/capabilities`.
 
 `required_capability` is a scheduler label, not the conda activation itself. It restricts placement to accounts that declare the capability in `accounts.yaml`. Use a `conda:<env-name>` label when the requirement is a prepared conda environment, for example `required_capability=conda:flight-searcher`. Use `env_profile=flight-searcher` when the task also needs the scheduler to run concrete shell setup such as `conda activate flight-searcher`.
 

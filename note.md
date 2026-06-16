@@ -396,3 +396,10 @@ Remaining verification:
 - `/tasks/git`, `/jobs job_mode=python_git`, and new `/api/tasks/git` now build git-task payload metadata with a credential id when the repo URL matches.
 - During task attach, the scheduler reads the master key, writes it into the assigned task's temporary remote directory, sets `GIT_SSH_COMMAND`, and runs clone without relying on the target account's `~/.ssh/config`.
 - Added tests for config parsing, URL alias matching, canonical clone URL rewrite, secret-free task payloads, and `GIT_SSH_COMMAND` export.
+## 2026-06-16 19:19:17 KST
+
+- Requested change: show available scheduler capabilities and their conditions in the Web UI.
+- Added capability summary generation that merges static `accounts.yaml` capabilities with conda sync overlay capabilities.
+- Added `/api/capabilities` so agents can inspect capability placement constraints before submitting tasks.
+- Added a dashboard `Capabilities` section showing capability, eligible accounts, matching env profiles, source, and account-level rule details.
+- Updated README and API docs with the new capability inspection endpoint.

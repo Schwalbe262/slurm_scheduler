@@ -56,6 +56,86 @@ def build_token_chart(points: list[dict]) -> str:
     """
 
 
+def build_capability_summary(accounts: list, overlays: list[dict]) -> list[dict]:
+    by_capability: dict[str, dict] = {}
+
+    def item_for(capability: str) -> dict:
+        item = by_capability.setdefault(
+            capability,
+            {
+                "capability": capability,
+                "accounts": [],
+                "profiles": [],
+                "sources": [],
+                "details": [],
+            },
+        )
+        return item
+
+    for account in accounts:
+        account_profiles = sorted((account.env_profiles or {}).keys())
+        for capability in sorted(account.capabilities or []):
+            item = item_for(capability)
+            if account.name not in item["accounts"]:
+                item["accounts"].append(account.name)
+            for profile in matching_profiles_for_capability(capability, account_profiles):
+                if profile not in item["profiles"]:
+                    item["profiles"].append(profile)
+            if "accounts.yaml" not in item["sources"]:
+                item["sources"].append("accounts.yaml")
+            item["details"].append(
+                {
+                    "account": account.name,
+                    "profiles": matching_profiles_for_capability(capability, account_profiles),
+                    "source": "accounts.yaml",
+                    "condition": "account declares capability",
+                }
+            )
+
+    for overlay in overlays:
+        capability = str(overlay.get("capability") or "").strip()
+        account_name = str(overlay.get("account_name") or "").strip()
+        profile = str(overlay.get("env_profile") or "").strip()
+        if not capability or not account_name:
+            continue
+        item = item_for(capability)
+        if account_name not in item["accounts"]:
+            item["accounts"].append(account_name)
+        if profile and profile not in item["profiles"]:
+            item["profiles"].append(profile)
+        if "conda-sync-overlay" not in item["sources"]:
+            item["sources"].append("conda-sync-overlay")
+        item["details"].append(
+            {
+                "account": account_name,
+                "profiles": [profile] if profile else [],
+                "source": "conda-sync-overlay",
+                "condition": f"synced env {overlay.get('env_name') or ''}".strip(),
+                "installed_prefix": overlay.get("installed_prefix") or "",
+            }
+        )
+
+    for item in by_capability.values():
+        item["accounts"] = sorted(item["accounts"])
+        item["profiles"] = sorted(item["profiles"])
+        item["sources"] = sorted(item["sources"])
+        item["details"] = sorted(item["details"], key=lambda detail: (detail["account"], detail["source"]))
+    return sorted(by_capability.values(), key=lambda item: item["capability"])
+
+
+def matching_profiles_for_capability(capability: str, profiles: list[str]) -> list[str]:
+    if not capability:
+        return []
+    candidates = {capability}
+    if capability.startswith("conda:"):
+        candidates.add(capability.split(":", 1)[1])
+    normalized = capability.replace("-", "_")
+    candidates.add(normalized)
+    if normalized.startswith("conda:"):
+        candidates.add(normalized.split(":", 1)[1])
+    return [profile for profile in profiles if profile in candidates]
+
+
 def parse_memory_mb(value: str) -> int:
     raw = (value or "").strip().lower()
     if not raw:
@@ -490,6 +570,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         jobs = job_elapsed(db.list_jobs())
         active_jobs = [item for item in jobs if item["status"] not in {"completed", "failed", "cancelled"}]
         finished_jobs = [item for item in jobs if item["status"] in {"completed", "failed", "cancelled"}]
+        env_overlays = db.list_account_env_overlays()
+        capabilities = build_capability_summary(accounts, env_overlays)
         return templates.TemplateResponse(
             "dashboard.html",
             {
@@ -513,8 +595,9 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 "gpu_partitions": partition_rank(db.list_node_inventory(), needs_gpu=True),
                 "gpu_capacity": scheduler.gpu_capacity_summary(),
                 "account_names": [account.name for account in accounts],
+                "capabilities": capabilities,
                 "env_sync_jobs": [env_sync_job_json(job) for job in db.list_env_sync_jobs(limit=10)],
-                "env_overlays": db.list_account_env_overlays(),
+                "env_overlays": env_overlays,
             },
         )
 
@@ -1129,6 +1212,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     @app.get("/api/accounts/status/live")
     def api_accounts_live() -> list[dict]:
         return [snapshot.__dict__ for snapshot in scheduler.snapshots()]
+
+    @app.get("/api/capabilities")
+    def api_capabilities() -> list[dict]:
+        return build_capability_summary(accounts, db.list_account_env_overlays())
 
     @app.post("/api/conda-env-sync")
     async def api_create_conda_env_sync(request: Request) -> JSONResponse:
