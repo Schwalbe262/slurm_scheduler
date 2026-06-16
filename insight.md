@@ -273,3 +273,9 @@
 - Problem: Shared CPU pool selection can fall back to GPU partitions even when CPU partitions have mixed nodes with enough free cores.
 - Discovery: The single-job partition guard excluded any `cpu2` node with nonzero `cpu_used`, so the best remaining candidate became a 48-core GPU node.
 - Improvement: Allow non-exclusive CPU pools onto mixed CPU nodes, keep the request at configured pool size, and rank CPU partitions ahead of GPU fallback capacity.
+
+## 2026-06-16 14:49:53 KST
+
+- Problem: GPU warm pool fallback can submit an impossible CPU request when no concrete candidate node is selected.
+- Discovery: The fallback path reused `allocation_cpus=64` for a `gpu:a6000ada` Slurm request even though the target GPU partition's nodes have fewer CPUs.
+- Improvement: Cap fallback GPU allocation CPU requests by observed node capacity and classify failed allocations with closed allocations in the dashboard.

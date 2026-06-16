@@ -353,3 +353,12 @@ Remaining verification:
 - Changed CPU pool ranking to prefer CPU partitions first and only use GPU partitions as fallback CPU capacity.
 - Verified current live shape selection returns `cpu2 / n111 / 64 CPU`.
 - Verified `python3 -m unittest discover -s tests` and `git diff --check`.
+
+## 2026-06-16 14:49:53 KST
+
+- Investigated allocation `90` failing with `CPU count per node can not be satisfied` for `gpu:a6000ada`.
+- Found the GPU allocation fallback path could not identify a concrete candidate node and then submitted `allocation_cpus=64`, even though the target `gpu3` nodes only expose fewer CPUs per node.
+- Changed GPU fallback sizing to cap requested CPUs by matching partition/node CPU capacity from pestat/inventory, including the configured GPU CPU reserve when the node has unclaimed GPUs.
+- Changed the dashboard to treat `failed` allocations as terminal together with `closed`, so they appear in the collapsed closed allocation section instead of the active pool.
+- Added a regression test proving a GPU fallback request on a 56-core GPU partition does not request 64 CPUs.
+- Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, and `git diff --check`.

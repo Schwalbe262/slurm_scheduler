@@ -1511,6 +1511,27 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(allocation["total_cpus"], 4)
         self.assertEqual(allocation["total_gpus"], 2)
 
+    def test_gpu_fallback_caps_cpu_request_to_partition_node_capacity(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "gpu-ada gpu3 mix 4 56 0.0 876000 800000\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            allocation_cpus=64,
+            gpu_cpu_reserve=4,
+            gpu_prewarm_partition="auto",
+            gpu_prewarm_gpus_per_allocation=2,
+        )
+        shape = scheduler.choose_allocation_shape(resource_pool="gpu:a6000ada", gpu_model="a6000ada", gpus=2)
+        self.assertEqual(shape["partition"], "gpu3")
+        self.assertLessEqual(shape["cpus"], 56)
+
     def test_gpu_prewarm_leaves_cpu_for_unclaimed_gpus(self) -> None:
         inventory = parse_scontrol_nodes(
             "NodeName=gpu-a6000 CPUTot=48 RealMemory=687626 Gres=gpu:a6000:4 GresUsed=gpu:a6000:0 State=IDLE Partitions=gpu5\n"

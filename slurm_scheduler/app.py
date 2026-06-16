@@ -371,14 +371,18 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         snapshots = scheduler.cached_snapshots()
         snapshot_error = "" if snapshots else "Account status will appear after the background scheduler refreshes."
         allocations = db.list_allocations(limit=500)
-        active_allocations = sorted([item for item in allocations if item["state"] != "closed"], key=allocation_sort_key)
+        terminal_allocation_states = {"closed", "failed"}
+        active_allocations = sorted(
+            [item for item in allocations if item["state"] not in terminal_allocation_states],
+            key=allocation_sort_key,
+        )
         allocated_summary_rows = [
             item
             for item in active_allocations
             if item["state"] in {"active", "warm", "draining", "closing"}
         ]
         allocation_summary = allocation_usage_summary(allocated_summary_rows)
-        closed_allocations = [item for item in allocations if item["state"] == "closed"]
+        closed_allocations = [item for item in allocations if item["state"] in terminal_allocation_states]
         active_task_rows = {
             int(task["id"]): task
             for task in (

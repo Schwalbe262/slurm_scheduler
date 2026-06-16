@@ -1478,10 +1478,26 @@ class Scheduler:
         partition = target_partition if target_partition != "auto" else self.choose_partition({"gpus": max(1, int(gpus or 1)) if wants_gpu else 0})
         if self.is_single_job_partition(partition):
             return None
+        fallback_cpu_limit = 0
+        if wants_gpu:
+            requested_gpu_count = max(1, int(gpus or self.gpu_prewarm_gpus_per_allocation))
+            for node in nodes:
+                if not node.usable or node.partition != partition:
+                    continue
+                inventory = inventory_by_node.get(node.hostname, {})
+                node_gpu_model = normalize_gpu_model(str(inventory.get("gpu_model") or ""))
+                if target_models and node_gpu_model and node_gpu_model not in target_models:
+                    continue
+                node_gpu_count = int(inventory.get("gpu_count") or 0)
+                reserve = self.gpu_cpu_reserve if node_gpu_count > requested_gpu_count else 0
+                fallback_cpu_limit = max(fallback_cpu_limit, max(1, int(node.cpu_total) - reserve))
+        fallback_cpus = requested_cpus or self.allocation_cpus or 4
+        if fallback_cpu_limit:
+            fallback_cpus = min(fallback_cpus, fallback_cpu_limit)
         return {
             "partition": partition,
             "node_name": "",
-            "cpus": requested_cpus or self.allocation_cpus or 4,
+            "cpus": fallback_cpus,
             "memory_mb": requested_memory_mb or self._memory_mb(self.allocation_memory) or 16384,
             "gpus": max(1, int(gpus or self.gpu_prewarm_gpus_per_allocation)) if wants_gpu else 0,
             "gpu_model": (target_models[0] if target_models else "") if wants_gpu else "",
