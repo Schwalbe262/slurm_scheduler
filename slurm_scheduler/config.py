@@ -8,6 +8,19 @@ import yaml
 
 
 @dataclass(frozen=True)
+class GitCredentialConfig:
+    id: str
+    url_patterns: list[str]
+    private_key_path: str = ""
+    clone_url: str = ""
+    known_hosts_path: str = ""
+    source_account: str = ""
+    source_private_key_path: str = ""
+    source_known_hosts_path: str = ""
+    strict_host_key_checking: str = "accept-new"
+
+
+@dataclass(frozen=True)
 class AccountConfig:
     name: str
     host: str
@@ -65,6 +78,7 @@ class AppConfig:
     cleanup_finished_task_ttl_seconds: int = 604800
     cleanup_finished_job_ttl_seconds: int = 604800
     cleanup_closed_allocation_ttl_seconds: int = 86400
+    git_credentials: list[GitCredentialConfig] = field(default_factory=list)
 
 
 def _read_yaml(path: str | Path) -> dict[str, Any]:
@@ -108,6 +122,12 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
         for source, target in mapping.items():
             if source in cleanup:
                 data[target] = cleanup[source]
+    credentials = data.pop("git_credentials", [])
+    if credentials is None:
+        credentials = []
+    if not isinstance(credentials, list):
+        raise ValueError("git_credentials must be a list")
+    data["git_credentials"] = [GitCredentialConfig(**item) for item in credentials]
     return AppConfig(**{k: v for k, v in data.items() if k in AppConfig.__dataclass_fields__})
 
 

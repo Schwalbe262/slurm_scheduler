@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from pathlib import Path
 
-from slurm_scheduler.config import AccountConfig
+from slurm_scheduler.config import AccountConfig, GitCredentialConfig, load_app_config
 from slurm_scheduler.conda_sync import conda_bootstrap, env_prefix_lookup_command
 from slurm_scheduler.db import Database
+from slurm_scheduler.git_auth import find_git_credential, git_task_payload
 from slurm_scheduler.models import AccountSnapshot, AllocationStatus, JobCreate, JobStatus, TaskCreate, TaskStatus
 from slurm_scheduler.scheduler import Scheduler
 from slurm_scheduler.inventory import parse_scontrol_nodes, parse_sinfo_nodes, partition_rank
@@ -27,6 +29,26 @@ from slurm_scheduler.slurm import (
 
 
 class SlurmParsingTests(unittest.TestCase):
+    def test_load_app_config_parses_git_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "app.yaml"
+            path.write_text(
+                "\n".join(
+                    [
+                        "git_credentials:",
+                        "  - id: private-project",
+                        "    url_patterns: ['*org/private-project*']",
+                        "    clone_url: 'git@github.com:org/private-project.git'",
+                        "    source_account: account_a",
+                        "    source_private_key_path: '~/.ssh/private_project_deploy'",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config = load_app_config(path)
+        self.assertEqual(config.git_credentials[0].id, "private-project")
+        self.assertEqual(config.git_credentials[0].source_account, "account_a")
+
     def test_parse_squeue_counts(self) -> None:
         self.assertEqual(parse_squeue_counts("RUNNING\nPENDING\nR\nPD\nCOMPLETED\n"), (2, 2))
 
@@ -206,6 +228,23 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("$HOME/scheduler/git_tasks", task["command"])
         self.assertIn("task-42", task["command"])
 
+    def test_git_credential_matches_alias_and_payload_exposes_only_id(self) -> None:
+        credential = GitCredentialConfig(
+            id="kakao-loco-bot",
+            url_patterns=["*Schwalbe262/kakao-loco-bot*"],
+            clone_url="git@github.com:Schwalbe262/kakao-loco-bot.git",
+            source_account="r1jae262",
+            source_private_key_path="~/.ssh/kakao_loco_bot_deploy",
+        )
+        repo_url = "git@github.com-kakao-loco-bot:Schwalbe262/kakao-loco-bot.git"
+        self.assertEqual(find_git_credential([credential], repo_url).id, "kakao-loco-bot")
+        payload = git_task_payload(repo_url, "main", "run.py", credential=credential)
+        self.assertIn('"git_credential_id":"kakao-loco-bot"', payload)
+        self.assertNotIn("kakao_loco_bot_deploy", payload)
+        command = build_git_task_command(credential.clone_url, "main", "run.py")
+        self.assertIn("git clone git@github.com:Schwalbe262/kakao-loco-bot.git", command)
+        self.assertNotIn("github.com-kakao-loco-bot", command)
+
     def test_task_script_uses_remote_cwd_and_command(self) -> None:
         task = {
             "remote_cwd": "~/case",
@@ -216,6 +255,18 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("cd $HOME/case", script)
         self.assertIn("module load ansys", script)
         self.assertIn("ansys -b -i input.dat", script)
+
+    def test_task_script_exports_git_ssh_command(self) -> None:
+        script = build_task_script(
+            {
+                "remote_cwd": "~/case",
+                "git_ssh_command": "ssh -i ~/task/key -o IdentitiesOnly=yes",
+                "command": "git clone git@github.com:org/private.git repo",
+            }
+        )
+        self.assertIn("export GIT_TERMINAL_PROMPT=0", script)
+        self.assertIn("export GIT_SSH_COMMAND=", script)
+        self.assertIn("git clone git@github.com:org/private.git repo", script)
 
     def test_task_script_writes_payload_json(self) -> None:
         task = {

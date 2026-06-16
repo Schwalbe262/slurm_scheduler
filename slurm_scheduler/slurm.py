@@ -6,11 +6,13 @@ import shlex
 import time
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import paramiko
 
-from .config import AccountConfig
+from .config import AccountConfig, GitCredentialConfig
+from .git_auth import git_credential_id_from_payload
 from .inventory import normalize_gpu_model
 from .models import AccountSnapshot, JobStatus
 from .task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, TASK_ID_PLACEHOLDER
@@ -411,6 +413,9 @@ def build_task_script(task: dict) -> str:
                 f"export SLURM_SCHEDULER_PAYLOAD_PATH={shlex.quote(str(task['payload_path']))}",
             ]
         )
+    if task.get("git_ssh_command"):
+        lines.append("export GIT_TERMINAL_PROMPT=0")
+        lines.append(f"export GIT_SSH_COMMAND={shlex.quote(str(task['git_ssh_command']))}")
     lines.append(f"cd {shell_path(task['remote_cwd'])}")
     if task.get("env_setup"):
         lines.append(task["env_setup"])
@@ -455,8 +460,15 @@ def build_srun_attach_command(
 
 
 class SlurmAccountClient:
-    def __init__(self, account: AccountConfig):
+    def __init__(
+        self,
+        account: AccountConfig,
+        git_credentials: list[GitCredentialConfig] | None = None,
+        git_source_accounts: list[AccountConfig] | None = None,
+    ):
         self.account = account
+        self.git_credentials = git_credentials or []
+        self.git_source_accounts = {item.name: item for item in (git_source_accounts or [])}
 
     def snapshot(self, storage_used_gb: float | None = None) -> AccountSnapshot:
         with SSHSession(self.account) as ssh:
@@ -606,6 +618,18 @@ class SlurmAccountClient:
         }
         task = resolve_task_placeholders(apply_env_profile(task, self.account), self.account)
         task = {**task, "payload_path": posixpath.join(remote_dir, "payload.json")}
+        credential = self.git_credential_for_task(task)
+        if credential:
+            key_path = posixpath.join(remote_dir, "git-auth", f"{credential.id}.key")
+            known_hosts_path = posixpath.join(remote_dir, "git-auth", "known_hosts") if credential.known_hosts_path else ""
+            ssh_options = [
+                f"-i {shlex.quote(key_path)}",
+                "-o IdentitiesOnly=yes",
+                f"-o StrictHostKeyChecking={shlex.quote(credential.strict_host_key_checking or 'accept-new')}",
+            ]
+            if known_hosts_path:
+                ssh_options.append(f"-o UserKnownHostsFile={shlex.quote(known_hosts_path)}")
+            task = {**task, "git_ssh_command": "ssh " + " ".join(ssh_options)}
         script = build_task_script(task)
         wrapper = build_srun_attach_command(
             task,
@@ -624,6 +648,13 @@ class SlurmAccountClient:
             result = ssh.run(commands[0])
             if result.exit_code != 0:
                 raise RemoteExecutionError(command_failure_message(result, "failed to create remote task directory"), result_fields)
+            if credential:
+                try:
+                    self.write_git_credential_files(ssh, credential, remote_dir)
+                except RemoteExecutionError as exc:
+                    raise RemoteExecutionError(str(exc), result_fields) from exc
+                except OSError as exc:
+                    raise RemoteExecutionError(f"failed to read git credential {credential.id}: {exc}", result_fields) from exc
             ssh.write_text_file(script_path, script)
             result = ssh.run(" && ".join(commands[1:]))
         if result.exit_code != 0:
@@ -635,6 +666,48 @@ class SlurmAccountClient:
             "exit_code_path": exit_code_path,
             "wrapper_pid": result.stdout.strip().splitlines()[-1],
         }
+
+    def git_credential_for_task(self, task: dict) -> GitCredentialConfig | None:
+        credential_id = git_credential_id_from_payload(str(task.get("payload_json") or ""))
+        if not credential_id:
+            return None
+        return next((item for item in self.git_credentials if item.id == credential_id), None)
+
+    def write_git_credential_files(self, ssh: SSHSession, credential: GitCredentialConfig, remote_dir: str) -> None:
+        key_text = self.read_git_credential_text(credential, "private_key")
+        key_dir = posixpath.join(remote_dir, "git-auth")
+        key_path = posixpath.join(key_dir, f"{credential.id}.key")
+        commands = [f"mkdir -p {shlex.quote(key_dir)}", f"chmod 700 {shlex.quote(key_dir)}"]
+        result = ssh.run(" && ".join(commands))
+        if result.exit_code != 0:
+            raise RemoteExecutionError(command_failure_message(result, "failed to prepare git credential directory"))
+        ssh.write_text_file(key_path, key_text)
+        chmod = ssh.run(f"chmod 600 {shlex.quote(key_path)}")
+        if chmod.exit_code != 0:
+            raise RemoteExecutionError(command_failure_message(chmod, "failed to protect git credential key"))
+        if credential.known_hosts_path or credential.source_known_hosts_path:
+            known_hosts = self.read_git_credential_text(credential, "known_hosts")
+            ssh.write_text_file(posixpath.join(key_dir, "known_hosts"), known_hosts)
+
+    def read_git_credential_text(self, credential: GitCredentialConfig, kind: str) -> str:
+        if kind == "private_key":
+            local_path = credential.private_key_path
+            remote_path = credential.source_private_key_path
+        else:
+            local_path = credential.known_hosts_path
+            remote_path = credential.source_known_hosts_path
+        if local_path:
+            return Path(local_path).read_text(encoding="utf-8")
+        if remote_path and credential.source_account:
+            source = self.git_source_accounts.get(credential.source_account)
+            if not source:
+                raise FileNotFoundError(f"git credential source account not found: {credential.source_account}")
+            with SSHSession(source) as source_ssh:
+                result = source_ssh.run(f"cat {shell_path(remote_path)}")
+            if result.exit_code != 0:
+                raise FileNotFoundError(result.stderr.strip() or f"failed to read {remote_path}")
+            return result.stdout
+        raise FileNotFoundError(f"git credential {credential.id} has no {kind} path")
 
     def task_state(self, task: dict) -> JobStatus:
         exit_path = task.get("exit_code_path") or ""

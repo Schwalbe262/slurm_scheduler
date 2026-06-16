@@ -47,6 +47,13 @@ cleanup:
   finished_task_ttl_seconds: 604800
   finished_job_ttl_seconds: 604800
   closed_allocation_ttl_seconds: 86400
+git_credentials:
+  - id: private-project
+    url_patterns: ["*org/private-project*"]
+    clone_url: "git@github.com:org/private-project.git"
+    source_account: "account_a"
+    source_private_key_path: "~/.ssh/private_project_deploy"
+    strict_host_key_checking: "accept-new"
 ```
 
 Field meanings:
@@ -65,6 +72,7 @@ Field meanings:
 - `single_job_per_node_partitions`: partitions where the scheduler should pin an idle node and avoid more than one scheduler job per node.
 - `gpu_cpu_reserve`: CPU cores left unrequested on GPU nodes. CPU pools always apply this reserve. GPU warm allocations apply it when they leave some GPUs unclaimed, so the remaining GPUs still have CPU available for other users.
 - `cleanup`: automatic removal of scheduler-created remote artifact directories. Only paths under each account's `remote_workspace` whose basename starts with `task-`, `job-`, or `allocation-` are deleted.
+- `git_credentials`: central Git credentials for `/tasks/git`. `source_account` can point at a master account that already has a read-only deploy key; the scheduler reads that key and injects it into each task's temporary directory, so target accounts do not need GitHub SSH setup.
 
 ## Cleanup Config
 

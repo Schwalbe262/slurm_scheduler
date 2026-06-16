@@ -155,8 +155,9 @@ curl -sS "$SCHEDULER_URL/api/jobs/<job_id>/remote-file?base=remote_job_dir&path=
 
 Common causes:
 
-- `Host key verification failed`: add the Git host to the selected account's `~/.ssh/known_hosts` or use `StrictHostKeyChecking accept-new` for the SSH alias.
-- `Permission denied (publickey)`: the scheduler account cannot read the expected SSH alias or deploy key.
+- `Host key verification failed`: configure `git_credentials.strict_host_key_checking: "accept-new"` or provide a `known_hosts_path` / `source_known_hosts_path`.
+- `Permission denied (publickey)`: the configured deploy key is missing, unreadable from `source_account`, or not registered on the GitHub repo.
+- `Could not resolve hostname github.com-...`: the task used an SSH alias from one account's `~/.ssh/config`. Add a `git_credentials` entry with `clone_url: "git@github.com:org/repo.git"` so the scheduler rewrites the clone to a canonical host and injects `GIT_SSH_COMMAND`.
 - `Repository not found`: the deploy key is installed on the wrong repository or does not have read access.
 
 ## GPU Capacity Looks Wrong

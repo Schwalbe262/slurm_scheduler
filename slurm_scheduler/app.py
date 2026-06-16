@@ -16,6 +16,7 @@ from fastapi.templating import Jinja2Templates
 from .conda_sync import CondaEnvSyncManager
 from .config import AppConfig, load_accounts, load_app_config
 from .db import Database
+from .git_auth import find_git_credential, git_task_payload
 from .models import JobCreate, TaskCreate
 from .inventory import partition_rank
 from .pestat import PestatNode, plan_dynamic_allocations
@@ -189,10 +190,12 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     accounts = load_accounts(config.accounts_path)
     db = Database(config.database_path)
     db.init()
+    client_factory = lambda account: SlurmAccountClient(account, config.git_credentials, accounts)
     scheduler = Scheduler(
         db,
         accounts,
         config.poll_interval_seconds,
+        client_factory=client_factory,
         cluster_refresh_interval_seconds=config.cluster_refresh_interval_seconds,
         min_warm_allocations=config.min_warm_allocations,
         allocation_partition=config.allocation_partition,
@@ -399,6 +402,18 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             ),
         }
 
+    def git_task_fields(
+        repo_url: str,
+        git_ref: str,
+        entrypoint: str,
+        arguments: str,
+        git_credential_id: str = "",
+    ) -> tuple[str, str]:
+        credential = find_git_credential(config.git_credentials, repo_url, git_credential_id)
+        clone_url = credential.clone_url if credential and credential.clone_url else repo_url
+        payload_json = git_task_payload(repo_url, git_ref, entrypoint, arguments, credential)
+        return build_git_task_command(clone_url, git_ref, entrypoint, arguments), payload_json
+
     def create_task_record(payload: dict) -> tuple[int, bool]:
         dedupe_key = str(payload.get("dedupe_key") or "").strip()
         if dedupe_key:
@@ -522,6 +537,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         git_ref: str = Form("main"),
         entrypoint: str = Form(...),
         arguments: str = Form(""),
+        git_credential_id: str = Form(""),
         env_setup: str = Form(""),
         required_capability: str = Form(""),
         env_profile: str = Form(""),
@@ -666,11 +682,12 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                     )
                 )
         else:
+            command, payload_json = git_task_fields(repo_url, git_ref, entrypoint, arguments, git_credential_id)
             db.create_task(
                 TaskCreate(
                     name=job_name or "git-task",
                     remote_cwd=ACCOUNT_WORKSPACE_PLACEHOLDER,
-                    command=build_git_task_command(repo_url, git_ref, entrypoint, arguments),
+                    command=command,
                     env_setup=env_setup,
                     required_capability=required_capability,
                     env_profile=env_profile,
@@ -682,6 +699,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                     partition=partition,
                     node_name=node_name,
                     exclusive_node=exclusive_node,
+                    payload_json=payload_json,
                 )
             )
         return RedirectResponse("/", status_code=303)
@@ -730,6 +748,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         git_ref: str = Form("main"),
         entrypoint: str = Form(...),
         arguments: str = Form(""),
+        git_credential_id: str = Form(""),
         env_setup: str = Form(""),
         required_capability: str = Form(""),
         env_profile: str = Form(""),
@@ -742,11 +761,12 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         node_name: str = Form(""),
         exclusive_node: bool = Form(False),
     ) -> Response:
+        command, payload_json = git_task_fields(repo_url, git_ref, entrypoint, arguments, git_credential_id)
         db.create_task(
             TaskCreate(
                 name=job_name or "git-task",
                 remote_cwd=ACCOUNT_WORKSPACE_PLACEHOLDER,
-                command=build_git_task_command(repo_url, git_ref, entrypoint, arguments),
+                command=command,
                 env_setup=env_setup,
                 required_capability=required_capability,
                 env_profile=env_profile,
@@ -758,6 +778,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 partition=partition,
                 node_name=node_name,
                 exclusive_node=exclusive_node,
+                payload_json=payload_json,
             )
         )
         return RedirectResponse("/", status_code=303)
@@ -857,6 +878,52 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="request body must be a JSON object")
         task_id, deduped = create_task_record(payload)
+        task = db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=500, detail="task was not created")
+        response = task_json(task)
+        response["deduped"] = deduped
+        return JSONResponse(response, status_code=200 if deduped else 201)
+
+    @app.post("/api/tasks/git")
+    async def api_create_git_task(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="request body must be JSON") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="request body must be a JSON object")
+        repo_url = str(payload.get("repo_url") or "").strip()
+        entrypoint = str(payload.get("entrypoint") or "").strip()
+        if not repo_url:
+            raise HTTPException(status_code=422, detail="repo_url is required")
+        if not entrypoint:
+            raise HTTPException(status_code=422, detail="entrypoint is required")
+        git_ref = str(payload.get("git_ref") or "main")
+        arguments = str(payload.get("arguments") or "")
+        command, payload_json = git_task_fields(repo_url, git_ref, entrypoint, arguments, str(payload.get("git_credential_id") or ""))
+        task_payload = {
+            "name": str(payload.get("name") or payload.get("job_name") or "git-task"),
+            "remote_cwd": ACCOUNT_WORKSPACE_PLACEHOLDER,
+            "command": command,
+            "env_setup": str(payload.get("env_setup") or ""),
+            "required_capability": str(payload.get("required_capability") or ""),
+            "env_profile": str(payload.get("env_profile") or ""),
+            "account_name": str(payload.get("account_name") or ""),
+            "cpus": max(1, int(payload.get("cpus") or 1)),
+            "memory_mb": max(1, int(payload.get("memory_mb") or parse_memory_mb(str(payload.get("memory") or "4G")))),
+            "gpus": max(0, int(payload.get("gpus") or 0)),
+            "gpu_model": str(payload.get("gpu_model") or ""),
+            "partition": str(payload.get("partition") or "auto"),
+            "node_name": str(payload.get("node_name") or ""),
+            "exclusive_node": bool(payload.get("exclusive_node") or False),
+            "priority": int(payload.get("priority") or 0),
+            "timeout_seconds": max(0, int(payload.get("timeout_seconds") or payload.get("timeout") or 0)),
+            "dedupe_key": str(payload.get("dedupe_key") or ""),
+            "max_workers_per_node": max(0, int(payload.get("max_workers_per_node") or 0)),
+            "payload_json": payload_json,
+        }
+        task_id, deduped = create_task_record(task_payload)
         task = db.get_task(task_id)
         if not task:
             raise HTTPException(status_code=500, detail="task was not created")

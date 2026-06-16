@@ -295,3 +295,7 @@
 
 - GPU warm pool should distinguish task GPU requests from scheduler-owned prewarm requests. A user task with `gpus=1` must still fit one GPU, but an internal warm-pool request can leave `gpus=0` and let the scheduler choose the best available 4/3/2 A6000-class shape.
 - Lower-tier GPU fallback is useful for explicit task demand, but harmful for a warm pool whose purpose is to reserve scarce A6000-class capacity. The fallback model set should therefore be the configured warm `preferred_models`, not every GPU model in cluster capacity.
+## 2026-06-16 18:57:59 KST
+
+- Private repo access should be attached to the scheduler's task execution context, not to each Slurm account's home directory. A master-account deploy key plus per-task temporary `GIT_SSH_COMMAND` keeps capacity scheduling account-independent while avoiding long-lived key copies in every account.
+- SSH aliases are convenient for humans but brittle for distributed scheduler tasks. Rewriting matched repo URLs to canonical `git@github.com:org/repo.git` removes dependency on per-account `~/.ssh/config`.

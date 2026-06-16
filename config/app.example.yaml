@@ -38,3 +38,13 @@ cleanup:
   finished_task_ttl_seconds: 604800
   finished_job_ttl_seconds: 604800
   closed_allocation_ttl_seconds: 86400
+git_credentials:
+  - id: private-project
+    url_patterns:
+      - "git@github.com:org/private-project.git"
+      - "https://github.com/org/private-project.git"
+      - "*org/private-project*"
+    clone_url: "git@github.com:org/private-project.git"
+    source_account: "account_a"
+    source_private_key_path: "~/.ssh/private_project_deploy"
+    strict_host_key_checking: "accept-new"

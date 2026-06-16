@@ -388,3 +388,11 @@ Remaining verification:
 - Restricted GPU warm fallback to configured preferred models, so default warm pool fallback stays inside `a6000ada` and `a6000` and no longer opens RTX3090/A10 warm pools solely because A6000-class requests are pending.
 - Updated README, config docs, GPU scheduling docs, troubleshooting docs, and example config.
 - Added/updated tests for 4-GPU warm selection, 3-GPU fallback, 2-GPU minimum behavior, and no lower-GPU warm fallback.
+## 2026-06-16 18:57:59 KST
+
+- Requested change: private GitHub repo tasks should not require GitHub SSH alias/deploy-key setup in every cluster account. `r1jae262` is the master account.
+- Added `git_credentials` config with URL-pattern matching, canonical `clone_url` rewrite, and either local key files or `source_account` remote key files.
+- Configured `kakao-loco-bot` to use `r1jae262:~/.ssh/kakao_loco_bot_deploy` as the master deploy key source.
+- `/tasks/git`, `/jobs job_mode=python_git`, and new `/api/tasks/git` now build git-task payload metadata with a credential id when the repo URL matches.
+- During task attach, the scheduler reads the master key, writes it into the assigned task's temporary remote directory, sets `GIT_SSH_COMMAND`, and runs clone without relying on the target account's `~/.ssh/config`.
+- Added tests for config parsing, URL alias matching, canonical clone URL rewrite, secret-free task payloads, and `GIT_SSH_COMMAND` export.

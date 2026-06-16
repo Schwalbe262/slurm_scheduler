@@ -104,7 +104,7 @@ Use `/tasks/git` when the scheduler should clone or update a Git repo before run
 ```bash
 curl -sS -X POST "$SCHEDULER_URL/tasks/git" \
   -F job_name=git-case-001 \
-  -F repo_url=git@github.com-project:org/private-repo.git \
+  -F repo_url=git@github.com:org/private-repo.git \
   -F git_ref=main \
   -F entrypoint=scripts/run.py \
   -F arguments='--case case001' \
@@ -114,7 +114,17 @@ curl -sS -X POST "$SCHEDULER_URL/tasks/git" \
   -F gpus=0
 ```
 
-Private Git repos must be cloneable from the selected cluster account. Prefer a read-only GitHub deploy key and an SSH alias in that account's `~/.ssh/config`; avoid putting personal access tokens in scheduler form fields.
+Private Git repos can use central scheduler credentials instead of per-account SSH setup. Add a read-only deploy key once to a reference account and configure `git_credentials`; `/tasks/git` will copy that key into the assigned task directory temporarily and set `GIT_SSH_COMMAND`, so `account_name` can be left empty and the scheduler may use any matching warm pool.
+
+```yaml
+git_credentials:
+  - id: kakao-loco-bot
+    url_patterns: ["*Schwalbe262/kakao-loco-bot*"]
+    clone_url: "git@github.com:Schwalbe262/kakao-loco-bot.git"
+    source_account: "r1jae262"
+    source_private_key_path: "~/.ssh/kakao_loco_bot_deploy"
+    strict_host_key_checking: "accept-new"
+```
 
 GPU model constraints also accept comma-separated ordered candidates. For example, `gpu_model=a6000ada,a6000` tries A6000 ADA first and can fall back to A6000 if that is the available matching pool or node.
 

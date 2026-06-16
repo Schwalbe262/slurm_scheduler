@@ -182,6 +182,20 @@ curl -sS -X POST "$SCHEDULER_URL/tasks/git" \
 
 Additional fields match `/tasks`, except memory is supplied as `memory` with values such as `4096`, `4096M`, or `8G`.
 
+If `repo_url` matches `git_credentials` in `config/app.yaml`, the scheduler injects the configured deploy key for the task. The assigned account does not need its own `~/.ssh/config` or GitHub key.
+
+### `POST /api/tasks/git`
+
+JSON equivalent of `/tasks/git`:
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/tasks/git" \
+  -H 'Content-Type: application/json' \
+  --data '{"name":"git-smoke","repo_url":"git@github.com:org/private-project.git","git_ref":"main","entrypoint":"scripts/run.py","cpus":4,"memory_mb":8192}'
+```
+
+Optional `git_credential_id` forces a specific configured credential. If omitted, the scheduler matches by `url_patterns`.
+
 ## Submit Batch Jobs And Compatibility Jobs
 
 ### `POST /jobs`
