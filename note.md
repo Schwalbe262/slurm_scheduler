@@ -362,3 +362,11 @@ Remaining verification:
 - Changed the dashboard to treat `failed` allocations as terminal together with `closed`, so they appear in the collapsed closed allocation section instead of the active pool.
 - Added a regression test proving a GPU fallback request on a 56-core GPU partition does not request 64 CPUs.
 - Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, and `git diff --check`.
+
+## 2026-06-16 16:23:12 KST
+
+- Investigated dashboard auto-refresh disrupting the operator's current view.
+- Found the UI used a full `window.location.reload()` every 15 seconds without preserving `<details>` open states, page scroll, or horizontally/vertically scrolled table positions.
+- Added localStorage-backed capture/restore for open details sections, window scroll position, and every `.table-scroll` element before reload and after page load.
+- Kept auto-refresh disabled while an editable field is focused or the form is dirty.
+- Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, and `git diff --check`.

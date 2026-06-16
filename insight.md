@@ -279,3 +279,9 @@
 - Problem: GPU warm pool fallback can submit an impossible CPU request when no concrete candidate node is selected.
 - Discovery: The fallback path reused `allocation_cpus=64` for a `gpu:a6000ada` Slurm request even though the target GPU partition's nodes have fewer CPUs.
 - Improvement: Cap fallback GPU allocation CPU requests by observed node capacity and classify failed allocations with closed allocations in the dashboard.
+
+## 2026-06-16 16:23:12 KST
+
+- Problem: Full-page dashboard refreshes can collapse sections and move the operator away from the row/table they were inspecting.
+- Discovery: The refresh loop reloaded the page without storing any UI state beyond avoiding active form edits.
+- Improvement: Persist details open states and scroll positions in localStorage across auto-refreshes so passive monitoring does not disturb the current view.

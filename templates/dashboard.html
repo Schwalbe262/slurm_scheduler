@@ -753,8 +753,114 @@
 <script>
   (() => {
     const refreshMs = 15000;
+    const stateKey = "slurmSchedulerDashboardState";
     let formDirty = false;
     const editableSelector = "input, textarea, select";
+
+    function detailKey(details, index) {
+      const summary = details.querySelector("summary");
+      const text = summary ? summary.textContent.trim().replace(/\s+/g, " ") : "";
+      return details.id || details.dataset.persistKey || `${index}:${text}`;
+    }
+
+    function scrollKey(element, index) {
+      const heading = element.closest("section")?.querySelector("h1, h2")?.textContent.trim() || "";
+      return element.id || element.dataset.persistKey || `${index}:${heading}`;
+    }
+
+    function readState() {
+      try {
+        return JSON.parse(localStorage.getItem(stateKey) || "{}");
+      } catch (_error) {
+        return {};
+      }
+    }
+
+    function writeState(state) {
+      try {
+        localStorage.setItem(stateKey, JSON.stringify(state));
+      } catch (_error) {
+        // Ignore storage failures; auto-refresh should still work.
+      }
+    }
+
+    function captureState() {
+      const details = {};
+      document.querySelectorAll("details").forEach((element, index) => {
+        details[detailKey(element, index)] = element.open;
+      });
+      const tableScroll = {};
+      document.querySelectorAll(".table-scroll").forEach((element, index) => {
+        tableScroll[scrollKey(element, index)] = {
+          left: element.scrollLeft,
+          top: element.scrollTop,
+        };
+      });
+      writeState({
+        details,
+        tableScroll,
+        windowScroll: {
+          x: window.scrollX,
+          y: window.scrollY,
+        },
+      });
+    }
+
+    function restoreState() {
+      const state = readState();
+      if (state.details) {
+        document.querySelectorAll("details").forEach((element, index) => {
+          const value = state.details[detailKey(element, index)];
+          if (typeof value === "boolean") {
+            element.open = value;
+          }
+        });
+      }
+      if (state.tableScroll) {
+        document.querySelectorAll(".table-scroll").forEach((element, index) => {
+          const value = state.tableScroll[scrollKey(element, index)];
+          if (value) {
+            element.scrollLeft = Number(value.left) || 0;
+            element.scrollTop = Number(value.top) || 0;
+          }
+        });
+      }
+      if (state.windowScroll) {
+        window.scrollTo(Number(state.windowScroll.x) || 0, Number(state.windowScroll.y) || 0);
+      }
+    }
+
+    if ("scrollRestoration" in history) {
+      history.scrollRestoration = "manual";
+    }
+    restoreState();
+    window.addEventListener("load", () => {
+      window.requestAnimationFrame(restoreState);
+    });
+    window.addEventListener("beforeunload", captureState);
+    window.addEventListener("pagehide", captureState);
+    document.querySelectorAll("details").forEach((element) => {
+      element.addEventListener("toggle", captureState);
+    });
+    let scrollSaveTimer = 0;
+    window.addEventListener(
+      "scroll",
+      () => {
+        window.clearTimeout(scrollSaveTimer);
+        scrollSaveTimer = window.setTimeout(captureState, 150);
+      },
+      { passive: true },
+    );
+    document.querySelectorAll(".table-scroll").forEach((element) => {
+      element.addEventListener(
+        "scroll",
+        () => {
+          window.clearTimeout(scrollSaveTimer);
+          scrollSaveTimer = window.setTimeout(captureState, 150);
+        },
+        { passive: true },
+      );
+    });
 
     for (const field of document.querySelectorAll(editableSelector)) {
       field.addEventListener("input", () => {
@@ -779,6 +885,7 @@
       if (formDirty) {
         return;
       }
+      captureState();
       window.location.reload();
     }, refreshMs);
   })();
