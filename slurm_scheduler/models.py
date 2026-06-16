@@ -33,6 +33,18 @@ class TaskStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class SchedulingProfile(StrEnum):
+    STANDARD = "standard"
+    FEA_BURSTY = "fea_bursty"
+
+
+def normalize_scheduling_profile(value: str | None) -> str:
+    raw = (value or "").strip().lower()
+    if raw == SchedulingProfile.FEA_BURSTY.value:
+        return SchedulingProfile.FEA_BURSTY.value
+    return SchedulingProfile.STANDARD.value
+
+
 @dataclass(frozen=True)
 class JobCreate:
     repo_url: str
@@ -76,6 +88,7 @@ class TaskCreate:
     account_name: str = ""
     cpus: int = 1
     memory_mb: int = 4096
+    scheduling_profile: str = SchedulingProfile.STANDARD.value
     gpus: int = 0
     gpu_model: str = ""
     partition: str = "auto"

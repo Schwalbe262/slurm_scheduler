@@ -127,9 +127,10 @@ Estimates how many currently owned allocation slots can run a task shape.
 ```bash
 curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=16&memory_mb=32768&gpus=0&required_capability=conda:flight-searcher"
 curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=4&memory_mb=32768&gpus=1&gpu_model=a6000"
+curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=4&memory_mb=32768&scheduling_profile=fea_bursty"
 ```
 
-The response includes total `fit_slots` and per-allocation free CPU, memory, GPU, and fit slots.
+The response includes total `fit_slots`, `memory_pressure_state`, and per-allocation free CPU, memory, GPU, and fit slots. For `scheduling_profile=fea_bursty`, `memory_pressure_state` is `ok`, `soft_blocked`, or `hard_pressure`.
 
 Use:
 
@@ -151,6 +152,7 @@ curl -sS -X POST "$SCHEDULER_URL/tasks" \
   -F account_name=account_a \
   -F cpus=4 \
   -F memory_mb=8192 \
+  -F scheduling_profile=fea_bursty \
   -F gpus=0
 ```
 
@@ -165,6 +167,7 @@ Form fields:
 - `account_name`: optional exact account constraint. Use one account such as `account_a`, or ordered candidates such as `account_a,account_b`.
 - `cpus`: CPU cores requested from an allocation.
 - `memory_mb`: memory requested from an allocation. This is a scheduling/reservation and possible Slurm enforcement limit; it does not physically allocate RAM before the process uses it.
+- `scheduling_profile`: `standard` keeps the existing hard CPU/memory slot accounting. `fea_bursty` keeps `--cpus-per-task` and `--mem` on the Slurm step, uses `--overlap`, skips hard CPU/memory slot subtraction, and gates new attaches from live `pestat` load/free-memory data.
 - `gpus`: GPU count, normally `0` or `1`.
 - `gpu_model`: optional normalized model such as `a6000ada` or `a6000`. Ordered candidates such as `a6000ada,a6000` are accepted.
 - `partition`: `auto` or a specific Slurm partition.

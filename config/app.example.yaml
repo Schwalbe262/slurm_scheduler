@@ -32,6 +32,11 @@ gpu_prewarm:
   cpu_reserve_per_free_gpu: 8
   partition: "auto"
   time_limit: "48:00:00"
+fea_bursty:
+  soft_memory_free_percent: 60
+  hard_memory_free_percent: 40
+  load_target: 0.75
+  max_attach_per_loop: 8
 cleanup:
   enabled: true
   interval_seconds: 3600

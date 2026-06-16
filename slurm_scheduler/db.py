@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from .models import AllocationStatus, JobCreate, JobStatus, TaskCreate, TaskStatus
+from .models import AllocationStatus, JobCreate, JobStatus, SchedulingProfile, TaskCreate, TaskStatus
 
 
 def json_dumps(value: Any) -> str:
@@ -151,6 +151,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     env_profile TEXT NOT NULL DEFAULT '',
     cpus INTEGER NOT NULL DEFAULT 1,
     memory_mb INTEGER NOT NULL DEFAULT 4096,
+    scheduling_profile TEXT NOT NULL DEFAULT 'standard',
     gpus INTEGER NOT NULL DEFAULT 0,
     gpu_model TEXT NOT NULL DEFAULT '',
     partition TEXT NOT NULL DEFAULT 'auto',
@@ -282,6 +283,7 @@ class Database:
                 "required_capability": "TEXT NOT NULL DEFAULT ''",
                 "env_profile": "TEXT NOT NULL DEFAULT ''",
                 "account_name": "TEXT NOT NULL DEFAULT ''",
+                "scheduling_profile": f"TEXT NOT NULL DEFAULT '{SchedulingProfile.STANDARD.value}'",
                 "gpus": "INTEGER NOT NULL DEFAULT 0",
                 "gpu_model": "TEXT NOT NULL DEFAULT ''",
                 "partition": "TEXT NOT NULL DEFAULT 'auto'",
@@ -366,9 +368,9 @@ class Database:
                 """
                 INSERT INTO tasks (
                     name, remote_cwd, command, env_setup, required_capability, env_profile, account_name, cpus, memory_mb,
-                    gpus, gpu_model, partition, node_name, exclusive_node, priority, timeout_seconds, dedupe_key,
+                    scheduling_profile, gpus, gpu_model, partition, node_name, exclusive_node, priority, timeout_seconds, dedupe_key,
                     max_workers_per_node, payload_json, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.name,
@@ -380,6 +382,7 @@ class Database:
                     task.account_name,
                     task.cpus,
                     task.memory_mb,
+                    task.scheduling_profile,
                     task.gpus,
                     task.gpu_model,
                     task.partition,

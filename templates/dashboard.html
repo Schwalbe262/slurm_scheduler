@@ -194,6 +194,14 @@
         </div>
 
         <div>
+          <label for="task_scheduling_profile">Scheduling profile</label>
+          <select id="task_scheduling_profile" name="scheduling_profile">
+            <option value="standard">standard</option>
+            <option value="fea_bursty">fea_bursty</option>
+          </select>
+        </div>
+
+        <div>
           <label for="task_gpus">GPUs</label>
           <input id="task_gpus" name="gpus" type="number" min="0" value="0">
         </div>
@@ -268,6 +276,7 @@
         task_account_name: ["계정", "특정 Slurm 계정으로만 실행해야 할 때 입력합니다. 여러 후보는 account_a,account_b처럼 입력합니다. 비워두면 스케줄러가 선택합니다."],
         task_cpus: ["CPU 수", "srun --cpus-per-task 값입니다. warm pool의 남은 CPU 안에서 배정됩니다."],
         task_memory_mb: ["메모리 MB", "srun --mem 값입니다. MB 단위로 입력합니다."],
+        task_scheduling_profile: ["Scheduling profile", "standard는 CPU/메모리를 hard slot으로 예약합니다. fea_bursty는 CPU를 peak 요청으로만 보고, 메모리는 task별 peak limit을 유지하되 node free memory로 adaptive 제어합니다."],
         task_gpus: ["GPU 수", "0이면 CPU 작업입니다. 1 이상이면 GPU warm pool 또는 새 GPU allocation이 필요합니다."],
         task_gpu_model: ["GPU 모델", "특정 GPU가 필요하면 a6000ada 또는 a6000처럼 입력합니다. 여러 후보는 a6000ada,a6000처럼 입력합니다. 비워두면 모델을 고정하지 않습니다."],
         task_partition: ["파티션", "auto이면 스케줄러가 인벤토리를 보고 고릅니다. 특정 파티션이 필요하면 입력합니다."],
@@ -608,7 +617,7 @@
     <h2>Attached Tasks</h2>
     <div class="table-scroll">
       <table>
-        <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Allocation</th><th>Capability</th><th>Profile</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Elapsed</th></tr></thead>
+        <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Allocation</th><th>Capability</th><th>Env</th><th>Scheduling</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Elapsed</th></tr></thead>
         <tbody>
         {% for task in tasks %}
           <tr>
@@ -629,13 +638,14 @@
             <td>{{ task.allocation_id or "" }}</td>
             <td>{{ task.required_capability or "" }}</td>
             <td>{{ task.env_profile or "" }}</td>
+            <td>{{ task.scheduling_profile or "standard" }}</td>
             <td>{{ task.cpus }}</td>
             <td>{{ task.gpus or 0 }} {{ task.gpu_model }}</td>
             <td>{{ task.memory_mb }} MB</td>
             <td class="mono-cell">{{ task.elapsed_text or "" }}</td>
           </tr>
         {% else %}
-          <tr><td colspan="10" class="muted">No active attached tasks.</td></tr>
+          <tr><td colspan="11" class="muted">No active attached tasks.</td></tr>
         {% endfor %}
         </tbody>
       </table>
@@ -644,7 +654,7 @@
       <summary>Finished tasks: recent {{ finished_tasks|length }}{% if finished_task_count > finished_tasks|length %} of {{ finished_task_count }}{% endif %}</summary>
       <div class="table-scroll section-gap">
         <table>
-          <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Allocation</th><th>Capability</th><th>Profile</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Elapsed</th></tr></thead>
+          <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Allocation</th><th>Capability</th><th>Env</th><th>Scheduling</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Elapsed</th></tr></thead>
           <tbody>
           {% for task in finished_tasks %}
             <tr>
@@ -665,13 +675,14 @@
               <td>{{ task.allocation_id or "" }}</td>
               <td>{{ task.required_capability or "" }}</td>
               <td>{{ task.env_profile or "" }}</td>
+              <td>{{ task.scheduling_profile or "standard" }}</td>
               <td>{{ task.cpus }}</td>
               <td>{{ task.gpus or 0 }} {{ task.gpu_model }}</td>
               <td>{{ task.memory_mb }} MB</td>
               <td class="mono-cell">{{ task.elapsed_text or "" }}</td>
             </tr>
           {% else %}
-            <tr><td colspan="10" class="muted">No finished tasks.</td></tr>
+            <tr><td colspan="11" class="muted">No finished tasks.</td></tr>
           {% endfor %}
           </tbody>
         </table>

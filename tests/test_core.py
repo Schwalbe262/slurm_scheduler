@@ -8,7 +8,7 @@ from slurm_scheduler.config import AccountConfig, GitCredentialConfig, load_app_
 from slurm_scheduler.conda_sync import conda_bootstrap, env_prefix_lookup_command
 from slurm_scheduler.db import Database
 from slurm_scheduler.git_auth import find_git_credential, git_task_payload
-from slurm_scheduler.models import AccountSnapshot, AllocationStatus, JobCreate, JobStatus, TaskCreate, TaskStatus
+from slurm_scheduler.models import AccountSnapshot, AllocationStatus, JobCreate, JobStatus, SchedulingProfile, TaskCreate, TaskStatus
 from slurm_scheduler.scheduler import Scheduler
 from slurm_scheduler.inventory import parse_scontrol_nodes, parse_sinfo_nodes, partition_rank
 from slurm_scheduler.pestat import parse_pestat, plan_dynamic_allocations
@@ -314,6 +314,22 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("--overlap", command)
         self.assertNotIn("--exclusive", command)
 
+    def test_srun_attach_command_overlaps_fea_bursty_task(self) -> None:
+        task = {"cpus": 4, "memory_mb": 8192, "scheduling_profile": SchedulingProfile.FEA_BURSTY.value}
+        allocation = {"slurm_job_id": "12345", "free_cpus": 64}
+        command = build_srun_attach_command(
+            task,
+            allocation,
+            "/remote/task.sh",
+            "/remote/stdout.log",
+            "/remote/stderr.log",
+            "/remote/exit_code",
+        )
+        self.assertIn("--cpus-per-task=4", command)
+        self.assertIn("--mem=8192M", command)
+        self.assertIn("--overlap", command)
+        self.assertNotIn("--exclusive", command)
+
     def test_allocation_script_does_not_request_slurm_exclusive_for_scheduler_exclusive_pool(self) -> None:
         allocation = {
             "total_cpus": 12,
@@ -472,6 +488,9 @@ class FakeClient:
 
     def pending_reason(self, slurm_job_id: str) -> str:
         return self.pending_reasons.get(slurm_job_id, "")
+
+    def allocation_node_name(self, slurm_job_id: str) -> str:
+        return ""
 
     def cancel(self, slurm_job_id: str) -> None:
         self.cancelled.append(slurm_job_id)
@@ -829,6 +848,7 @@ class SchedulerTests(unittest.TestCase):
                 "~/flight",
                 "python worker.py",
                 required_capability="flight-crawl",
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 priority=7,
                 timeout_seconds=30,
                 dedupe_key="flight:ICN:SFO",
@@ -838,6 +858,7 @@ class SchedulerTests(unittest.TestCase):
         )
         task = self.db.get_task(task_id)
         self.assertEqual(task["required_capability"], "flight-crawl")
+        self.assertEqual(task["scheduling_profile"], SchedulingProfile.FEA_BURSTY.value)
         self.assertEqual(task["priority"], 7)
         self.assertEqual(task["timeout_seconds"], 30)
         self.assertEqual(task["dedupe_key"], "flight:ICN:SFO")
@@ -1791,6 +1812,182 @@ class SchedulerTests(unittest.TestCase):
         too_large = {"cpus": 17, "memory_mb": 2048, "gpus": 0, "partition": "auto", "node_name": ""}
         self.assertIsNotNone(scheduler.best_allocation_for_task(fitting))
         self.assertIsNone(scheduler.best_allocation_for_task(too_large))
+
+    def test_standard_cpu_task_capacity_uses_hard_cpu_slots(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="alloc-1",
+            free_cpus=64,
+            free_memory_mb=262144,
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        task = {
+            "cpus": 4,
+            "memory_mb": 8192,
+            "scheduling_profile": SchedulingProfile.STANDARD.value,
+            "gpus": 0,
+            "partition": "auto",
+            "node_name": "",
+        }
+        capacity = scheduler.task_fit_capacity(task)
+        self.assertEqual(capacity["fit_slots"], 16)
+        self.assertEqual(capacity["memory_pressure_state"], "ok")
+
+    def test_fea_bursty_task_ignores_hard_cpu_and_memory_slots_when_node_is_healthy(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=8,
+            total_memory_mb=65536,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="alloc-1",
+            free_cpus=0,
+            free_memory_mb=0,
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 12.0 100000 65000 some_job\n"
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, fea_max_attach_per_loop=8)
+        standard = {"cpus": 4, "memory_mb": 8192, "gpus": 0, "partition": "auto", "node_name": ""}
+        fea = {
+            **standard,
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+        }
+        self.assertIsNone(scheduler.best_allocation_for_task(standard))
+        self.assertEqual(scheduler.best_allocation_for_task(fea)["id"], allocation_id)
+        capacity = scheduler.task_fit_capacity(fea)
+        self.assertEqual(capacity["fit_slots"], 8)
+        self.assertEqual(capacity["memory_pressure_state"], "ok")
+
+    def test_fea_bursty_soft_memory_pressure_blocks_new_attach(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.WARM.value, slurm_job_id="alloc-1")
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 12.0 100000 55000 some_job\n"
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        task = {
+            "cpus": 4,
+            "memory_mb": 8192,
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+            "gpus": 0,
+            "partition": "auto",
+            "node_name": "",
+        }
+        self.assertIsNone(scheduler.best_allocation_for_task(task))
+        capacity = scheduler.task_fit_capacity(task)
+        self.assertEqual(capacity["fit_slots"], 0)
+        self.assertEqual(capacity["memory_pressure_state"], "soft_blocked")
+
+    def test_fea_hard_memory_pressure_cancels_newest_fea_task_only(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="alloc-1")
+        old_fea = self.db.create_task(
+            TaskCreate(
+                "fea-old",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=8192,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        new_fea = self.db.create_task(
+            TaskCreate(
+                "fea-new",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=8192,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        standard = self.db.create_task(TaskCreate("standard", "~/case", "run", cpus=4, memory_mb=8192))
+        for task_id, attached_at in [
+            (old_fea, "2026-01-01 00:00:00"),
+            (new_fea, "2026-01-01 00:01:00"),
+            (standard, "2026-01-01 00:02:00"),
+        ]:
+            self.db.update_task(
+                task_id,
+                status=TaskStatus.RUNNING.value,
+                account_name="a",
+                allocation_id=allocation_id,
+                wrapper_pid=str(1000 + task_id),
+                attached_at=attached_at,
+                started_at=attached_at,
+            )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 12.0 100000 35000 some_job\n"
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        scheduler.handle_fea_memory_pressure()
+        self.assertEqual(self.db.get_task(new_fea)["status"], TaskStatus.FAILED.value)
+        self.assertEqual(self.db.get_task(new_fea)["failure_message"], "memory pressure hard limit")
+        self.assertEqual(self.db.get_task(old_fea)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(self.db.get_task(standard)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(FakeClient.cancelled_tasks, [new_fea])
+
+    def test_fea_hard_memory_pressure_does_not_cancel_standard_task(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="alloc-1")
+        standard = self.db.create_task(TaskCreate("standard", "~/case", "run", cpus=4, memory_mb=8192))
+        self.db.update_task(
+            standard,
+            status=TaskStatus.RUNNING.value,
+            account_name="a",
+            allocation_id=allocation_id,
+            wrapper_pid="1234",
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 12.0 100000 35000 some_job\n"
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        scheduler.handle_fea_memory_pressure()
+        self.assertEqual(self.db.get_task(standard)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(FakeClient.cancelled_tasks, [])
 
     def test_gpu_task_can_attach_when_gpu_matches_but_cpu_is_tight(self) -> None:
         allocation_id = self.db.create_allocation(

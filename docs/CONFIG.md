@@ -41,6 +41,11 @@ warm_pool_preferred_accounts: ["account_a"]
 gpu_warm_pool_preferred_accounts: ["account_a"]
 single_job_per_node_partitions: ["cpu2"]
 gpu_cpu_reserve: 4
+fea_bursty:
+  soft_memory_free_percent: 60
+  hard_memory_free_percent: 40
+  load_target: 0.75
+  max_attach_per_loop: 8
 cleanup:
   enabled: true
   interval_seconds: 3600
@@ -71,8 +76,26 @@ Field meanings:
 - `gpu_warm_pool_preferred_accounts`: preferred accounts for GPU pools.
 - `single_job_per_node_partitions`: partitions where the scheduler should pin an idle node and avoid more than one scheduler job per node.
 - `gpu_cpu_reserve`: CPU cores left unrequested on GPU nodes. CPU pools always apply this reserve. GPU warm allocations apply it when they leave some GPUs unclaimed, so the remaining GPUs still have CPU available for other users.
+- `fea_bursty`: adaptive attached-task policy for bursty FEA workloads.
 - `cleanup`: automatic removal of scheduler-created remote artifact directories. Only paths under each account's `remote_workspace` whose basename starts with `task-`, `job-`, or `allocation-` are deleted.
 - `git_credentials`: central Git credentials for `/tasks/git`. `source_account` can point at a master account that already has a read-only deploy key; the scheduler reads that key and injects it into each task's temporary directory, so target accounts do not need GitHub SSH setup.
+
+## FEA Bursty Scheduling Config
+
+```yaml
+fea_bursty:
+  soft_memory_free_percent: 60
+  hard_memory_free_percent: 40
+  load_target: 0.75
+  max_attach_per_loop: 8
+```
+
+Meanings:
+
+- `soft_memory_free_percent`: stop attaching new `fea_bursty` tasks when the allocation node's `pestat` free memory is below this percentage.
+- `hard_memory_free_percent`: fail and cancel the newest running `fea_bursty` task on a pressured allocation when free memory drops below this percentage.
+- `load_target`: attach only while `pestat` CPU load is at or below `cpu_total * load_target`.
+- `max_attach_per_loop`: maximum new `fea_bursty` tasks the scheduler starts in one tick.
 
 ## Cleanup Config
 

@@ -17,7 +17,7 @@ from .conda_sync import CondaEnvSyncManager
 from .config import AppConfig, load_accounts, load_app_config
 from .db import Database
 from .git_auth import find_git_credential, git_task_payload
-from .models import JobCreate, TaskCreate
+from .models import JobCreate, SchedulingProfile, TaskCreate, normalize_scheduling_profile
 from .inventory import partition_rank
 from .pestat import PestatNode, plan_dynamic_allocations
 from .scheduler import Scheduler
@@ -304,6 +304,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         gpu_prewarm_cpu_reserve_per_free_gpu=config.gpu_prewarm_cpu_reserve_per_free_gpu,
         gpu_prewarm_partition=config.gpu_prewarm_partition,
         gpu_prewarm_time_limit=config.gpu_prewarm_time_limit,
+        fea_soft_memory_free_percent=config.fea_soft_memory_free_percent,
+        fea_hard_memory_free_percent=config.fea_hard_memory_free_percent,
+        fea_load_target=config.fea_load_target,
+        fea_max_attach_per_loop=config.fea_max_attach_per_loop,
         cleanup_enabled=config.cleanup_enabled,
         cleanup_interval_seconds=config.cleanup_interval_seconds,
         cleanup_finished_task_ttl_seconds=config.cleanup_finished_task_ttl_seconds,
@@ -396,6 +400,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "stderr_path": task.get("stderr_path") or "",
             "exit_code_path": task.get("exit_code_path") or "",
             "required_capability": task.get("required_capability") or "",
+            "scheduling_profile": normalize_scheduling_profile(task.get("scheduling_profile") or ""),
             "priority": int(task.get("priority") or 0),
             "timeout_seconds": int(task.get("timeout_seconds") or 0),
             "dedupe_key": task.get("dedupe_key") or "",
@@ -453,6 +458,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "account_name": task.get("account_name") or "",
             "cpus": int(task.get("cpus") or 1),
             "memory_mb": int(task.get("memory_mb") or 4096),
+            "scheduling_profile": normalize_scheduling_profile(task.get("scheduling_profile") or ""),
             "gpus": int(task.get("gpus") or 0),
             "gpu_model": task.get("gpu_model") or "",
             "partition": task.get("partition") or "auto",
@@ -515,6 +521,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             account_name=str(payload.get("account_name") or ""),
             cpus=max(1, int(payload.get("cpus") or 1)),
             memory_mb=max(1, int(payload.get("memory_mb") or 4096)),
+            scheduling_profile=normalize_scheduling_profile(str(payload.get("scheduling_profile") or "")),
             gpus=max(0, int(payload.get("gpus") or 0)),
             gpu_model=str(payload.get("gpu_model") or ""),
             partition=str(payload.get("partition") or "auto"),
@@ -777,6 +784,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                     account_name=account_name,
                     cpus=max(1, cpus),
                     memory_mb=max(1, parse_memory_mb(memory)),
+                    scheduling_profile=SchedulingProfile.STANDARD.value,
                     gpus=max(0, gpus),
                     gpu_model=gpu_model,
                     partition=partition,
@@ -798,6 +806,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         account_name: str = Form(""),
         cpus: int = Form(1),
         memory_mb: int = Form(4096),
+        scheduling_profile: str = Form(SchedulingProfile.STANDARD.value),
         gpus: int = Form(0),
         gpu_model: str = Form(""),
         partition: str = Form("auto"),
@@ -815,6 +824,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 account_name=account_name,
                 cpus=max(1, cpus),
                 memory_mb=max(1, memory_mb),
+                scheduling_profile=normalize_scheduling_profile(scheduling_profile),
                 gpus=max(0, gpus),
                 gpu_model=gpu_model,
                 partition=partition,
@@ -839,6 +849,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         partition: str = Form("auto"),
         cpus: int = Form(1),
         memory: str = Form("4G"),
+        scheduling_profile: str = Form(SchedulingProfile.STANDARD.value),
         gpus: int = Form(0),
         gpu_model: str = Form(""),
         node_name: str = Form(""),
@@ -856,6 +867,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 account_name=account_name,
                 cpus=max(1, cpus),
                 memory_mb=max(1, parse_memory_mb(memory)),
+                scheduling_profile=normalize_scheduling_profile(scheduling_profile),
                 gpus=max(0, gpus),
                 gpu_model=gpu_model,
                 partition=partition,
@@ -995,6 +1007,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "account_name": str(payload.get("account_name") or ""),
             "cpus": max(1, int(payload.get("cpus") or 1)),
             "memory_mb": max(1, int(payload.get("memory_mb") or parse_memory_mb(str(payload.get("memory") or "4G")))),
+            "scheduling_profile": normalize_scheduling_profile(str(payload.get("scheduling_profile") or "")),
             "gpus": max(0, int(payload.get("gpus") or 0)),
             "gpu_model": str(payload.get("gpu_model") or ""),
             "partition": str(payload.get("partition") or "auto"),
@@ -1040,6 +1053,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     def api_task_capacity(
         cpus: int = 1,
         memory_mb: int = 4096,
+        scheduling_profile: str = SchedulingProfile.STANDARD.value,
         gpus: int = 0,
         gpu_model: str = "",
         required_capability: str = "",
@@ -1052,6 +1066,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         task = {
             "cpus": max(1, cpus),
             "memory_mb": max(1, memory_mb),
+            "scheduling_profile": normalize_scheduling_profile(scheduling_profile),
             "gpus": max(0, gpus),
             "gpu_model": gpu_model,
             "required_capability": required_capability,

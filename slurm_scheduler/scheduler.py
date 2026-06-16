@@ -11,7 +11,7 @@ from typing import Callable
 from .config import AccountConfig
 from .db import Database
 from .inventory import CPU_PROFILES_BY_PARTITION, GPU_PRIORITY, gpu_model_candidates, normalize_gpu_model, parse_scontrol_nodes, parse_sinfo_nodes, partition_rank
-from .models import AccountSnapshot, AllocationStatus, JobStatus, TaskStatus
+from .models import AccountSnapshot, AllocationStatus, JobStatus, SchedulingProfile, TaskStatus, normalize_scheduling_profile
 from .pestat import PestatNode, parse_pestat
 from .slurm import RemoteExecutionError, SSHSession, SlurmAccountClient
 
@@ -54,6 +54,10 @@ class Scheduler:
         gpu_prewarm_cpu_reserve_per_free_gpu: int = 8,
         gpu_prewarm_partition: str = "auto",
         gpu_prewarm_time_limit: str = "48:00:00",
+        fea_soft_memory_free_percent: float = 60.0,
+        fea_hard_memory_free_percent: float = 40.0,
+        fea_load_target: float = 0.75,
+        fea_max_attach_per_loop: int = 8,
         cleanup_enabled: bool = True,
         cleanup_interval_seconds: int = 3600,
         cleanup_finished_task_ttl_seconds: int = 604800,
@@ -102,6 +106,10 @@ class Scheduler:
         self.gpu_prewarm_cpu_reserve_per_free_gpu = gpu_prewarm_cpu_reserve_per_free_gpu
         self.gpu_prewarm_partition = gpu_prewarm_partition
         self.gpu_prewarm_time_limit = gpu_prewarm_time_limit
+        self.fea_soft_memory_free_percent = max(0.0, float(fea_soft_memory_free_percent))
+        self.fea_hard_memory_free_percent = max(0.0, float(fea_hard_memory_free_percent))
+        self.fea_load_target = max(0.0, float(fea_load_target))
+        self.fea_max_attach_per_loop = max(1, int(fea_max_attach_per_loop))
         self._allocation_backoff_until_by_pool: dict[str, float] = {}
         self.cleanup_enabled = cleanup_enabled
         self.cleanup_interval_seconds = cleanup_interval_seconds
@@ -135,6 +143,7 @@ class Scheduler:
         self.refresh_allocations()
         self.refresh_tasks()
         self.apply_allocation_lifecycle()
+        self.handle_fea_memory_pressure()
         self.assign_queued_tasks()
         self.maintain_allocation_pool()
         self.refresh_submitted_jobs()
@@ -390,12 +399,27 @@ class Scheduler:
                 LOGGER.warning("failed to refresh allocation %s: %s", allocation["id"], exc)
                 continue
             if status == JobStatus.RUNNING and allocation["state"] == AllocationStatus.PENDING.value:
+                node_name = str(allocation.get("node_name") or "")
+                if not node_name:
+                    try:
+                        node_name = client.allocation_node_name(allocation["slurm_job_id"])
+                    except Exception as exc:
+                        LOGGER.debug("failed to read allocation %s node name: %s", allocation["id"], exc)
                 self.db.update_allocation(
                     allocation["id"],
                     state=AllocationStatus.WARM.value,
                     started_at="CURRENT_TIMESTAMP",
                     pending_reason="",
+                    node_name=node_name or allocation.get("node_name") or "",
                 )
+            elif status == JobStatus.RUNNING and not allocation.get("node_name"):
+                try:
+                    node_name = client.allocation_node_name(allocation["slurm_job_id"])
+                except Exception as exc:
+                    LOGGER.debug("failed to read allocation %s node name: %s", allocation["id"], exc)
+                    node_name = ""
+                if node_name:
+                    self.db.update_allocation(allocation["id"], node_name=node_name)
             elif status == JobStatus.SUBMITTED and allocation["state"] == AllocationStatus.PENDING.value:
                 try:
                     reason = client.pending_reason(allocation["slurm_job_id"])
@@ -500,18 +524,23 @@ class Scheduler:
 
     def recalculate_allocation_capacity(self) -> None:
         tasks = self.db.list_tasks(limit=5000)
-        running_by_allocation: dict[int, tuple[int, int, int]] = {}
+        running_by_allocation: dict[int, dict[str, int]] = {}
         for task in tasks:
             if task["status"] not in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
                 continue
             if not task.get("allocation_id"):
                 continue
-            cpus, mem, gpus = running_by_allocation.get(int(task["allocation_id"]), (0, 0, 0))
-            running_by_allocation[int(task["allocation_id"])] = (
-                cpus + int(task.get("cpus") or 0),
-                mem + int(task.get("memory_mb") or 0),
-                gpus + int(task.get("gpus") or 0),
+            stats = running_by_allocation.setdefault(
+                int(task["allocation_id"]),
+                {"active_tasks": 0, "reserved_cpus": 0, "reserved_mem": 0, "reserved_gpus": 0},
             )
+            stats["active_tasks"] += 1
+            if self.task_scheduling_profile(task) == SchedulingProfile.FEA_BURSTY.value:
+                stats["reserved_gpus"] += int(task.get("gpus") or 0)
+                continue
+            stats["reserved_cpus"] += int(task.get("cpus") or 0)
+            stats["reserved_mem"] += int(task.get("memory_mb") or 0)
+            stats["reserved_gpus"] += int(task.get("gpus") or 0)
         for allocation in self.db.list_allocations(limit=500):
             if allocation["state"] not in {
                 AllocationStatus.WARM.value,
@@ -519,20 +548,23 @@ class Scheduler:
                 AllocationStatus.DRAINING.value,
             }:
                 continue
-            used_cpus, used_mem, used_gpus = running_by_allocation.get(allocation["id"], (0, 0, 0))
-            free_cpus = max(0, int(allocation["total_cpus"]) - used_cpus)
-            free_mem = max(0, int(allocation["total_memory_mb"]) - used_mem)
-            free_gpus = max(0, int(allocation.get("total_gpus") or 0) - used_gpus)
+            stats = running_by_allocation.get(
+                allocation["id"],
+                {"active_tasks": 0, "reserved_cpus": 0, "reserved_mem": 0, "reserved_gpus": 0},
+            )
+            free_cpus = max(0, int(allocation["total_cpus"]) - stats["reserved_cpus"])
+            free_mem = max(0, int(allocation["total_memory_mb"]) - stats["reserved_mem"])
+            free_gpus = max(0, int(allocation.get("total_gpus") or 0) - stats["reserved_gpus"])
             state = allocation["state"]
             if state != AllocationStatus.DRAINING.value:
-                state = AllocationStatus.ACTIVE.value if used_cpus or used_mem or used_gpus else AllocationStatus.WARM.value
+                state = AllocationStatus.ACTIVE.value if stats["active_tasks"] else AllocationStatus.WARM.value
             self.db.update_allocation(
                 allocation["id"],
                 state=state,
                 free_cpus=free_cpus,
                 free_memory_mb=free_mem,
                 free_gpus=free_gpus,
-                last_active_at="CURRENT_TIMESTAMP" if used_cpus or used_mem or used_gpus else allocation.get("last_active_at"),
+                last_active_at="CURRENT_TIMESTAMP" if stats["active_tasks"] else allocation.get("last_active_at"),
             )
 
     def apply_allocation_lifecycle(self) -> None:
@@ -634,7 +666,10 @@ class Scheduler:
                 int(item["id"]),
             ),
         )
+        fea_attached_this_loop = 0
         for task in queued_tasks:
+            if self.task_is_fea_bursty(task) and fea_attached_this_loop >= self.fea_max_attach_per_loop:
+                continue
             allocation = self.best_allocation_for_task(task)
             if not allocation:
                 continue
@@ -671,6 +706,8 @@ class Scheduler:
                 self.recalculate_allocation_capacity()
                 continue
             self.db.update_task(task["id"], status=TaskStatus.RUNNING.value, started_at="CURRENT_TIMESTAMP", **result)
+            if self.task_is_fea_bursty(task):
+                fea_attached_this_loop += 1
             self.recalculate_allocation_capacity()
 
     def best_allocation_for_task(self, task: dict) -> dict | None:
@@ -715,6 +752,7 @@ class Scheduler:
     def task_fit_capacity(self, task: dict) -> dict:
         allocations = []
         total_slots = 0
+        pressure_states: list[str] = []
         for allocation in self.db.list_allocations(limit=500):
             if allocation["state"] not in {AllocationStatus.WARM.value, AllocationStatus.ACTIVE.value}:
                 continue
@@ -722,6 +760,10 @@ class Scheduler:
                 continue
             if not allocation.get("slurm_job_id"):
                 continue
+            allocation_pressure_state = "ok"
+            if self.task_is_fea_bursty(task) and self.allocation_matches_task_constraints(allocation, task, include_pending=False):
+                allocation_pressure_state = self.fea_memory_pressure_state(allocation)
+                pressure_states.append(allocation_pressure_state)
             if not self.allocation_can_run_task(allocation, task, include_pending=False):
                 continue
             slots = self.fit_slots_for_allocation(allocation, task)
@@ -741,11 +783,28 @@ class Scheduler:
                     "free_gpus": int(allocation.get("free_gpus") or 0),
                     "gpu_model": allocation.get("gpu_model") or "",
                     "fit_slots": slots,
+                    "memory_pressure_state": allocation_pressure_state,
+                    "node_memory_free_percent": self.fea_memory_free_percent(allocation) if self.task_is_fea_bursty(task) else None,
                 }
             )
-        return {"fit_slots": total_slots, "allocations": allocations}
+        pressure_rank = {"ok": 0, "soft_blocked": 1, "hard_pressure": 2}
+        memory_pressure_state = "ok"
+        if pressure_states:
+            memory_pressure_state = max(pressure_states, key=lambda item: pressure_rank.get(item, 0))
+        return {"fit_slots": total_slots, "memory_pressure_state": memory_pressure_state, "allocations": allocations}
 
     def fit_slots_for_allocation(self, allocation: dict, task: dict) -> int:
+        if self.task_is_fea_bursty(task):
+            if allocation.get("state") != AllocationStatus.PENDING.value and not self.fea_allocation_accepts_task(allocation):
+                return 0
+            slots = self.fea_max_attach_per_loop
+            max_workers = int(task.get("max_workers_per_node") or 0)
+            if max_workers > 0:
+                slots = min(slots, max(0, max_workers - self.allocation_worker_count(int(allocation["id"]))))
+            if self.task_requires_gpu(task):
+                gpu_slots = int(allocation.get("free_gpus") or 0) // max(1, int(task.get("gpus") or 1))
+                slots = min(slots, gpu_slots)
+            return max(0, slots)
         memory_slots = int(allocation.get("free_memory_mb") or 0) // max(1, int(task.get("memory_mb") or 1))
         if self.task_requires_gpu(task):
             gpu_slots = int(allocation.get("free_gpus") or 0) // max(1, int(task.get("gpus") or 1))
@@ -778,6 +837,108 @@ class Scheduler:
 
     def task_requires_gpu(self, task: dict) -> bool:
         return int(task.get("gpus") or 0) > 0
+
+    def task_scheduling_profile(self, task: dict) -> str:
+        return normalize_scheduling_profile(str(task.get("scheduling_profile") or ""))
+
+    def task_is_fea_bursty(self, task: dict) -> bool:
+        return self.task_scheduling_profile(task) == SchedulingProfile.FEA_BURSTY.value
+
+    def pestat_stale_after_seconds(self) -> float:
+        candidates = [120.0, float(max(1, self.poll_interval_seconds) * 4)]
+        if self.cluster_refresh_interval_seconds > 0:
+            candidates.append(float(self.cluster_refresh_interval_seconds) * 2)
+        return max(candidates)
+
+    def pestat_node_for_allocation(self, allocation: dict) -> dict | None:
+        node_name = str(allocation.get("node_name") or "").strip()
+        if not node_name:
+            return None
+        for row in self.db.list_pestat_nodes():
+            if str(row.get("hostname") or "") != node_name:
+                continue
+            observed_at = self._timestamp(row.get("observed_at"))
+            if not observed_at:
+                return None
+            if (self._now() - observed_at).total_seconds() > self.pestat_stale_after_seconds():
+                return None
+            return row
+        return None
+
+    def fea_memory_free_percent(self, allocation: dict) -> float | None:
+        node = self.pestat_node_for_allocation(allocation)
+        if not node:
+            return None
+        total = int(node.get("memory_mb") or 0)
+        if total <= 0:
+            return None
+        return max(0.0, (int(node.get("free_memory_mb") or 0) / total) * 100.0)
+
+    def fea_memory_pressure_state(self, allocation: dict) -> str:
+        percent = self.fea_memory_free_percent(allocation)
+        if percent is None:
+            return "soft_blocked"
+        if percent < self.fea_hard_memory_free_percent:
+            return "hard_pressure"
+        if percent < self.fea_soft_memory_free_percent:
+            return "soft_blocked"
+        return "ok"
+
+    def fea_node_load_ok(self, allocation: dict) -> bool:
+        node = self.pestat_node_for_allocation(allocation)
+        if not node:
+            return False
+        cpu_total = max(1, int(node.get("cpu_total") or 1))
+        return float(node.get("cpu_load") or 0.0) <= cpu_total * self.fea_load_target
+
+    def fea_allocation_accepts_task(self, allocation: dict) -> bool:
+        return self.fea_memory_pressure_state(allocation) == "ok" and self.fea_node_load_ok(allocation)
+
+    def handle_fea_memory_pressure(self) -> None:
+        for allocation in self.db.list_allocations(limit=500):
+            if allocation["state"] not in {
+                AllocationStatus.WARM.value,
+                AllocationStatus.ACTIVE.value,
+                AllocationStatus.DRAINING.value,
+            }:
+                continue
+            if self.fea_memory_pressure_state(allocation) != "hard_pressure":
+                continue
+            task = self.newest_running_fea_task(int(allocation["id"]))
+            if not task:
+                continue
+            account = self.account_by_name(str(task.get("account_name") or allocation.get("account_name") or ""))
+            if account:
+                try:
+                    self.client_factory(account).cancel_task(task)
+                except Exception as exc:
+                    LOGGER.warning("failed to cancel FEA task %s under memory pressure: %s", task["id"], exc)
+            self.db.update_task(
+                task["id"],
+                status=TaskStatus.FAILED.value,
+                failure_message="memory pressure hard limit",
+                finished_at="CURRENT_TIMESTAMP",
+            )
+            self.recalculate_allocation_capacity()
+            return
+
+    def newest_running_fea_task(self, allocation_id: int) -> dict | None:
+        candidates = [
+            task
+            for task in self.db.list_tasks(limit=5000)
+            if int(task.get("allocation_id") or 0) == allocation_id
+            and task["status"] in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}
+            and self.task_is_fea_bursty(task)
+        ]
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda task: (
+                task.get("attached_at") or task.get("started_at") or task.get("created_at") or "",
+                int(task.get("id") or 0),
+            ),
+        )
 
     def requested_accounts(self, account_name: str) -> list[str]:
         return [part.strip() for part in re.split(r"[\s,;/|]+", account_name or "") if part.strip()]
@@ -818,7 +979,7 @@ class Scheduler:
                 return True
         return False
 
-    def allocation_can_run_task(self, allocation: dict, task: dict, include_pending: bool) -> bool:
+    def allocation_matches_task_constraints(self, allocation: dict, task: dict, include_pending: bool) -> bool:
         requested_accounts = self.requested_accounts(str(task.get("account_name") or ""))
         if requested_accounts and allocation.get("account_name") not in requested_accounts:
             return False
@@ -828,8 +989,6 @@ class Scheduler:
             str(task.get("required_capability") or ""),
             str(task.get("env_profile") or ""),
         ):
-            return False
-        if int(allocation["free_memory_mb"]) < int(task["memory_mb"]):
             return False
         max_workers = int(task.get("max_workers_per_node") or 0)
         if max_workers > 0 and not include_pending and self.allocation_worker_count(int(allocation["id"])) >= max_workers:
@@ -849,12 +1008,31 @@ class Scheduler:
             return False
         if task.get("node_name") and allocation.get("node_name") != task.get("node_name"):
             return False
+        return True
+
+    def allocation_gpu_matches_task(self, allocation: dict, task: dict) -> bool:
         if self.task_requires_gpu(task):
             task_models = gpu_model_candidates(str(task.get("gpu_model") or ""))
             allocation_model = normalize_gpu_model(str(allocation.get("gpu_model") or ""))
             if task_models and allocation_model not in task_models:
                 return False
             if int(allocation.get("free_gpus") or 0) < int(task.get("gpus") or 0):
+                return False
+        return True
+
+    def allocation_can_run_task(self, allocation: dict, task: dict, include_pending: bool) -> bool:
+        if not self.allocation_matches_task_constraints(allocation, task, include_pending):
+            return False
+        if self.task_is_fea_bursty(task):
+            if not self.allocation_gpu_matches_task(allocation, task):
+                return False
+            if include_pending:
+                return True
+            return self.fea_allocation_accepts_task(allocation)
+        if int(allocation["free_memory_mb"]) < int(task["memory_mb"]):
+            return False
+        if self.task_requires_gpu(task):
+            if not self.allocation_gpu_matches_task(allocation, task):
                 return False
             if int(allocation["free_cpus"]) >= int(task["cpus"]):
                 return True
@@ -1027,6 +1205,10 @@ class Scheduler:
                 int(item.get("free_memory_mb") or 0),
             ),
         )
+        if self.task_is_fea_bursty(task):
+            if self.task_requires_gpu(task):
+                allocation["free_gpus"] = max(0, int(allocation.get("free_gpus") or 0) - int(task.get("gpus") or 0))
+            return allocation
         allocation["free_memory_mb"] = max(0, int(allocation.get("free_memory_mb") or 0) - int(task.get("memory_mb") or 0))
         allocation["free_cpus"] = max(0, int(allocation.get("free_cpus") or 0) - int(task.get("cpus") or 0))
         if self.task_requires_gpu(task):

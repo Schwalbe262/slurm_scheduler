@@ -14,7 +14,7 @@ import paramiko
 from .config import AccountConfig, GitCredentialConfig
 from .git_auth import git_credential_id_from_payload
 from .inventory import normalize_gpu_model
-from .models import AccountSnapshot, JobStatus
+from .models import AccountSnapshot, JobStatus, SchedulingProfile, normalize_scheduling_profile
 from .task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, TASK_ID_PLACEHOLDER
 
 
@@ -447,7 +447,8 @@ def build_srun_attach_command(
         and int(task.get("cpus") or 0) <= 4
         and int(allocation.get("free_cpus") or 0) < int(task.get("cpus") or 0)
     )
-    if cpu_shortage_gpu_task:
+    fea_bursty_task = normalize_scheduling_profile(str(task.get("scheduling_profile") or "")) == SchedulingProfile.FEA_BURSTY.value
+    if fea_bursty_task or cpu_shortage_gpu_task:
         srun_parts.append("--overlap")
     else:
         srun_parts.append("--exclusive")
@@ -756,6 +757,17 @@ class SlurmAccountClient:
         if result.exit_code != 0 or not result.stdout.strip():
             return ""
         return result.stdout.strip().splitlines()[0].strip()
+
+    def allocation_node_name(self, slurm_job_id: str) -> str:
+        command = f"squeue -h -j {shlex.quote(slurm_job_id)} -o \"%N\""
+        with SSHSession(self.account) as ssh:
+            result = ssh.run(command)
+        if result.exit_code != 0 or not result.stdout.strip():
+            return ""
+        node_name = result.stdout.strip().splitlines()[0].strip()
+        if node_name in {"(None)", "N/A", "None"}:
+            return ""
+        return node_name
 
     def cancel(self, slurm_job_id: str) -> None:
         with SSHSession(self.account) as ssh:

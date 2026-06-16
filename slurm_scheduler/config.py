@@ -73,6 +73,10 @@ class AppConfig:
     gpu_prewarm_cpu_reserve_per_free_gpu: int = 8
     gpu_prewarm_partition: str = "auto"
     gpu_prewarm_time_limit: str = "48:00:00"
+    fea_soft_memory_free_percent: float = 60.0
+    fea_hard_memory_free_percent: float = 40.0
+    fea_load_target: float = 0.75
+    fea_max_attach_per_loop: int = 8
     cleanup_enabled: bool = True
     cleanup_interval_seconds: int = 3600
     cleanup_finished_task_ttl_seconds: int = 604800
@@ -110,6 +114,17 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
         for source, target in mapping.items():
             if source in gpu_prewarm:
                 data[target] = gpu_prewarm[source]
+    fea_bursty = data.pop("fea_bursty", None)
+    if isinstance(fea_bursty, dict):
+        mapping = {
+            "soft_memory_free_percent": "fea_soft_memory_free_percent",
+            "hard_memory_free_percent": "fea_hard_memory_free_percent",
+            "load_target": "fea_load_target",
+            "max_attach_per_loop": "fea_max_attach_per_loop",
+        }
+        for source, target in mapping.items():
+            if source in fea_bursty:
+                data[target] = fea_bursty[source]
     cleanup = data.pop("cleanup", None)
     if isinstance(cleanup, dict):
         mapping = {

@@ -1,105 +1,85 @@
-# slurm_scheduler
+# Slurm Scheduler
 
-Web-based Slurm scheduler for CPU FEA/RL batches, remote command tasks, and GPU/LLM work.
+Slurm job을 매번 새로 제출하지 않고, 미리 띄워 둔 warm allocation에 작업을 `srun --jobid`로 붙여 실행하는 웹 기반 스케줄러입니다. CPU FEA/RL 배치, 기존 원격 디렉터리 실행, Git 기반 작업, GPU/LLM 작업을 하나의 Web UI와 HTTP API로 다룹니다.
 
-This project keeps Slurm allocation jobs warm and attaches user work with `srun --jobid`, so lightweight jobs do not consume one account-limited Slurm job slot each. Git-backed work is treated as an attached task by default, while packed simulation batches remain available for compatibility.
+이 README는 사람이 먼저 전체 기능을 이해하도록 정리한 문서입니다. 상세 API, 설정, 장애 대응은 `docs/` 아래 문서에 분리되어 있습니다.
 
-This repository is public-safe by design. Real hostnames, account names, IP addresses, private key names, Slurm job IDs, passwords, and local `config/*.yaml` files must stay outside Git.
+## 왜 만들었나
 
-## What It Does
+일반 Slurm 사용 방식에서는 작은 작업도 Slurm job 하나를 차지합니다. 계정별 job 개수 제한이 있는 환경에서는 수백 개의 짧은 FEA/RL 작업, Git 기반 실험, GPU 태스크를 효율적으로 넣기 어렵습니다.
 
-- Maintains warm CPU and GPU allocation pools.
-- Attaches remote commands to existing allocations through `/tasks`.
-- Clones/updates Git repos and runs entrypoints through `/tasks/git`.
-- Runs dynamic packed FEA/RL batches through `/jobs` with `dynamic_packed_srun`.
-- Tracks accounts, jobs, tasks, allocations, GPU capacity, and token usage in the Web UI and API.
-- Supports account-local software routing through `capabilities` and `env_profiles`.
+이 프로젝트는 다음 방식으로 그 문제를 줄입니다.
 
-## Quickstart
+- Slurm allocation job을 warm pool로 유지합니다.
+- 실제 사용자 작업은 allocation 내부에 `srun --jobid` step으로 붙입니다.
+- CPU, GPU, mixed capacity를 따로 추적하되 필요한 경우 안전하게 재사용합니다.
+- Web UI와 JSON API에서 계정, allocation, task, GPU capacity, 로그 경로를 확인합니다.
 
-```bash
-git clone https://github.com/Schwalbe262/slurm_scheduler.git
-cd slurm_scheduler
+## 현재 구현된 주요 기능
 
-sudo apt update
-sudo apt install -y python3.12-venv python3-pip
+### 1. Warm Allocation Pool
 
-cp config/app.example.yaml config/app.yaml
-cp config/accounts.example.yaml config/accounts.yaml
-```
+- CPU warm pool과 GPU warm pool을 유지합니다.
+- allocation 상태를 `pending`, `warm`, `active`, `draining`, `closing`, `closed`, `failed`로 관리합니다.
+- 오래된 allocation은 drain 후 종료하고, idle allocation은 최소 개수를 지키며 scale-in합니다.
+- queued task가 현재 capacity에 맞지 않으면 새 allocation을 demand 기반으로 엽니다.
 
-Edit `config/accounts.yaml` with your real Slurm login accounts, SSH key paths, account job limits, and optional environment profiles.
+### 2. Attached Task 실행
 
-Then run:
-
-```bash
-bash scripts/setup_and_smoke.sh
-. .venv/bin/activate
-python3 -m slurm_scheduler
-```
-
-Open the configured bind address:
-
-```text
-http://127.0.0.1:8000/
-```
-
-For another machine on a trusted LAN/VPN/Tailscale network, set:
-
-```bash
-export SCHEDULER_URL=http://<scheduler-host>:8000
-curl -sS "$SCHEDULER_URL/api/health"
-curl -sS "$SCHEDULER_URL/api/allocations"
-curl -sS "$SCHEDULER_URL/api/gpu-capacity"
-```
-
-The web UI has no built-in login page. Keep it on a trusted private network or put it behind an authenticated reverse proxy.
-
-## Choose The Right Submission Path
-
-- Use `POST /tasks` when the project already exists on the cluster filesystem.
-- Use `POST /tasks/git` when the scheduler should clone/update a Git repo before running a Python entrypoint.
-- Use `POST /jobs` with `job_mode=python_git` only as a compatibility alias for `/tasks/git`; it still creates an attached task.
-- Use `POST /jobs` with `job_mode=dynamic_packed_srun` for many simulation cases in one packed Slurm job.
-- Use the Web UI for interactive operation and quick status checks.
-
-## How Clients Submit Work
-
-Clients do not call Slurm directly. They send `multipart/form-data` HTTP requests to the scheduler, then poll the scheduler APIs for placement and result paths.
-
-Basic client flow:
-
-1. Set the scheduler URL.
-2. Check health and capacity.
-3. Choose `/tasks` or `/tasks/git` for normal virtual jobs. Use `/jobs` only for compatibility or packed simulation batches.
-4. Include resource requests such as `cpus`, `memory_mb` or `memory`, `gpus`, and `gpu_model`.
-5. Include `account_name` only when the job must stay on a specific Slurm account. Use comma-separated values such as `account_a,account_b` when either account is acceptable in that preference order.
-6. Poll `/api/tasks`, `/api/jobs`, and `/api/allocations`.
-7. Read task output through `/api/tasks/{task_id}/stdout` or `/api/tasks/{task_id}/remote-file`.
-8. For attached task output, read `/api/tasks/{task_id}/stdout`, `/api/tasks/{task_id}/stderr`, or `/api/tasks/{task_id}/remote-file`.
-
-```bash
-export SCHEDULER_URL=http://<scheduler-host>:8000
-curl -sS "$SCHEDULER_URL/api/health"
-curl -sS "$SCHEDULER_URL/api/accounts/status"
-curl -sS "$SCHEDULER_URL/api/allocations"
-curl -sS "$SCHEDULER_URL/api/gpu-capacity"
-```
-
-Use `/tasks` for a project that already exists on the cluster account:
+기존 원격 디렉터리에 있는 프로젝트를 그대로 실행할 수 있습니다.
 
 ```bash
 curl -sS -X POST "$SCHEDULER_URL/tasks" \
-  -F name=case-001 \
+  -F name=fea-case-001 \
   -F remote_cwd=/remote/project/path \
-  -F command='python run.py --case case001 --out results/case001.json' \
-  -F account_name=account_a,account_b \
+  -F command='python run_fea.py --case case001' \
   -F cpus=4 \
   -F memory_mb=8192 \
+  -F scheduling_profile=standard \
   -F gpus=0
 ```
 
-Use `/tasks/git` when the scheduler should clone or update a Git repo before running a Python entrypoint:
+스케줄러는 적합한 allocation을 찾고, 해당 allocation job 안에서 `srun --jobid=<allocation>`으로 task script를 실행합니다.
+
+### 3. FEA Bursty Scheduling Profile
+
+FEA 작업은 CPU와 메모리를 항상 고정량으로 점유하지 않는 경우가 많습니다. 이를 위해 attached task에 `scheduling_profile=fea_bursty`가 추가되어 있습니다.
+
+동작 방식:
+
+- `cpus`는 peak CPU 요청으로 유지하지만 scheduler slot 계산에서는 hard reservation으로 쓰지 않습니다.
+- `memory_mb`는 task별 Slurm step memory limit이자 예상 peak 상한입니다.
+- 신규 FEA attach는 `pestat`의 node free memory와 CPU load를 보고 결정합니다.
+- free memory가 soft threshold 미만이면 새 FEA attach를 막습니다.
+- free memory가 hard threshold 미만이면 해당 allocation에서 가장 늦게 붙은 running FEA task를 실패 처리하고 cancel합니다.
+- FEA task의 `srun`은 `--overlap --cpus-per-task=<cpus> --mem=<memory_mb>M` 형태로 실행됩니다.
+
+기본 정책:
+
+```yaml
+fea_bursty:
+  soft_memory_free_percent: 60
+  hard_memory_free_percent: 40
+  load_target: 0.75
+  max_attach_per_loop: 8
+```
+
+예시:
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/tasks" \
+  -F name=fea-bursty-001 \
+  -F remote_cwd=/remote/fea/project \
+  -F command='python run_fea.py --case 001' \
+  -F cpus=4 \
+  -F memory_mb=32768 \
+  -F scheduling_profile=fea_bursty \
+  -F gpus=0
+```
+
+### 4. Git 기반 작업
+
+Git repo를 clone/update한 뒤 Python entrypoint를 실행하는 task를 만들 수 있습니다.
 
 ```bash
 curl -sS -X POST "$SCHEDULER_URL/tasks/git" \
@@ -108,159 +88,23 @@ curl -sS -X POST "$SCHEDULER_URL/tasks/git" \
   -F git_ref=main \
   -F entrypoint=scripts/run.py \
   -F arguments='--case case001' \
-  -F account_name=account_a,account_b \
   -F cpus=4 \
   -F memory=8G \
+  -F scheduling_profile=standard \
   -F gpus=0
 ```
 
-Private Git repos can use central scheduler credentials instead of per-account SSH setup. Add a read-only deploy key once to a reference account and configure `git_credentials`; `/tasks/git` will copy that key into the assigned task directory temporarily and set `GIT_SSH_COMMAND`, so `account_name` can be left empty and the scheduler may use any matching warm pool.
+Private repo는 중앙 Git credential 설정을 통해 처리할 수 있습니다. 각 Slurm 계정 홈에 GitHub key를 복사하지 않고, scheduler가 task 임시 디렉터리에 deploy key를 주입하고 `GIT_SSH_COMMAND`를 설정합니다.
 
-```yaml
-git_credentials:
-  - id: kakao-loco-bot
-    url_patterns: ["*Schwalbe262/kakao-loco-bot*"]
-    clone_url: "git@github.com:Schwalbe262/kakao-loco-bot.git"
-    source_account: "r1jae262"
-    source_private_key_path: "~/.ssh/kakao_loco_bot_deploy"
-    strict_host_key_checking: "accept-new"
-```
+### 5. GPU Scheduling
 
-GPU model constraints also accept comma-separated ordered candidates. For example, `gpu_model=a6000ada,a6000` tries A6000 ADA first and can fall back to A6000 if that is the available matching pool or node.
+- GPU warm pool을 유지할 수 있습니다.
+- 기본 우선순위는 A6000 ADA, A6000 순서입니다.
+- task는 `gpus`, `gpu_model`, `partition`, `node_name`을 요청할 수 있습니다.
+- `gpu_model=a6000ada,a6000`처럼 ordered fallback 후보를 받을 수 있습니다.
+- GPU capacity는 물리 총량뿐 아니라 cluster used/free, scheduler owned/free를 분리해서 보여줍니다.
 
-`POST /jobs` with `job_mode=python_git` is kept for old clients, but it is routed into the attached-task scheduler and appears under Attached Tasks. This is the intended "virtual job" path: the client submits a job-like request, and the scheduler places it inside an existing warm allocation.
-
-Task names in the Web UI link to `/tasks/{id}`. The detail page shows the stored task fields, log paths, and equivalent JSON/curl/Python submission examples for recreating the task through `/api/tasks`.
-
-### Sync conda environments across accounts
-
-Use `POST /api/conda-env-sync` to clone a conda environment from a reference account to explicit target accounts. The scheduler uses `conda-pack`, backs up an existing target env with a timestamp suffix, installs the packed env under the same env name, and then records a dynamic `conda:<env-name>` capability plus matching `env_profile`.
-
-```bash
-curl -sS -X POST "$SCHEDULER_URL/api/conda-env-sync" \
-  -H 'Content-Type: application/json' \
-  --data '{
-    "reference_account": "r1jae262",
-    "source_env_name": "pyaedt2026v1",
-    "target_accounts": ["account_b", "account_c"]
-  }'
-```
-
-Poll status:
-
-```bash
-curl -sS "$SCHEDULER_URL/api/conda-env-sync/1"
-```
-
-After a target completes, tasks can request the synced environment with `required_capability=conda:pyaedt2026v1` and `env_profile=pyaedt2026v1` without editing `accounts.yaml`.
-
-Use `/jobs` with `dynamic_packed_srun` when the scheduler should split many simulation cases into packed Slurm jobs:
-
-```bash
-curl -sS -X POST "$SCHEDULER_URL/jobs" \
-  -F job_mode=dynamic_packed_srun \
-  -F remote_path=/remote/project/path \
-  -F entrypoint=scripts/run_fea.py \
-  -F arguments='--campaign sweep-001' \
-  -F account_name=account_a \
-  -F total_simulations=20 \
-  -F cpus_per_simulation=4 \
-  -F mem_per_simulation_gb=8 \
-  -F max_workers_per_job=20 \
-  -F max_new_jobs=10 \
-  -F time_limit=48:00:00 \
-  -F partition=auto
-```
-
-Useful polling commands:
-
-```bash
-curl -sS "$SCHEDULER_URL/api/tasks"
-curl -sS "$SCHEDULER_URL/api/jobs"
-curl -sS "$SCHEDULER_URL/api/allocations"
-curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/stdout"
-curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/stderr?tail_lines=100"
-curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/remote-file?base=remote_cwd&path=results/case001.json"
-curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/remote-files?base=remote_cwd&glob=logs/vllm-scheduler*.err"
-curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/remote-file?base=git_repo&path=results/best.json"
-curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=16&memory_mb=32768&required_capability=conda:flight-searcher"
-curl -sS "$SCHEDULER_URL/api/capabilities"
-curl -sS -X POST "$SCHEDULER_URL/api/tasks/cancel?name_contains=crypto-sweep&statuses=queued,attaching,running"
-curl -sS "$SCHEDULER_URL/api/jobs/<job_id>/remote-file?base=remote_job_dir&path=submit.stderr.log"
-```
-
-The scheduler automatically cleans old scheduler-created remote directories such as `task-*`, `job-*`, and `allocation-*` under each account's `remote_workspace`. By default, finished task/job artifacts are kept for 7 days and closed allocation artifacts for 1 day. Read stdout, stderr, and result files through the API before the cleanup TTL expires.
-
-## CPU And Memory Requests
-
-The Web UI has a `Capabilities` section that shows each usable `required_capability`, eligible accounts, matching env profiles, and whether the rule came from `accounts.yaml` or a conda sync overlay. The same data is available from `/api/capabilities`.
-
-`required_capability` is a scheduler label, not the conda activation itself. It restricts placement to accounts that declare the capability in `accounts.yaml`. Use a `conda:<env-name>` label when the requirement is a prepared conda environment, for example `required_capability=conda:flight-searcher`. Use `env_profile=flight-searcher` when the task also needs the scheduler to run concrete shell setup such as `conda activate flight-searcher`.
-
-`cpus` and `memory_mb` are scheduling requests for an attached task. They are not a Python virtual environment or a preallocated RAM block. The process uses physical memory only when it actually allocates memory, but the scheduler reserves that amount from the warm allocation's available capacity and Slurm may enforce the limit with cgroups/OOM handling depending on cluster configuration.
-
-If you do not know memory usage:
-
-- Start with a conservative estimate such as `memory_mb=8192` for a small CPU task.
-- For ANSYS/FEA, use the best observed peak RSS or solver memory report from a similar case, then add headroom.
-- If tasks fail with OOM or Slurm memory errors, increase `memory_mb`.
-- If allocations look underused and many tasks are queued only because of memory, lower future requests after confirming actual usage.
-- Do not set memory unrealistically high; it reduces how many tasks can attach to the same warm allocation.
-
-## Minimal API Examples
-
-Existing remote directory:
-
-```bash
-curl -sS -X POST "$SCHEDULER_URL/tasks" \
-  -F name=fea-case-001 \
-  -F remote_cwd=/remote/project/path \
-  -F command='python run_fea.py --case case001' \
-  -F account_name=account_a \
-  -F cpus=4 \
-  -F memory_mb=8192 \
-  -F gpus=0
-```
-
-JSON pool task for service clients:
-
-```bash
-curl -sS -X POST "$SCHEDULER_URL/api/tasks" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "name": "flight-crawl-icn-sfo",
-    "remote_cwd": "/remote/flight-searcher",
-    "command": "python worker.py --payload \"$SLURM_SCHEDULER_PAYLOAD_PATH\"",
-    "payload_json": {"from": "ICN", "to": "SFO"},
-    "required_capability": "conda:flight-searcher",
-    "env_profile": "flight-searcher",
-    "cpus": 1,
-    "memory_mb": 1024,
-    "priority": 10,
-    "timeout_seconds": 300,
-    "dedupe_key": "flight:ICN:SFO",
-    "max_workers_per_node": 200
-  }'
-
-curl -sS "$SCHEDULER_URL/api/tasks/<task_id>?include_output=true"
-```
-
-Git-based task:
-
-```bash
-curl -sS -X POST "$SCHEDULER_URL/tasks/git" \
-  -F job_name=git-cpu-demo \
-  -F repo_url=https://github.com/example/project.git \
-  -F git_ref=main \
-  -F account_name=account_a \
-  -F entrypoint=scripts/run.py \
-  -F arguments='--case demo' \
-  -F cpus=4 \
-  -F memory=8G \
-  -F gpus=0
-```
-
-GPU task:
+GPU task 예시:
 
 ```bash
 curl -sS -X POST "$SCHEDULER_URL/tasks" \
@@ -274,25 +118,127 @@ curl -sS -X POST "$SCHEDULER_URL/tasks" \
   -F partition=auto
 ```
 
-Dynamic packed FEA/RL batch:
+### 6. Mixed CPU/GPU Capacity
+
+CPU-only task는 CPU allocation을 우선 사용합니다. 필요한 경우 GPU allocation 안의 남는 CPU도 빌릴 수 있습니다.
+
+다만 GPU allocation의 free GPU를 위해 CPU reserve를 남깁니다.
+
+```text
+borrowable_cpu = free_cpus - (free_gpus * gpu_prewarm.cpu_reserve_per_free_gpu)
+```
+
+즉 GPU를 잡아두고 있는 allocation이라고 해서 CPU-only task가 모든 CPU를 가져가지는 않습니다.
+
+### 7. Dynamic Packed FEA/RL Batch
+
+많은 simulation case를 한 번에 돌리는 기존 packed workflow도 유지됩니다.
+
+`dynamic_packed_srun`은 저장된 `pestat` 데이터를 기반으로 node별 CPU load, free memory, CPU/thread 요구량을 보고 packed Slurm job 계획을 만듭니다.
 
 ```bash
 curl -sS -X POST "$SCHEDULER_URL/jobs" \
   -F job_mode=dynamic_packed_srun \
   -F remote_path=/remote/project/path \
   -F entrypoint=scripts/run_fea.py \
-  -F arguments='--campaign rl-loop-001' \
-  -F partition=auto \
-  -F time_limit=48:00:00 \
+  -F arguments='--campaign sweep-001' \
   -F total_simulations=20 \
   -F cpus_per_simulation=4 \
   -F mem_per_simulation_gb=8 \
   -F max_workers_per_job=20 \
   -F max_new_jobs=10 \
-  -F job_name=fea-rl
+  -F time_limit=48:00:00 \
+  -F partition=auto
 ```
 
-Token usage:
+일반 작업은 attached task가 기본 경로이고, packed job은 다수 simulation을 하나의 batch allocation 안에서 orchestrate해야 할 때 사용합니다.
+
+### 8. Capability / Env Profile Routing
+
+계정마다 설치된 conda 환경이나 소프트웨어가 다를 수 있습니다. 그래서 task는 다음 필드로 실행 가능한 계정을 제한할 수 있습니다.
+
+- `required_capability`: 예를 들어 `conda:pyaedt2026v1`
+- `env_profile`: 실제 shell setup을 prepend할 profile 이름
+
+계정 설정 예시:
+
+```yaml
+capabilities: ["conda:pyaedt2026v1"]
+env_profiles:
+  pyaedt2026v1: |
+    source ~/miniconda3/etc/profile.d/conda.sh
+    conda activate pyaedt2026v1
+```
+
+Web UI의 Capabilities 섹션과 `/api/capabilities`에서 어떤 account가 어떤 capability를 지원하는지 확인할 수 있습니다.
+
+### 9. Conda Env Sync
+
+reference account의 conda 환경을 다른 account로 복제하는 API가 있습니다.
+
+- `conda-pack` 기반으로 환경을 묶습니다.
+- target account에 같은 이름의 환경이 있으면 timestamp backup으로 옮깁니다.
+- 설치가 끝나면 `conda:<env-name>` capability와 matching `env_profile` overlay를 DB에 기록합니다.
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/conda-env-sync" \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "reference_account": "account_a",
+    "source_env_name": "pyaedt2026v1",
+    "target_accounts": ["account_b", "account_c"]
+  }'
+```
+
+### 10. Web UI와 운영 API
+
+Web UI에서 볼 수 있는 것:
+
+- 계정별 running/pending/limit/storage
+- capability와 account 매핑
+- active/closed allocation pool
+- active/finished attached task
+- active/finished direct job
+- GPU capacity
+- token usage
+- conda env sync 상태
+- task detail, stdout/stderr path, recreate payload
+
+주요 API:
+
+```bash
+curl -sS "$SCHEDULER_URL/api/health"
+curl -sS "$SCHEDULER_URL/api/accounts/status"
+curl -sS "$SCHEDULER_URL/api/allocations"
+curl -sS "$SCHEDULER_URL/api/gpu-capacity"
+curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=4&memory_mb=32768&scheduling_profile=fea_bursty"
+curl -sS "$SCHEDULER_URL/api/tasks"
+curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/stdout"
+curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/stderr?tail_lines=100"
+curl -sS "$SCHEDULER_URL/api/tasks/<task_id>/remote-file?base=remote_cwd&path=results/out.json"
+```
+
+`/api/task-capacity`는 `scheduling_profile=fea_bursty`일 때 `memory_pressure_state`를 반환합니다.
+
+```text
+ok | soft_blocked | hard_pressure
+```
+
+### 11. Remote Output과 Cleanup
+
+task detail과 API에서 stdout/stderr, remote file, remote glob을 조회할 수 있습니다.
+
+오래된 scheduler-created remote directory는 자동 cleanup 대상입니다.
+
+- `task-*`
+- `job-*`
+- `allocation-*`
+
+기본 TTL은 finished task/job 7일, closed allocation 1일입니다.
+
+### 12. Token Usage 기록
+
+Codex나 LLM 작업량을 프로젝트별로 기록하고 Web UI에서 그래프와 테이블로 볼 수 있습니다.
 
 ```bash
 curl -sS -X POST "$SCHEDULER_URL/token-usage" \
@@ -304,133 +250,103 @@ curl -sS -X POST "$SCHEDULER_URL/token-usage" \
   -F note='example run'
 ```
 
-## Shell Examples
-
-All scripts require `SCHEDULER_URL`:
+## 빠른 시작
 
 ```bash
-export SCHEDULER_URL=http://<scheduler-host>:8000
+git clone https://github.com/Schwalbe262/slurm_scheduler.git
+cd slurm_scheduler
 
-bash examples/health.sh
-bash examples/submit_cpu_task.sh
-bash examples/submit_gpu_a6000ada_task.sh
-bash examples/submit_specific_gpu_node_task.sh
-bash examples/submit_git_task.sh
-bash examples/submit_dynamic_packed_job.sh
-bash examples/record_token_usage.sh
+sudo apt update
+sudo apt install -y python3.12-venv python3-pip
+
+cp config/app.example.yaml config/app.yaml
+cp config/accounts.example.yaml config/accounts.yaml
 ```
 
-Override inputs with environment variables such as `REMOTE_CWD`, `TASK_COMMAND`, `REPO_URL`, `GPU_MODEL`, `CPUS`, and `MEMORY_MB`.
+`config/accounts.yaml`에 실제 Slurm login account, SSH key path, remote workspace, job limit, capability/profile을 입력합니다.
 
-## Configuration
+설치와 smoke check:
 
-Local runtime files are ignored by Git:
+```bash
+bash scripts/setup_and_smoke.sh
+. .venv/bin/activate
+python3 -m slurm_scheduler
+```
+
+기본 접속:
+
+```text
+http://127.0.0.1:8000/
+```
+
+다른 장비에서 접근하려면 trusted LAN/VPN/Tailscale 뒤에 두고 `bind_host`, firewall, reverse proxy 설정을 확인하세요. 이 Web UI에는 자체 로그인 기능이 없습니다.
+
+## 설정 파일
+
+runtime 설정은 Git에 올리지 않습니다.
 
 ```bash
 cp config/app.example.yaml config/app.yaml
 cp config/accounts.example.yaml config/accounts.yaml
 ```
 
-Example account:
+중요 설정:
 
-```yaml
-accounts:
-  - name: account_a
-    host: login.example.edu
-    port: 22
-    username: account_a
-    private_key_path: "secrets/cluster/account_a.pem"
-    remote_workspace: "slurm_scheduler"
-    max_running_jobs: 10
-    max_pending_jobs: 10
-    max_total_jobs: 10
-    capabilities: ["conda:pyaedt2026v1"]
-    env_profiles:
-      pyaedt2026v1: |
-        source ~/miniconda3/etc/profile.d/conda.sh
-        conda activate pyaedt2026v1
+- `cluster_refresh_interval_seconds`: inventory와 `pestat` refresh 주기
+- `min_warm_allocations`: CPU warm allocation 최소 개수
+- `allocation_cpus`: CPU warm pool allocation 크기
+- `cpu_pool_allow_gpu_partitions`: CPU pool이 GPU partition의 CPU를 사용할 수 있는지
+- `warm_pool_preferred_accounts`: CPU warm pool 선호 account
+- `gpu_prewarm`: GPU warm pool 정책
+- `fea_bursty`: bursty FEA pressure threshold
+- `cleanup`: remote artifact cleanup TTL
+- `git_credentials`: private Git repo credential 주입
+
+상세 내용은 [docs/CONFIG.md](docs/CONFIG.md)를 보세요.
+
+## 문서 지도
+
+- [docs/API.md](docs/API.md): HTTP endpoint, form field, JSON response reference
+- [docs/EXAMPLES.md](docs/EXAMPLES.md): copy-paste 운영 예시
+- [docs/CONFIG.md](docs/CONFIG.md): app/account 설정
+- [docs/scheduling-principles.md](docs/scheduling-principles.md): CPU/GPU/mixed scheduling 정책
+- [docs/gpu-scheduling.md](docs/gpu-scheduling.md): GPU prewarm, model priority, capacity 해석
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md): pending, SSH, inventory, task 문제 대응
+- [docs/remote-access.md](docs/remote-access.md): LAN/VPN/Tailscale 접근
+- [docs/llm-operator-guide.md](docs/llm-operator-guide.md): LLM agent가 API로 운영할 때의 짧은 가이드
+- [docs/ROADMAP.md](docs/ROADMAP.md): 다음 개선 후보
+
+## 테스트
+
+로컬 단위 테스트:
+
+```bash
+python3 -m unittest tests.test_core
 ```
 
-Example scheduler policy:
+추가 정적 확인:
 
-```yaml
-cluster_refresh_interval_seconds: 120
-allocation_cpus: 64
-allocation_scale_out_usage_threshold: 0.50
-allocation_pending_timeout_seconds: 1800
-allocation_pending_backoff_seconds: 1800
-cpu_pool_allow_gpu_partitions: true
-warm_pool_preferred_accounts: ["account_a"]
-gpu_warm_pool_preferred_accounts: ["account_a"]
-single_job_per_node_partitions: ["cpu2"]
-gpu_prewarm:
-  enabled: true
-  preferred_models: ["a6000ada", "a6000"]
-  min_warm_allocations: 1
-  max_warm_allocations: 3
-  gpus_per_allocation: 4
-  min_gpus_per_allocation: 2
-cleanup:
-  enabled: true
-  interval_seconds: 3600
-  finished_task_ttl_seconds: 604800
-  finished_job_ttl_seconds: 604800
-  closed_allocation_ttl_seconds: 86400
+```bash
+python3 -m compileall slurm_scheduler tests scripts
+bash -n scripts/*.sh examples/*.sh
+git diff --check
 ```
 
-Read [docs/CONFIG.md](docs/CONFIG.md) before changing scheduling policy.
-
-## Documentation Map
-
-- [docs/API.md](docs/API.md): HTTP endpoints, form fields, and examples.
-- [docs/EXAMPLES.md](docs/EXAMPLES.md): Copy-paste operational recipes.
-- [docs/CONFIG.md](docs/CONFIG.md): App and account configuration.
-- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md): Network, Slurm, inventory, and task issues.
-- [docs/scheduling-principles.md](docs/scheduling-principles.md): CPU/GPU/mixed-capacity scheduling policy.
-- [docs/gpu-scheduling.md](docs/gpu-scheduling.md): GPU model priority, prewarm, and capacity meaning.
-- [docs/remote-access.md](docs/remote-access.md): Trusted remote access through LAN/VPN/Tailscale.
-- [docs/llm-operator-guide.md](docs/llm-operator-guide.md): Short guide for remote LLM agents.
-- [docs/ROADMAP.md](docs/ROADMAP.md): Recommended future improvements.
-
-## LLM Operator Prompt
-
-Give a remote LLM agent this repository link plus:
-
-```text
-Use the Slurm scheduler documented in this repository.
-Set SCHEDULER_URL to http://<scheduler-host>:8000.
-First call /api/health, /api/accounts/status, /api/allocations, and /api/gpu-capacity.
-Use /tasks for existing remote directories, /tasks/git for Git-based work, and /jobs dynamic_packed_srun only for packed simulation batches.
-Do not assume direct Slurm access from the client machine.
-Do not submit GPU work until /api/gpu-capacity has been checked.
-```
-
-## Live Checks
-
-After local config and keys are prepared:
+실제 Slurm 환경 점검:
 
 ```bash
 python3 scripts/check_ssh.py --account account_a
 python3 scripts/refresh_inventory.py --account account_a
 python3 scripts/refresh_pestat.py --account account_a
 python3 scripts/live_sleep_test.py --account account_a --count 1 --partition cpu_partition
-python3 scripts/live_distributed_sleep_test.py --count 6 --partition cpu_partition
 ```
 
-Live checks submit real Slurm jobs.
+live check는 실제 Slurm job을 제출합니다.
 
-## Tests
+## 보안과 운영 주의
 
-```bash
-python3 -m unittest discover -s tests
-python3 -m compileall slurm_scheduler tests scripts
-bash -n scripts/*.sh examples/*.sh
-git diff --check
-```
-
-## Recommended Next Improvements
-
-- Add placement decision traces for accounts, partitions, nodes, and allocations.
-- Add inventory freshness warnings in the Web UI.
-- Add a dry-run placement API for LLM agents and operators.
-- Add optional authentication before exposing write endpoints outside a private network.
+- 실제 host, account, key path, local `config/*.yaml`, credential은 Git에 올리지 않습니다.
+- Web UI에는 자체 인증이 없습니다. private network 또는 authenticated reverse proxy 뒤에서 운영하세요.
+- scheduler는 각 account의 `remote_workspace` 아래에서 만든 `task-*`, `job-*`, `allocation-*` artifact만 cleanup합니다.
+- `memory_mb`는 RAM을 미리 물리적으로 할당한다는 뜻이 아니라 scheduler reservation 및 Slurm step memory limit입니다.
+- `fea_bursty`는 bursty workload용입니다. 항상 고정 CPU/memory를 써야 하는 작업은 `standard`를 사용하세요.
