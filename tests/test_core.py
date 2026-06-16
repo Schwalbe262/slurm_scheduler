@@ -1475,14 +1475,14 @@ class SchedulerTests(unittest.TestCase):
 
     def test_gpu_prewarm_prefers_a6000ada(self) -> None:
         inventory = parse_scontrol_nodes(
-            "NodeName=gpu-ada CPUTot=64 RealMemory=1024000 Gres=gpu:a6000ada:4 GresUsed=gpu:a6000ada:2(IDX:0-1) State=MIXED Partitions=gpu3\n"
+            "NodeName=gpu-ada CPUTot=64 RealMemory=1024000 Gres=gpu:a6000ada:4 GresUsed=gpu:a6000ada:0 State=IDLE Partitions=gpu3\n"
             "NodeName=gpu-a6000 CPUTot=64 RealMemory=1024000 Gres=gpu:a6000:4 GresUsed=gpu:a6000:0 State=IDLE Partitions=gpu5\n"
         )
         self.db.replace_node_inventory(inventory)
         self.db.replace_pestat_nodes(
             parse_pestat(
                 "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
-                "gpu-ada gpu3 mix 8 64 4.0 1024000 900000\n"
+                "gpu-ada gpu3 idle 0 64 0.0 1024000 900000\n"
                 "gpu-a6000 gpu5 idle 0 64 0.0 1024000 900000\n"
             )
         )
@@ -1491,6 +1491,7 @@ class SchedulerTests(unittest.TestCase):
             self.accounts,
             30,
             client_factory=FakeClient,
+            min_warm_allocations=0,
             gpu_prewarm_enabled=True,
             gpu_prewarm_min_warm_allocations=1,
             gpu_prewarm_preferred_models=["a6000ada", "a6000"],
@@ -1500,7 +1501,33 @@ class SchedulerTests(unittest.TestCase):
         gpu_allocations = [item for item in allocations if item["resource_pool"].startswith("gpu:")]
         self.assertEqual(len(gpu_allocations), 1)
         self.assertEqual(gpu_allocations[0]["gpu_model"], "a6000ada")
-        self.assertEqual(gpu_allocations[0]["total_gpus"], 2)
+        self.assertEqual(gpu_allocations[0]["total_gpus"], 4)
+
+    def test_gpu_prewarm_takes_three_when_four_are_not_free(self) -> None:
+        inventory = parse_scontrol_nodes(
+            "NodeName=gpu-ada CPUTot=64 RealMemory=1024000 Gres=gpu:a6000ada:4 GresUsed=gpu:a6000ada:1(IDX:0) State=MIXED Partitions=gpu3\n"
+        )
+        self.db.replace_node_inventory(inventory)
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "gpu-ada gpu3 mix 8 64 1.0 1024000 900000\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            gpu_prewarm_enabled=True,
+            gpu_prewarm_min_warm_allocations=1,
+            gpu_prewarm_preferred_models=["a6000ada", "a6000"],
+        )
+        scheduler.maintain_allocation_pool()
+        allocation = self.db.list_allocations()[0]
+        self.assertEqual(allocation["resource_pool"], "gpu:a6000ada")
+        self.assertEqual(allocation["total_gpus"], 3)
 
     def test_gpu_prewarm_uses_a6000_node_with_only_four_free_cpus(self) -> None:
         inventory = parse_scontrol_nodes(
@@ -1552,7 +1579,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(shape["partition"], "gpu3")
         self.assertLessEqual(shape["cpus"], 56)
 
-    def test_gpu_prewarm_leaves_cpu_for_unclaimed_gpus(self) -> None:
+    def test_gpu_prewarm_takes_all_four_gpus_when_available(self) -> None:
         inventory = parse_scontrol_nodes(
             "NodeName=gpu-a6000 CPUTot=48 RealMemory=687626 Gres=gpu:a6000:4 GresUsed=gpu:a6000:0 State=IDLE Partitions=gpu5\n"
         )
@@ -1578,10 +1605,10 @@ class SchedulerTests(unittest.TestCase):
         scheduler.maintain_allocation_pool()
         allocation = self.db.list_allocations()[0]
         self.assertEqual(allocation["resource_pool"], "gpu:a6000")
-        self.assertEqual(allocation["total_gpus"], 2)
-        self.assertEqual(allocation["total_cpus"], 44)
+        self.assertEqual(allocation["total_gpus"], 4)
+        self.assertEqual(allocation["total_cpus"], 48)
 
-    def test_gpu_prewarm_opens_lower_fallback_when_preferred_is_only_pending(self) -> None:
+    def test_gpu_prewarm_does_not_open_lower_fallback_when_preferred_is_only_pending(self) -> None:
         for model in ["a6000ada", "a6000"]:
             allocation_id = self.db.create_allocation(
                 account_name="a",
@@ -1618,8 +1645,8 @@ class SchedulerTests(unittest.TestCase):
         )
         scheduler.maintain_allocation_pool()
         gpu_allocations = [item for item in self.db.list_allocations() if item["resource_pool"].startswith("gpu:")]
-        self.assertEqual(len(gpu_allocations), 3)
-        self.assertTrue(any(item["gpu_model"] == "rtx3090" for item in gpu_allocations))
+        self.assertEqual(len(gpu_allocations), 2)
+        self.assertFalse(any(item["gpu_model"] == "rtx3090" for item in gpu_allocations))
 
     def test_gpu_prewarm_keeps_preferred_queue_when_fallback_is_ready(self) -> None:
         fallback_id = self.db.create_allocation(

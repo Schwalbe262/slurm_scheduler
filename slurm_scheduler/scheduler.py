@@ -49,7 +49,8 @@ class Scheduler:
         gpu_prewarm_preferred_models: list[str] | None = None,
         gpu_prewarm_min_warm_allocations: int = 1,
         gpu_prewarm_max_warm_allocations: int = 3,
-        gpu_prewarm_gpus_per_allocation: int = 2,
+        gpu_prewarm_gpus_per_allocation: int = 4,
+        gpu_prewarm_min_gpus_per_allocation: int = 2,
         gpu_prewarm_cpu_reserve_per_free_gpu: int = 8,
         gpu_prewarm_partition: str = "auto",
         gpu_prewarm_time_limit: str = "48:00:00",
@@ -97,6 +98,7 @@ class Scheduler:
         self.gpu_prewarm_min_warm_allocations = gpu_prewarm_min_warm_allocations
         self.gpu_prewarm_max_warm_allocations = gpu_prewarm_max_warm_allocations
         self.gpu_prewarm_gpus_per_allocation = gpu_prewarm_gpus_per_allocation
+        self.gpu_prewarm_min_gpus_per_allocation = gpu_prewarm_min_gpus_per_allocation
         self.gpu_prewarm_cpu_reserve_per_free_gpu = gpu_prewarm_cpu_reserve_per_free_gpu
         self.gpu_prewarm_partition = gpu_prewarm_partition
         self.gpu_prewarm_time_limit = gpu_prewarm_time_limit
@@ -915,7 +917,7 @@ class Scheduler:
             f"fallback GPU warm pool {model}",
             resource_pool=resource_pool,
             gpu_model=model,
-            gpus=self.gpu_prewarm_gpus_per_allocation,
+            gpus=0,
             preferred_accounts=self.gpu_warm_pool_preferred_accounts or self.warm_pool_preferred_accounts,
             account_name=self.preferred_gpu_warm_account_constraint(),
         )
@@ -935,7 +937,7 @@ class Scheduler:
                 f"minimum GPU warm pool {model}",
                 resource_pool=resource_pool,
                 gpu_model=model,
-                gpus=self.gpu_prewarm_gpus_per_allocation,
+                gpus=0,
                 preferred_accounts=self.gpu_warm_pool_preferred_accounts or self.warm_pool_preferred_accounts,
                 account_name=self.preferred_gpu_warm_account_constraint(),
             ):
@@ -1310,7 +1312,7 @@ class Scheduler:
             return ""
         for model in self.gpu_prewarm_preferred_models:
             item = by_model.get(model)
-            if item and int(item["cluster_free_gpus"]) >= self.gpu_prewarm_gpus_per_allocation:
+            if item and int(item["cluster_free_gpus"]) >= self.gpu_prewarm_min_gpus_per_allocation:
                 return model
         return self.gpu_prewarm_preferred_models[0] if self.gpu_prewarm_preferred_models else ""
 
@@ -1330,11 +1332,13 @@ class Scheduler:
 
     def choose_gpu_model_for_fallback(self, excluded_models: set[str]) -> str:
         capacity = self.gpu_capacity_summary()
+        preferred_models = set(self.gpu_prewarm_preferred_models)
         candidates = [
             item
             for item in capacity
-            if normalize_gpu_model(str(item.get("gpu_model") or "")) not in excluded_models
-            and int(item.get("cluster_free_gpus") or 0) >= self.gpu_prewarm_gpus_per_allocation
+            if normalize_gpu_model(str(item.get("gpu_model") or "")) in preferred_models
+            and normalize_gpu_model(str(item.get("gpu_model") or "")) not in excluded_models
+            and int(item.get("cluster_free_gpus") or 0) >= self.gpu_prewarm_min_gpus_per_allocation
         ]
         if not candidates:
             return ""
@@ -1388,6 +1392,9 @@ class Scheduler:
             ]
         candidates = []
         wants_gpu = resource_pool.startswith("gpu:") or int(gpus or 0) > 0
+        dynamic_warm_gpu_count = wants_gpu and resource_pool.startswith("gpu:") and int(gpus or 0) <= 0
+        target_gpu_count = max(1, int(gpus or self.gpu_prewarm_gpus_per_allocation))
+        minimum_gpu_count = max(1, self.gpu_prewarm_min_gpus_per_allocation) if dynamic_warm_gpu_count else max(1, int(gpus or 1))
         target_models = gpu_model_candidates(gpu_model)
         target_partition = self.gpu_prewarm_partition if wants_gpu else self.allocation_partition
         occupied_by_partition: dict[str, set[str]] = {}
@@ -1417,7 +1424,7 @@ class Scheduler:
                     continue
                 if node_gpu_count <= 0:
                     continue
-                if max(0, node_gpu_count - node_gpu_used) < max(1, int(gpus or 1)):
+                if max(0, node_gpu_count - node_gpu_used) < minimum_gpu_count:
                     continue
             else:
                 if target_partition != "auto" and node.partition != target_partition:
@@ -1427,7 +1434,7 @@ class Scheduler:
             if target_partition != "auto" and node.partition != target_partition:
                 continue
             gpu_free = max(0, node_gpu_count - node_gpu_used)
-            requested_gpus = min(max(1, int(gpus or self.gpu_prewarm_gpus_per_allocation)), gpu_free) if wants_gpu else 0
+            requested_gpus = min(target_gpu_count, gpu_free) if wants_gpu else 0
             leaves_unclaimed_gpus = wants_gpu and gpu_free > requested_gpus
             reserve = self.gpu_cpu_reserve if node.partition.startswith("gpu") and (not wants_gpu or leaves_unclaimed_gpus) else 0
             available_cpus = node.effective_free_cpus - reserve
@@ -1477,7 +1484,7 @@ class Scheduler:
                     reverse=True,
                 )
             node, cpus, memory_mb, chosen_gpu_model, gpu_free, _score, _cpu_score, _node_is_gpu_partition = candidates[0]
-            chosen_gpus = min(max(1, int(gpus or self.gpu_prewarm_gpus_per_allocation)), gpu_free) if wants_gpu else 0
+            chosen_gpus = min(target_gpu_count, gpu_free) if wants_gpu else 0
             node_name = node.hostname
             if not wants_gpu and not self.is_single_job_partition(node.partition):
                 node_name = ""
@@ -1497,7 +1504,7 @@ class Scheduler:
             return None
         fallback_cpu_limit = 0
         if wants_gpu:
-            requested_gpu_count = max(1, int(gpus or self.gpu_prewarm_gpus_per_allocation))
+            requested_gpu_count = target_gpu_count
             for node in nodes:
                 if not node.usable or node.partition != partition:
                     continue
@@ -1516,7 +1523,7 @@ class Scheduler:
             "node_name": "",
             "cpus": fallback_cpus,
             "memory_mb": requested_memory_mb or self._memory_mb(self.allocation_memory) or 16384,
-            "gpus": max(1, int(gpus or self.gpu_prewarm_gpus_per_allocation)) if wants_gpu else 0,
+            "gpus": target_gpu_count if wants_gpu else 0,
             "gpu_model": (target_models[0] if target_models else "") if wants_gpu else "",
             "exclusive_node": exclusive_node,
         }

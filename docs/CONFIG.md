@@ -95,7 +95,8 @@ gpu_prewarm:
   preferred_models: ["a6000ada", "a6000"]
   min_warm_allocations: 1
   max_warm_allocations: 3
-  gpus_per_allocation: 2
+  gpus_per_allocation: 4
+  min_gpus_per_allocation: 2
   cpu_reserve_per_free_gpu: 8
   partition: "auto"
   time_limit: "48:00:00"
@@ -103,10 +104,11 @@ gpu_prewarm:
 
 Meanings:
 
-- `preferred_models`: model priority. A6000ADA is preferred for LLM work; A6000 is fallback.
+- `preferred_models`: GPU warm pool model allow-list and priority. The default keeps warm pools on A6000ADA or A6000 only.
 - `min_warm_allocations`: number of GPU allocations to keep warm even before GPU work arrives.
 - `max_warm_allocations`: demand-based upper bound for scheduler-owned GPU allocations.
-- `gpus_per_allocation`: GPUs requested per GPU warm allocation. The default is `2`, so each GPU warm allocation tries to hold two GPUs on one node.
+- `gpus_per_allocation`: target GPUs requested per GPU warm allocation. The default is `4`, so each GPU warm allocation tries to hold a full four-GPU node.
+- `min_gpus_per_allocation`: minimum GPU count for a warm allocation. The default is `2`, so warm placement may take four, three, or two GPUs on an A6000-class node, but not one.
 - `cpu_reserve_per_free_gpu`: CPU cores reserved inside GPU allocations for future GPU tasks.
 - `partition`: `auto` lets scheduler choose from live capacity.
 - `time_limit`: Slurm time limit for GPU warm allocations.

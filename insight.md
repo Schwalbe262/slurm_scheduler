@@ -291,3 +291,7 @@
 - Problem: Account-local conda environments were manually prepared and then reflected in `accounts.yaml`, making multi-account scheduling brittle.
 - Discovery: The scheduler already has SSH account access and capability/profile placement gates, so synced environments can be represented as DB overlays instead of rewriting local config.
 - Improvement: Track conda-pack sync jobs and expose completed target environments as dynamic capabilities/profiles; add task detail pages that show how a task was submitted and how to recreate it.
+## 2026-06-16 18:39:31 KST
+
+- GPU warm pool should distinguish task GPU requests from scheduler-owned prewarm requests. A user task with `gpus=1` must still fit one GPU, but an internal warm-pool request can leave `gpus=0` and let the scheduler choose the best available 4/3/2 A6000-class shape.
+- Lower-tier GPU fallback is useful for explicit task demand, but harmful for a warm pool whose purpose is to reserve scarce A6000-class capacity. The fallback model set should therefore be the configured warm `preferred_models`, not every GPU model in cluster capacity.

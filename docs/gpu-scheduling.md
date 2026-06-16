@@ -69,15 +69,16 @@ gpu_prewarm:
   preferred_models: ["a6000ada", "a6000"]
   min_warm_allocations: 1
   max_warm_allocations: 3
-  gpus_per_allocation: 2
+  gpus_per_allocation: 4
+  min_gpus_per_allocation: 2
   cpu_reserve_per_free_gpu: 8
   partition: "auto"
   time_limit: "48:00:00"
 ```
 
-The scheduler keeps at least one preferred GPU allocation warm. By default each GPU warm allocation requests two GPUs on one node. It queues preferred models first, such as A6000ADA and A6000. If preferred allocations are only `PENDING` and no GPU allocation is ready, it may also open a lower-priority fallback allocation such as RTX 3090 or A10, up to `max_warm_allocations`.
+The scheduler keeps at least one A6000-class GPU allocation warm. By default each GPU warm allocation tries to request four GPUs on one node. If four are not free but three are, it requests three; if only two are free, it requests two. One GPU is below the warm-pool minimum and is left for direct task demand instead.
 
-This means the scheduler can keep an A6000-class request in the Slurm queue while still holding a lower GPU for immediate work.
+GPU warm pool fallback stays inside the configured A6000-class models. With the default policy it may queue A6000ADA or A6000, but it will not open RTX 3090 or A10 warm pools just because A6000 jobs are pending.
 
 GPU warm placement prioritizes holding the GPU, but it should not make the remaining GPUs unusable. If a GPU warm allocation requests only part of a node's free GPUs, the scheduler leaves `gpu_cpu_reserve` CPU cores unrequested for other users of the remaining GPUs. For example, on a 48-core, 4-GPU node, a 2-GPU warm allocation requests 44 CPU cores rather than all 48.
 

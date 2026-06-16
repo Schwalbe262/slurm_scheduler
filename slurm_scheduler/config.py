@@ -55,7 +55,8 @@ class AppConfig:
     gpu_prewarm_preferred_models: list[str] = field(default_factory=lambda: ["a6000ada", "a6000"])
     gpu_prewarm_min_warm_allocations: int = 1
     gpu_prewarm_max_warm_allocations: int = 3
-    gpu_prewarm_gpus_per_allocation: int = 2
+    gpu_prewarm_gpus_per_allocation: int = 4
+    gpu_prewarm_min_gpus_per_allocation: int = 2
     gpu_prewarm_cpu_reserve_per_free_gpu: int = 8
     gpu_prewarm_partition: str = "auto"
     gpu_prewarm_time_limit: str = "48:00:00"
@@ -87,6 +88,7 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
             "min_warm_allocations": "gpu_prewarm_min_warm_allocations",
             "max_warm_allocations": "gpu_prewarm_max_warm_allocations",
             "gpus_per_allocation": "gpu_prewarm_gpus_per_allocation",
+            "min_gpus_per_allocation": "gpu_prewarm_min_gpus_per_allocation",
             "cpu_reserve_per_free_gpu": "gpu_prewarm_cpu_reserve_per_free_gpu",
             "partition": "gpu_prewarm_partition",
             "time_limit": "gpu_prewarm_time_limit",

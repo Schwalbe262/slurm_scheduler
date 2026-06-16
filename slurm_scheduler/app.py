@@ -217,6 +217,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         gpu_prewarm_min_warm_allocations=config.gpu_prewarm_min_warm_allocations,
         gpu_prewarm_max_warm_allocations=config.gpu_prewarm_max_warm_allocations,
         gpu_prewarm_gpus_per_allocation=config.gpu_prewarm_gpus_per_allocation,
+        gpu_prewarm_min_gpus_per_allocation=config.gpu_prewarm_min_gpus_per_allocation,
         gpu_prewarm_cpu_reserve_per_free_gpu=config.gpu_prewarm_cpu_reserve_per_free_gpu,
         gpu_prewarm_partition=config.gpu_prewarm_partition,
         gpu_prewarm_time_limit=config.gpu_prewarm_time_limit,

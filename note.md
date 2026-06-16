@@ -380,3 +380,11 @@ Remaining verification:
 - Added task detail pages at `/tasks/{id}` and linked task names from the dashboard. The detail page shows task fields, paths, and equivalent JSON/curl/Python submission examples.
 - Documented conda env sync and task detail usage in README and API docs.
 - Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, `git diff --check`, and smoke route registration with `/tmp/slurm_scheduler_smoke_venv/bin/python`.
+## 2026-06-16 18:39:31 KST
+
+- Requested change: GPU warm pool should only prewarm A6000-class GPUs and should claim as many GPUs as possible on one node: 4 if available, 3 if that is the limit, and 2 as the minimum.
+- Updated scheduler config to target `gpus_per_allocation: 4` with `min_gpus_per_allocation: 2`.
+- Changed GPU warm pool opening to let `choose_allocation_shape()` dynamically select 4/3/2 GPUs instead of always passing a fixed two-GPU request.
+- Restricted GPU warm fallback to configured preferred models, so default warm pool fallback stays inside `a6000ada` and `a6000` and no longer opens RTX3090/A10 warm pools solely because A6000-class requests are pending.
+- Updated README, config docs, GPU scheduling docs, troubleshooting docs, and example config.
+- Added/updated tests for 4-GPU warm selection, 3-GPU fallback, 2-GPU minimum behavior, and no lower-GPU warm fallback.

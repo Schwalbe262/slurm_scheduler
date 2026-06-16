@@ -134,12 +134,14 @@ Tuning:
 allocation_pending_timeout_seconds: 1800
 allocation_pending_backoff_seconds: 1800
 gpu_prewarm:
-  gpus_per_allocation: 2
+  preferred_models: ["a6000ada", "a6000"]
+  gpus_per_allocation: 4
+  min_gpus_per_allocation: 2
 ```
 
-If pending reason repeatedly shows `(Resources)`, the two-GPU shape may not fit current nodes. If it repeatedly shows `(Priority)`, the request is valid but queue priority is delaying it.
+If pending reason repeatedly shows `(Resources)`, the A6000-class shape may not fit current nodes. The default warm policy tries four GPUs first, then three or two if that is all the selected node can provide. If it repeatedly shows `(Priority)`, the request is valid but queue priority is delaying it.
 
-When preferred A6000-class warm jobs are pending, the scheduler can still open a lower-priority GPU allocation if `gpu_prewarm.max_warm_allocations` has spare room. This keeps some GPU capacity ready while the preferred request remains queued.
+GPU warm fallback stays inside `preferred_models`. With the default config the scheduler may keep A6000ADA and A6000 requests queued, but it does not open RTX 3090 or A10 warm pools just because A6000-class jobs are pending.
 
 ## Git Clone Fails Before Slurm Starts
 

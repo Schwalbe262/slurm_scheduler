@@ -355,7 +355,8 @@ gpu_prewarm:
   preferred_models: ["a6000ada", "a6000"]
   min_warm_allocations: 1
   max_warm_allocations: 3
-  gpus_per_allocation: 2
+  gpus_per_allocation: 4
+  min_gpus_per_allocation: 2
 cleanup:
   enabled: true
   interval_seconds: 3600
