@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 from slurm_scheduler.config import AccountConfig
+from slurm_scheduler.conda_sync import conda_bootstrap, env_prefix_lookup_command
 from slurm_scheduler.db import Database
 from slurm_scheduler.models import AccountSnapshot, AllocationStatus, JobCreate, JobStatus, TaskCreate, TaskStatus
 from slurm_scheduler.scheduler import Scheduler
@@ -500,6 +501,25 @@ class SchedulerTests(unittest.TestCase):
         ]
         scheduler = Scheduler(self.db, accounts, 30, client_factory=FakeClient)
         self.assertEqual(scheduler.choose_account(required_capability="conda:pyaedt").name, "a")
+
+    def test_choose_account_uses_synced_conda_overlay_capability(self) -> None:
+        self.db.upsert_account_env_overlay("b", "pyaedt", "/work/miniconda3/envs/pyaedt", sync_job_id=1)
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        account = scheduler.choose_account(required_capability="conda:pyaedt", env_profile="pyaedt")
+        self.assertEqual(account.name, "b")
+
+    def test_dynamic_env_profile_prepends_synced_overlay_setup(self) -> None:
+        self.db.upsert_account_env_overlay("a", "pyaedt", "/work/miniconda3/envs/pyaedt", sync_job_id=1)
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        payload = scheduler.apply_dynamic_env_profile({"env_profile": "pyaedt", "env_setup": "module load ansys"}, self.accounts[0])
+        self.assertIn("conda activate pyaedt", payload["env_setup"])
+        self.assertTrue(payload["env_setup"].endswith("module load ansys"))
+
+    def test_conda_sync_command_helpers_reference_env_name(self) -> None:
+        lookup = env_prefix_lookup_command("pyaedt")
+        self.assertIn("conda env list --json", lookup)
+        self.assertIn("pyaedt", lookup)
+        self.assertIn("miniconda3", conda_bootstrap())
 
     def test_choose_account_respects_requested_account(self) -> None:
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)

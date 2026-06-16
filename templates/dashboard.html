@@ -419,6 +419,79 @@
   </section>
 
   <section class="panel">
+    <h2>Conda Env Sync</h2>
+    <form method="post" action="/conda-env-sync" class="two-column-grid">
+      <div>
+        <label for="sync_reference_account">Reference account</label>
+        <select id="sync_reference_account" name="reference_account" required>
+          {% for account_name in account_names %}
+            <option value="{{ account_name }}">{{ account_name }}</option>
+          {% endfor %}
+        </select>
+        <label for="sync_source_env_name">Source env name</label>
+        <input id="sync_source_env_name" name="source_env_name" placeholder="pyaedt2026v1" required>
+      </div>
+      <div>
+        <label for="sync_target_accounts">Target accounts</label>
+        <input id="sync_target_accounts" name="target_accounts" placeholder="account_b, account_c" required>
+        <p><button type="submit">Start sync</button></p>
+      </div>
+    </form>
+    <div class="table-scroll section-gap">
+      <table>
+        <thead><tr><th>ID</th><th>STATUS</th><th>REFERENCE</th><th>ENV</th><th>TARGETS</th><th>CREATED</th><th>FAILURE</th></tr></thead>
+        <tbody>
+        {% for job in env_sync_jobs %}
+          <tr>
+            <td>{{ job.id }}</td>
+            <td>{{ job.status }}</td>
+            <td>{{ job.reference_account }}</td>
+            <td>{{ job.source_env_name }}</td>
+            <td>{{ job.target_accounts|join(", ") }}</td>
+            <td class="mono-cell">{{ job.created_at or "" }}</td>
+            <td class="mono-cell">{{ job.failure_message or "" }}</td>
+          </tr>
+          {% for target in job.targets %}
+            <tr>
+              <td class="muted">- {{ target.account_name }}</td>
+              <td>{{ target.status }}</td>
+              <td colspan="2" class="mono-cell">{{ target.installed_prefix or target.remote_dir or "" }}</td>
+              <td class="mono-cell">{{ target.backup_path or "" }}</td>
+              <td class="mono-cell">{{ target.log_path or "" }}</td>
+              <td class="mono-cell">{{ target.failure_message or "" }}</td>
+            </tr>
+          {% endfor %}
+        {% else %}
+          <tr><td colspan="7" class="muted">No conda env sync jobs yet.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <details class="section-gap">
+      <summary>Synced conda overlays: {{ env_overlays|length }}</summary>
+      <div class="table-scroll section-gap">
+        <table>
+          <thead><tr><th>ACCOUNT</th><th>ENV</th><th>CAPABILITY</th><th>PROFILE</th><th>PREFIX</th><th>UPDATED</th></tr></thead>
+          <tbody>
+          {% for overlay in env_overlays %}
+            <tr>
+              <td>{{ overlay.account_name }}</td>
+              <td>{{ overlay.env_name }}</td>
+              <td>{{ overlay.capability }}</td>
+              <td>{{ overlay.env_profile }}</td>
+              <td class="mono-cell">{{ overlay.installed_prefix }}</td>
+              <td class="mono-cell">{{ overlay.updated_at }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="6" class="muted">No synced overlays yet.</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  </section>
+
+  <section class="panel">
     <h2>Allocation Pool</h2>
     <div class="summary-row" aria-label="Allocation pool usage summary">
       <div class="summary-item">
@@ -494,7 +567,7 @@
           <tr>
             <td>{{ task.id }}</td>
             <td>
-              {{ task.name }}
+              <a href="/tasks/{{ task.id }}">{{ task.name }}</a>
               {% if task.log_path %}
                 <button
                   type="button"
@@ -530,7 +603,7 @@
             <tr>
               <td>{{ task.id }}</td>
               <td>
-                {{ task.name }}
+                <a href="/tasks/{{ task.id }}">{{ task.name }}</a>
                 {% if task.log_path %}
                   <button
                     type="button"

@@ -75,6 +75,20 @@ class SSHSession:
             sftp.close()
         return data.decode("utf-8", errors="replace")
 
+    def download_file(self, remote_path: str, local_path: str) -> None:
+        sftp = self.client.open_sftp()
+        try:
+            sftp.get(remote_path, local_path)
+        finally:
+            sftp.close()
+
+    def upload_file(self, local_path: str, remote_path: str) -> None:
+        sftp = self.client.open_sftp()
+        try:
+            sftp.put(local_path, remote_path)
+        finally:
+            sftp.close()
+
 
 def command_failure_message(result: CommandResult, fallback: str) -> str:
     message = result.stderr.strip() or result.stdout.strip()

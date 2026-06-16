@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
 from .models import AllocationStatus, JobCreate, JobStatus, TaskCreate, TaskStatus
+
+
+def json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 SCHEMA = """
@@ -175,6 +180,58 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_allocation_id ON tasks(allocation_id);
+
+CREATE TABLE IF NOT EXISTS env_sync_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reference_account TEXT NOT NULL,
+    source_env_name TEXT NOT NULL,
+    target_env_name TEXT NOT NULL,
+    target_accounts TEXT NOT NULL,
+    status TEXT NOT NULL,
+    failure_message TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    started_at TEXT,
+    finished_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_env_sync_jobs_status ON env_sync_jobs(status);
+
+CREATE TABLE IF NOT EXISTS env_sync_targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sync_job_id INTEGER NOT NULL,
+    account_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    remote_dir TEXT NOT NULL DEFAULT '',
+    remote_pid TEXT NOT NULL DEFAULT '',
+    log_path TEXT NOT NULL DEFAULT '',
+    archive_path TEXT NOT NULL DEFAULT '',
+    installed_prefix TEXT NOT NULL DEFAULT '',
+    backup_path TEXT NOT NULL DEFAULT '',
+    failure_message TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    started_at TEXT,
+    finished_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_env_sync_targets_job ON env_sync_targets(sync_job_id);
+
+CREATE TABLE IF NOT EXISTS account_env_overlays (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_name TEXT NOT NULL,
+    env_name TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    env_profile TEXT NOT NULL,
+    env_setup TEXT NOT NULL,
+    installed_prefix TEXT NOT NULL DEFAULT '',
+    sync_job_id INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(account_name, env_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_account_env_overlays_account ON account_env_overlays(account_name);
 """
 
 
@@ -469,6 +526,111 @@ class Database:
 
     def update_job(self, job_id: int, **fields: Any) -> None:
         self._update_row("jobs", job_id, fields)
+
+    def create_env_sync_job(
+        self,
+        reference_account: str,
+        source_env_name: str,
+        target_env_name: str,
+        target_accounts: list[str],
+    ) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO env_sync_jobs (
+                    reference_account, source_env_name, target_env_name, target_accounts, status
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (reference_account, source_env_name, target_env_name, json_dumps(target_accounts), "queued"),
+            )
+            return int(cursor.lastrowid)
+
+    def create_env_sync_target(self, sync_job_id: int, account_name: str) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO env_sync_targets (sync_job_id, account_name, status)
+                VALUES (?, ?, ?)
+                """,
+                (sync_job_id, account_name, "queued"),
+            )
+            return int(cursor.lastrowid)
+
+    def get_env_sync_job(self, sync_job_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM env_sync_jobs WHERE id = ?", (sync_job_id,)).fetchone()
+            return dict(row) if row else None
+
+    def list_env_sync_jobs(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM env_sync_jobs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_env_sync_targets(self, sync_job_id: int | None = None, limit: int = 500) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if sync_job_id is None:
+                rows = conn.execute("SELECT * FROM env_sync_targets ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM env_sync_targets WHERE sync_job_id = ? ORDER BY id ASC",
+                    (sync_job_id,),
+                ).fetchall()
+            return [dict(row) for row in rows]
+
+    def update_env_sync_job(self, sync_job_id: int, **fields: Any) -> None:
+        self._update_row("env_sync_jobs", sync_job_id, fields)
+
+    def update_env_sync_target(self, target_id: int, **fields: Any) -> None:
+        self._update_row("env_sync_targets", target_id, fields)
+
+    def upsert_account_env_overlay(
+        self,
+        account_name: str,
+        env_name: str,
+        installed_prefix: str,
+        sync_job_id: int,
+    ) -> None:
+        capability = f"conda:{env_name}"
+        env_setup = (
+            "if [ -f \"$HOME/miniconda3/etc/profile.d/conda.sh\" ]; then source \"$HOME/miniconda3/etc/profile.d/conda.sh\"; "
+            "elif [ -f \"$HOME/anaconda3/etc/profile.d/conda.sh\" ]; then source \"$HOME/anaconda3/etc/profile.d/conda.sh\"; fi\n"
+            f"conda activate {env_name}"
+        )
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO account_env_overlays (
+                    account_name, env_name, capability, env_profile, env_setup, installed_prefix, sync_job_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_name, env_name) DO UPDATE SET
+                    capability = excluded.capability,
+                    env_profile = excluded.env_profile,
+                    env_setup = excluded.env_setup,
+                    installed_prefix = excluded.installed_prefix,
+                    sync_job_id = excluded.sync_job_id,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (account_name, env_name, capability, env_name, env_setup, installed_prefix, sync_job_id),
+            )
+
+    def list_account_env_overlays(self, account_name: str = "") -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if account_name:
+                rows = conn.execute(
+                    "SELECT * FROM account_env_overlays WHERE account_name = ? ORDER BY env_name",
+                    (account_name,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM account_env_overlays ORDER BY account_name, env_name").fetchall()
+            return [dict(row) for row in rows]
+
+    def get_account_env_overlay(self, account_name: str, env_name: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM account_env_overlays WHERE account_name = ? AND env_name = ?",
+                (account_name, env_name),
+            ).fetchone()
+            return dict(row) if row else None
 
     def _update_row(self, table: str, row_id: int, fields: dict[str, Any]) -> None:
         if not fields:

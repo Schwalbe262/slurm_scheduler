@@ -120,6 +120,30 @@ GPU model constraints also accept comma-separated ordered candidates. For exampl
 
 `POST /jobs` with `job_mode=python_git` is kept for old clients, but it is routed into the attached-task scheduler and appears under Attached Tasks. This is the intended "virtual job" path: the client submits a job-like request, and the scheduler places it inside an existing warm allocation.
 
+Task names in the Web UI link to `/tasks/{id}`. The detail page shows the stored task fields, log paths, and equivalent JSON/curl/Python submission examples for recreating the task through `/api/tasks`.
+
+### Sync conda environments across accounts
+
+Use `POST /api/conda-env-sync` to clone a conda environment from a reference account to explicit target accounts. The scheduler uses `conda-pack`, backs up an existing target env with a timestamp suffix, installs the packed env under the same env name, and then records a dynamic `conda:<env-name>` capability plus matching `env_profile`.
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/conda-env-sync" \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "reference_account": "r1jae262",
+    "source_env_name": "pyaedt2026v1",
+    "target_accounts": ["account_b", "account_c"]
+  }'
+```
+
+Poll status:
+
+```bash
+curl -sS "$SCHEDULER_URL/api/conda-env-sync/1"
+```
+
+After a target completes, tasks can request the synced environment with `required_capability=conda:pyaedt2026v1` and `env_profile=pyaedt2026v1` without editing `accounts.yaml`.
+
 Use `/jobs` with `dynamic_packed_srun` when the scheduler should split many simulation cases into packed Slurm jobs:
 
 ```bash

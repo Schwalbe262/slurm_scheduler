@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <div class="title-row">
+    <h1>Task {{ task.id }}: {{ task.name }}</h1>
+    {% if task.status not in ["completed", "failed", "cancelled"] %}
+      <form method="post" action="/tasks/{{ task.id }}/cancel"><button class="danger" type="submit">Cancel</button></form>
+    {% endif %}
+  </div>
+  <div class="table-scroll">
+    <table>
+      <tbody>
+        <tr><th>Status</th><td>{{ task.status }}</td></tr>
+        <tr><th>Account</th><td>{{ task.account_name or "" }}</td></tr>
+        <tr><th>Allocation</th><td>{{ task.allocation_id or "" }}</td></tr>
+        <tr><th>Remote CWD</th><td class="mono-cell">{{ task.remote_cwd }}</td></tr>
+        <tr><th>Command</th><td class="mono-cell"><pre>{{ task.command }}</pre></td></tr>
+        <tr><th>Environment setup</th><td class="mono-cell"><pre>{{ task.env_setup or "" }}</pre></td></tr>
+        <tr><th>Capability / Profile</th><td>{{ task.required_capability or "" }} / {{ task.env_profile or "" }}</td></tr>
+        <tr><th>CPU / Memory</th><td>{{ task.cpus }} CPUs / {{ task.memory_mb }} MB</td></tr>
+        <tr><th>GPU</th><td>{{ task.gpus or 0 }} {{ task.gpu_model or "" }}</td></tr>
+        <tr><th>Partition / Node</th><td>{{ task.partition or "" }} / {{ task.node_name or "" }}</td></tr>
+        <tr><th>Priority / Timeout</th><td>{{ task.priority or 0 }} / {{ task.timeout_seconds or 0 }} seconds</td></tr>
+        <tr><th>Dedupe key</th><td class="mono-cell">{{ task.dedupe_key or "" }}</td></tr>
+        <tr><th>Payload JSON</th><td class="mono-cell"><pre>{{ task.payload_json or "" }}</pre></td></tr>
+        <tr><th>Remote dir</th><td class="mono-cell">{{ task.remote_dir or "" }}</td></tr>
+        <tr><th>stdout</th><td class="mono-cell">{{ task.stdout_path or "" }}</td></tr>
+        <tr><th>stderr</th><td class="mono-cell">{{ task.stderr_path or "" }}</td></tr>
+        <tr><th>Exit code</th><td>{{ task.exit_code if task.exit_code is not none else "" }}</td></tr>
+        <tr><th>Failure</th><td class="error">{{ task.failure_message or "" }}</td></tr>
+        <tr><th>Created / Started / Finished</th><td class="mono-cell">{{ task.created_at }} / {{ task.started_at or "" }} / {{ task.finished_at or "" }}</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Submission Payload</h2>
+  <p class="muted">The original HTTP client is not stored, but this payload recreates the same task through the scheduler API.</p>
+  <h3>JSON</h3>
+  <pre class="mono-cell">{{ submission.json }}</pre>
+  <h3>curl</h3>
+  <pre class="mono-cell">{{ submission.curl }}</pre>
+  <h3>Python requests</h3>
+  <pre class="mono-cell">{{ submission.python }}</pre>
+</section>
+{% endblock %}

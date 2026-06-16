@@ -40,6 +40,51 @@ Refreshes account status immediately through SSH. Use sparingly because it touch
 curl -sS "$SCHEDULER_URL/api/accounts/status/live"
 ```
 
+### `POST /api/conda-env-sync`
+
+Clones a conda environment from a reference account to explicit target accounts with `conda-pack`. Existing target environments with the same name are moved aside with a timestamp backup suffix before the packed environment is installed.
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/conda-env-sync" \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "reference_account": "r1jae262",
+    "source_env_name": "pyaedt2026v1",
+    "target_accounts": ["account_b", "account_c"]
+  }'
+```
+
+After a target completes, the scheduler records a dynamic capability/profile overlay. Jobs and tasks can then use:
+
+```text
+required_capability=conda:pyaedt2026v1
+env_profile=pyaedt2026v1
+```
+
+### `GET /api/conda-env-sync`
+
+Lists recent conda environment sync jobs and target-account states.
+
+```bash
+curl -sS "$SCHEDULER_URL/api/conda-env-sync"
+```
+
+### `GET /api/conda-env-sync/{sync_job_id}`
+
+Returns one sync job with target statuses, remote log paths, backup paths, installed prefixes, and failure messages.
+
+```bash
+curl -sS "$SCHEDULER_URL/api/conda-env-sync/1"
+```
+
+### `POST /api/conda-env-sync/{sync_job_id}/cancel`
+
+Marks unfinished sync targets cancelled. Remote work is stopped best-effort; already completed target overlays remain recorded.
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/conda-env-sync/1/cancel"
+```
+
 ### `GET /api/allocations`
 
 Lists scheduler-owned Slurm allocation pools.
@@ -269,6 +314,8 @@ curl -sS "$SCHEDULER_URL/api/tasks/123?include_output=true"
 ```
 
 The JSON includes `state`, `status`, `exit_code`, `failure_message`, `assigned_allocation`, `slurm_job_id`, stdout/stderr paths, and timestamps. With `include_output=true`, it also includes `stdout`, `stderr`, and `result_json`, where `result_json` is parsed from the final JSON object or array in stdout.
+
+The Web UI task detail page is available at `/tasks/{task_id}`. It shows the stored task fields and equivalent JSON/curl/Python examples for submitting the same task again.
 
 ### `GET /api/tasks/{task_id}/stdout`
 

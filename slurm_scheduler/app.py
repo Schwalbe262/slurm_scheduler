@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 from pathlib import Path
 from math import ceil
 import posixpath
@@ -11,6 +13,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from .conda_sync import CondaEnvSyncManager
 from .config import AppConfig, load_accounts, load_app_config
 from .db import Database
 from .models import JobCreate, TaskCreate
@@ -228,6 +231,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     app.state.config = config
     app.state.db = db
     app.state.scheduler = scheduler
+    env_sync_manager = CondaEnvSyncManager(db, accounts)
+    app.state.env_sync_manager = env_sync_manager
 
     def apply_text_window(text: str, tail_lines: int = 0, max_bytes: int = 0) -> str:
         if tail_lines > 0:
@@ -319,6 +324,79 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             payload["stderr"] = read_task_file_text(task, "stderr_path", output_limit)
             payload["result_json"] = last_json_object(stdout)
         return payload
+
+    def parse_account_list(value: str | list[str]) -> list[str]:
+        raw = ",".join(value) if isinstance(value, list) else value
+        return [item.strip() for item in re.split(r"[\s,;/|]+", raw or "") if item.strip()]
+
+    def env_sync_job_json(job: dict, include_targets: bool = True) -> dict:
+        try:
+            target_accounts = json.loads(job.get("target_accounts") or "[]")
+        except json.JSONDecodeError:
+            target_accounts = []
+        payload = {
+            "id": int(job["id"]),
+            "status": job.get("status") or "",
+            "reference_account": job.get("reference_account") or "",
+            "source_env_name": job.get("source_env_name") or "",
+            "target_env_name": job.get("target_env_name") or "",
+            "target_accounts": target_accounts,
+            "failure_message": job.get("failure_message") or "",
+            "created_at": job.get("created_at"),
+            "started_at": job.get("started_at"),
+            "finished_at": job.get("finished_at"),
+        }
+        if include_targets:
+            payload["targets"] = db.list_env_sync_targets(int(job["id"]))
+        return payload
+
+    def task_submission_payload(task: dict) -> dict:
+        raw_payload_json = task.get("payload_json") or ""
+        if raw_payload_json:
+            try:
+                payload_json = json.loads(raw_payload_json)
+            except json.JSONDecodeError:
+                payload_json = raw_payload_json
+        else:
+            payload_json = ""
+        return {
+            "name": task.get("name") or "remote-task",
+            "remote_cwd": task.get("remote_cwd") or "",
+            "command": task.get("command") or "",
+            "env_setup": task.get("env_setup") or "",
+            "required_capability": task.get("required_capability") or "",
+            "env_profile": task.get("env_profile") or "",
+            "account_name": task.get("account_name") or "",
+            "cpus": int(task.get("cpus") or 1),
+            "memory_mb": int(task.get("memory_mb") or 4096),
+            "gpus": int(task.get("gpus") or 0),
+            "gpu_model": task.get("gpu_model") or "",
+            "partition": task.get("partition") or "auto",
+            "node_name": task.get("node_name") or "",
+            "exclusive_node": bool(task.get("exclusive_node") or False),
+            "priority": int(task.get("priority") or 0),
+            "timeout_seconds": int(task.get("timeout_seconds") or 0),
+            "dedupe_key": task.get("dedupe_key") or "",
+            "max_workers_per_node": int(task.get("max_workers_per_node") or 0),
+            "payload_json": payload_json,
+        }
+
+    def task_submission_examples(task: dict) -> dict:
+        payload = task_submission_payload(task)
+        pretty_json = json.dumps(payload, ensure_ascii=False, indent=2)
+        compact_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        return {
+            "json": pretty_json,
+            "curl": f"curl -sS -X POST \"$SCHEDULER_URL/api/tasks\" -H 'Content-Type: application/json' --data {shlex.quote(compact_json)}",
+            "python": (
+                "import requests\n\n"
+                "base = \"http://100.112.168.31:8000\"\n"
+                f"payload = {pretty_json}\n"
+                "response = requests.post(f\"{base}/api/tasks\", json=payload, timeout=10)\n"
+                "response.raise_for_status()\n"
+                "print(response.json())\n"
+            ),
+        }
 
     def create_task_record(payload: dict) -> tuple[int, bool]:
         dedupe_key = str(payload.get("dedupe_key") or "").strip()
@@ -418,8 +496,23 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 "cpu_partitions": partition_rank(db.list_node_inventory(), needs_gpu=False),
                 "gpu_partitions": partition_rank(db.list_node_inventory(), needs_gpu=True),
                 "gpu_capacity": scheduler.gpu_capacity_summary(),
+                "account_names": [account.name for account in accounts],
+                "env_sync_jobs": [env_sync_job_json(job) for job in db.list_env_sync_jobs(limit=10)],
+                "env_overlays": db.list_account_env_overlays(),
             },
         )
+
+    @app.post("/conda-env-sync")
+    def create_conda_env_sync_form(
+        reference_account: str = Form(...),
+        source_env_name: str = Form(...),
+        target_accounts: str = Form(...),
+    ) -> Response:
+        try:
+            env_sync_manager.start(reference_account, source_env_name, parse_account_list(target_accounts))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return RedirectResponse("/", status_code=303)
 
     @app.post("/jobs")
     def create_job(
@@ -674,6 +767,20 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         if not job:
             raise HTTPException(status_code=404)
         return templates.TemplateResponse("job_detail.html", {"request": request, "job": job})
+
+    @app.get("/tasks/{task_id}", response_class=HTMLResponse)
+    def task_detail(task_id: int, request: Request) -> HTMLResponse:
+        task = db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404)
+        return templates.TemplateResponse(
+            "task_detail.html",
+            {
+                "request": request,
+                "task": task,
+                "submission": task_submission_examples(task),
+            },
+        )
 
     @app.post("/jobs/{job_id}/cancel")
     def cancel_job(job_id: int) -> Response:
@@ -954,6 +1061,40 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     @app.get("/api/accounts/status/live")
     def api_accounts_live() -> list[dict]:
         return [snapshot.__dict__ for snapshot in scheduler.snapshots()]
+
+    @app.post("/api/conda-env-sync")
+    async def api_create_conda_env_sync(request: Request) -> JSONResponse:
+        payload = await request.json()
+        try:
+            sync_job_id = env_sync_manager.start(
+                str(payload.get("reference_account") or ""),
+                str(payload.get("source_env_name") or ""),
+                parse_account_list(payload.get("target_accounts") or []),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        job = db.get_env_sync_job(sync_job_id)
+        return JSONResponse(env_sync_job_json(job) if job else {"id": sync_job_id, "status": "queued"})
+
+    @app.get("/api/conda-env-sync")
+    def api_list_conda_env_sync() -> list[dict]:
+        return [env_sync_job_json(job) for job in db.list_env_sync_jobs(limit=50)]
+
+    @app.get("/api/conda-env-sync/{sync_job_id}")
+    def api_get_conda_env_sync(sync_job_id: int) -> dict:
+        job = db.get_env_sync_job(sync_job_id)
+        if not job:
+            raise HTTPException(status_code=404)
+        return env_sync_job_json(job)
+
+    @app.post("/api/conda-env-sync/{sync_job_id}/cancel")
+    def api_cancel_conda_env_sync(sync_job_id: int) -> dict:
+        try:
+            env_sync_manager.cancel(sync_job_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        job = db.get_env_sync_job(sync_job_id)
+        return env_sync_job_json(job) if job else {"id": sync_job_id, "status": "cancelled"}
 
     @app.get("/api/token-usage")
     def api_token_usage() -> list[dict]:

@@ -285,3 +285,9 @@
 - Problem: Full-page dashboard refreshes can collapse sections and move the operator away from the row/table they were inspecting.
 - Discovery: The refresh loop reloaded the page without storing any UI state beyond avoiding active form edits.
 - Improvement: Persist details open states and scroll positions in localStorage across auto-refreshes so passive monitoring does not disturb the current view.
+
+## 2026-06-16 18:23:53 KST
+
+- Problem: Account-local conda environments were manually prepared and then reflected in `accounts.yaml`, making multi-account scheduling brittle.
+- Discovery: The scheduler already has SSH account access and capability/profile placement gates, so synced environments can be represented as DB overlays instead of rewriting local config.
+- Improvement: Track conda-pack sync jobs and expose completed target environments as dynamic capabilities/profiles; add task detail pages that show how a task was submitted and how to recreate it.

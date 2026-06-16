@@ -294,11 +294,27 @@ class Scheduler:
             return False
         capability = (required_capability or "").strip()
         profile = (env_profile or "").strip()
-        if capability and capability not in (account.capabilities or []):
+        overlays = self.db.list_account_env_overlays(account.name)
+        overlay_capabilities = {str(item.get("capability") or "") for item in overlays}
+        overlay_profiles = {str(item.get("env_profile") or "") for item in overlays}
+        if capability and capability not in (account.capabilities or []) and capability not in overlay_capabilities:
             return False
-        if profile and profile not in (account.env_profiles or {}):
+        if profile and profile not in (account.env_profiles or {}) and profile not in overlay_profiles:
             return False
         return True
+
+    def apply_dynamic_env_profile(self, payload: dict, account: AccountConfig) -> dict:
+        profile = str(payload.get("env_profile") or "").strip()
+        if not profile or profile in (account.env_profiles or {}):
+            return payload
+        overlay = self.db.get_account_env_overlay(account.name, profile)
+        if not overlay:
+            return payload
+        setup = str(overlay.get("env_setup") or "").strip()
+        if not setup:
+            return payload
+        existing = str(payload.get("env_setup") or "").strip()
+        return {**payload, "env_setup": setup if not existing else f"{setup}\n{existing}"}
 
     def is_single_job_partition(self, partition: str) -> bool:
         return (partition or "").strip() in self.single_job_per_node_partitions
@@ -623,6 +639,7 @@ class Scheduler:
             account = next((item for item in self.accounts if item.name == allocation["account_name"]), None)
             if not account:
                 continue
+            task = self.apply_dynamic_env_profile(task, account)
             self.db.update_task(
                 task["id"],
                 status=TaskStatus.ATTACHING.value,
@@ -1696,6 +1713,7 @@ class Scheduler:
         if not self.prepare_single_job_node(job):
             return
         self.db.update_job(job["id"], status=JobStatus.SUBMITTING.value, account_name=account.name)
+        job = self.apply_dynamic_env_profile(job, account)
         try:
             result = self.client_factory(account).submit(job)
         except RemoteExecutionError as exc:

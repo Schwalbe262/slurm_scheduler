@@ -370,3 +370,13 @@ Remaining verification:
 - Added localStorage-backed capture/restore for open details sections, window scroll position, and every `.table-scroll` element before reload and after page load.
 - Kept auto-refresh disabled while an editable field is focused or the form is dirty.
 - Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, and `git diff --check`.
+
+## 2026-06-16 18:23:53 KST
+
+- Added conda environment synchronization from a reference account to explicit target accounts using `conda-pack`.
+- Added DB tracking for env sync jobs, per-target states, and dynamic account env overlays that expose synced environments as `conda:<env>` capabilities and matching env profiles.
+- Added `/api/conda-env-sync` create/list/detail/cancel endpoints and a Web UI panel for starting syncs and inspecting recent target states.
+- Updated scheduler placement and execution setup so DB overlays count like account capabilities/profiles without mutating `accounts.yaml`.
+- Added task detail pages at `/tasks/{id}` and linked task names from the dashboard. The detail page shows task fields, paths, and equivalent JSON/curl/Python submission examples.
+- Documented conda env sync and task detail usage in README and API docs.
+- Verified `python3 -m unittest discover -s tests`, `python3 -m compileall slurm_scheduler`, `git diff --check`, and smoke route registration with `/tmp/slurm_scheduler_smoke_venv/bin/python`.
