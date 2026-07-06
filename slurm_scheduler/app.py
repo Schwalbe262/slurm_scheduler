@@ -402,6 +402,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         cleanup_finished_task_ttl_seconds=config.cleanup_finished_task_ttl_seconds,
         cleanup_finished_job_ttl_seconds=config.cleanup_finished_job_ttl_seconds,
         cleanup_closed_allocation_ttl_seconds=config.cleanup_closed_allocation_ttl_seconds,
+        reconcile_on_start=config.reconcile_on_start,
+        backup_enabled=config.backup_enabled,
+        backup_interval_seconds=config.backup_interval_seconds,
+        backup_keep=config.backup_keep,
+        backup_dir=config.backup_dir,
         cleanup_orphan_sweep_enabled=config.cleanup_orphan_sweep_enabled,
         cleanup_orphan_sweep_interval_seconds=config.cleanup_orphan_sweep_interval_seconds,
         cleanup_orphan_min_age_seconds=config.cleanup_orphan_min_age_seconds,
@@ -799,6 +804,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request) -> HTMLResponse:
         attached_task_name_filter = (request.query_params.get("task_name_contains") or "").strip()
+        finished_page_size = 50
+        try:
+            finished_page = max(0, int(request.query_params.get("finished_page") or 0))
+        except ValueError:
+            finished_page = 0
         snapshots = scheduler.cached_snapshots()
         snapshot_error = "" if snapshots else "Account status will appear after the background scheduler refreshes."
         allocations = annotate_allocation_fea_pressure(
@@ -882,8 +892,9 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             for task in attach_task_elapsed(
                 db.list_tasks_by_statuses(
                     terminal_task_statuses,
-                    limit=50,
+                    limit=finished_page_size,
                     name_contains=attached_task_name_filter,
+                    offset=finished_page * finished_page_size,
                 )
             )
         ]
@@ -907,6 +918,9 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 "task_summary": task_summary,
                 "finished_tasks": finished_tasks,
                 "finished_task_count": finished_task_count,
+                "finished_page": finished_page,
+                "finished_page_size": finished_page_size,
+                "finished_page_count": max(1, ceil(finished_task_count / finished_page_size)),
                 "attached_task_name_filter": attached_task_name_filter,
                 "allocations": active_allocations,
                 "allocation_summary": allocation_summary,
@@ -1399,7 +1413,18 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         name_contains: str = "",
         statuses: str = "queued,attaching,running",
         limit: int = 5000,
+        task_ids: str = "",
     ) -> dict:
+        ids = [int(part) for part in task_ids.split(",") if part.strip().isdigit()]
+        if ids:
+            cancelled_ids: list[int] = []
+            for task_id in ids:
+                try:
+                    scheduler.cancel_task(task_id)
+                    cancelled_ids.append(task_id)
+                except ValueError:
+                    continue
+            return {"cancelled": cancelled_ids, "count": len(cancelled_ids)}
         requested_statuses = {part.strip() for part in statuses.split(",") if part.strip()}
         valid_statuses = {"queued", "attaching", "running", "completed", "failed", "cancelled"}
         unknown = sorted(requested_statuses - valid_statuses)
@@ -1506,6 +1531,36 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     @app.get("/api/events")
     def api_events(limit: int = 200) -> list[dict]:
         return db.list_events(limit=max(1, min(1000, limit)))
+
+    @app.post("/api/placement/dry-run")
+    def api_placement_dry_run(
+        cpus: int = Form(1),
+        memory_mb: int = Form(4096),
+        scheduling_profile: str = Form(SchedulingProfile.STANDARD.value),
+        gpus: int = Form(0),
+        gpu_model: str = Form(""),
+        required_capability: str = Form(""),
+        env_profile: str = Form(""),
+        account_name: str = Form(""),
+        partition: str = Form("auto"),
+        node_name: str = Form(""),
+        max_workers_per_node: int = Form(0),
+    ) -> dict:
+        task = {
+            "cpus": max(1, cpus),
+            "memory_mb": max(1, memory_mb),
+            "scheduling_profile": normalize_scheduling_profile(scheduling_profile),
+            "gpus": max(0, gpus),
+            "gpu_model": gpu_model,
+            "required_capability": required_capability,
+            "env_profile": env_profile,
+            "account_name": account_name,
+            "partition": partition,
+            "node_name": node_name,
+            "exclusive_node": 0,
+            "max_workers_per_node": max(0, max_workers_per_node),
+        }
+        return scheduler.placement_dry_run(task)
 
     @app.get("/api/dashboard-summary")
     def api_dashboard_summary() -> dict:

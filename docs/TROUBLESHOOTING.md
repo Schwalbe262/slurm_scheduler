@@ -240,3 +240,22 @@ Then check:
 ```bash
 curl -sS "$SCHEDULER_URL/api/token-usage"
 ```
+
+## Scheduler Looks Stuck
+
+Check the loop itself first:
+
+```bash
+curl -sS "$SCHEDULER_URL/api/health"
+```
+
+- `scheduler_stalled: true` (HTTP 503) means a tick has been stuck past the watchdog threshold. The watchdog force-closes SSH transports first, then exits the process; the `start_web.cmd` restart loop brings it back within seconds. Look for `watchdog` entries in `/api/events` and in `logs/scheduler.log`.
+- `consecutive_tick_failures` counts back-to-back tick exceptions; a nonzero value with the stack trace in `logs/scheduler.log` points at the failing phase.
+
+## FEA Task Disappeared And Re-queued
+
+That is memory-pressure handling working as designed. When an allocation node crosses `hard_memory_free_percent`, the newest FEA worker on it is cancelled and the task returns to `queued` with `attempt_count` incremented (visible as `task_requeued` in `/api/events`). After `pressure_max_attempts` kills, the task is marked failed with `memory pressure hard limit after N attempts`. Frequent requeues on the same node usually mean `mem_per_simulation_gb` is set lower than the simulations actually use.
+
+## Where Did Old Finished Entries Go
+
+Terminal tasks/jobs/allocations whose remote artifacts were already cleaned are deleted from the database after `cleanup.db_row_ttl_seconds` (default 14 days). Daily database backups are kept in `data/backups/` if older history is needed.

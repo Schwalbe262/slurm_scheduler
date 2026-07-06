@@ -314,6 +314,16 @@ class Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def backup_to(self, backup_path: str) -> None:
+        """Consistent online backup via sqlite's backup API (WAL-safe)."""
+        Path(backup_path).parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as conn:
+            target = sqlite3.connect(backup_path)
+            try:
+                conn.backup(target)
+            finally:
+                target.close()
+
     def list_referenced_remote_paths(self) -> set[str]:
         queries = (
             "SELECT remote_dir FROM tasks WHERE COALESCE(remote_dir, '') != ''",
@@ -555,6 +565,7 @@ class Database:
         statuses: list[str],
         limit: int = 200,
         name_contains: str = "",
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         if not statuses:
             return []
@@ -562,8 +573,8 @@ class Database:
         name_filter, name_params = self._name_contains_filter(name_contains)
         with self.connect() as conn:
             rows = conn.execute(
-                f"SELECT * FROM tasks WHERE status IN ({placeholders}){name_filter} ORDER BY id DESC LIMIT ?",
-                (*statuses, *name_params, limit),
+                f"SELECT * FROM tasks WHERE status IN ({placeholders}){name_filter} ORDER BY id DESC LIMIT ? OFFSET ?",
+                (*statuses, *name_params, limit, max(0, int(offset))),
             ).fetchall()
             return [dict(row) for row in rows]
 

@@ -809,11 +809,12 @@
       <div class="actions">
         <button type="button" class="secondary" id="attached-task-refresh">Refresh</button>
         <button type="button" class="secondary" id="attached-task-clear">Clear</button>
+        <button type="button" class="danger" id="cancel-selected-tasks" disabled>Cancel selected</button>
       </div>
     </div>
     <div class="table-scroll">
       <table id="attached-tasks-table">
-        <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Allocation</th><th>Capability</th><th>Env</th><th>Scheduling</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Queue reason</th><th>Elapsed</th><th>Action</th></tr></thead>
+        <thead><tr><th><input type="checkbox" id="select-all-tasks" aria-label="Select all visible tasks"></th><th>ID</th><th>Name</th><th>Status</th><th>Allocation</th><th>Capability</th><th>Env</th><th>Scheduling</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Queue reason</th><th>Elapsed</th><th>Action</th></tr></thead>
         <tbody id="attached-tasks-body">
         {% for task in tasks %}
           <tr
@@ -826,6 +827,7 @@
             data-gpus="{{ task.gpus or 0 }}"
             data-same-node="{{ task.same_node_as_task_id or 0 }}"
           >
+            <td><input type="checkbox" class="task-select" value="{{ task.id }}" aria-label="Select task {{ task.id }}"></td>
             <td>{{ task.id }}</td>
             <td>
               <a href="/tasks/{{ task.id }}">{{ task.name }}</a>
@@ -862,9 +864,9 @@
             </td>
           </tr>
         {% else %}
-          <tr><td colspan="13" class="muted">No active attached tasks.</td></tr>
+          <tr><td colspan="14" class="muted">No active attached tasks.</td></tr>
         {% endfor %}
-          <tr id="attached-task-no-filter-match" hidden><td colspan="13" class="muted">No matching attached tasks.</td></tr>
+          <tr id="attached-task-no-filter-match" hidden><td colspan="14" class="muted">No matching attached tasks.</td></tr>
         </tbody>
       </table>
     </div>
@@ -915,6 +917,15 @@
             <tr id="finished-task-no-filter-match" hidden><td colspan="12" class="muted">No matching finished tasks.</td></tr>
           </tbody>
         </table>
+      </div>
+      <div class="section-gap" style="display: flex; gap: 10px; align-items: center;">
+        {% if finished_page > 0 %}
+          <a class="button" href="/?finished_page={{ finished_page - 1 }}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">&laquo; Prev</a>
+        {% endif %}
+        <span class="muted">Page {{ finished_page + 1 }} / {{ finished_page_count }} ({{ finished_task_count }} tasks)</span>
+        {% if finished_page + 1 < finished_page_count %}
+          <a class="button" href="/?finished_page={{ finished_page + 1 }}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">Next &raquo;</a>
+        {% endif %}
       </div>
     </details>
     <script>
@@ -1430,6 +1441,47 @@
     }
     refreshSummaries();
     setInterval(refreshSummaries, 20000);
+
+    // Bulk cancel: checkbox selection over the attached-tasks table.
+    const selectAll = document.getElementById("select-all-tasks");
+    const cancelSelected = document.getElementById("cancel-selected-tasks");
+    const taskChecks = () => Array.from(document.querySelectorAll("#attached-tasks-body .task-select"));
+    const selectedIds = () => taskChecks().filter((box) => box.checked).map((box) => box.value);
+    function updateCancelButton() {
+      if (!cancelSelected) return;
+      const count = selectedIds().length;
+      cancelSelected.disabled = count === 0;
+      cancelSelected.textContent = count ? `Cancel selected (${count})` : "Cancel selected";
+    }
+    if (selectAll) {
+      selectAll.addEventListener("change", () => {
+        taskChecks().forEach((box) => {
+          const row = box.closest("tr");
+          if (!row || row.hidden) return;
+          box.checked = selectAll.checked;
+        });
+        updateCancelButton();
+      });
+    }
+    document.getElementById("attached-tasks-body")?.addEventListener("change", (event) => {
+      if (event.target && event.target.classList.contains("task-select")) updateCancelButton();
+    });
+    if (cancelSelected) {
+      cancelSelected.addEventListener("click", async () => {
+        const ids = selectedIds();
+        if (!ids.length) return;
+        if (!confirm(`Cancel ${ids.length} selected task(s)?`)) return;
+        cancelSelected.disabled = true;
+        cancelSelected.textContent = "Cancelling…";
+        try {
+          const response = await fetch(`/api/tasks/cancel?task_ids=${ids.join(",")}`, { method: "POST" });
+          if (!response.ok) alert(`Bulk cancel failed: HTTP ${response.status}`);
+        } catch (err) {
+          alert("Bulk cancel failed: " + err);
+        }
+        window.location.reload();
+      });
+    }
 
     // Clone-from-task prefill (set by the task detail page).
     let payload = null;

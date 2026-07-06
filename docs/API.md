@@ -12,7 +12,7 @@ export SCHEDULER_URL=http://<scheduler-host>:8000
 
 ### `GET /api/health`
 
-Checks that the FastAPI service and local database are reachable.
+Checks the FastAPI service, local database, and the scheduler loop itself. Returns `503` with `"ok": false` when the scheduler thread is dead or a tick has stalled past the watchdog threshold.
 
 ```bash
 curl -sS "$SCHEDULER_URL/api/health"
@@ -21,7 +21,54 @@ curl -sS "$SCHEDULER_URL/api/health"
 Typical response:
 
 ```json
-{"ok": true, "accounts": 6, "jobs": 12, "tasks": 0, "allocations": 7}
+{
+  "ok": true, "accounts": 6, "jobs": 12, "tasks": 0, "allocations": 7,
+  "scheduler_thread_alive": true, "scheduler_stalled": false, "scheduler_ok": true,
+  "last_tick_completed_at": "2026-07-07T00:00:00+00:00",
+  "last_tick_duration_seconds": 2.6, "tick_in_progress_seconds": null,
+  "consecutive_tick_failures": 0
+}
+```
+
+### `GET /api/events`
+
+Returns recent scheduler events (allocation open/warm/close/fail, task complete/fail/requeue, account SSH failures, watchdog firings, reconcile actions, orphan sweeps), newest first.
+
+```bash
+curl -sS "$SCHEDULER_URL/api/events?limit=100"
+```
+
+### `GET /api/dashboard-summary`
+
+Lightweight aggregate used by the dashboard's live headline refresh: task activity counters and allocation pool usage.
+
+```bash
+curl -sS "$SCHEDULER_URL/api/dashboard-summary"
+```
+
+### `POST /api/placement/dry-run`
+
+Explains where a hypothetical task would land without creating any state: aggregate queue diagnostics plus per-account eligibility and per-allocation fit slots with rejection reasons.
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/placement/dry-run" \
+  -F cpus=8 \
+  -F memory_mb=32768 \
+  -F gpus=1 \
+  -F gpu_model=a6000 \
+  -F partition=auto
+```
+
+Response shape: `{"queue_state", "queue_reason", "capacity", "accounts": [{"name", "eligible", "reasons"}], "allocations": [{"id", "state", "node_name", "fit_slots", "reasons"}]}`.
+
+### `GET /api/scheduler/gpu-prewarm` / `POST /api/scheduler/gpu-prewarm`
+
+Reads or sets the GPU warm pool toggle. The setting persists in the database and overrides `gpu_prewarm.enabled` from the config file.
+
+```bash
+curl -sS "$SCHEDULER_URL/api/scheduler/gpu-prewarm"
+curl -sS -X POST "$SCHEDULER_URL/api/scheduler/gpu-prewarm" \
+  -H "Content-Type: application/json" -d '{"enabled": false}'
 ```
 
 ### `GET /api/accounts/status`
@@ -406,10 +453,11 @@ Response:
 
 ### `POST /api/tasks/cancel`
 
-Bulk-cancels tasks matching a name substring and status list. This is intended for external agents that accidentally submitted duplicate task batches.
+Bulk-cancels tasks matching a name substring and status list, or an explicit id list. `task_ids` takes precedence when supplied (this is what the dashboard's "Cancel selected" checkboxes use).
 
 ```bash
 curl -sS -X POST "$SCHEDULER_URL/api/tasks/cancel?name_contains=crypto-sweep&statuses=queued,attaching,running"
+curl -sS -X POST "$SCHEDULER_URL/api/tasks/cancel?task_ids=101,102,103"
 ```
 
 ### `GET /api/tasks/{task_id}/remote-file`

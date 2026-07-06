@@ -106,6 +106,11 @@ class AppConfig:
     cleanup_finished_task_ttl_seconds: int = 259200
     cleanup_finished_job_ttl_seconds: int = 259200
     cleanup_closed_allocation_ttl_seconds: int = 86400
+    reconcile_on_start: bool = True
+    backup_enabled: bool = True
+    backup_interval_seconds: int = 86400
+    backup_keep: int = 7
+    backup_dir: str = "data/backups"
     cleanup_orphan_sweep_enabled: bool = True
     cleanup_orphan_sweep_interval_seconds: int = 86400
     cleanup_orphan_min_age_seconds: int = 604800

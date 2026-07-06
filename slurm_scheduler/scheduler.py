@@ -138,6 +138,11 @@ class Scheduler:
         cleanup_finished_task_ttl_seconds: int = 259200,
         cleanup_finished_job_ttl_seconds: int = 259200,
         cleanup_closed_allocation_ttl_seconds: int = 86400,
+        reconcile_on_start: bool = False,
+        backup_enabled: bool = False,
+        backup_interval_seconds: int = 86400,
+        backup_keep: int = 7,
+        backup_dir: str = "data/backups",
         cleanup_orphan_sweep_enabled: bool = True,
         cleanup_orphan_sweep_interval_seconds: int = 86400,
         cleanup_orphan_min_age_seconds: int = 604800,
@@ -233,6 +238,13 @@ class Scheduler:
         self.cleanup_db_row_ttl_seconds = max(86400, int(cleanup_db_row_ttl_seconds))
         self.cleanup_event_ttl_seconds = max(3600, int(cleanup_event_ttl_seconds))
         self._last_orphan_sweep_at = 0.0
+        self.reconcile_on_start = reconcile_on_start
+        self._needs_reconcile = False
+        self.backup_enabled = backup_enabled
+        self.backup_interval_seconds = max(3600, int(backup_interval_seconds))
+        self.backup_keep = max(1, int(backup_keep))
+        self.backup_dir = backup_dir
+        self._last_backup_at = 0.0
         self._last_tick_completed_monotonic: float | None = None
         self._last_tick_completed_at: str = ""
         self._last_tick_duration: float | None = None
@@ -265,6 +277,7 @@ class Scheduler:
         if self._thread and self._thread.is_alive():
             return
         self.recover_transient_states()
+        self._needs_reconcile = self.reconcile_on_start
         self._stop.clear()
         self._thread = threading.Thread(target=self.run_forever, name="scheduler", daemon=True)
         self._thread.start()
@@ -394,6 +407,56 @@ class Scheduler:
                     entity_id=task["id"],
                 )
 
+    def reconcile_slurm_state(self) -> None:
+        """Cancel scheduler-created 'pool' allocation jobs the DB no longer
+        tracks (rows lost or DB reset while the Slurm job kept running).
+        Only jobs named 'pool' are touched — that name is set exclusively by
+        build_allocation_script."""
+        live_states = {
+            AllocationStatus.PENDING.value,
+            AllocationStatus.WARM.value,
+            AllocationStatus.ACTIVE.value,
+            AllocationStatus.DRAINING.value,
+            AllocationStatus.CLOSING.value,
+        }
+        known_ids = {
+            str(allocation.get("slurm_job_id"))
+            for allocation in self.db.list_allocations(limit=1000)
+            if allocation["state"] in live_states and allocation.get("slurm_job_id")
+        }
+        for account in self.accounts:
+            try:
+                with SSHSession(account, default_timeout=30) as ssh:
+                    result = ssh.run('squeue -h -u "$USER" -o "%i|%j"')
+                if result.exit_code != 0:
+                    continue
+                orphan_ids = []
+                for line in result.stdout.splitlines():
+                    job_id, sep, job_name = line.strip().partition("|")
+                    if not sep or job_name.strip() != "pool":
+                        continue
+                    if job_id.strip() and job_id.strip() not in known_ids:
+                        orphan_ids.append(job_id.strip())
+                if not orphan_ids:
+                    continue
+                client = self._client(account)
+                for job_id in orphan_ids:
+                    try:
+                        client.cancel(job_id)
+                    except Exception as exc:
+                        LOGGER.warning("failed to cancel orphan pool job %s on %s: %s", job_id, account.name, exc)
+                        continue
+                    LOGGER.warning("cancelled orphan pool job %s on %s (not tracked in DB)", job_id, account.name)
+                    self.record_event(
+                        "reconcile",
+                        f"cancelled orphan pool job {job_id} not tracked in the DB",
+                        entity_type="account",
+                        entity_id=account.name,
+                        account_name=account.name,
+                    )
+            except Exception as exc:
+                LOGGER.warning("slurm reconcile skipped for %s: %s", account.name, exc)
+
     def _watchdog_stall_seconds(self) -> float:
         if self.watchdog_stall_seconds > 0:
             return float(self.watchdog_stall_seconds)
@@ -490,6 +553,9 @@ class Scheduler:
         self._tick_attach_workers_by_node.clear()
         try:
             with self._tick_client_cache():
+                if self._needs_reconcile:
+                    self._needs_reconcile = False
+                    self.reconcile_slurm_state()
                 self.fail_stale_same_node_tasks()
                 self.enforce_cpu_partition_allocation_limits()
                 self.update_fea_overload_state()
@@ -508,6 +574,7 @@ class Scheduler:
                 self.refresh_submitted_jobs()
                 self.submit_next_queued_job()
                 self.cleanup_remote_artifacts_if_due()
+                self.backup_database_if_due()
         finally:
             started = self._tick_started_at
             if started is not None:
@@ -558,6 +625,44 @@ class Scheduler:
         self.cleanup_closed_allocations()
         self.prune_database_rows()
         self.sweep_orphan_remote_artifacts_if_due()
+
+    def backup_database_if_due(self) -> None:
+        if not self.backup_enabled:
+            return
+        now = time.time()
+        if self._last_backup_at == 0.0:
+            # Survive restarts: resume the cadence from the newest backup file.
+            try:
+                mtimes = [
+                    os.path.getmtime(os.path.join(self.backup_dir, entry))
+                    for entry in os.listdir(self.backup_dir)
+                    if entry.startswith("slurm_scheduler-") and entry.endswith(".db")
+                ]
+                if mtimes:
+                    self._last_backup_at = max(mtimes)
+            except OSError:
+                pass
+        if now - self._last_backup_at < self.backup_interval_seconds:
+            return
+        self._last_backup_at = now
+        stamp = self._now().strftime("%Y%m%d-%H%M%S")
+        backup_path = os.path.join(self.backup_dir, f"slurm_scheduler-{stamp}.db")
+        try:
+            self.db.backup_to(backup_path)
+        except Exception as exc:
+            LOGGER.warning("database backup failed: %s", exc)
+            return
+        LOGGER.info("database backed up to %s", backup_path)
+        try:
+            backups = sorted(
+                entry
+                for entry in os.listdir(self.backup_dir)
+                if entry.startswith("slurm_scheduler-") and entry.endswith(".db")
+            )
+            for stale in backups[: -self.backup_keep]:
+                os.unlink(os.path.join(self.backup_dir, stale))
+        except OSError as exc:
+            LOGGER.warning("failed to rotate database backups: %s", exc)
 
     def prune_database_rows(self) -> None:
         try:
@@ -1876,6 +1981,126 @@ class Scheduler:
             "preferred_node_relaxed": preferred_node_relaxed,
             "allocations": allocations,
         }
+
+    def placement_dry_run(self, task: dict) -> dict:
+        """Explain, without submitting anything, where a hypothetical task
+        would land: per-account eligibility, per-allocation fit and rejection
+        reasons, plus the aggregate queue diagnostics."""
+        allocation_rows = self.db.list_allocations_with_live(limit=500)
+        active_ids, active_exclusive_ids = self.active_task_allocation_sets()
+        capacity = self.task_fit_capacity(
+            task,
+            allocation_rows=allocation_rows,
+            active_task_allocation_ids=active_ids,
+            active_exclusive_allocation_ids=active_exclusive_ids,
+        )
+        diagnostics = self.task_queue_diagnostics(
+            task,
+            capacity=capacity,
+            allocation_rows=allocation_rows,
+            active_task_allocation_ids=active_ids,
+            active_exclusive_allocation_ids=active_exclusive_ids,
+        )
+        snapshots_by_name = {snapshot.account_name: snapshot for snapshot in self.snapshots()}
+        requested = self.requested_accounts(str(task.get("account_name") or ""))
+        accounts = []
+        for account in self.accounts:
+            reasons: list[str] = []
+            if requested and account.name not in requested:
+                reasons.append("not in the requested account list")
+            if not self.account_supports(
+                account, str(task.get("required_capability") or ""), str(task.get("env_profile") or "")
+            ):
+                reasons.append("missing required capability or env profile")
+            snapshot = snapshots_by_name.get(account.name)
+            if snapshot is None:
+                reasons.append("no account snapshot yet")
+            elif not snapshot.available:
+                reasons.append(
+                    f"job limit reached ({snapshot.running} running + {snapshot.pending} pending of {snapshot.max_total})"
+                )
+            accounts.append({"name": account.name, "eligible": not reasons, "reasons": reasons})
+        live_states = {
+            AllocationStatus.PENDING.value,
+            AllocationStatus.WARM.value,
+            AllocationStatus.ACTIVE.value,
+            AllocationStatus.DRAINING.value,
+        }
+        allocations = []
+        for allocation in allocation_rows:
+            if allocation["state"] not in live_states:
+                continue
+            slots = self.fit_slots_for_allocation(allocation, task)
+            allocations.append(
+                {
+                    "id": allocation["id"],
+                    "state": allocation["state"],
+                    "account_name": allocation.get("account_name") or "",
+                    "node_name": allocation.get("node_name") or "",
+                    "resource_pool": allocation.get("resource_pool") or "cpu",
+                    "fit_slots": slots,
+                    "reasons": [] if slots > 0 else self.allocation_rejection_reasons(allocation, task),
+                }
+            )
+        return {
+            "task": {key: task.get(key) for key in (
+                "cpus", "memory_mb", "gpus", "gpu_model", "partition", "node_name",
+                "scheduling_profile", "required_capability", "env_profile", "account_name",
+            )},
+            "queue_state": diagnostics.get("queue_state"),
+            "queue_reason": diagnostics.get("queue_reason"),
+            "capacity": capacity,
+            "accounts": accounts,
+            "allocations": allocations,
+        }
+
+    def allocation_rejection_reasons(self, allocation: dict, task: dict) -> list[str]:
+        reasons: list[str] = []
+        if self.task_is_fea_bursty(task):
+            if allocation.get("state") != AllocationStatus.PENDING.value:
+                node = self.pestat_node_for_allocation(allocation)
+                if node is None:
+                    if self.fea_stale_node_recently_ok(allocation):
+                        reasons.append("pestat stale; conservative single slot only")
+                    else:
+                        reasons.append("pestat stale or missing and last snapshot was not healthy")
+                else:
+                    pressure = self.fea_memory_pressure_state(allocation)
+                    if pressure != "ok":
+                        percent = self.fea_memory_free_percent(allocation)
+                        reasons.append(
+                            f"memory pressure {pressure}"
+                            + (f" (free {percent:.0f}%)" if percent is not None else "")
+                        )
+                    if not self.fea_node_load_ok(allocation):
+                        reasons.append("node CPU load above target")
+                if self.fea_allocation_sustained_overloaded(allocation):
+                    reasons.append("node in sustained FEA overload")
+            return reasons or ["no free FEA slots"]
+        requested_cpus = int(task.get("cpus") or 1)
+        requested_memory = int(task.get("memory_mb") or 0)
+        requested_gpus = int(task.get("gpus") or 0)
+        if requested_gpus > 0:
+            if int(allocation.get("free_gpus") or 0) < requested_gpus:
+                reasons.append(
+                    f"insufficient free GPUs ({allocation.get('free_gpus') or 0} of {requested_gpus} requested)"
+                )
+            wanted_model = normalize_gpu_model(str(task.get("gpu_model") or ""))
+            if wanted_model and normalize_gpu_model(str(allocation.get("gpu_model") or "")) != wanted_model:
+                reasons.append(f"gpu model mismatch (allocation has '{allocation.get('gpu_model') or 'none'}')")
+        if int(allocation.get("free_cpus") or 0) < requested_cpus:
+            reasons.append(f"insufficient free CPUs ({allocation.get('free_cpus') or 0} of {requested_cpus} requested)")
+        if requested_memory and int(allocation.get("free_memory_mb") or 0) < requested_memory:
+            reasons.append(
+                f"insufficient free memory ({allocation.get('free_memory_mb') or 0} of {requested_memory} MB requested)"
+            )
+        partition = str(task.get("partition") or "auto")
+        if partition not in {"", "auto"} and str(allocation.get("partition") or "") != partition:
+            reasons.append(f"partition mismatch (allocation on '{allocation.get('partition') or ''}')")
+        node_name = str(task.get("node_name") or "")
+        if node_name and str(allocation.get("node_name") or "") != node_name:
+            reasons.append(f"node mismatch (allocation on '{allocation.get('node_name') or ''}')")
+        return reasons or ["not eligible for this task"]
 
     def task_queue_diagnostics(
         self,

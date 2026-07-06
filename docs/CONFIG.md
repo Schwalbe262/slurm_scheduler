@@ -34,6 +34,16 @@ web_remote_read_cache_seconds: 3
 web_timeout_keep_alive_seconds: 5
 web_timeout_graceful_shutdown_seconds: 15
 web_limit_concurrency: 64
+ssh_command_timeout_seconds: 30
+ssh_slow_command_timeout_seconds: 300
+scheduler_watchdog_enabled: true
+scheduler_watchdog_stall_seconds: 0
+scheduler_ssh_parallelism: 4
+reconcile_on_start: true
+backup_enabled: true
+backup_interval_seconds: 86400
+backup_keep: 7
+backup_dir: "data/backups"
 cluster_refresh_interval_seconds: 120
 min_warm_allocations: 1
 allocation_partition: "auto"
@@ -82,6 +92,12 @@ Field meanings:
 - `web_remote_read_concurrency`: maximum simultaneous web-triggered SSH log/remote-file/glob reads. Extra requests return `429` quickly instead of blocking the dashboard.
 - `web_remote_read_cache_seconds`: short TTL cache for repeated remote log/file reads.
 - `web_timeout_keep_alive_seconds`, `web_timeout_graceful_shutdown_seconds`, `web_limit_concurrency`: Uvicorn stability limits for slow VPN/client connections and request bursts.
+- `ssh_command_timeout_seconds`: default deadline for every scheduler SSH command. A hung remote raises `RemoteCommandTimeout` instead of blocking the scheduler loop forever.
+- `ssh_slow_command_timeout_seconds`: deadline for legitimately slow remote work (`du -sk` storage scans, `git clone` during submit).
+- `scheduler_watchdog_enabled` / `scheduler_watchdog_stall_seconds`: a watchdog thread force-closes SSH transports when a tick stalls past the threshold (`0` = auto `max(300, 3 * poll_interval_seconds)`), then exits the process for the supervisor restart loop if the tick is still stuck one interval later.
+- `scheduler_ssh_parallelism`: bounded thread pool for per-account state refreshes so one slow account does not serialize the others.
+- `reconcile_on_start`: on startup, cancel Slurm jobs named `pool` that the database no longer tracks (orphaned warm pools after a DB reset or lost rows).
+- `backup_*`: online SQLite backup into `backup_dir` every `backup_interval_seconds`, keeping the newest `backup_keep` files.
 - `min_warm_allocations`: minimum CPU warm allocation count.
 - `allocation_partition`: `auto` lets the scheduler rank partitions from inventory.
 - `allocation_cpus`: CPU target/cap for shared CPU pool allocations. CPU-only nodes avoid tiny fragments by requiring this many usable CPUs when the node can provide it, smaller CPU-only nodes use their full node size, and GPU nodes use their currently free CPUs after leaving `gpu_cpu_reserve` cores unrequested for other GPU users.
@@ -111,12 +127,16 @@ fea_bursty:
   node_name_policy: preferred
   overload_scale_out_load_factor: 2.0
   overload_scale_out_seconds: 300
+  pressure_max_attempts: 3
+  max_attach_per_node_per_loop: 8
 ```
 
 Meanings:
 
 - `soft_memory_free_percent`: stop attaching new `fea_bursty` tasks when the allocation node's `pestat` free memory is below this percentage.
-- `hard_memory_free_percent`: fail and cancel the newest running `fea_bursty` task on a pressured allocation when free memory drops below this percentage.
+- `hard_memory_free_percent`: cancel the newest running `fea_bursty` task on each pressured allocation when free memory drops below this percentage. The task is requeued (not failed) so the simulation reruns elsewhere, up to `pressure_max_attempts`.
+- `pressure_max_attempts`: how many memory-pressure kills a task survives before it is marked failed for good.
+- `max_attach_per_node_per_loop`: per-node cap on new FEA attaches in one tick. Together with the attach ledger (budgets are discounted by attaches issued since the last `pestat` snapshot), this prevents dogpiling one node on stale data.
 - `load_target`: attach only while `pestat` CPU load is at or below `cpu_total * load_target`. For `fea_bursty`, the scheduler may exceed a task's `max_workers_per_node` baseline when both load budget and free-memory budget are still healthy.
 - `max_attach_per_loop`: maximum new `fea_bursty` tasks the scheduler starts in one tick.
 - `node_name_policy`: `preferred` treats `node_name` on CPU `fea_bursty` tasks as a preferred node with healthy-node fallback; `strict` preserves exact-node matching.
@@ -132,6 +152,11 @@ cleanup:
   finished_task_ttl_seconds: 259200
   finished_job_ttl_seconds: 259200
   closed_allocation_ttl_seconds: 86400
+  orphan_sweep_enabled: true
+  orphan_sweep_interval_seconds: 86400
+  orphan_min_age_seconds: 604800
+  db_row_ttl_seconds: 1209600
+  event_ttl_seconds: 604800
 ```
 
 Meanings:
@@ -141,8 +166,13 @@ Meanings:
 - `finished_task_ttl_seconds`: how long completed, failed, or cancelled attached-task directories are kept. Default is 3 days.
 - `finished_job_ttl_seconds`: how long completed, failed, or cancelled direct-job directories are kept. Default is 3 days.
 - `closed_allocation_ttl_seconds`: how long closed allocation directories are kept. Default is 1 day.
+- `orphan_sweep_*`: a daily sweep lists `task-*`/`job-*`/`allocation-*` (and `env-sync/job-*`) directories in each account workspace and removes the ones no database row references and whose mtime is older than `orphan_min_age_seconds` (default 7 days). This catches directories left behind by DB resets, deleted rows, or wedged tasks that the TTL cleanups above cannot see.
+- `db_row_ttl_seconds`: terminal task/job/allocation rows whose remote directories were already cleaned are deleted from the database after this long (default 14 days), followed by a WAL checkpoint. Older run history disappears from the finished lists after this window.
+- `event_ttl_seconds`: retention for `scheduler_events` rows.
 
 Cleanup clears the DB log path fields after deleting the remote directory. If a client needs stdout, stderr, or result files, read them through the API before the TTL expires.
+
+Conda env-sync also cleans after itself: the remote pack/install directories are deleted on success, only the newest `<env>.bak.<timestamp>` backup is kept per environment, and orphaned local sync tarballs are removed at service startup.
 
 ## GPU Prewarm Config
 

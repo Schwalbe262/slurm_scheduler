@@ -5454,6 +5454,60 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(health["consecutive_tick_failures"], 0)
 
 
+class PlacementDryRunTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(f"{self.tmp.name}/scheduler.db")
+        self.db.init()
+        self.accounts = [AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)]
+        FakeClient.snapshots = {
+            "a": AccountSnapshot("a", running=0, pending=0, max_running=10, max_pending=10, max_total=10),
+        }
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_dry_run_reports_allocation_rejections(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=8,
+            total_memory_mb=16384,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="alloc-1",
+            free_cpus=2,
+            free_memory_mb=1024,
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        result = scheduler.placement_dry_run(
+            {
+                "cpus": 4,
+                "memory_mb": 8192,
+                "gpus": 0,
+                "gpu_model": "",
+                "partition": "auto",
+                "node_name": "",
+                "scheduling_profile": "standard",
+                "required_capability": "",
+                "env_profile": "",
+                "account_name": "",
+                "exclusive_node": 0,
+                "max_workers_per_node": 0,
+            }
+        )
+        self.assertEqual(len(result["accounts"]), 1)
+        self.assertTrue(result["accounts"][0]["eligible"])
+        candidate = next(item for item in result["allocations"] if item["id"] == allocation_id)
+        self.assertEqual(candidate["fit_slots"], 0)
+        self.assertTrue(any("free CPUs" in reason for reason in candidate["reasons"]))
+        self.assertTrue(any("free memory" in reason for reason in candidate["reasons"]))
+        self.assertIn(result["queue_state"], {"ready", "pending", "opening"})
+
+
 class TransientStateRecoveryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
