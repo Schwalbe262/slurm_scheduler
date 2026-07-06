@@ -31,6 +31,18 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
+def cleanup_local_temp_artifacts() -> None:
+    """Remove conda-env-sync tarballs orphaned by a crash mid-sync."""
+    import glob
+    import tempfile
+
+    for path in glob.glob(os.path.join(tempfile.gettempdir(), "conda-env-sync-*.tar.gz")):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def build_token_chart(points: list[dict]) -> str:
     if not points:
         return ""
@@ -390,6 +402,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         cleanup_finished_task_ttl_seconds=config.cleanup_finished_task_ttl_seconds,
         cleanup_finished_job_ttl_seconds=config.cleanup_finished_job_ttl_seconds,
         cleanup_closed_allocation_ttl_seconds=config.cleanup_closed_allocation_ttl_seconds,
+        cleanup_orphan_sweep_enabled=config.cleanup_orphan_sweep_enabled,
+        cleanup_orphan_sweep_interval_seconds=config.cleanup_orphan_sweep_interval_seconds,
+        cleanup_orphan_min_age_seconds=config.cleanup_orphan_min_age_seconds,
+        cleanup_db_row_ttl_seconds=config.cleanup_db_row_ttl_seconds,
+        cleanup_event_ttl_seconds=config.cleanup_event_ttl_seconds,
         watchdog_enabled=config.scheduler_watchdog_enabled,
         watchdog_stall_seconds=config.scheduler_watchdog_stall_seconds,
         ssh_parallelism=config.scheduler_ssh_parallelism,
@@ -772,6 +789,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
 
     @app.on_event("startup")
     def _startup() -> None:
+        cleanup_local_temp_artifacts()
         scheduler.start()
 
     @app.on_event("shutdown")
@@ -907,6 +925,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 "capabilities": capabilities,
                 "env_sync_jobs": [env_sync_job_json(job) for job in db.list_env_sync_jobs(limit=10)],
                 "env_overlays": env_overlays,
+                "scheduler_events": db.list_events(limit=50),
+                "scheduler_health": scheduler.health_status(),
             },
         )
 
@@ -1469,14 +1489,23 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         return capacity
 
     @app.get("/api/health")
-    def api_health() -> dict:
+    def api_health(response: Response) -> dict:
+        health = scheduler.health_status()
+        ok = bool(health.get("scheduler_ok"))
+        if not ok:
+            response.status_code = 503
         return {
-            "ok": True,
+            "ok": ok,
             "accounts": len(accounts),
             "jobs": len(db.list_jobs()),
             "tasks": len(db.list_tasks()),
             "allocations": len(db.list_allocations()),
+            **health,
         }
+
+    @app.get("/api/events")
+    def api_events(limit: int = 200) -> list[dict]:
+        return db.list_events(limit=max(1, min(1000, limit)))
 
     @app.get("/api/jobs/{job_id}")
     def api_job(job_id: int) -> dict:

@@ -4,6 +4,7 @@ import logging
 import os
 import posixpath
 import re
+import shlex
 import sys
 import threading
 import time
@@ -137,6 +138,11 @@ class Scheduler:
         cleanup_finished_task_ttl_seconds: int = 259200,
         cleanup_finished_job_ttl_seconds: int = 259200,
         cleanup_closed_allocation_ttl_seconds: int = 86400,
+        cleanup_orphan_sweep_enabled: bool = True,
+        cleanup_orphan_sweep_interval_seconds: int = 86400,
+        cleanup_orphan_min_age_seconds: int = 604800,
+        cleanup_db_row_ttl_seconds: int = 1209600,
+        cleanup_event_ttl_seconds: int = 604800,
         watchdog_enabled: bool = True,
         watchdog_stall_seconds: int = 0,
         ssh_parallelism: int = 4,
@@ -221,6 +227,16 @@ class Scheduler:
         self.cleanup_finished_job_ttl_seconds = cleanup_finished_job_ttl_seconds
         self.cleanup_closed_allocation_ttl_seconds = cleanup_closed_allocation_ttl_seconds
         self._last_cleanup_at = 0.0
+        self.cleanup_orphan_sweep_enabled = cleanup_orphan_sweep_enabled
+        self.cleanup_orphan_sweep_interval_seconds = max(3600, int(cleanup_orphan_sweep_interval_seconds))
+        self.cleanup_orphan_min_age_seconds = max(3600, int(cleanup_orphan_min_age_seconds))
+        self.cleanup_db_row_ttl_seconds = max(86400, int(cleanup_db_row_ttl_seconds))
+        self.cleanup_event_ttl_seconds = max(3600, int(cleanup_event_ttl_seconds))
+        self._last_orphan_sweep_at = 0.0
+        self._last_tick_completed_monotonic: float | None = None
+        self._last_tick_completed_at: str = ""
+        self._last_tick_duration: float | None = None
+        self._consecutive_tick_failures = 0
         self.watchdog_enabled = watchdog_enabled
         self.watchdog_stall_seconds = max(0, int(watchdog_stall_seconds))
         self._watchdog_thread: threading.Thread | None = None
@@ -296,9 +312,61 @@ class Scheduler:
         while not self._stop.is_set():
             try:
                 self.tick()
+                self._consecutive_tick_failures = 0
             except Exception:
+                self._consecutive_tick_failures += 1
                 LOGGER.exception("scheduler tick failed")
             self._stop.wait(self.poll_interval_seconds)
+
+    def record_event(
+        self,
+        kind: str,
+        message: str,
+        entity_type: str = "",
+        entity_id: int | str = "",
+        account_name: str = "",
+    ) -> None:
+        try:
+            self.db.record_event(
+                kind, message, entity_type=entity_type, entity_id=str(entity_id), account_name=account_name
+            )
+        except Exception:
+            LOGGER.debug("failed to record scheduler event %s", kind, exc_info=True)
+
+    def health_status(self) -> dict:
+        thread_alive = bool(self._thread and self._thread.is_alive())
+        now = time.monotonic()
+        stall_after = self._watchdog_stall_seconds()
+        tick_in_progress_seconds = (
+            now - self._tick_started_at if self._tick_started_at is not None else None
+        )
+        seconds_since_last_tick = (
+            now - self._last_tick_completed_monotonic
+            if self._last_tick_completed_monotonic is not None
+            else None
+        )
+        stalled = bool(
+            (tick_in_progress_seconds is not None and tick_in_progress_seconds >= stall_after)
+            or (
+                tick_in_progress_seconds is None
+                and thread_alive
+                and seconds_since_last_tick is not None
+                and seconds_since_last_tick >= stall_after
+            )
+        )
+        return {
+            "scheduler_thread_alive": thread_alive,
+            "scheduler_stalled": stalled,
+            "scheduler_ok": thread_alive and not stalled,
+            "last_tick_completed_at": self._last_tick_completed_at,
+            "last_tick_duration_seconds": round(self._last_tick_duration, 3)
+            if self._last_tick_duration is not None
+            else None,
+            "tick_in_progress_seconds": round(tick_in_progress_seconds, 1)
+            if tick_in_progress_seconds is not None
+            else None,
+            "consecutive_tick_failures": self._consecutive_tick_failures,
+        }
 
     def recover_transient_states(self) -> None:
         """Reset states that only make sense mid-operation; they orphan when the
@@ -307,6 +375,9 @@ class Scheduler:
             if job.get("status") == JobStatus.SUBMITTING.value:
                 LOGGER.warning("recovering job %s stuck in submitting; resetting to queued", job["id"])
                 self.db.update_job(job["id"], status=JobStatus.QUEUED.value, failure_message="")
+                self.record_event(
+                    "recovered", "job stuck in submitting reset to queued", entity_type="job", entity_id=job["id"]
+                )
         for task in self.db.list_tasks_by_statuses([TaskStatus.ATTACHING.value], limit=5000):
             if not str(task.get("exit_code_path") or ""):
                 LOGGER.warning("recovering task %s stuck in attaching without exit_code_path; requeueing", task["id"])
@@ -315,6 +386,12 @@ class Scheduler:
                     status=TaskStatus.QUEUED.value,
                     allocation_id=None,
                     failure_message="",
+                )
+                self.record_event(
+                    "recovered",
+                    "task stuck in attaching requeued",
+                    entity_type="task",
+                    entity_id=task["id"],
                 )
 
     def _watchdog_stall_seconds(self) -> float:
@@ -341,11 +418,17 @@ class Scheduler:
             )
             self._dump_scheduler_stack()
             self._tick_sessions_force_close()
+            self.record_event(
+                "watchdog", f"tick {seq} stalled for {int(stalled_for)}s; SSH transports force-closed"
+            )
             return seq
         LOGGER.critical(
             "scheduler tick %s still stalled after transport close (%.0fs); exiting for supervisor restart",
             seq,
             stalled_for,
+        )
+        self.record_event(
+            "watchdog", f"tick {seq} still stalled after transport close; exiting for supervisor restart"
         )
         self._watchdog_exit(70)
         return seq
@@ -379,6 +462,13 @@ class Scheduler:
         cache = getattr(self._tick_local, "cache", None)
         if cache is not None:
             cache.mark_failed(account_name)
+            self.record_event(
+                "account_unavailable",
+                "account skipped for the rest of this tick after an SSH failure",
+                entity_type="account",
+                entity_id=account_name,
+                account_name=account_name,
+            )
 
     @contextmanager
     def _tick_client_cache(self):
@@ -419,6 +509,11 @@ class Scheduler:
                 self.submit_next_queued_job()
                 self.cleanup_remote_artifacts_if_due()
         finally:
+            started = self._tick_started_at
+            if started is not None:
+                self._last_tick_duration = time.monotonic() - started
+            self._last_tick_completed_monotonic = time.monotonic()
+            self._last_tick_completed_at = self._now().isoformat()
             self._tick_started_at = None
 
     def _now(self) -> datetime:
@@ -461,6 +556,85 @@ class Scheduler:
         self.cleanup_finished_tasks()
         self.cleanup_finished_jobs()
         self.cleanup_closed_allocations()
+        self.prune_database_rows()
+        self.sweep_orphan_remote_artifacts_if_due()
+
+    def prune_database_rows(self) -> None:
+        try:
+            deleted = self.db.prune_old_rows(
+                self._cleanup_cutoff_timestamp(self.cleanup_db_row_ttl_seconds),
+                self._cleanup_cutoff_timestamp(self.cleanup_event_ttl_seconds),
+            )
+        except Exception as exc:
+            LOGGER.warning("failed to prune old database rows: %s", exc)
+            return
+        if any(deleted.values()):
+            LOGGER.info("pruned old database rows: %s", deleted)
+
+    def sweep_orphan_remote_artifacts_if_due(self) -> None:
+        """Remove workspace directories the DB no longer references (rows
+        deleted, DB reset, or tasks wedged in a non-terminal state). The
+        TTL cleanups above only see directories still recorded in the DB."""
+        if not self.cleanup_orphan_sweep_enabled:
+            return
+        now = time.time()
+        if now - self._last_orphan_sweep_at < self.cleanup_orphan_sweep_interval_seconds:
+            return
+        self._last_orphan_sweep_at = now
+        try:
+            referenced: set[str] = set()
+            for path in self.db.list_referenced_remote_paths():
+                normalized = self._normalize_remote_path(path)
+                referenced.add(normalized)
+                # env-sync targets live one level below the swept job dir.
+                referenced.add(posixpath.dirname(normalized))
+        except Exception as exc:
+            LOGGER.warning("orphan sweep skipped; failed to list referenced paths: %s", exc)
+            return
+        age_minutes = max(60, int(self.cleanup_orphan_min_age_seconds // 60))
+        prefixes = ("task-", "job-", "allocation-")
+        for account in self.accounts:
+            workspace = str(account.remote_workspace or "").strip()
+            if not workspace:
+                continue
+            env_sync_dir = posixpath.join(workspace, "env-sync")
+            command = (
+                f"find {shlex.quote(workspace)} -mindepth 1 -maxdepth 1 -type d "
+                f"\\( -name 'task-*' -o -name 'job-*' -o -name 'allocation-*' \\) -mmin +{age_minutes} 2>/dev/null; "
+                f"find {shlex.quote(env_sync_dir)} -mindepth 1 -maxdepth 1 -type d -name 'job-*' -mmin +{age_minutes} 2>/dev/null; "
+                "true"
+            )
+            try:
+                with SSHSession(account, default_timeout=120) as ssh:
+                    result = ssh.run(command)
+            except Exception as exc:
+                LOGGER.warning("orphan sweep failed to list %s workspace: %s", account.name, exc)
+                continue
+            candidates = []
+            for line in result.stdout.splitlines():
+                path = line.strip()
+                if not path:
+                    continue
+                if self._normalize_remote_path(path) in referenced:
+                    continue
+                if not self.is_safe_scheduler_artifact_path(account, path, prefixes):
+                    continue
+                candidates.append(path)
+            if not candidates:
+                continue
+            try:
+                self._client(account).remove_trees(candidates)
+            except Exception as exc:
+                LOGGER.warning("orphan sweep failed to remove %d dirs on %s: %s", len(candidates), account.name, exc)
+                continue
+            LOGGER.info("orphan sweep removed %d stale dirs on %s", len(candidates), account.name)
+            self.record_event(
+                "orphan_sweep",
+                f"removed {len(candidates)} stale workspace dirs older than {age_minutes // 60}h",
+                entity_type="account",
+                entity_id=account.name,
+                account_name=account.name,
+            )
 
     def cleanup_finished_tasks(self) -> None:
         terminal = [TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value]
@@ -841,6 +1015,13 @@ class Scheduler:
                 pending_reason="",
                 node_name=allocation.get("node_name") or info.node_name or "",
             )
+            self.record_event(
+                "allocation_warm",
+                f"allocation started on {allocation.get('node_name') or info.node_name or 'unknown node'}",
+                entity_type="allocation",
+                entity_id=allocation["id"],
+                account_name=str(allocation.get("account_name") or ""),
+            )
         elif status == JobStatus.RUNNING and not allocation.get("node_name"):
             if info.node_name:
                 self.db.update_allocation(allocation["id"], node_name=info.node_name)
@@ -850,8 +1031,22 @@ class Scheduler:
                 self.db.update_allocation(allocation["id"], pending_reason=reason)
         elif status in {JobStatus.COMPLETED, JobStatus.CANCELLED}:
             self.db.update_allocation(allocation["id"], state=AllocationStatus.CLOSED.value, closed_at="CURRENT_TIMESTAMP")
+            self.record_event(
+                "allocation_closed",
+                f"slurm job {allocation.get('slurm_job_id')} left the queue ({status.value})",
+                entity_type="allocation",
+                entity_id=allocation["id"],
+                account_name=str(allocation.get("account_name") or ""),
+            )
         elif status == JobStatus.FAILED:
             self.db.update_allocation(allocation["id"], state=AllocationStatus.FAILED.value, closed_at="CURRENT_TIMESTAMP")
+            self.record_event(
+                "allocation_failed",
+                f"slurm job {allocation.get('slurm_job_id')} failed",
+                entity_type="allocation",
+                entity_id=allocation["id"],
+                account_name=str(allocation.get("account_name") or ""),
+            )
 
     def refresh_tasks(self, max_tasks: int | None = None) -> None:
         accounts_by_name = {account.name: account for account in self.accounts}
@@ -902,6 +1097,13 @@ class Scheduler:
             return
         if status == JobStatus.COMPLETED:
             self.db.update_task(task["id"], status=TaskStatus.COMPLETED.value, exit_code=probe.exit_code, finished_at="CURRENT_TIMESTAMP")
+            self.record_event(
+                "task_completed",
+                f"task {task.get('name') or task['id']} completed",
+                entity_type="task",
+                entity_id=task["id"],
+                account_name=str(task.get("account_name") or ""),
+            )
             self.close_allocation_after_exclusive_task(task)
         elif status == JobStatus.CANCELLED:
             self.db.update_task(task["id"], status=TaskStatus.CANCELLED.value, finished_at="CURRENT_TIMESTAMP")
@@ -917,6 +1119,13 @@ class Scheduler:
                 exit_code=probe.exit_code,
                 failure_message=failure_message,
                 finished_at="CURRENT_TIMESTAMP",
+            )
+            self.record_event(
+                "task_failed",
+                f"task {task.get('name') or task['id']} failed (exit {probe.exit_code}): {failure_message[:200]}",
+                entity_type="task",
+                entity_id=task["id"],
+                account_name=str(task.get("account_name") or ""),
             )
             self.close_allocation_after_exclusive_task(task)
 
@@ -1185,6 +1394,13 @@ class Scheduler:
             state=AllocationStatus.CLOSED.value,
             failure_message="",
             closed_at="CURRENT_TIMESTAMP",
+        )
+        self.record_event(
+            "allocation_closed",
+            reason,
+            entity_type="allocation",
+            entity_id=allocation["id"],
+            account_name=str(allocation.get("account_name") or ""),
         )
 
     def active_task_ids_for_allocation(self, allocation_id: int) -> list[int]:
@@ -2371,6 +2587,13 @@ class Scheduler:
             self.fea_pressure_max_attempts,
         )
         self._fea_pressures_cache = None
+        self.record_event(
+            "task_requeued",
+            f"task {task.get('name') or task['id']} requeued after memory-pressure kill (attempt {attempts}/{self.fea_pressure_max_attempts})",
+            entity_type="task",
+            entity_id=task["id"],
+            account_name=str(task.get("account_name") or ""),
+        )
         self.db.update_task(
             task["id"],
             status=TaskStatus.QUEUED.value,
@@ -3253,6 +3476,13 @@ class Scheduler:
             submitted_at="CURRENT_TIMESTAMP",
             drain_reason=reason,
             **result,
+        )
+        self.record_event(
+            "allocation_opened",
+            f"{reason} (pool {resource_pool}, slurm job {result.get('slurm_job_id')})",
+            entity_type="allocation",
+            entity_id=allocation_id,
+            account_name=account.name,
         )
         return self.db.get_allocation(allocation_id)
 

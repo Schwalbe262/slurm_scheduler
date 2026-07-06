@@ -693,6 +693,45 @@
   </section>
 
   <section class="panel">
+    <h2>Scheduler Events</h2>
+    <div class="summary-row" aria-label="Scheduler health">
+      <div class="summary-item">
+        <span class="summary-label">Scheduler</span>
+        <span class="summary-value">{{ "OK" if scheduler_health.scheduler_ok else "STALLED" }}</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Last tick</span>
+        <span class="summary-value">{{ scheduler_health.last_tick_duration_seconds ~ "s" if scheduler_health.last_tick_duration_seconds is not none else "-" }}</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Tick failures</span>
+        <span class="summary-value">{{ scheduler_health.consecutive_tick_failures }}</span>
+      </div>
+    </div>
+    <details>
+      <summary>Recent events: {{ scheduler_events|length }}</summary>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Time</th><th>Kind</th><th>Entity</th><th>Account</th><th>Message</th></tr></thead>
+          <tbody>
+          {% for event in scheduler_events %}
+            <tr>
+              <td class="mono-cell">{{ event.created_at }}</td>
+              <td>{{ event.kind }}</td>
+              <td class="mono-cell">{{ event.entity_type }} {{ event.entity_id }}</td>
+              <td>{{ event.account_name }}</td>
+              <td>{{ event.message }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="5" class="muted">No events yet.</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  </section>
+
+  <section class="panel">
     <h2>Attached Tasks</h2>
     <div class="summary-row" aria-label="Attached task summary">
       <div class="summary-item">

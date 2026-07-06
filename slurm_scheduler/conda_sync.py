@@ -169,6 +169,10 @@ class CondaEnvSyncManager:
             local_file = tempfile.NamedTemporaryFile(prefix=f"conda-env-sync-{job['id']}-", suffix=".tar.gz", delete=False)
             local_file.close()
             ssh.download_file(archive_path, local_file.name)
+            # The archive is local now; drop the remote pack dir (tarball + log)
+            # so successful syncs leave nothing behind. Failures keep theirs
+            # for inspection and are reaped by the orphan sweep later.
+            ssh.run(f"rm -rf -- {shlex.quote(remote_dir)}")
         return local_file.name, archive_path
 
     def _run_target(self, sync_job_id: int, target: dict, local_archive: str, source_archive: str) -> None:
@@ -211,6 +215,7 @@ class CondaEnvSyncManager:
                     backup_path = ssh.read_text_file(posixpath.join(remote_dir, "backup_path.txt")).strip()
                 except Exception:
                     backup_path = ""
+                ssh.run(f"rm -rf -- {shlex.quote(remote_dir)}")
             self.db.upsert_account_env_overlay(account_name, env_name, installed_prefix, sync_job_id)
             self.db.update_env_sync_target(
                 target["id"],
@@ -247,5 +252,7 @@ class CondaEnvSyncManager:
                 f"tar -xzf {shlex.quote(archive_path)} -C \"$target\"",
                 "if [ -x \"$target/bin/conda-unpack\" ]; then \"$target/bin/conda-unpack\"; fi",
                 "echo \"$target\" > " + shlex.quote(posixpath.join(posixpath.dirname(archive_path), "installed_prefix.txt")),
+                # Each re-sync leaves a full env copy behind; keep only the newest backup.
+                "ls -dt \"${target}\".bak.* 2>/dev/null | tail -n +2 | xargs -r rm -rf || true",
             ]
         )

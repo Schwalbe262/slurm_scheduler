@@ -106,6 +106,11 @@ class AppConfig:
     cleanup_finished_task_ttl_seconds: int = 259200
     cleanup_finished_job_ttl_seconds: int = 259200
     cleanup_closed_allocation_ttl_seconds: int = 86400
+    cleanup_orphan_sweep_enabled: bool = True
+    cleanup_orphan_sweep_interval_seconds: int = 86400
+    cleanup_orphan_min_age_seconds: int = 604800
+    cleanup_db_row_ttl_seconds: int = 1209600
+    cleanup_event_ttl_seconds: int = 604800
     git_credentials: list[GitCredentialConfig] = field(default_factory=list)
 
 
@@ -166,6 +171,11 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
             "finished_task_ttl_seconds": "cleanup_finished_task_ttl_seconds",
             "finished_job_ttl_seconds": "cleanup_finished_job_ttl_seconds",
             "closed_allocation_ttl_seconds": "cleanup_closed_allocation_ttl_seconds",
+            "orphan_sweep_enabled": "cleanup_orphan_sweep_enabled",
+            "orphan_sweep_interval_seconds": "cleanup_orphan_sweep_interval_seconds",
+            "orphan_min_age_seconds": "cleanup_orphan_min_age_seconds",
+            "db_row_ttl_seconds": "cleanup_db_row_ttl_seconds",
+            "event_ttl_seconds": "cleanup_event_ttl_seconds",
         }
         for source, target in mapping.items():
             if source in cleanup:

@@ -241,6 +241,18 @@ CREATE TABLE IF NOT EXISTS scheduler_settings (
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS scheduler_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    kind TEXT NOT NULL,
+    entity_type TEXT NOT NULL DEFAULT '',
+    entity_id TEXT NOT NULL DEFAULT '',
+    account_name TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduler_events_created_at ON scheduler_events(created_at);
 """
 
 
@@ -279,6 +291,74 @@ class Database:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
                 (key, value),
             )
+
+    def record_event(
+        self,
+        kind: str,
+        message: str,
+        entity_type: str = "",
+        entity_id: str = "",
+        account_name: str = "",
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO scheduler_events(kind, message, entity_type, entity_id, account_name) VALUES(?, ?, ?, ?, ?)",
+                (kind, message, entity_type, str(entity_id), account_name),
+            )
+
+    def list_events(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scheduler_events ORDER BY id DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_referenced_remote_paths(self) -> set[str]:
+        queries = (
+            "SELECT remote_dir FROM tasks WHERE COALESCE(remote_dir, '') != ''",
+            "SELECT remote_job_dir FROM jobs WHERE COALESCE(remote_job_dir, '') != ''",
+            "SELECT remote_dir FROM allocations WHERE COALESCE(remote_dir, '') != ''",
+            "SELECT remote_dir FROM env_sync_targets WHERE COALESCE(remote_dir, '') != ''",
+        )
+        paths: set[str] = set()
+        with self.connect() as conn:
+            for query in queries:
+                for row in conn.execute(query):
+                    paths.add(str(row[0]))
+        return paths
+
+    def prune_old_rows(
+        self,
+        row_cutoff: str,
+        event_cutoff: str,
+    ) -> dict[str, int]:
+        """Delete terminal rows whose remote artifacts were already cleaned
+        (remote dir columns emptied) and old events, then truncate the WAL."""
+        deleted: dict[str, int] = {}
+        with self.connect() as conn:
+            deleted["tasks"] = conn.execute(
+                "DELETE FROM tasks WHERE status IN ('completed','failed','cancelled') "
+                "AND COALESCE(remote_dir, '') = '' AND COALESCE(finished_at, updated_at, created_at) < ?",
+                (row_cutoff,),
+            ).rowcount
+            deleted["jobs"] = conn.execute(
+                "DELETE FROM jobs WHERE status IN ('completed','failed','cancelled') "
+                "AND COALESCE(remote_job_dir, '') = '' AND COALESCE(finished_at, updated_at, created_at) < ?",
+                (row_cutoff,),
+            ).rowcount
+            deleted["allocations"] = conn.execute(
+                "DELETE FROM allocations WHERE state IN ('closed','failed') "
+                "AND COALESCE(remote_dir, '') = '' AND COALESCE(closed_at, updated_at, created_at) < ?",
+                (row_cutoff,),
+            ).rowcount
+            deleted["events"] = conn.execute(
+                "DELETE FROM scheduler_events WHERE created_at < ?",
+                (event_cutoff,),
+            ).rowcount
+        with self.connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return deleted
 
     def _ensure_columns(self, conn: sqlite3.Connection) -> None:
         table_columns = {

@@ -4,7 +4,12 @@ import threading
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+
+def days_ago(days: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
 from slurm_scheduler.config import AccountConfig, GitCredentialConfig, load_app_config
 from slurm_scheduler.allocation_metrics import annotate_allocation_fea_pressure, annotate_allocation_node_metrics
@@ -1016,7 +1021,7 @@ class SchedulerTests(unittest.TestCase):
             stderr_path="/work/task-1-1000/stderr.log",
             exit_code_path="/work/task-1-1000/exit_code",
             wrapper_pid="123",
-            finished_at="2000-01-01 00:00:00",
+            finished_at=days_ago(7),
         )
         self.db.update_task(
             unsafe_id,
@@ -1025,7 +1030,7 @@ class SchedulerTests(unittest.TestCase):
             remote_dir="/work/project",
             stdout_path="/work/project/stdout.log",
             stderr_path="/work/project/stderr.log",
-            finished_at="2000-01-01 00:00:00",
+            finished_at=days_ago(7),
         )
         scheduler = Scheduler(
             self.db,
@@ -1050,7 +1055,7 @@ class SchedulerTests(unittest.TestCase):
             stdout_path="/work/task-old-1000/stdout.log",
             stderr_path="/work/task-old-1000/stderr.log",
             exit_code_path="/work/task-old-1000/exit_code",
-            finished_at="2000-01-01 00:00:00",
+            finished_at=days_ago(7),
         )
         with self.db.connect() as conn:
             conn.executemany(
@@ -1084,7 +1089,7 @@ class SchedulerTests(unittest.TestCase):
             remote_job_dir="/work/job-1-1000",
             stdout_path="/work/job-1-1000/out",
             stderr_path="/work/job-1-1000/err",
-            finished_at="2000-01-01 00:00:00",
+            finished_at=days_ago(7),
         )
         self.db.update_allocation(
             allocation_id,
@@ -1092,7 +1097,7 @@ class SchedulerTests(unittest.TestCase):
             remote_dir="/work/allocation-1-1000",
             stdout_path="/work/allocation-1-1000/out",
             stderr_path="/work/allocation-1-1000/err",
-            closed_at="2000-01-01 00:00:00",
+            closed_at=days_ago(7),
         )
         scheduler = Scheduler(
             self.db,
@@ -1222,7 +1227,7 @@ class SchedulerTests(unittest.TestCase):
         first = self.db.create_task(TaskCreate("crypto-sweep-a", "~/case", "run"))
         second = self.db.create_task(TaskCreate("crypto-sweep-b", "~/case", "run"))
         third = self.db.create_task(TaskCreate("other", "~/case", "run"))
-        self.db.update_task(second, status=TaskStatus.COMPLETED.value, finished_at="2000-01-01 00:00:00")
+        self.db.update_task(second, status=TaskStatus.COMPLETED.value, finished_at=days_ago(7))
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
         cancelled = scheduler.cancel_tasks(name_contains="crypto-sweep")
         self.assertEqual(cancelled, [first])
@@ -5394,6 +5399,59 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(suspect, 8)
         self.assertEqual(self.exits, [])
         self.assertEqual(self.force_closes, [True, True])
+
+
+class ObservabilityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(f"{self.tmp.name}/scheduler.db")
+        self.db.init()
+        self.accounts = [AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)]
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_record_and_list_events(self) -> None:
+        self.db.record_event("allocation_opened", "warm pool", entity_type="allocation", entity_id="7", account_name="a")
+        self.db.record_event("task_failed", "boom", entity_type="task", entity_id="9")
+        events = self.db.list_events(limit=10)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]["kind"], "task_failed")
+        self.assertEqual(events[1]["entity_id"], "7")
+
+    def test_prune_old_rows_deletes_only_cleaned_terminal_rows(self) -> None:
+        old_clean = self.db.create_task(TaskCreate("old-clean", "~/w", "run"))
+        self.db.update_task(old_clean, status=TaskStatus.COMPLETED.value, remote_dir="")
+        old_dirty = self.db.create_task(TaskCreate("old-dirty", "~/w", "run"))
+        self.db.update_task(old_dirty, status=TaskStatus.COMPLETED.value, remote_dir="/work/task-2")
+        live = self.db.create_task(TaskCreate("live", "~/w", "run"))
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET finished_at = datetime('now', '-30 days'), updated_at = datetime('now', '-30 days')"
+            )
+        self.db.record_event("old_event", "stale")
+        with self.db.connect() as conn:
+            conn.execute("UPDATE scheduler_events SET created_at = datetime('now', '-30 days')")
+        deleted = self.db.prune_old_rows(
+            "2100-01-01 00:00:00",
+            "2100-01-01 00:00:00",
+        )
+        self.assertEqual(deleted["tasks"], 1)
+        self.assertEqual(deleted["events"], 1)
+        self.assertIsNone(self.db.get_task(old_clean))
+        self.assertIsNotNone(self.db.get_task(old_dirty))
+        self.assertIsNotNone(self.db.get_task(live))
+
+    def test_health_status_reports_thread_and_tick_state(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        health = scheduler.health_status()
+        self.assertFalse(health["scheduler_thread_alive"])
+        self.assertFalse(health["scheduler_stalled"])
+        scheduler.tick()
+        health = scheduler.health_status()
+        self.assertIsNotNone(health["last_tick_duration_seconds"])
+        self.assertTrue(health["last_tick_completed_at"])
+        self.assertEqual(health["consecutive_tick_failures"], 0)
 
 
 class TransientStateRecoveryTests(unittest.TestCase):
