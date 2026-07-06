@@ -262,6 +262,9 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("initial_limit = 11", script)
         self.assertIn("max_limit = 16", script)
         self.assertIn("[adaptive] increased worker limit", script)
+        self.assertIn("[adaptive] reduced worker limit", script)
+        self.assertIn("cpu_headroom", script)
+        self.assertIn("probe_interval = 60", script)
         self.assertLess(script.index("#SBATCH --job-name"), script.index("set -euo pipefail"))
 
     def test_build_packed_script_includes_requested_node(self) -> None:
@@ -4844,11 +4847,116 @@ class SchedulerTests(unittest.TestCase):
         )
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
         scheduler.handle_fea_memory_pressure()
-        self.assertEqual(self.db.get_task(new_fea)["status"], TaskStatus.FAILED.value)
-        self.assertEqual(self.db.get_task(new_fea)["failure_message"], "memory pressure hard limit")
+        requeued = self.db.get_task(new_fea)
+        self.assertEqual(requeued["status"], TaskStatus.QUEUED.value)
+        self.assertEqual(requeued["attempt_count"], 1)
+        self.assertIsNone(requeued["allocation_id"])
+        self.assertEqual(requeued["failure_message"], "")
         self.assertEqual(self.db.get_task(old_fea)["status"], TaskStatus.RUNNING.value)
         self.assertEqual(self.db.get_task(standard)["status"], TaskStatus.RUNNING.value)
         self.assertEqual(FakeClient.cancelled_tasks, [new_fea])
+
+    def test_fea_hard_memory_pressure_fails_task_at_attempt_cap(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="alloc-1")
+        task_id = self.db.create_task(
+            TaskCreate(
+                "fea-retried",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=8192,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        self.db.update_task(
+            task_id,
+            status=TaskStatus.RUNNING.value,
+            account_name="a",
+            allocation_id=allocation_id,
+            wrapper_pid="2000",
+            attempt_count=2,
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 12.0 100000 35000 some_job\n"
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        scheduler.handle_fea_memory_pressure()
+        failed = self.db.get_task(task_id)
+        self.assertEqual(failed["status"], TaskStatus.FAILED.value)
+        self.assertEqual(failed["attempt_count"], 3)
+        self.assertIn("after 3 attempts", failed["failure_message"])
+
+    def test_fea_dynamic_extra_slots_discounts_attaches_since_pestat_snapshot(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 4.0 100000 90000 some_job\n"
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        allocation = {"id": 1, "state": AllocationStatus.WARM.value, "node_name": "n001"}
+        task = {"id": 10, "cpus": 4, "memory_mb": 8192}
+        baseline = scheduler.fea_dynamic_extra_slots(allocation, task)
+        self.assertGreater(baseline, 0)
+        for _ in range(3):
+            scheduler._record_attach_delta(allocation, task)
+        discounted = scheduler.fea_dynamic_extra_slots(allocation, task)
+        self.assertLess(discounted, baseline)
+
+    def test_fea_dynamic_extra_slots_caps_attaches_per_node_per_tick(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 4.0 100000 90000 some_job\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db, self.accounts, 30, client_factory=FakeClient, fea_max_attach_per_node_per_loop=2
+        )
+        allocation = {"id": 1, "state": AllocationStatus.WARM.value, "node_name": "n001"}
+        task = {"id": 10, "cpus": 1, "memory_mb": 128}
+        scheduler._record_attach_delta(allocation, task)
+        scheduler._record_attach_delta(allocation, task)
+        self.assertEqual(scheduler.fea_dynamic_extra_slots(allocation, task), 0)
+
+    def test_fea_stale_pestat_allows_single_slot_when_last_row_was_healthy(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 4.0 100000 90000 some_job\n"
+            )
+        )
+        with self.db.connect() as conn:
+            conn.execute("UPDATE pestat_nodes SET observed_at = datetime('now', '-300 seconds')")
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        allocation = {"id": 1, "state": AllocationStatus.WARM.value, "node_name": "n001"}
+        task = {"id": 10, "cpus": 4, "memory_mb": 8192}
+        self.assertIsNone(scheduler.pestat_node_for_allocation(allocation))
+        self.assertEqual(scheduler.fea_dynamic_extra_slots(allocation, task), 1)
+
+    def test_fea_stale_pestat_blocks_when_last_row_was_pressured(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 12.0 100000 35000 some_job\n"
+            )
+        )
+        with self.db.connect() as conn:
+            conn.execute("UPDATE pestat_nodes SET observed_at = datetime('now', '-300 seconds')")
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        allocation = {"id": 1, "state": AllocationStatus.WARM.value, "node_name": "n001"}
+        task = {"id": 10, "cpus": 4, "memory_mb": 8192}
+        self.assertEqual(scheduler.fea_dynamic_extra_slots(allocation, task), 0)
 
     def test_fea_hard_memory_pressure_does_not_cancel_standard_task(self) -> None:
         allocation_id = self.db.create_allocation(

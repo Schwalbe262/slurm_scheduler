@@ -99,6 +99,8 @@ class AppConfig:
     fea_node_name_policy: str = "preferred"
     fea_overload_scale_out_load_factor: float = 2.0
     fea_overload_scale_out_seconds: int = 300
+    fea_pressure_max_attempts: int = 3
+    fea_max_attach_per_node_per_loop: int = 8
     cleanup_enabled: bool = True
     cleanup_interval_seconds: int = 3600
     cleanup_finished_task_ttl_seconds: int = 259200
@@ -150,6 +152,8 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
             "node_name_policy": "fea_node_name_policy",
             "overload_scale_out_load_factor": "fea_overload_scale_out_load_factor",
             "overload_scale_out_seconds": "fea_overload_scale_out_seconds",
+            "pressure_max_attempts": "fea_pressure_max_attempts",
+            "max_attach_per_node_per_loop": "fea_max_attach_per_node_per_loop",
         }
         for source, target in mapping.items():
             if source in fea_bursty:

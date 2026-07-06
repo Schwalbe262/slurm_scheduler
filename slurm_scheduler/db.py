@@ -164,6 +164,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     same_node_as_task_id INTEGER NOT NULL DEFAULT 0,
     payload_json TEXT NOT NULL DEFAULT '',
     exit_code INTEGER,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL,
     allocation_id INTEGER,
     account_name TEXT,
@@ -316,6 +317,7 @@ class Database:
                 "same_node_as_task_id": "INTEGER NOT NULL DEFAULT 0",
                 "payload_json": "TEXT NOT NULL DEFAULT ''",
                 "exit_code": "INTEGER",
+                "attempt_count": "INTEGER NOT NULL DEFAULT 0",
             },
             "allocations": {
                 "total_gpus": "INTEGER NOT NULL DEFAULT 0",

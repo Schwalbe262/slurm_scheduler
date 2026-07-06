@@ -129,6 +129,8 @@ class Scheduler:
         fea_node_name_policy: str = "preferred",
         fea_overload_scale_out_load_factor: float = 2.0,
         fea_overload_scale_out_seconds: int = 300,
+        fea_pressure_max_attempts: int = 3,
+        fea_max_attach_per_node_per_loop: int = 8,
         task_refresh_max_per_tick: int = 32,
         cleanup_enabled: bool = True,
         cleanup_interval_seconds: int = 3600,
@@ -199,6 +201,13 @@ class Scheduler:
         self.fea_node_name_policy = node_policy if node_policy in {"preferred", "strict"} else "preferred"
         self.fea_overload_scale_out_load_factor = max(0.0, float(fea_overload_scale_out_load_factor))
         self.fea_overload_scale_out_seconds = max(0, int(fea_overload_scale_out_seconds))
+        self.fea_pressure_max_attempts = max(1, int(fea_pressure_max_attempts))
+        self.fea_max_attach_per_node_per_loop = max(1, int(fea_max_attach_per_node_per_loop))
+        # Attaches since the last pestat refresh, per node; discounts budgets
+        # so a stale pestat row cannot dogpile one node.
+        self._attach_delta_by_node: dict[str, dict[str, float]] = {}
+        self._tick_attach_workers_by_node: dict[str, int] = {}
+        self._fea_pressures_cache: tuple[int, dict[str, dict[str, int]]] | None = None
         self._fea_overload_since_by_node: dict[str, float] = {}
         self._fea_overload_scaled_nodes: set[str] = set()
         self.task_refresh_max_per_tick = max(1, int(task_refresh_max_per_tick))
@@ -388,6 +397,7 @@ class Scheduler:
     def tick(self) -> None:
         self._tick_seq += 1
         self._tick_started_at = time.monotonic()
+        self._tick_attach_workers_by_node.clear()
         try:
             with self._tick_client_cache():
                 self.fail_stale_same_node_tasks()
@@ -570,23 +580,26 @@ class Scheduler:
         self._last_cluster_refresh_at = now
         preferred = self.warm_pool_preferred_accounts or self.gpu_warm_pool_preferred_accounts
         preferred_names = set(preferred)
-        account = next((item for item in self.accounts if item.name in preferred_names), None) or (self.accounts[0] if self.accounts else None)
-        if not account:
-            return
-        try:
-            with SSHSession(account, default_timeout=60) as ssh:
-                inventory_result = ssh.run("scontrol -o show nodes")
-                if inventory_result.exit_code == 0 and inventory_result.stdout.strip():
-                    self.db.replace_node_inventory(parse_scontrol_nodes(inventory_result.stdout))
-                else:
-                    sinfo = ssh.run('sinfo -N -h -o "%N|%P|%c|%m|%G|%t"')
-                    if sinfo.exit_code == 0 and sinfo.stdout.strip():
-                        self.db.replace_node_inventory(parse_sinfo_nodes(sinfo.stdout))
-                pestat_result = ssh.run("pestat")
-                if pestat_result.exit_code == 0 and pestat_result.stdout.strip():
-                    self.db.replace_pestat_nodes(parse_pestat(pestat_result.stdout))
-        except Exception as exc:
-            LOGGER.warning("failed to refresh cluster state through %s: %s", account.name, exc)
+        candidates = sorted(self.accounts, key=lambda item: item.name not in preferred_names)
+        for account in candidates[:3]:
+            try:
+                with SSHSession(account, default_timeout=60) as ssh:
+                    inventory_result = ssh.run("scontrol -o show nodes")
+                    if inventory_result.exit_code == 0 and inventory_result.stdout.strip():
+                        self.db.replace_node_inventory(parse_scontrol_nodes(inventory_result.stdout))
+                    else:
+                        sinfo = ssh.run('sinfo -N -h -o "%N|%P|%c|%m|%G|%t"')
+                        if sinfo.exit_code == 0 and sinfo.stdout.strip():
+                            self.db.replace_node_inventory(parse_sinfo_nodes(sinfo.stdout))
+                    pestat_result = ssh.run("pestat")
+                    if pestat_result.exit_code == 0 and pestat_result.stdout.strip():
+                        self.db.replace_pestat_nodes(parse_pestat(pestat_result.stdout))
+                        # Fresh node data supersedes the attach discounts accumulated
+                        # against the previous snapshot.
+                        self._attach_delta_by_node.clear()
+                return
+            except Exception as exc:
+                LOGGER.warning("failed to refresh cluster state through %s: %s", account.name, exc)
 
     def account_by_name(self, name: str) -> AccountConfig | None:
         return next((item for item in self.accounts if item.name == name), None)
@@ -1367,6 +1380,7 @@ class Scheduler:
             account_name=allocation["account_name"],
             attached_at="CURRENT_TIMESTAMP",
         )
+        self._record_attach_delta(allocation, task)
         self.recalculate_allocation_capacity()
         return {**task, "status": TaskStatus.ATTACHING.value, "allocation_id": allocation["id"], "account_name": allocation["account_name"]}
 
@@ -2049,20 +2063,47 @@ class Scheduler:
             candidates.append(float(self.cluster_refresh_interval_seconds) * 2)
         return max(candidates)
 
-    def pestat_node_for_allocation(self, allocation: dict) -> dict | None:
+    def pestat_node_for_allocation(self, allocation: dict, max_age_seconds: float | None = None) -> dict | None:
         node_name = str(allocation.get("node_name") or "").strip()
         if not node_name:
             return None
+        age_limit = self.pestat_stale_after_seconds() if max_age_seconds is None else max_age_seconds
         for row in self.db.list_pestat_nodes():
             if str(row.get("hostname") or "") != node_name:
                 continue
             observed_at = self._timestamp(row.get("observed_at"))
             if not observed_at:
                 return None
-            if (self._now() - observed_at).total_seconds() > self.pestat_stale_after_seconds():
+            if (self._now() - observed_at).total_seconds() > age_limit:
                 return None
             return row
         return None
+
+    def _record_attach_delta(self, allocation: dict, task: dict) -> None:
+        node_name = str(allocation.get("node_name") or "").strip()
+        if not node_name:
+            return
+        delta = self._attach_delta_by_node.setdefault(node_name, {"cpus": 0.0, "memory_mb": 0.0})
+        delta["cpus"] += float(task.get("cpus") or 0)
+        delta["memory_mb"] += float(task.get("memory_mb") or 0)
+        self._tick_attach_workers_by_node[node_name] = self._tick_attach_workers_by_node.get(node_name, 0) + 1
+        self._fea_pressures_cache = None
+
+    def fea_stale_node_recently_ok(self, allocation: dict) -> bool:
+        """Fresh pestat is missing; look at the last (up to 3x stale) row. If
+        the node looked healthy then, allow a trickle instead of freezing all
+        FEA attach cluster-wide on one failed refresh."""
+        row = self.pestat_node_for_allocation(allocation, max_age_seconds=3 * self.pestat_stale_after_seconds())
+        if not row:
+            return False
+        total = int(row.get("memory_mb") or 0)
+        if total <= 0:
+            return False
+        free_percent = (int(row.get("free_memory_mb") or 0) / total) * 100.0
+        if free_percent < self.fea_soft_memory_free_percent:
+            return False
+        cpu_total = max(1, int(row.get("cpu_total") or 1))
+        return float(row.get("cpu_load") or 0.0) <= cpu_total * self.fea_load_target
 
     def fea_memory_free_percent(self, allocation: dict) -> float | None:
         node = self.pestat_node_for_allocation(allocation)
@@ -2091,6 +2132,10 @@ class Scheduler:
         return float(node.get("cpu_load") or 0.0) <= cpu_total * self.fea_load_target
 
     def fea_allocation_accepts_task(self, allocation: dict) -> bool:
+        if self.pestat_node_for_allocation(allocation) is None:
+            return self.fea_stale_node_recently_ok(allocation) and not self.fea_allocation_sustained_overloaded(
+                allocation
+            )
         return (
             self.fea_memory_pressure_state(allocation) == "ok"
             and self.fea_node_load_ok(allocation)
@@ -2098,6 +2143,14 @@ class Scheduler:
         )
 
     def fea_owned_node_pressures(self) -> dict[str, dict[str, int]]:
+        cached = self._fea_pressures_cache
+        if cached is not None and cached[0] == self._tick_seq:
+            return cached[1]
+        pressures = self._compute_fea_owned_node_pressures()
+        self._fea_pressures_cache = (self._tick_seq, pressures)
+        return pressures
+
+    def _compute_fea_owned_node_pressures(self) -> dict[str, dict[str, int]]:
         allocation_node_by_id: dict[int, str] = {}
         owned_cpus_by_node: dict[str, int] = {}
         for allocation in self.db.list_allocations(limit=500):
@@ -2229,21 +2282,38 @@ class Scheduler:
     def fea_dynamic_extra_slots(self, allocation: dict, task: dict) -> int:
         if allocation.get("state") == AllocationStatus.PENDING.value:
             return self.fea_max_attach_per_loop
-        node = self.pestat_node_for_allocation(allocation)
-        if not node or not self.fea_allocation_accepts_task(allocation):
+        node_name = str(allocation.get("node_name") or "").strip()
+        node_tick_attaches = self._tick_attach_workers_by_node.get(node_name, 0) if node_name else 0
+        if node_tick_attaches >= self.fea_max_attach_per_node_per_loop:
             return 0
+        node = self.pestat_node_for_allocation(allocation)
+        if not node:
+            # Stale pestat: conservative single slot when the node was healthy
+            # at the last observation, instead of freezing attach entirely.
+            return 1 if self.fea_allocation_accepts_task(allocation) else 0
+        if not self.fea_allocation_accepts_task(allocation):
+            return 0
+        delta = self._attach_delta_by_node.get(node_name, {}) if node_name else {}
         memory_total = max(1, int(node.get("memory_mb") or 1))
-        memory_free = max(0, int(node.get("free_memory_mb") or 0))
+        memory_free = max(0, int(node.get("free_memory_mb") or 0) - int(delta.get("memory_mb") or 0))
         soft_floor = int(memory_total * (self.fea_soft_memory_free_percent / 100.0))
         memory_budget = max(0, memory_free - soft_floor)
         memory_slots = memory_budget // max(1, int(task.get("memory_mb") or 1))
 
         cpu_total = max(1, int(node.get("cpu_total") or 1))
-        cpu_load = max(0.0, float(node.get("cpu_load") or 0.0))
+        cpu_load = max(0.0, float(node.get("cpu_load") or 0.0)) + float(delta.get("cpus") or 0.0)
         load_budget = max(0.0, (cpu_total * self.fea_load_target) - cpu_load)
         cpu_slots = int(load_budget // max(1, int(task.get("cpus") or 1)))
 
-        return max(0, min(memory_slots, cpu_slots, self.fea_max_attach_per_loop))
+        return max(
+            0,
+            min(
+                memory_slots,
+                cpu_slots,
+                self.fea_max_attach_per_loop,
+                self.fea_max_attach_per_node_per_loop - node_tick_attaches,
+            ),
+        )
 
     def fea_effective_worker_limit(
         self,
@@ -2257,6 +2327,7 @@ class Scheduler:
         return max(base_limit, current_workers + self.fea_dynamic_extra_slots(allocation, task))
 
     def handle_fea_memory_pressure(self) -> None:
+        reclaimed = False
         for allocation in self.db.list_allocations(limit=500):
             if allocation["state"] not in {
                 AllocationStatus.WARM.value,
@@ -2275,14 +2346,45 @@ class Scheduler:
                     self._client(account).cancel_task(task)
                 except Exception as exc:
                     LOGGER.warning("failed to cancel FEA task %s under memory pressure: %s", task["id"], exc)
+            self.requeue_pressure_killed_task(task)
+            reclaimed = True
+        if reclaimed:
+            self.recalculate_allocation_capacity()
+
+    def requeue_pressure_killed_task(self, task: dict) -> None:
+        """A pressure kill discards the worker, not the work: requeue so the
+        simulation reruns elsewhere, up to the attempt cap."""
+        attempts = int(task.get("attempt_count") or 0) + 1
+        if attempts >= self.fea_pressure_max_attempts:
             self.db.update_task(
                 task["id"],
                 status=TaskStatus.FAILED.value,
-                failure_message="memory pressure hard limit",
+                attempt_count=attempts,
+                failure_message=f"memory pressure hard limit after {attempts} attempts",
                 finished_at="CURRENT_TIMESTAMP",
             )
-            self.recalculate_allocation_capacity()
             return
+        LOGGER.info(
+            "requeueing FEA task %s after memory-pressure kill (attempt %d/%d)",
+            task["id"],
+            attempts,
+            self.fea_pressure_max_attempts,
+        )
+        self._fea_pressures_cache = None
+        self.db.update_task(
+            task["id"],
+            status=TaskStatus.QUEUED.value,
+            attempt_count=attempts,
+            allocation_id=None,
+            remote_dir="",
+            stdout_path="",
+            stderr_path="",
+            exit_code_path="",
+            wrapper_pid="",
+            failure_message="",
+            attached_at=None,
+            started_at=None,
+        )
 
     def newest_running_fea_task(self, allocation_id: int) -> dict | None:
         candidates = [
