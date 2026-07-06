@@ -107,6 +107,7 @@ Field meanings:
 - `allocation_pending_backoff_seconds`: cooldown before the same resource pool is submitted again after a pending timeout.
 - `allocation_max_new_per_loop`: maximum demand allocations the scheduler may submit in one loop while walking queued tasks.
 - `cpu_pool_allow_gpu_partitions`: allows CPU pools to use GPU partitions when their CPU profile is stronger.
+- `cpu_pool_partition_spread`: when a CPU pool must go to GPU partitions, submit it unpinned with a comma-separated partition list (best CPU profile first) instead of betting on one partition. Slurm starts the job wherever room opens first; the DB records the granted partition once it starts. The pool is sized so every listed partition can serve it.
 - `warm_pool_preferred_accounts`: preferred accounts for CPU pools. This is preference, not a hard lock.
 - `gpu_warm_pool_preferred_accounts`: preferred accounts for GPU pools.
 - `single_job_per_node_partitions`: partitions where the scheduler should pin an idle node and avoid more than one scheduler job per node.
@@ -129,6 +130,7 @@ fea_bursty:
   overload_scale_out_seconds: 300
   pressure_max_attempts: 3
   max_attach_per_node_per_loop: 8
+  node_requested_cpu_factor: 1.0
 ```
 
 Meanings:
@@ -137,6 +139,7 @@ Meanings:
 - `hard_memory_free_percent`: cancel the newest running `fea_bursty` task on each pressured allocation when free memory drops below this percentage. The task is requeued (not failed) so the simulation reruns elsewhere, up to `pressure_max_attempts`.
 - `pressure_max_attempts`: how many memory-pressure kills a task survives before it is marked failed for good.
 - `max_attach_per_node_per_loop`: per-node cap on new FEA attaches in one tick. Together with the attach ledger (budgets are discounted by attaches issued since the last `pestat` snapshot), this prevents dogpiling one node on stale data.
+- `node_requested_cpu_factor`: hard node-wide cap — total FEA-requested CPUs on a physical node may not exceed `cpu_total * factor` (default 1.0 = the node's core count). Load-based ramping alone lets idle-heavy simulations stack far past the core count; this bounds the worst case. Set `0` to disable.
 - `load_target`: attach only while `pestat` CPU load is at or below `cpu_total * load_target`. For `fea_bursty`, the scheduler may exceed a task's `max_workers_per_node` baseline when both load budget and free-memory budget are still healthy.
 - `max_attach_per_loop`: maximum new `fea_bursty` tasks the scheduler starts in one tick.
 - `node_name_policy`: `preferred` treats `node_name` on CPU `fea_bursty` tasks as a preferred node with healthy-node fallback; `strict` preserves exact-node matching.

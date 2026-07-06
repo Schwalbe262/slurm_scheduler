@@ -74,6 +74,7 @@ class AppConfig:
     allocation_reserved_job_slots: int = 0
     allocation_max_new_per_loop: int = 8
     cpu_pool_allow_gpu_partitions: bool = True
+    cpu_pool_partition_spread: bool = True
     warm_pool_preferred_accounts: list[str] = field(default_factory=list)
     gpu_warm_pool_preferred_accounts: list[str] = field(default_factory=list)
     single_job_per_node_partitions: list[str] = field(default_factory=lambda: ["cpu2"])
@@ -101,6 +102,7 @@ class AppConfig:
     fea_overload_scale_out_seconds: int = 300
     fea_pressure_max_attempts: int = 3
     fea_max_attach_per_node_per_loop: int = 8
+    fea_node_requested_cpu_factor: float = 1.0
     cleanup_enabled: bool = True
     cleanup_interval_seconds: int = 3600
     cleanup_finished_task_ttl_seconds: int = 259200
@@ -164,6 +166,7 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
             "overload_scale_out_seconds": "fea_overload_scale_out_seconds",
             "pressure_max_attempts": "fea_pressure_max_attempts",
             "max_attach_per_node_per_loop": "fea_max_attach_per_node_per_loop",
+            "node_requested_cpu_factor": "fea_node_requested_cpu_factor",
         }
         for source, target in mapping.items():
             if source in fea_bursty:

@@ -622,9 +622,15 @@
             <td>
               {{ allocation.resource_pool or "cpu" }}
               {% if allocation.is_warm_pool %}<span class="warm-pool-tag">warm</span>{% endif %}
+              <div class="muted mono-cell" title="partition">{{ allocation.partition }}</div>
             </td>
             <td>{{ allocation.account_name }}</td>
-            <td>{{ allocation.node_name or allocation.partition }}</td>
+            <td>
+              {{ allocation.node_name or "-" }}
+              {% if allocation.node_name and allocation.partition and "," not in allocation.partition %}
+                <div class="muted">{{ allocation.partition }}</div>
+              {% endif %}
+            </td>
             <td title="FEA tasks on physical node {{ allocation.node_name }}">{{ allocation.node_fea_worker_count if allocation.node_name else "" }}</td>
             <td class="mono-cell" title="Scheduler-owned running/attaching FEA requested CPU on {{ allocation.node_name }} / scheduler-owned CPU allocation cores on that node">
               {% if allocation.node_fea_owned_cpus is not none %}

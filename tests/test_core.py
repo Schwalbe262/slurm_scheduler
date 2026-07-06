@@ -4949,6 +4949,56 @@ class SchedulerTests(unittest.TestCase):
         self.assertIsNone(scheduler.pestat_node_for_allocation(allocation))
         self.assertEqual(scheduler.fea_dynamic_extra_slots(allocation, task), 1)
 
+    def test_fea_node_cpu_cap_limits_total_requested_cpus(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=48,
+            total_memory_mb=380000,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="alloc-1")
+        for index in range(10):
+            task_id = self.db.create_task(
+                TaskCreate(
+                    f"fea-{index}",
+                    "~/case",
+                    "run",
+                    cpus=4,
+                    memory_mb=4096,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                )
+            )
+            self.db.update_task(
+                task_id,
+                status=TaskStatus.RUNNING.value,
+                account_name="a",
+                allocation_id=allocation_id,
+                wrapper_pid=str(3000 + index),
+            )
+        # Node reports low load and plenty of memory, so the load-based ramp
+        # alone would allow many more workers.
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 48 4.0 380000 350000 busy\n"
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        allocation = self.db.get_allocation(allocation_id)
+        task = {"id": 999, "cpus": 4, "memory_mb": 4096, "scheduling_profile": SchedulingProfile.FEA_BURSTY.value}
+        # 10 workers x 4 cpus = 40 requested; cap 48 * 1.0 -> only 2 more 4-cpu workers.
+        self.assertEqual(scheduler.fea_node_cpu_cap_remaining(allocation, task), 2)
+        limit = scheduler.fea_effective_worker_limit(allocation, task, current_workers=10, base_limit=32)
+        self.assertEqual(limit, 12)
+        uncapped = Scheduler(
+            self.db, self.accounts, 30, client_factory=FakeClient, fea_node_requested_cpu_factor=0
+        )
+        self.assertIsNone(uncapped.fea_node_cpu_cap_remaining(allocation, task))
+        self.assertGreaterEqual(
+            uncapped.fea_effective_worker_limit(allocation, task, current_workers=10, base_limit=32), 32
+        )
+
     def test_fea_stale_pestat_blocks_when_last_row_was_pressured(self) -> None:
         self.db.replace_pestat_nodes(
             parse_pestat(
@@ -5208,16 +5258,16 @@ class BatchParserTests(unittest.TestCase):
     def test_parse_squeue_table(self) -> None:
         output = "\n".join(
             [
-                "101|RUNNING|None|n001",
-                "102|PENDING|(Resources)|(None)",
+                "101|RUNNING|None|n001|gpu1",
+                "102|PENDING|(Resources)|(None)|gpu1,gpu3",
                 "garbage-line",
                 "103|COMPLETING||n002",
             ]
         )
         table = parse_squeue_table(output)
-        self.assertEqual(table["101"], ("RUNNING", "None", "n001"))
-        self.assertEqual(table["102"], ("PENDING", "(Resources)", ""))
-        self.assertEqual(table["103"], ("COMPLETING", "", "n002"))
+        self.assertEqual(table["101"], ("RUNNING", "None", "n001", "gpu1"))
+        self.assertEqual(table["102"], ("PENDING", "(Resources)", "", "gpu1,gpu3"))
+        self.assertEqual(table["103"], ("COMPLETING", "", "n002", ""))
         self.assertNotIn("garbage-line", table)
 
     def test_parse_sacct_states_skips_substeps_and_keeps_first_word(self) -> None:
@@ -5452,6 +5502,74 @@ class ObservabilityTests(unittest.TestCase):
         self.assertIsNotNone(health["last_tick_duration_seconds"])
         self.assertTrue(health["last_tick_completed_at"])
         self.assertEqual(health["consecutive_tick_failures"], 0)
+
+
+class CpuPoolPartitionSpreadTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(f"{self.tmp.name}/scheduler.db")
+        self.db.init()
+        self.accounts = [AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)]
+        # cpu1 busy; several gpu partitions with idle capacity of differing CPU quality.
+        self.db.replace_node_inventory(
+            parse_scontrol_nodes(
+                "NodeName=c01 CPUTot=48 RealMemory=192000 State=ALLOCATED Partitions=cpu1\n"
+                "NodeName=g101 CPUTot=48 RealMemory=384000 State=IDLE Partitions=gpu1 Gres=gpu:rtx3090:4\n"
+                "NodeName=g301 CPUTot=56 RealMemory=512000 State=IDLE Partitions=gpu3 Gres=gpu:a10:4\n"
+                "NodeName=g501 CPUTot=64 RealMemory=512000 State=MIXED Partitions=gpu5 Gres=gpu:a6000:4\n"
+            )
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "c01 cpu1 alloc 48 48 40.0 192000 20000 busy\n"
+                "g101 gpu1 idle 0 48 0.1 384000 380000 \n"
+                "g301 gpu3 idle 0 56 0.1 512000 500000 \n"
+                "g501 gpu5 mix 20 64 10.0 512000 400000 other\n"
+            )
+        )
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_spread_orders_partitions_by_cpu_score(self) -> None:
+        scheduler = Scheduler(
+            self.db, self.accounts, 30, client_factory=FakeClient, cpu_pool_partition_spread=True
+        )
+        shape = scheduler.choose_allocation_shape(resource_pool="cpu", requested_cpus=8)
+        self.assertIsNotNone(shape)
+        partitions = shape["partition"].split(",")
+        self.assertGreater(len(partitions), 1)
+        self.assertEqual(shape["node_name"], "")
+        # gpu5 (score 300) must come before gpu3 (200) before gpu1 (100).
+        self.assertLess(partitions.index("gpu5"), partitions.index("gpu3"))
+        self.assertLess(partitions.index("gpu3"), partitions.index("gpu1"))
+
+    def test_spread_disabled_keeps_single_partition_pin(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        shape = scheduler.choose_allocation_shape(resource_pool="cpu", requested_cpus=8)
+        self.assertIsNotNone(shape)
+        self.assertNotIn(",", shape["partition"])
+
+    def test_started_spread_allocation_records_granted_partition(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="gpu5,gpu3,gpu1",
+            node_name="",
+            total_cpus=40,
+            total_memory_mb=131072,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.PENDING.value, slurm_job_id="900")
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        allocation = self.db.get_allocation(allocation_id)
+        scheduler._apply_allocation_state(
+            allocation,
+            JobStateInfo(status=JobStatus.RUNNING, node_name="g301", partition="gpu3"),
+        )
+        updated = self.db.get_allocation(allocation_id)
+        self.assertEqual(updated["state"], AllocationStatus.WARM.value)
+        self.assertEqual(updated["partition"], "gpu3")
+        self.assertEqual(updated["node_name"], "g301")
 
 
 class PlacementDryRunTests(unittest.TestCase):

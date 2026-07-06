@@ -105,6 +105,7 @@ class Scheduler:
         allocation_reserved_job_slots: int = 0,
         allocation_max_new_per_loop: int = 8,
         cpu_pool_allow_gpu_partitions: bool = True,
+        cpu_pool_partition_spread: bool = False,
         warm_pool_preferred_accounts: list[str] | None = None,
         gpu_warm_pool_preferred_accounts: list[str] | None = None,
         single_job_per_node_partitions: list[str] | None = None,
@@ -132,6 +133,7 @@ class Scheduler:
         fea_overload_scale_out_seconds: int = 300,
         fea_pressure_max_attempts: int = 3,
         fea_max_attach_per_node_per_loop: int = 8,
+        fea_node_requested_cpu_factor: float = 1.0,
         task_refresh_max_per_tick: int = 32,
         cleanup_enabled: bool = True,
         cleanup_interval_seconds: int = 3600,
@@ -178,6 +180,7 @@ class Scheduler:
         self.allocation_reserved_job_slots = allocation_reserved_job_slots
         self.allocation_max_new_per_loop = max(1, int(allocation_max_new_per_loop))
         self.cpu_pool_allow_gpu_partitions = cpu_pool_allow_gpu_partitions
+        self.cpu_pool_partition_spread = cpu_pool_partition_spread
         self.warm_pool_preferred_accounts = warm_pool_preferred_accounts or []
         self.gpu_warm_pool_preferred_accounts = gpu_warm_pool_preferred_accounts or []
         self.single_job_per_node_partitions = {
@@ -214,6 +217,7 @@ class Scheduler:
         self.fea_overload_scale_out_seconds = max(0, int(fea_overload_scale_out_seconds))
         self.fea_pressure_max_attempts = max(1, int(fea_pressure_max_attempts))
         self.fea_max_attach_per_node_per_loop = max(1, int(fea_max_attach_per_node_per_loop))
+        self.fea_node_requested_cpu_factor = max(0.0, float(fea_node_requested_cpu_factor))
         # Attaches since the last pestat refresh, per node; discounts budgets
         # so a stale pestat row cannot dogpile one node.
         self._attach_delta_by_node: dict[str, dict[str, float]] = {}
@@ -1113,12 +1117,18 @@ class Scheduler:
     def _apply_allocation_state(self, allocation: dict, info: JobStateInfo) -> None:
         status = info.status
         if status == JobStatus.RUNNING and allocation["state"] == AllocationStatus.PENDING.value:
+            updates = {}
+            # Spread submissions store the partition candidate list; replace it
+            # with the partition Slurm actually granted once the job starts.
+            if "," in str(allocation.get("partition") or "") and info.partition and "," not in info.partition:
+                updates["partition"] = info.partition
             self.db.update_allocation(
                 allocation["id"],
                 state=AllocationStatus.WARM.value,
                 started_at="CURRENT_TIMESTAMP",
                 pending_reason="",
                 node_name=allocation.get("node_name") or info.node_name or "",
+                **updates,
             )
             self.record_event(
                 "allocation_warm",
@@ -2764,8 +2774,43 @@ class Scheduler:
         base_limit: int,
     ) -> int:
         if base_limit <= 0:
-            return current_workers + self.fea_dynamic_extra_slots(allocation, task)
-        return max(base_limit, current_workers + self.fea_dynamic_extra_slots(allocation, task))
+            limit = current_workers + self.fea_dynamic_extra_slots(allocation, task)
+        else:
+            limit = max(base_limit, current_workers + self.fea_dynamic_extra_slots(allocation, task))
+        cap_remaining = self.fea_node_cpu_cap_remaining(allocation, task)
+        if cap_remaining is not None:
+            limit = min(limit, current_workers + cap_remaining)
+        return limit
+
+    def fea_node_cpu_cap_remaining(self, allocation: dict, task: dict) -> int | None:
+        """How many more workers of this task fit under the node-wide cap of
+        total FEA-requested CPUs <= cpu_total * fea_node_requested_cpu_factor.
+        Load-based ramping alone lets idle-heavy simulations stack far past the
+        core count; this bounds the worst case. None = no cap applicable."""
+        if self.fea_node_requested_cpu_factor <= 0:
+            return None
+        if allocation.get("state") == AllocationStatus.PENDING.value:
+            return None
+        node_name = str(allocation.get("node_name") or "").strip()
+        if not node_name:
+            return None
+        cpu_total = 0
+        node = self.pestat_node_for_allocation(allocation, max_age_seconds=float("inf"))
+        if node:
+            cpu_total = int(node.get("cpu_total") or 0)
+        if cpu_total <= 0:
+            for row in self.db.list_node_inventory():
+                if str(row.get("node_name") or "") == node_name:
+                    cpu_total = int(row.get("cpus") or 0)
+                    break
+        if cpu_total <= 0:
+            return None
+        # fea_owned_node_pressures reads live DB rows (invalidated on every
+        # attach), so it already includes this tick's attaches.
+        pressure = self.fea_owned_node_pressures().get(node_name, {})
+        requested = int(pressure.get("requested_cpus") or 0)
+        budget = cpu_total * self.fea_node_requested_cpu_factor - requested
+        return max(0, int(budget // max(1, int(task.get("cpus") or 1))))
 
     def handle_fea_memory_pressure(self) -> None:
         reclaimed = False
@@ -4028,6 +4073,47 @@ class Scheduler:
             return partitions[:1]
         return sorted(partitions, key=self.partition_sort_key)
 
+    def cpu_pool_spread(self, cpus: int, memory_mb: int, requested_cpus: int = 0) -> tuple[list[str], int, int]:
+        """Partitions (best CPU profile first) whose nodes can eventually serve
+        a CPU pool, plus a CPU/memory request every listed partition can grant.
+        Total node capacity is used, not current free capacity — the point of a
+        spread submission is to wait in several queues at once, so the pool is
+        sized down to what the smallest listed node type can offer."""
+        floor = max(1, int(requested_cpus or 0), int(cpus) // 2)
+        best_by_partition: dict[str, dict] = {}
+        for row in self.db.list_node_inventory():
+            partition = str(row.get("partition") or "")
+            if not partition or self.is_single_job_partition(partition):
+                continue
+            if str(row.get("state") or "").lower() not in {"idle", "mix", "mixed"}:
+                continue
+            is_gpu = partition.startswith("gpu") or int(row.get("gpu_count") or 0) > 0
+            if is_gpu and not self.cpu_pool_allow_gpu_partitions:
+                continue
+            reserve = self.gpu_cpu_reserve if is_gpu else 0
+            capacity = int(row.get("cpus") or 0) - reserve
+            if capacity < floor:
+                continue
+            entry = best_by_partition.setdefault(
+                partition, {"cpu_score": 0, "capacity": 0, "memory_mb": 0, "is_cpu_only": not is_gpu}
+            )
+            entry["cpu_score"] = max(entry["cpu_score"], int(row.get("cpu_score") or 0))
+            entry["capacity"] = max(entry["capacity"], capacity)
+            entry["memory_mb"] = max(entry["memory_mb"], int(row.get("memory_mb") or 0))
+        if not best_by_partition:
+            return [], cpus, memory_mb
+        spread_cpus = max(floor, min(int(cpus), min(entry["capacity"] for entry in best_by_partition.values())))
+        # Ask only for memory the smallest listed node type can grant, so no
+        # partition in the list is unable to start the job.
+        grantable_memory = min(entry["memory_mb"] for entry in best_by_partition.values())
+        spread_memory_mb = max(1024, min(memory_mb, int(grantable_memory * 0.9)))
+        ordered = sorted(
+            best_by_partition.items(),
+            key=lambda item: (item[1]["cpu_score"], item[1]["is_cpu_only"], item[1]["capacity"]),
+            reverse=True,
+        )
+        return [partition for partition, _entry in ordered], spread_cpus, spread_memory_mb
+
     def choose_allocation_shape(
         self,
         resource_pool: str = "cpu",
@@ -4223,6 +4309,28 @@ class Scheduler:
             node_name = node.hostname
             if not wants_gpu and not self.is_single_job_partition(node.partition) and not _node_is_gpu_partition:
                 node_name = ""
+            if (
+                wants_shared_cpu_pool
+                and _node_is_gpu_partition
+                and self.cpu_pool_partition_spread
+                and target_partition == "auto"
+            ):
+                spread, spread_cpus, spread_memory_mb = self.cpu_pool_spread(
+                    cpus, memory_mb, requested_cpus=int(requested_cpus or 0)
+                )
+                if len(spread) > 1:
+                    # Every listed partition can eventually serve this shape, so
+                    # submit unpinned and let the Slurm queue start it wherever
+                    # room opens first instead of betting on one partition.
+                    return {
+                        "partition": ",".join(spread),
+                        "node_name": "",
+                        "cpus": spread_cpus,
+                        "memory_mb": spread_memory_mb,
+                        "gpus": 0,
+                        "gpu_model": "",
+                        "exclusive_node": exclusive_node,
+                    }
             return {
                 "partition": node.partition,
                 "node_name": node_name,

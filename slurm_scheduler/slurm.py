@@ -175,6 +175,7 @@ class JobStateInfo:
     raw_state: str = ""
     pending_reason: str = ""
     node_name: str = ""
+    partition: str = ""
 
 
 @dataclass(frozen=True)
@@ -183,9 +184,9 @@ class TaskProbe:
     exit_code: int | None = None
 
 
-def parse_squeue_table(output: str) -> dict[str, tuple[str, str, str]]:
-    """Parse `squeue -h -o "%i|%T|%R|%N"` into job_id -> (state, reason, node)."""
-    table: dict[str, tuple[str, str, str]] = {}
+def parse_squeue_table(output: str) -> dict[str, tuple[str, str, str, str]]:
+    """Parse `squeue -h -o "%i|%T|%R|%N|%P"` into job_id -> (state, reason, node, partition)."""
+    table: dict[str, tuple[str, str, str, str]] = {}
     for line in output.splitlines():
         parts = line.strip().split("|")
         if len(parts) < 2 or not parts[0].strip():
@@ -194,9 +195,10 @@ def parse_squeue_table(output: str) -> dict[str, tuple[str, str, str]]:
         state = parts[1].strip()
         reason = parts[2].strip() if len(parts) > 2 else ""
         node = parts[3].strip() if len(parts) > 3 else ""
+        partition = parts[4].strip() if len(parts) > 4 else ""
         if node in {"(None)", "N/A", "None"}:
             node = ""
-        table[job_id] = (state, reason, node)
+        table[job_id] = (state, reason, node, partition)
     return table
 
 
@@ -974,18 +976,19 @@ class SlurmAccountClient:
             return {}
         out: dict[str, JobStateInfo] = {}
         with self._open_session() as ssh:
-            result = ssh.run('squeue -h -u "$USER" -o "%i|%T|%R|%N"')
+            result = ssh.run('squeue -h -u "$USER" -o "%i|%T|%R|%N|%P"')
             table = parse_squeue_table(result.stdout) if result.exit_code == 0 else {}
             for job_id in ids:
                 row = table.get(job_id)
                 if not row:
                     continue
-                state, reason, node = row
+                state, reason, node, partition = row
                 out[job_id] = JobStateInfo(
                     status=map_slurm_state(state),
                     raw_state=state,
                     pending_reason=reason if state in {"PD", "PENDING"} else "",
                     node_name=node,
+                    partition=partition,
                 )
             missing = [job_id for job_id in ids if job_id not in out]
             for index in range(0, len(missing), 100):
