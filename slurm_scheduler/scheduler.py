@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import posixpath
 import re
+import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
@@ -73,6 +76,8 @@ class Scheduler:
         cleanup_finished_task_ttl_seconds: int = 259200,
         cleanup_finished_job_ttl_seconds: int = 259200,
         cleanup_closed_allocation_ttl_seconds: int = 86400,
+        watchdog_enabled: bool = True,
+        watchdog_stall_seconds: int = 0,
     ):
         self.db = db
         self.accounts = accounts
@@ -147,6 +152,12 @@ class Scheduler:
         self.cleanup_finished_job_ttl_seconds = cleanup_finished_job_ttl_seconds
         self.cleanup_closed_allocation_ttl_seconds = cleanup_closed_allocation_ttl_seconds
         self._last_cleanup_at = 0.0
+        self.watchdog_enabled = watchdog_enabled
+        self.watchdog_stall_seconds = max(0, int(watchdog_stall_seconds))
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_exit: Callable[[int], None] = os._exit
+        self._tick_started_at: float | None = None
+        self._tick_seq = 0
 
     @property
     def gpu_prewarm_enabled(self) -> bool:
@@ -161,9 +172,13 @@ class Scheduler:
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        self.recover_transient_states()
         self._stop.clear()
         self._thread = threading.Thread(target=self.run_forever, name="scheduler", daemon=True)
         self._thread.start()
+        if self.watchdog_enabled and (self._watchdog_thread is None or not self._watchdog_thread.is_alive()):
+            self._watchdog_thread = threading.Thread(target=self._watchdog_loop, name="scheduler-watchdog", daemon=True)
+            self._watchdog_thread.start()
 
     def stop(self) -> None:
         self._stop.set()
@@ -178,25 +193,94 @@ class Scheduler:
                 LOGGER.exception("scheduler tick failed")
             self._stop.wait(self.poll_interval_seconds)
 
+    def recover_transient_states(self) -> None:
+        """Reset states that only make sense mid-operation; they orphan when the
+        process dies between the DB write and the remote call completing."""
+        for job in self.db.list_jobs(limit=5000):
+            if job.get("status") == JobStatus.SUBMITTING.value:
+                LOGGER.warning("recovering job %s stuck in submitting; resetting to queued", job["id"])
+                self.db.update_job(job["id"], status=JobStatus.QUEUED.value, failure_message="")
+        for task in self.db.list_tasks_by_statuses([TaskStatus.ATTACHING.value], limit=5000):
+            if not str(task.get("exit_code_path") or ""):
+                LOGGER.warning("recovering task %s stuck in attaching without exit_code_path; requeueing", task["id"])
+                self.db.update_task(
+                    task["id"],
+                    status=TaskStatus.QUEUED.value,
+                    allocation_id=None,
+                    failure_message="",
+                )
+
+    def _watchdog_stall_seconds(self) -> float:
+        if self.watchdog_stall_seconds > 0:
+            return float(self.watchdog_stall_seconds)
+        return float(max(300, 3 * self.poll_interval_seconds))
+
+    def _watchdog_loop(self) -> None:
+        suspect_seq = -1
+        while not self._stop.wait(self.poll_interval_seconds):
+            suspect_seq = self._watchdog_check_once(suspect_seq)
+
+    def _watchdog_check_once(self, suspect_seq: int) -> int:
+        started = self._tick_started_at
+        seq = self._tick_seq
+        if started is None:
+            return -1
+        stalled_for = time.monotonic() - started
+        if stalled_for < self._watchdog_stall_seconds():
+            return -1
+        if seq != suspect_seq:
+            LOGGER.critical(
+                "scheduler tick %s stalled for %.0fs; force-closing SSH transports", seq, stalled_for
+            )
+            self._dump_scheduler_stack()
+            self._tick_sessions_force_close()
+            return seq
+        LOGGER.critical(
+            "scheduler tick %s still stalled after transport close (%.0fs); exiting for supervisor restart",
+            seq,
+            stalled_for,
+        )
+        self._watchdog_exit(70)
+        return seq
+
+    def _dump_scheduler_stack(self) -> None:
+        thread = self._thread
+        if not thread or thread.ident is None:
+            return
+        frame = sys._current_frames().get(thread.ident)
+        if frame is None:
+            return
+        stack = "".join(traceback.format_stack(frame))
+        LOGGER.critical("scheduler thread stack:\n%s", stack)
+
+    def _tick_sessions_force_close(self) -> None:
+        # Populated by the per-tick session cache (Phase 2); nothing to close yet.
+        return
+
     def tick(self) -> None:
-        self.fail_stale_same_node_tasks()
-        self.enforce_cpu_partition_allocation_limits()
-        self.update_fea_overload_state()
-        self.assign_ready_same_node_tasks()
-        self.assign_ready_gpu_tasks()
-        self.assign_ready_standard_tasks()
-        self.assign_ready_fea_tasks(background=True)
-        self.refresh_cluster_state_if_due()
-        self.refresh_allocations()
-        self.refresh_tasks()
-        self.apply_allocation_lifecycle()
-        self.handle_fea_memory_pressure()
-        self.update_fea_overload_state()
-        self.assign_queued_tasks(include_fea=False)
-        self.maintain_allocation_pool()
-        self.refresh_submitted_jobs()
-        self.submit_next_queued_job()
-        self.cleanup_remote_artifacts_if_due()
+        self._tick_seq += 1
+        self._tick_started_at = time.monotonic()
+        try:
+            self.fail_stale_same_node_tasks()
+            self.enforce_cpu_partition_allocation_limits()
+            self.update_fea_overload_state()
+            self.assign_ready_same_node_tasks()
+            self.assign_ready_gpu_tasks()
+            self.assign_ready_standard_tasks()
+            self.assign_ready_fea_tasks(background=True)
+            self.refresh_cluster_state_if_due()
+            self.refresh_allocations()
+            self.refresh_tasks()
+            self.apply_allocation_lifecycle()
+            self.handle_fea_memory_pressure()
+            self.update_fea_overload_state()
+            self.assign_queued_tasks(include_fea=False)
+            self.maintain_allocation_pool()
+            self.refresh_submitted_jobs()
+            self.submit_next_queued_job()
+            self.cleanup_remote_artifacts_if_due()
+        finally:
+            self._tick_started_at = None
 
     def _now(self) -> datetime:
         return datetime.now(timezone.utc)
@@ -361,7 +445,7 @@ class Scheduler:
         if not account:
             return
         try:
-            with SSHSession(account) as ssh:
+            with SSHSession(account, default_timeout=60) as ssh:
                 inventory_result = ssh.run("scontrol -o show nodes")
                 if inventory_result.exit_code == 0 and inventory_result.stdout.strip():
                     self.db.replace_node_inventory(parse_scontrol_nodes(inventory_result.stdout))

@@ -330,7 +330,13 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     accounts = load_accounts(config.accounts_path)
     db = Database(config.database_path)
     db.init()
-    client_factory = lambda account: SlurmAccountClient(account, config.git_credentials, accounts)
+    client_factory = lambda account: SlurmAccountClient(
+        account,
+        config.git_credentials,
+        accounts,
+        command_timeout=config.ssh_command_timeout_seconds,
+        slow_command_timeout=config.ssh_slow_command_timeout_seconds,
+    )
     scheduler = Scheduler(
         db,
         accounts,
@@ -382,6 +388,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         cleanup_finished_task_ttl_seconds=config.cleanup_finished_task_ttl_seconds,
         cleanup_finished_job_ttl_seconds=config.cleanup_finished_job_ttl_seconds,
         cleanup_closed_allocation_ttl_seconds=config.cleanup_closed_allocation_ttl_seconds,
+        watchdog_enabled=config.scheduler_watchdog_enabled,
+        watchdog_stall_seconds=config.scheduler_watchdog_stall_seconds,
     )
 
     app = FastAPI(title="Slurm Scheduler")

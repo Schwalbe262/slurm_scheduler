@@ -157,7 +157,8 @@ class CondaEnvSyncManager:
                 f"conda-pack -p \"$prefix\" -o {shlex.quote(archive_path)} --force",
             ]
         )
-        with SSHSession(account) as ssh:
+        # conda-pack legitimately runs for minutes; keep a long but bounded deadline.
+        with SSHSession(account, default_timeout=1800) as ssh:
             result = ssh.run(f"mkdir -p {shlex.quote(remote_dir)} && {shell_script(command)} > {shlex.quote(log_path)} 2>&1")
             if result.exit_code != 0:
                 try:
@@ -191,7 +192,7 @@ class CondaEnvSyncManager:
             archive_path=archive_path,
         )
         try:
-            with SSHSession(account) as ssh:
+            with SSHSession(account, default_timeout=1800) as ssh:
                 mkdir = ssh.run(f"mkdir -p {shlex.quote(remote_dir)}")
                 if mkdir.exit_code != 0:
                     raise RuntimeError(command_failure_message(mkdir, "failed to create target sync directory"))

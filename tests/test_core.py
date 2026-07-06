@@ -17,7 +17,9 @@ from slurm_scheduler.inventory import parse_scontrol_nodes, parse_sinfo_nodes, p
 from slurm_scheduler.pestat import parse_pestat, plan_dynamic_allocations
 from slurm_scheduler.task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, TASK_ID_PLACEHOLDER, build_git_task_command
 from slurm_scheduler.slurm import (
+    RemoteCommandTimeout,
     RemoteExecutionError,
+    SSHSession,
     apply_env_profile,
     background_wrapper_command,
     build_allocation_script,
@@ -5063,6 +5065,155 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(summary["single_node_max_free_gpus"], 4)
         self.assertEqual(summary["single_node_max_free_cpus"], 4)
         self.assertEqual(summary["single_node_max_free_gpu_node"], "gpu-a6000")
+
+
+class _FakeSSHChannel:
+    def __init__(self, ready: bool = False, exit_code: int = 0):
+        self.ready = ready
+        self.exit_code = exit_code
+        self.closed = False
+
+    def exit_status_ready(self) -> bool:
+        return self.ready
+
+    def recv_exit_status(self) -> int:
+        return self.exit_code
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeSSHStream:
+    def __init__(self, channel: _FakeSSHChannel):
+        self.channel = channel
+
+    def read(self) -> bytes:
+        return b""
+
+
+class _FakeParamikoClient:
+    def __init__(self, channel: _FakeSSHChannel):
+        self._channel = channel
+
+    def exec_command(self, command: str, timeout: float | None = None):
+        stream = _FakeSSHStream(self._channel)
+        return stream, stream, stream
+
+
+class SSHTimeoutTests(unittest.TestCase):
+    def make_session(self, channel: _FakeSSHChannel, default_timeout: float | None) -> SSHSession:
+        account = AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)
+        session = SSHSession(account, default_timeout=default_timeout)
+        session.client = _FakeParamikoClient(channel)
+        return session
+
+    def test_run_times_out_by_default_and_closes_channel(self) -> None:
+        channel = _FakeSSHChannel(ready=False)
+        session = self.make_session(channel, default_timeout=0.15)
+        with self.assertRaises(RemoteCommandTimeout) as ctx:
+            session.run("sleep forever")
+        self.assertIsInstance(ctx.exception, TimeoutError)
+        self.assertIsInstance(ctx.exception, RemoteExecutionError)
+        self.assertTrue(channel.closed)
+        self.assertIn("a", str(ctx.exception))
+
+    def test_run_with_explicit_none_skips_deadline(self) -> None:
+        channel = _FakeSSHChannel(ready=True, exit_code=3)
+        session = self.make_session(channel, default_timeout=0.15)
+        result = session.run("quick", timeout=None)
+        self.assertEqual(result.exit_code, 3)
+        self.assertFalse(channel.closed)
+
+    def test_run_completes_within_deadline(self) -> None:
+        channel = _FakeSSHChannel(ready=True, exit_code=0)
+        session = self.make_session(channel, default_timeout=5)
+        result = session.run("quick")
+        self.assertEqual(result.exit_code, 0)
+
+
+class WatchdogTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(f"{self.tmp.name}/scheduler.db")
+        self.db.init()
+        self.accounts = [AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)]
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def make_scheduler(self) -> Scheduler:
+        scheduler = Scheduler(
+            self.db, self.accounts, 30, client_factory=FakeClient, watchdog_stall_seconds=1
+        )
+        self.exits: list[int] = []
+        self.force_closes: list[bool] = []
+        scheduler._watchdog_exit = lambda code: self.exits.append(code)
+        scheduler._tick_sessions_force_close = lambda: self.force_closes.append(True)
+        return scheduler
+
+    def test_watchdog_ignores_healthy_tick(self) -> None:
+        scheduler = self.make_scheduler()
+        scheduler._tick_seq = 5
+        scheduler._tick_started_at = time.monotonic()
+        self.assertEqual(scheduler._watchdog_check_once(-1), -1)
+        self.assertEqual(self.force_closes, [])
+        self.assertEqual(self.exits, [])
+
+    def test_watchdog_ignores_idle_scheduler(self) -> None:
+        scheduler = self.make_scheduler()
+        scheduler._tick_started_at = None
+        self.assertEqual(scheduler._watchdog_check_once(3), -1)
+        self.assertEqual(self.exits, [])
+
+    def test_watchdog_two_stage_escalation(self) -> None:
+        scheduler = self.make_scheduler()
+        scheduler._tick_seq = 7
+        scheduler._tick_started_at = time.monotonic() - 10
+        suspect = scheduler._watchdog_check_once(-1)
+        self.assertEqual(suspect, 7)
+        self.assertEqual(self.force_closes, [True])
+        self.assertEqual(self.exits, [])
+        suspect = scheduler._watchdog_check_once(suspect)
+        self.assertEqual(self.exits, [70])
+
+    def test_watchdog_resets_when_new_tick_stalls(self) -> None:
+        scheduler = self.make_scheduler()
+        scheduler._tick_seq = 7
+        scheduler._tick_started_at = time.monotonic() - 10
+        suspect = scheduler._watchdog_check_once(-1)
+        scheduler._tick_seq = 8
+        suspect = scheduler._watchdog_check_once(suspect)
+        self.assertEqual(suspect, 8)
+        self.assertEqual(self.exits, [])
+        self.assertEqual(self.force_closes, [True, True])
+
+
+class TransientStateRecoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(f"{self.tmp.name}/scheduler.db")
+        self.db.init()
+        self.accounts = [AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)]
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_recovers_submitting_job_and_orphaned_attaching_task(self) -> None:
+        job_id = self.db.create_job(JobCreate("https://example/repo.git", "main", "run.py"))
+        self.db.update_job(job_id, status=JobStatus.SUBMITTING.value)
+        orphan_id = self.db.create_task(TaskCreate("orphan", "~/work", "run"))
+        self.db.update_task(orphan_id, status=TaskStatus.ATTACHING.value)
+        tracked_id = self.db.create_task(TaskCreate("tracked", "~/work", "run"))
+        self.db.update_task(
+            tracked_id,
+            status=TaskStatus.ATTACHING.value,
+            exit_code_path="/remote/task/exit_code",
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        scheduler.recover_transient_states()
+        self.assertEqual(self.db.get_job(job_id)["status"], JobStatus.QUEUED.value)
+        self.assertEqual(self.db.get_task(orphan_id)["status"], TaskStatus.QUEUED.value)
+        self.assertEqual(self.db.get_task(tracked_id)["status"], TaskStatus.ATTACHING.value)
 
 
 if __name__ == "__main__":

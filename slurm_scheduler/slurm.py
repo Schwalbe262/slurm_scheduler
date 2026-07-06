@@ -31,9 +31,23 @@ class RemoteExecutionError(RuntimeError):
         self.result_fields = result_fields or {}
 
 
+class RemoteCommandTimeout(RemoteExecutionError, TimeoutError):
+    """Remote command exceeded its deadline.
+
+    Subclasses both RemoteExecutionError and TimeoutError so every existing
+    except clause keeps catching it.
+    """
+
+
+DEFAULT_COMMAND_TIMEOUT = 30.0
+SLOW_COMMAND_TIMEOUT = 300.0
+_UNSET = object()
+
+
 class SSHSession:
-    def __init__(self, account: AccountConfig):
+    def __init__(self, account: AccountConfig, default_timeout: float | None = DEFAULT_COMMAND_TIMEOUT):
         self.account = account
+        self.default_timeout = default_timeout
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
@@ -50,7 +64,13 @@ class SSHSession:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.client.close()
 
-    def run(self, command: str, timeout: float | None = None) -> CommandResult:
+    def _resolve_timeout(self, timeout: float | None | object) -> float | None:
+        if timeout is _UNSET:
+            return self.default_timeout
+        return timeout  # type: ignore[return-value]
+
+    def run(self, command: str, timeout: float | None | object = _UNSET) -> CommandResult:
+        timeout = self._resolve_timeout(timeout)
         stdin, stdout, stderr = self.client.exec_command(command, timeout=timeout)
         del stdin
         if timeout and timeout > 0:
@@ -59,7 +79,9 @@ class SSHSession:
             while not channel.exit_status_ready():
                 if time.monotonic() >= deadline:
                     channel.close()
-                    raise TimeoutError(f"remote command timed out after {timeout:g}s")
+                    raise RemoteCommandTimeout(
+                        f"remote command timed out after {timeout:g}s on {self.account.name}: {command[:120]}"
+                    )
                 time.sleep(0.05)
             exit_code = channel.recv_exit_status()
         else:
@@ -70,8 +92,15 @@ class SSHSession:
             exit_code=exit_code,
         )
 
-    def write_text_file(self, path: str, text: str) -> None:
+    def _open_sftp(self) -> paramiko.SFTPClient:
         sftp = self.client.open_sftp()
+        channel = sftp.get_channel()
+        if channel is not None:
+            channel.settimeout(self.default_timeout or DEFAULT_COMMAND_TIMEOUT)
+        return sftp
+
+    def write_text_file(self, path: str, text: str) -> None:
+        sftp = self._open_sftp()
         try:
             with sftp.file(path, "wb") as remote_file:
                 remote_file.write(text.encode("utf-8"))
@@ -79,7 +108,7 @@ class SSHSession:
             sftp.close()
 
     def read_text_file(self, path: str) -> str:
-        sftp = self.client.open_sftp()
+        sftp = self._open_sftp()
         try:
             with sftp.file(path, "rb") as remote_file:
                 data = remote_file.read()
@@ -88,14 +117,14 @@ class SSHSession:
         return data.decode("utf-8", errors="replace")
 
     def download_file(self, remote_path: str, local_path: str) -> None:
-        sftp = self.client.open_sftp()
+        sftp = self._open_sftp()
         try:
             sftp.get(remote_path, local_path)
         finally:
             sftp.close()
 
     def upload_file(self, local_path: str, remote_path: str) -> None:
-        sftp = self.client.open_sftp()
+        sftp = self._open_sftp()
         try:
             sftp.put(local_path, remote_path)
         finally:
@@ -526,13 +555,21 @@ class SlurmAccountClient:
         account: AccountConfig,
         git_credentials: list[GitCredentialConfig] | None = None,
         git_source_accounts: list[AccountConfig] | None = None,
+        *,
+        command_timeout: float = DEFAULT_COMMAND_TIMEOUT,
+        slow_command_timeout: float = SLOW_COMMAND_TIMEOUT,
     ):
         self.account = account
         self.git_credentials = git_credentials or []
         self.git_source_accounts = {item.name: item for item in (git_source_accounts or [])}
+        self.command_timeout = command_timeout
+        self.slow_command_timeout = slow_command_timeout
+
+    def _open_session(self) -> SSHSession:
+        return SSHSession(self.account, default_timeout=self.command_timeout)
 
     def snapshot(self, storage_used_gb: float | None = None) -> AccountSnapshot:
-        with SSHSession(self.account) as ssh:
+        with self._open_session() as ssh:
             result = ssh.run("squeue -h -u \"$USER\" -o \"%T\"")
             storage_path = self.account.storage_path or self.account.remote_workspace
         if result.exit_code != 0:
@@ -554,8 +591,11 @@ class SlurmAccountClient:
         storage_path = self.account.storage_path or self.account.remote_workspace
         if not self.account.storage_quota_gb:
             return None
-        with SSHSession(self.account) as ssh:
-            du = ssh.run(f"mkdir -p {shlex.quote(storage_path)} && du -sk {shlex.quote(storage_path)}")
+        with self._open_session() as ssh:
+            du = ssh.run(
+                f"mkdir -p {shlex.quote(storage_path)} && du -sk {shlex.quote(storage_path)}",
+                timeout=self.slow_command_timeout,
+            )
         if du.exit_code == 0 and du.stdout.strip():
             return parse_du_gb(du.stdout)
         return None
@@ -590,7 +630,7 @@ class SlurmAccountClient:
                 ),
                 f"cd {shlex.quote(remote_job_dir)} && sbatch run.sbatch >> {shlex.quote(submit_stdout_file)} 2>> {shlex.quote(submit_stderr_file)}",
             ]
-        with SSHSession(self.account) as ssh:
+        with self._open_session() as ssh:
             mkdir = ssh.run(commands[0])
             if mkdir.exit_code != 0:
                 raise RemoteExecutionError(
@@ -604,7 +644,7 @@ class SlurmAccountClient:
             ssh.write_text_file(run_script_path, script)
             submit_stdout = ""
             for command in commands[1:]:
-                result = ssh.run(command)
+                result = ssh.run(command, timeout=self.slow_command_timeout)
                 if result.exit_code != 0:
                     break
             else:
@@ -639,7 +679,7 @@ class SlurmAccountClient:
             f"mkdir -p {shlex.quote(remote_dir)}",
             f"cd {shlex.quote(remote_dir)} && sbatch allocation.sbatch",
         ]
-        with SSHSession(self.account) as ssh:
+        with self._open_session() as ssh:
             result = ssh.run(commands[0])
             if result.exit_code != 0:
                 raise RemoteExecutionError(
@@ -705,7 +745,7 @@ class SlurmAccountClient:
             f"chmod +x {shlex.quote(script_path)}",
             f"bash -lc {shlex.quote(background_wrapper_command(wrapper, wrapper_path))}",
         ]
-        with SSHSession(self.account) as ssh:
+        with self._open_session() as ssh:
             result = ssh.run(commands[0])
             if result.exit_code != 0:
                 raise RemoteExecutionError(command_failure_message(result, "failed to create remote task directory"), result_fields)
@@ -779,7 +819,7 @@ class SlurmAccountClient:
         if wrapper_pid:
             checks.append(f"if ps -p {shlex.quote(str(wrapper_pid))} >/dev/null 2>&1; then echo RUNNING; exit 0; fi")
         checks.append("echo UNKNOWN")
-        with SSHSession(self.account) as ssh:
+        with self._open_session() as ssh:
             result = ssh.run("; ".join(checks))
         text = result.stdout.strip().splitlines()[0] if result.stdout.strip() else "UNKNOWN"
         if text == "RUNNING":
@@ -801,7 +841,7 @@ class SlurmAccountClient:
 
     def state(self, slurm_job_id: str) -> JobStatus:
         command = f"squeue -h -j {shlex.quote(slurm_job_id)} -o \"%T\""
-        with SSHSession(self.account) as ssh:
+        with self._open_session() as ssh:
             result = ssh.run(command)
             if result.exit_code == 0 and result.stdout.strip():
                 return map_slurm_state(result.stdout.splitlines()[0].strip())
@@ -812,7 +852,7 @@ class SlurmAccountClient:
 
     def pending_reason(self, slurm_job_id: str) -> str:
         command = f"squeue -h -j {shlex.quote(slurm_job_id)} -o \"%R\""
-        with SSHSession(self.account) as ssh:
+        with self._open_session() as ssh:
             result = ssh.run(command)
         if result.exit_code != 0 or not result.stdout.strip():
             return ""
@@ -820,7 +860,7 @@ class SlurmAccountClient:
 
     def allocation_node_name(self, slurm_job_id: str) -> str:
         command = f"squeue -h -j {shlex.quote(slurm_job_id)} -o \"%N\""
-        with SSHSession(self.account) as ssh:
+        with self._open_session() as ssh:
             result = ssh.run(command)
         if result.exit_code != 0 or not result.stdout.strip():
             return ""
@@ -830,8 +870,8 @@ class SlurmAccountClient:
         return node_name
 
     def cancel(self, slurm_job_id: str) -> None:
-        with SSHSession(self.account) as ssh:
-            result = ssh.run(f"scancel {shlex.quote(slurm_job_id)}")
+        with self._open_session() as ssh:
+            result = ssh.run(f"scancel {shlex.quote(slurm_job_id)}", timeout=15)
         if result.exit_code != 0:
             raise RuntimeError(result.stderr.strip() or "scancel failed")
 
@@ -840,14 +880,14 @@ class SlurmAccountClient:
         if not wrapper_pid:
             return
         command = cancel_process_group_command(wrapper_pid)
-        with SSHSession(self.account) as ssh:
-            result = ssh.run(command)
+        with self._open_session() as ssh:
+            result = ssh.run(command, timeout=15)
         if result.exit_code != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "task cancel failed")
 
     def remove_tree(self, remote_path: str) -> None:
-        with SSHSession(self.account) as ssh:
-            result = ssh.run(f"rm -rf -- {shlex.quote(remote_path)}")
+        with self._open_session() as ssh:
+            result = ssh.run(f"rm -rf -- {shlex.quote(remote_path)}", timeout=120)
         if result.exit_code != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"failed to remove {remote_path}")
 
@@ -855,10 +895,10 @@ class SlurmAccountClient:
         paths = [str(path) for path in remote_paths if str(path or "").strip()]
         if not paths:
             return
-        with SSHSession(self.account) as ssh:
+        with self._open_session() as ssh:
             for index in range(0, len(paths), 100):
                 chunk = paths[index : index + 100]
-                result = ssh.run("rm -rf -- " + " ".join(shlex.quote(path) for path in chunk))
+                result = ssh.run("rm -rf -- " + " ".join(shlex.quote(path) for path in chunk), timeout=120)
                 if result.exit_code != 0:
                     message = result.stderr.strip() or result.stdout.strip() or "failed to remove remote artifacts"
                     raise RuntimeError(message)
@@ -870,10 +910,10 @@ class SlurmAccountClient:
         max_bytes: int = 0,
         timeout: float | None = None,
     ) -> str:
-        with SSHSession(self.account) as ssh:
+        with self._open_session() as ssh:
             result = ssh.run(
                 remote_text_command(path, tail_lines=max(0, tail_lines), max_bytes=max(0, max_bytes)),
-                timeout=timeout,
+                timeout=timeout if timeout is not None else _UNSET,
             )
         if result.exit_code != 0:
             raise FileNotFoundError(result.stderr.strip() or f"remote file not found: {path}")
@@ -892,8 +932,8 @@ class SlurmAccountClient:
             "print(json.dumps(sorted(matches)))\n"
             "PY"
         )
-        with SSHSession(self.account) as ssh:
-            result = ssh.run(script, timeout=timeout)
+        with self._open_session() as ssh:
+            result = ssh.run(script, timeout=timeout if timeout is not None else _UNSET)
         if result.exit_code != 0:
             raise FileNotFoundError(result.stderr.strip() or f"remote files not found: {root}/{pattern}")
         try:

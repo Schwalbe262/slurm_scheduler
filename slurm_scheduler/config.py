@@ -53,6 +53,10 @@ class AppConfig:
     web_timeout_keep_alive_seconds: int = 5
     web_timeout_graceful_shutdown_seconds: int = 15
     web_limit_concurrency: int = 64
+    ssh_command_timeout_seconds: int = 30
+    ssh_slow_command_timeout_seconds: int = 300
+    scheduler_watchdog_enabled: bool = True
+    scheduler_watchdog_stall_seconds: int = 0
     cluster_refresh_interval_seconds: int = 120
     min_warm_allocations: int = 1
     allocation_partition: str = "auto"
