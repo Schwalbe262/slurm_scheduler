@@ -961,8 +961,12 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         return db.list_jobs()
 
     @app.get("/api/tasks")
-    def api_tasks() -> list[dict]:
-        return [task_json(task, derive_failure_message=False) for task in db.list_tasks()]
+    def api_tasks(limit: int = 200, name_prefix: str = "") -> list[dict]:
+        # limit/name_prefix: 대규모 캠페인(수백 태스크) 집계·회수용 (MFT_1MW_2026)
+        tasks = db.list_tasks(limit=max(1, min(int(limit), 10000)))
+        if name_prefix:
+            tasks = [t for t in tasks if str(t.get("name") or "").startswith(name_prefix)]
+        return [task_json(task, derive_failure_message=False) for task in tasks]
 
     @app.post("/api/tasks")
     async def api_create_task(request: Request) -> JSONResponse:
