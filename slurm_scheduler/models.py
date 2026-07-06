@@ -98,6 +98,7 @@ class TaskCreate:
     timeout_seconds: int = 0
     dedupe_key: str = ""
     max_workers_per_node: int = 0
+    same_node_as_task_id: int = 0
     payload_json: str = ""
 
 

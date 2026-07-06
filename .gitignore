@@ -6,3 +6,4 @@ secrets/
 config/app.yaml
 config/accounts.yaml
 *:Zone.Identifier
+logs/

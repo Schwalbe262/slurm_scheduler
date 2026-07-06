@@ -161,6 +161,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     timeout_seconds INTEGER NOT NULL DEFAULT 0,
     dedupe_key TEXT NOT NULL DEFAULT '',
     max_workers_per_node INTEGER NOT NULL DEFAULT 0,
+    same_node_as_task_id INTEGER NOT NULL DEFAULT 0,
     payload_json TEXT NOT NULL DEFAULT '',
     exit_code INTEGER,
     status TEXT NOT NULL,
@@ -233,6 +234,12 @@ CREATE TABLE IF NOT EXISTS account_env_overlays (
 );
 
 CREATE INDEX IF NOT EXISTS idx_account_env_overlays_account ON account_env_overlays(account_name);
+
+CREATE TABLE IF NOT EXISTS scheduler_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -258,6 +265,19 @@ class Database:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
             self._ensure_columns(conn)
+
+    def get_setting(self, key: str) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM scheduler_settings WHERE key = ?", (key,)).fetchone()
+            return str(row["value"]) if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO scheduler_settings(key, value, updated_at) VALUES(?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
+                (key, value),
+            )
 
     def _ensure_columns(self, conn: sqlite3.Connection) -> None:
         table_columns = {
@@ -293,6 +313,7 @@ class Database:
                 "timeout_seconds": "INTEGER NOT NULL DEFAULT 0",
                 "dedupe_key": "TEXT NOT NULL DEFAULT ''",
                 "max_workers_per_node": "INTEGER NOT NULL DEFAULT 0",
+                "same_node_as_task_id": "INTEGER NOT NULL DEFAULT 0",
                 "payload_json": "TEXT NOT NULL DEFAULT ''",
                 "exit_code": "INTEGER",
             },
@@ -369,8 +390,8 @@ class Database:
                 INSERT INTO tasks (
                     name, remote_cwd, command, env_setup, required_capability, env_profile, account_name, cpus, memory_mb,
                     scheduling_profile, gpus, gpu_model, partition, node_name, exclusive_node, priority, timeout_seconds, dedupe_key,
-                    max_workers_per_node, payload_json, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    max_workers_per_node, same_node_as_task_id, payload_json, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.name,
@@ -392,6 +413,7 @@ class Database:
                     task.timeout_seconds,
                     task.dedupe_key,
                     task.max_workers_per_node,
+                    max(0, int(task.same_node_as_task_id or 0)),
                     task.payload_json,
                     TaskStatus.QUEUED.value,
                 ),
@@ -424,25 +446,78 @@ class Database:
             rows = conn.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
             return [dict(row) for row in rows]
 
-    def list_tasks_by_statuses(self, statuses: list[str], limit: int = 200) -> list[dict[str, Any]]:
+    def list_tasks_with_active(self, limit: int = 200, active_limit: int = 5000) -> list[dict[str, Any]]:
+        active_statuses = (TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value)
+        placeholders = ",".join("?" for _ in active_statuses)
+        with self.connect() as conn:
+            recent_rows = conn.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            active_rows = conn.execute(
+                f"SELECT * FROM tasks WHERE status IN ({placeholders}) ORDER BY id DESC LIMIT ?",
+                (*active_statuses, active_limit),
+            ).fetchall()
+        by_id: dict[int, dict[str, Any]] = {}
+        for row in [*recent_rows, *active_rows]:
+            item = dict(row)
+            by_id[int(item["id"])] = item
+        return sorted(by_id.values(), key=lambda item: int(item["id"]), reverse=True)
+
+    def _name_contains_filter(self, name_contains: str) -> tuple[str, tuple[str, ...]]:
+        needle = (name_contains or "").strip()
+        if not needle:
+            return "", ()
+        escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return " AND name LIKE ? ESCAPE '\\'", (f"%{escaped}%",)
+
+    def list_tasks_by_statuses(
+        self,
+        statuses: list[str],
+        limit: int = 200,
+        name_contains: str = "",
+    ) -> list[dict[str, Any]]:
+        if not statuses:
+            return []
+        placeholders = ",".join("?" for _ in statuses)
+        name_filter, name_params = self._name_contains_filter(name_contains)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM tasks WHERE status IN ({placeholders}){name_filter} ORDER BY id DESC LIMIT ?",
+                (*statuses, *name_params, limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_finished_tasks_for_cleanup(
+        self,
+        statuses: list[str],
+        finished_before: str,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
         if not statuses:
             return []
         placeholders = ",".join("?" for _ in statuses)
         with self.connect() as conn:
             rows = conn.execute(
-                f"SELECT * FROM tasks WHERE status IN ({placeholders}) ORDER BY id DESC LIMIT ?",
-                (*statuses, limit),
+                f"""
+                SELECT * FROM tasks
+                WHERE status IN ({placeholders})
+                  AND COALESCE(remote_dir, '') != ''
+                  AND finished_at IS NOT NULL
+                  AND finished_at <= ?
+                ORDER BY finished_at ASC, id ASC
+                LIMIT ?
+                """,
+                (*statuses, finished_before, limit),
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def count_tasks_by_statuses(self, statuses: list[str]) -> int:
+    def count_tasks_by_statuses(self, statuses: list[str], name_contains: str = "") -> int:
         if not statuses:
             return 0
         placeholders = ",".join("?" for _ in statuses)
+        name_filter, name_params = self._name_contains_filter(name_contains)
         with self.connect() as conn:
             row = conn.execute(
-                f"SELECT COUNT(*) AS count FROM tasks WHERE status IN ({placeholders})",
-                tuple(statuses),
+                f"SELECT COUNT(*) AS count FROM tasks WHERE status IN ({placeholders}){name_filter}",
+                (*statuses, *name_params),
             ).fetchone()
             return int(row["count"]) if row else 0
 
@@ -506,6 +581,51 @@ class Database:
             rows = conn.execute("SELECT * FROM allocations ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
             return [dict(row) for row in rows]
 
+    def list_allocations_with_live(self, limit: int = 200, live_limit: int = 5000) -> list[dict[str, Any]]:
+        live_states = (
+            AllocationStatus.PENDING.value,
+            AllocationStatus.WARM.value,
+            AllocationStatus.ACTIVE.value,
+            AllocationStatus.DRAINING.value,
+            AllocationStatus.CLOSING.value,
+        )
+        placeholders = ",".join("?" for _ in live_states)
+        with self.connect() as conn:
+            recent_rows = conn.execute("SELECT * FROM allocations ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            live_rows = conn.execute(
+                f"SELECT * FROM allocations WHERE state IN ({placeholders}) ORDER BY id DESC LIMIT ?",
+                (*live_states, live_limit),
+            ).fetchall()
+        by_id: dict[int, dict[str, Any]] = {}
+        for row in [*recent_rows, *live_rows]:
+            item = dict(row)
+            by_id[int(item["id"])] = item
+        return sorted(by_id.values(), key=lambda item: int(item["id"]), reverse=True)
+
+    def list_closed_allocations_for_cleanup(
+        self,
+        states: list[str],
+        closed_before: str,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        if not states:
+            return []
+        placeholders = ",".join("?" for _ in states)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM allocations
+                WHERE state IN ({placeholders})
+                  AND COALESCE(remote_dir, '') != ''
+                  AND closed_at IS NOT NULL
+                  AND closed_at <= ?
+                ORDER BY closed_at ASC, id ASC
+                LIMIT ?
+                """,
+                (*states, closed_before, limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def update_allocation(self, allocation_id: int, **fields: Any) -> None:
         self._update_row("allocations", allocation_id, fields)
 
@@ -517,6 +637,30 @@ class Database:
     def list_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_finished_jobs_for_cleanup(
+        self,
+        statuses: list[str],
+        finished_before: str,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        if not statuses:
+            return []
+        placeholders = ",".join("?" for _ in statuses)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM jobs
+                WHERE status IN ({placeholders})
+                  AND COALESCE(remote_job_dir, '') != ''
+                  AND finished_at IS NOT NULL
+                  AND finished_at <= ?
+                ORDER BY finished_at ASC, id ASC
+                LIMIT ?
+                """,
+                (*statuses, finished_before, limit),
+            ).fetchall()
             return [dict(row) for row in rows]
 
     def next_queued_job(self) -> dict[str, Any] | None:

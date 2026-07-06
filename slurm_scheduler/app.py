@@ -4,6 +4,8 @@ import json
 import os
 import re
 import shlex
+import threading
+import time
 from pathlib import Path
 from math import ceil
 import posixpath
@@ -13,6 +15,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from .allocation_metrics import annotate_allocation_fea_pressure, annotate_allocation_node_metrics
 from .conda_sync import CondaEnvSyncManager
 from .config import AppConfig, load_accounts, load_app_config
 from .db import Database
@@ -197,6 +200,28 @@ def job_elapsed(jobs: list[dict]) -> list[dict]:
     return hydrated
 
 
+def allocation_elapsed(allocations: list[dict]) -> list[dict]:
+    now = datetime.now(timezone.utc)
+    hydrated: list[dict] = []
+    for allocation in allocations:
+        item = dict(allocation)
+        end = parse_timestamp(item.get("closed_at")) or now
+        requested_at = parse_timestamp(item.get("submitted_at") or item.get("created_at"))
+        started_at = parse_timestamp(item.get("started_at"))
+        if not started_at and item.get("state") in {"warm", "active", "draining", "closing"}:
+            started_at = parse_timestamp(item.get("created_at"))
+        request_elapsed = format_elapsed((end - requested_at).total_seconds()) if requested_at else ""
+        held_elapsed = format_elapsed((end - started_at).total_seconds()) if started_at else ""
+        item["request_elapsed_text"] = request_elapsed
+        item["held_elapsed_text"] = held_elapsed
+        item["is_warm_pool"] = (
+            item.get("state") == "warm"
+            or "warm pool" in str(item.get("drain_reason") or "").lower()
+        )
+        hydrated.append(item)
+    return hydrated
+
+
 def allocation_sort_key(allocation: dict) -> tuple[int, int]:
     state_rank = {
         "active": 0,
@@ -226,6 +251,41 @@ def allocation_usage_summary(allocations: list[dict]) -> dict[str, int]:
         "memory_used_gb": round(max(0, total_memory_mb - free_memory_mb) / 1024),
         "memory_total_gb": round(total_memory_mb / 1024),
     }
+
+
+def task_activity_summary(tasks: list[dict]) -> dict[str, int]:
+    summary = {
+        "total": 0,
+        "running": 0,
+        "attaching": 0,
+        "queued": 0,
+        "fea": 0,
+        "fea_running": 0,
+        "standard": 0,
+        "gpu": 0,
+        "cpu": 0,
+        "same_node": 0,
+    }
+    for task in tasks:
+        status = str(task.get("status") or "")
+        if status not in {"running", "attaching", "queued"}:
+            continue
+        summary["total"] += 1
+        if status in summary:
+            summary[status] += 1
+        if normalize_scheduling_profile(str(task.get("scheduling_profile") or "")) == SchedulingProfile.FEA_BURSTY.value:
+            summary["fea"] += 1
+            if status == "running":
+                summary["fea_running"] += 1
+        else:
+            summary["standard"] += 1
+        if int(task.get("gpus") or 0) > 0:
+            summary["gpu"] += 1
+        else:
+            summary["cpu"] += 1
+        if int(task.get("same_node_as_task_id") or 0) > 0:
+            summary["same_node"] += 1
+    return summary
 
 
 def task_state_for_api(status: str) -> str:
@@ -290,10 +350,12 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         allocation_pending_timeout_seconds=config.allocation_pending_timeout_seconds,
         allocation_pending_backoff_seconds=config.allocation_pending_backoff_seconds,
         allocation_reserved_job_slots=config.allocation_reserved_job_slots,
+        allocation_max_new_per_loop=config.allocation_max_new_per_loop,
         cpu_pool_allow_gpu_partitions=config.cpu_pool_allow_gpu_partitions,
         warm_pool_preferred_accounts=config.warm_pool_preferred_accounts,
         gpu_warm_pool_preferred_accounts=config.gpu_warm_pool_preferred_accounts,
         single_job_per_node_partitions=config.single_job_per_node_partitions,
+        cpu_partition_allocation_limits=config.cpu_partition_allocation_limits,
         gpu_cpu_reserve=config.gpu_cpu_reserve,
         gpu_prewarm_enabled=config.gpu_prewarm_enabled,
         gpu_prewarm_preferred_models=config.gpu_prewarm_preferred_models,
@@ -301,13 +363,20 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         gpu_prewarm_max_warm_allocations=config.gpu_prewarm_max_warm_allocations,
         gpu_prewarm_gpus_per_allocation=config.gpu_prewarm_gpus_per_allocation,
         gpu_prewarm_min_gpus_per_allocation=config.gpu_prewarm_min_gpus_per_allocation,
+        gpu_prewarm_cpus_per_allocation=config.gpu_prewarm_cpus_per_allocation,
         gpu_prewarm_cpu_reserve_per_free_gpu=config.gpu_prewarm_cpu_reserve_per_free_gpu,
+        gpu_prewarm_stagger_seconds=config.gpu_prewarm_stagger_seconds,
+        gpu_prewarm_memory=config.gpu_prewarm_memory,
         gpu_prewarm_partition=config.gpu_prewarm_partition,
         gpu_prewarm_time_limit=config.gpu_prewarm_time_limit,
+        gpu_prewarm_pinned_pending_timeout_seconds=config.gpu_prewarm_pinned_pending_timeout_seconds,
         fea_soft_memory_free_percent=config.fea_soft_memory_free_percent,
         fea_hard_memory_free_percent=config.fea_hard_memory_free_percent,
         fea_load_target=config.fea_load_target,
         fea_max_attach_per_loop=config.fea_max_attach_per_loop,
+        fea_node_name_policy=config.fea_node_name_policy,
+        fea_overload_scale_out_load_factor=config.fea_overload_scale_out_load_factor,
+        fea_overload_scale_out_seconds=config.fea_overload_scale_out_seconds,
         cleanup_enabled=config.cleanup_enabled,
         cleanup_interval_seconds=config.cleanup_interval_seconds,
         cleanup_finished_task_ttl_seconds=config.cleanup_finished_task_ttl_seconds,
@@ -321,6 +390,54 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     app.state.scheduler = scheduler
     env_sync_manager = CondaEnvSyncManager(db, accounts)
     app.state.env_sync_manager = env_sync_manager
+    remote_read_limit = max(1, int(config.web_remote_read_concurrency or 1))
+    remote_read_semaphore = threading.BoundedSemaphore(remote_read_limit)
+    remote_read_cache_seconds = max(0, int(config.web_remote_read_cache_seconds or 0))
+    remote_read_cache: dict[tuple, tuple[float, str]] = {}
+    remote_read_cache_lock = threading.Lock()
+
+    def remote_command_timeout() -> int | None:
+        timeout = int(config.web_remote_command_timeout_seconds or 0)
+        return timeout if timeout > 0 else None
+
+    def remote_read(cache_key: tuple, reader) -> str:
+        if remote_read_cache_seconds > 0:
+            now = time.monotonic()
+            with remote_read_cache_lock:
+                cached = remote_read_cache.get(cache_key)
+                if cached and now - cached[0] <= remote_read_cache_seconds:
+                    return cached[1]
+        if not remote_read_semaphore.acquire(blocking=False):
+            raise HTTPException(
+                status_code=429,
+                detail=f"remote log/file reads are busy; retry shortly (limit {remote_read_limit})",
+            )
+        try:
+            text = reader()
+        finally:
+            remote_read_semaphore.release()
+        if remote_read_cache_seconds > 0:
+            with remote_read_cache_lock:
+                remote_read_cache[cache_key] = (time.monotonic(), text)
+                if len(remote_read_cache) > 128:
+                    oldest = sorted(remote_read_cache, key=lambda key: remote_read_cache[key][0])[:32]
+                    for key in oldest:
+                        remote_read_cache.pop(key, None)
+        return text
+
+    def bounded_remote_window(tail_lines: int = 0, max_bytes: int = 0, default_max_bytes: int | None = None) -> tuple[int, int]:
+        tail = max(0, int(tail_lines or 0))
+        requested = max(0, int(max_bytes or 0))
+        if requested <= 0:
+            requested = int(
+                config.web_remote_file_default_max_bytes
+                if default_max_bytes is None
+                else default_max_bytes
+            )
+        hard = max(0, int(config.web_remote_file_hard_max_bytes or 0))
+        if hard > 0 and (requested <= 0 or requested > hard):
+            requested = hard
+        return tail, max(0, requested)
 
     def apply_text_window(text: str, tail_lines: int = 0, max_bytes: int = 0) -> str:
         if tail_lines > 0:
@@ -341,10 +458,19 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         if not account:
             return ""
         try:
-            text = SlurmAccountClient(account).read_text_file(path)
+            tail, byte_limit = bounded_remote_window(tail_lines=tail_lines, max_bytes=max_bytes, default_max_bytes=limit)
+            text = remote_read(
+                ("task-file", task.get("id"), field, path, tail, byte_limit),
+                lambda: SlurmAccountClient(account).read_text_file(
+                    path,
+                    tail_lines=tail,
+                    max_bytes=byte_limit,
+                    timeout=remote_command_timeout(),
+                ),
+            )
         except Exception:
             return ""
-        if limit > 0 and not max_bytes and len(text) > limit:
+        if limit > 0 and not max_bytes and not tail_lines and len(text) > limit:
             text = text[-limit:]
         return apply_text_window(text, tail_lines=tail_lines, max_bytes=max_bytes)
 
@@ -376,8 +502,76 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         stderr = read_task_file_text(task, "stderr_path", limit=8192, tail_lines=3)
         return "\n".join(line for line in stderr.splitlines()[:3]).strip()
 
-    def task_json(task: dict, include_output: bool = False, output_limit: int = 65536, derive_failure_message: bool = True) -> dict:
-        allocation = db.get_allocation(int(task["allocation_id"])) if task.get("allocation_id") else None
+    def task_view_fields(
+        task: dict,
+        allocation_rows: list[dict] | None = None,
+        allocation_by_id: dict[int, dict] | None = None,
+        active_task_allocation_ids: set[int] | None = None,
+        active_exclusive_allocation_ids: set[int] | None = None,
+        include_diagnostics: bool = True,
+    ) -> dict:
+        allocation = None
+        if task.get("allocation_id"):
+            allocation_id = int(task["allocation_id"])
+            allocation = allocation_by_id.get(allocation_id) if allocation_by_id is not None else db.get_allocation(allocation_id)
+        requested_node_name = task.get("node_name") or ""
+        allocation_node_name = allocation.get("node_name") if allocation else ""
+        same_node_as_task_id = int(task.get("same_node_as_task_id") or task.get("same_node_as") or 0)
+        same_node_target = scheduler.same_node_target_for_task(task) if same_node_as_task_id else None
+        preferred_node_relaxed = (
+            scheduler.task_can_relax_preferred_node(task)
+            and bool(requested_node_name)
+            and bool(allocation_node_name)
+            and requested_node_name != allocation_node_name
+        )
+        if include_diagnostics and task.get("status") == "queued":
+            queue_fields = scheduler.task_queue_diagnostics(
+                task,
+                allocation_rows=allocation_rows,
+                active_task_allocation_ids=active_task_allocation_ids,
+                active_exclusive_allocation_ids=active_exclusive_allocation_ids,
+            )
+        else:
+            queue_fields = {
+                "ready_fit_slots": 0,
+                "pending_fit_slots": 0,
+                "inflight_fit_slots": 0,
+                "queue_state": task.get("status") or "",
+                "queue_reason": "",
+                "preferred_node_relaxed": preferred_node_relaxed,
+            }
+        return {
+            **queue_fields,
+            "cpus": int(task.get("cpus") or 1),
+            "memory_mb": int(task.get("memory_mb") or 4096),
+            "gpus": int(task.get("gpus") or 0),
+            "gpu_model": task.get("gpu_model") or "",
+            "partition": task.get("partition") or "auto",
+            "node_name": requested_node_name,
+            "requested_node_name": requested_node_name,
+            "allocation_node_name": allocation_node_name,
+            "actual_node_name": allocation_node_name,
+            "same_node_as_task_id": same_node_as_task_id,
+            "same_node_as_node_name": same_node_target.get("node_name") if same_node_target else "",
+            "same_node_as_allocation_id": same_node_target.get("allocation_id") if same_node_target else None,
+            "env_profile": task.get("env_profile") or "",
+        }
+
+    def task_json(
+        task: dict,
+        include_output: bool = False,
+        output_limit: int = 65536,
+        derive_failure_message: bool = True,
+        allocation_rows: list[dict] | None = None,
+        allocation_by_id: dict[int, dict] | None = None,
+        active_task_allocation_ids: set[int] | None = None,
+        active_exclusive_allocation_ids: set[int] | None = None,
+        include_diagnostics: bool = False,
+    ) -> dict:
+        allocation = None
+        if task.get("allocation_id"):
+            allocation_id = int(task["allocation_id"])
+            allocation = allocation_by_id.get(allocation_id) if allocation_by_id is not None else db.get_allocation(allocation_id)
         payload = {
             "task_id": task["id"],
             "id": task["id"],
@@ -400,13 +594,25 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "stderr_path": task.get("stderr_path") or "",
             "exit_code_path": task.get("exit_code_path") or "",
             "required_capability": task.get("required_capability") or "",
+            "env_profile": task.get("env_profile") or "",
             "scheduling_profile": normalize_scheduling_profile(task.get("scheduling_profile") or ""),
             "priority": int(task.get("priority") or 0),
             "timeout_seconds": int(task.get("timeout_seconds") or 0),
             "dedupe_key": task.get("dedupe_key") or "",
             "max_workers_per_node": int(task.get("max_workers_per_node") or 0),
+            "same_node_as_task_id": int(task.get("same_node_as_task_id") or 0),
             "urls": task_result_urls(int(task["id"])),
         }
+        payload.update(
+            task_view_fields(
+                task,
+                allocation_rows=allocation_rows,
+                allocation_by_id=allocation_by_id,
+                active_task_allocation_ids=active_task_allocation_ids,
+                active_exclusive_allocation_ids=active_exclusive_allocation_ids,
+                include_diagnostics=include_diagnostics,
+            )
+        )
         if include_output:
             stdout = read_task_file_text(task, "stdout_path", output_limit)
             payload["stdout"] = stdout
@@ -468,6 +674,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "timeout_seconds": int(task.get("timeout_seconds") or 0),
             "dedupe_key": task.get("dedupe_key") or "",
             "max_workers_per_node": int(task.get("max_workers_per_node") or 0),
+            "same_node_as_task_id": int(task.get("same_node_as_task_id") or 0),
             "payload_json": payload_json,
         }
 
@@ -500,6 +707,15 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         payload_json = git_task_payload(repo_url, git_ref, entrypoint, arguments, credential)
         return build_git_task_command(clone_url, git_ref, entrypoint, arguments), payload_json
 
+    def maybe_assign_same_node_task(task_id: int) -> None:
+        task = db.get_task(task_id)
+        if not task or not int(task.get("same_node_as_task_id") or task.get("same_node_as") or 0):
+            return
+        scheduler.fail_stale_same_node_tasks()
+        task = db.get_task(task_id)
+        if task:
+            scheduler.assign_queued_task(task)
+
     def create_task_record(payload: dict) -> tuple[int, bool]:
         dedupe_key = str(payload.get("dedupe_key") or "").strip()
         if dedupe_key:
@@ -531,13 +747,17 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             timeout_seconds=max(0, int(payload.get("timeout_seconds") or payload.get("timeout") or 0)),
             dedupe_key=dedupe_key,
             max_workers_per_node=max(0, int(payload.get("max_workers_per_node") or 0)),
+            same_node_as_task_id=max(0, int(payload.get("same_node_as_task_id") or payload.get("same_node_as") or 0)),
             payload_json=payload_json,
         )
         if not task.remote_cwd:
             raise HTTPException(status_code=422, detail="remote_cwd is required")
         if not task.command:
             raise HTTPException(status_code=422, detail="command is required")
-        return db.create_task(task), False
+        task_id = db.create_task(task)
+        if task.same_node_as_task_id:
+            maybe_assign_same_node_task(task_id)
+        return task_id, False
 
     @app.on_event("startup")
     def _startup() -> None:
@@ -549,14 +769,23 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request) -> HTMLResponse:
+        attached_task_name_filter = (request.query_params.get("task_name_contains") or "").strip()
         snapshots = scheduler.cached_snapshots()
         snapshot_error = "" if snapshots else "Account status will appear after the background scheduler refreshes."
-        allocations = db.list_allocations(limit=500)
+        allocations = annotate_allocation_fea_pressure(
+            annotate_allocation_node_metrics(db.list_allocations_with_live(limit=500), db.list_pestat_nodes()),
+            scheduler.fea_owned_node_pressures(),
+        )
+        node_fea_worker_counts = scheduler.node_fea_worker_counts()
+        for allocation in allocations:
+            allocation["node_fea_worker_count"] = node_fea_worker_counts.get(str(allocation.get("node_name") or ""), 0)
+        allocation_by_id = {int(allocation["id"]): allocation for allocation in allocations}
+        active_task_allocation_ids, active_exclusive_allocation_ids = scheduler.active_task_allocation_sets()
         terminal_allocation_states = {"closed", "failed"}
-        active_allocations = sorted(
+        active_allocations = allocation_elapsed(sorted(
             [item for item in allocations if item["state"] not in terminal_allocation_states],
             key=allocation_sort_key,
-        )
+        ))
         allocated_summary_rows = [
             item
             for item in active_allocations
@@ -564,16 +793,75 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         ]
         allocation_summary = allocation_usage_summary(allocated_summary_rows)
         closed_allocations = [item for item in allocations if item["state"] in terminal_allocation_states]
+        active_running_rows = db.list_tasks_by_statuses(
+            ["running", "attaching"],
+            limit=5000,
+            name_contains=attached_task_name_filter,
+        )
+        visible_queued_rows = db.list_tasks_by_statuses(
+            ["queued"],
+            limit=50,
+            name_contains=attached_task_name_filter,
+        )
+        summary_queued_rows = db.list_tasks_by_statuses(
+            ["queued"],
+            limit=5000,
+            name_contains=attached_task_name_filter,
+        )
+        task_summary = task_activity_summary(active_running_rows + summary_queued_rows)
         active_task_rows = {
             int(task["id"]): task
-            for task in (
-                db.list_tasks_by_statuses(["running", "attaching"], limit=5000)
-                + db.list_tasks_by_statuses(["queued"], limit=50)
-            )
+            for task in (active_running_rows + visible_queued_rows)
         }
-        active_tasks = sorted(attach_task_elapsed(list(active_task_rows.values())), key=task_display_sort_key)
-        finished_tasks = attach_task_elapsed(db.list_tasks_by_statuses(["completed", "failed", "cancelled"], limit=50))
-        finished_task_count = db.count_tasks_by_statuses(["completed", "failed", "cancelled"])
+        queued_diagnostics_remaining = 5
+        active_task_items = []
+        for task in attach_task_elapsed(list(active_task_rows.values())):
+            include_diagnostics = False
+            if task.get("status") == "queued" and queued_diagnostics_remaining > 0:
+                include_diagnostics = True
+                queued_diagnostics_remaining -= 1
+            active_task_items.append(
+                {
+                    **task,
+                    **task_view_fields(
+                        task,
+                        allocation_rows=allocations,
+                        allocation_by_id=allocation_by_id,
+                        active_task_allocation_ids=active_task_allocation_ids,
+                        active_exclusive_allocation_ids=active_exclusive_allocation_ids,
+                        include_diagnostics=include_diagnostics,
+                    ),
+                }
+            )
+        active_tasks = sorted(
+            active_task_items,
+            key=task_display_sort_key,
+        )
+        terminal_task_statuses = ["completed", "failed", "cancelled"]
+        finished_tasks = [
+            {
+                **task,
+                **task_view_fields(
+                    task,
+                    allocation_rows=allocations,
+                    allocation_by_id=allocation_by_id,
+                    active_task_allocation_ids=active_task_allocation_ids,
+                    active_exclusive_allocation_ids=active_exclusive_allocation_ids,
+                    include_diagnostics=False,
+                ),
+            }
+            for task in attach_task_elapsed(
+                db.list_tasks_by_statuses(
+                    terminal_task_statuses,
+                    limit=50,
+                    name_contains=attached_task_name_filter,
+                )
+            )
+        ]
+        finished_task_count = db.count_tasks_by_statuses(
+            terminal_task_statuses,
+            name_contains=attached_task_name_filter,
+        )
         jobs = job_elapsed(db.list_jobs())
         active_jobs = [item for item in jobs if item["status"] not in {"completed", "failed", "cancelled"}]
         finished_jobs = [item for item in jobs if item["status"] in {"completed", "failed", "cancelled"}]
@@ -587,10 +875,13 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 "finished_jobs": finished_jobs[:50],
                 "finished_job_count": len(finished_jobs),
                 "tasks": active_tasks,
+                "task_summary": task_summary,
                 "finished_tasks": finished_tasks,
                 "finished_task_count": finished_task_count,
+                "attached_task_name_filter": attached_task_name_filter,
                 "allocations": active_allocations,
                 "allocation_summary": allocation_summary,
+                "gpu_prewarm_enabled": scheduler.gpu_prewarm_enabled,
                 "closed_allocations": closed_allocations[:20],
                 "closed_allocation_count": len(closed_allocations),
                 "snapshots": snapshots,
@@ -640,6 +931,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         gpu_model: str = Form(""),
         node_name: str = Form(""),
         exclusive_node: bool = Form(False),
+        same_node_as_task_id: int = Form(0),
         job_name: str = Form("web-job"),
         remote_path: str = Form(""),
         total_simulations: int = Form(1),
@@ -773,7 +1065,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 )
         else:
             command, payload_json = git_task_fields(repo_url, git_ref, entrypoint, arguments, git_credential_id)
-            db.create_task(
+            task_id = db.create_task(
                 TaskCreate(
                     name=job_name or "git-task",
                     remote_cwd=ACCOUNT_WORKSPACE_PLACEHOLDER,
@@ -790,9 +1082,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                     partition=partition,
                     node_name=node_name,
                     exclusive_node=exclusive_node,
+                    same_node_as_task_id=max(0, same_node_as_task_id),
                     payload_json=payload_json,
                 )
             )
+            maybe_assign_same_node_task(task_id)
         return RedirectResponse("/", status_code=303)
 
     @app.post("/tasks")
@@ -812,8 +1106,9 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         partition: str = Form("auto"),
         node_name: str = Form(""),
         exclusive_node: bool = Form(False),
+        same_node_as_task_id: int = Form(0),
     ) -> Response:
-        db.create_task(
+        task_id = db.create_task(
             TaskCreate(
                 name=name,
                 remote_cwd=remote_cwd,
@@ -830,8 +1125,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 partition=partition,
                 node_name=node_name,
                 exclusive_node=exclusive_node,
+                same_node_as_task_id=max(0, same_node_as_task_id),
             )
         )
+        maybe_assign_same_node_task(task_id)
         return RedirectResponse("/", status_code=303)
 
     @app.post("/tasks/git")
@@ -854,9 +1151,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         gpu_model: str = Form(""),
         node_name: str = Form(""),
         exclusive_node: bool = Form(False),
+        same_node_as_task_id: int = Form(0),
     ) -> Response:
         command, payload_json = git_task_fields(repo_url, git_ref, entrypoint, arguments, git_credential_id)
-        db.create_task(
+        task_id = db.create_task(
             TaskCreate(
                 name=job_name or "git-task",
                 remote_cwd=ACCOUNT_WORKSPACE_PLACEHOLDER,
@@ -873,9 +1171,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 partition=partition,
                 node_name=node_name,
                 exclusive_node=exclusive_node,
+                same_node_as_task_id=max(0, same_node_as_task_id),
                 payload_json=payload_json,
             )
         )
+        maybe_assign_same_node_task(task_id)
         return RedirectResponse("/", status_code=303)
 
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)
@@ -890,6 +1190,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         task = db.get_task(task_id)
         if not task:
             raise HTTPException(status_code=404)
+        task = {**task, **task_view_fields(task)}
         return templates.TemplateResponse(
             "task_detail.html",
             {
@@ -910,6 +1211,21 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             scheduler.cancel_task(task_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return RedirectResponse("/", status_code=303)
+
+    @app.post("/scheduler/gpu-prewarm")
+    def set_gpu_prewarm_form(enabled: str = Form(...)) -> Response:
+        scheduler.set_gpu_prewarm_enabled(enabled.strip().lower() in {"1", "true", "on", "yes"})
+        return RedirectResponse("/", status_code=303)
+
+    @app.post("/allocations/{allocation_id}/close")
+    def close_allocation(allocation_id: int, force: bool = Form(False)) -> Response:
+        try:
+            scheduler.request_close_allocation(allocation_id, force=force, allow_protected=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return RedirectResponse("/", status_code=303)
 
     @app.post("/jobs/{job_id}/simulation-count")
@@ -961,8 +1277,27 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         return db.list_jobs()
 
     @app.get("/api/tasks")
-    def api_tasks() -> list[dict]:
-        return [task_json(task, derive_failure_message=False) for task in db.list_tasks()]
+    def api_tasks(include_diagnostics: bool = False) -> list[dict]:
+        allocation_rows = None
+        allocation_by_id = None
+        active_task_allocation_ids = None
+        active_exclusive_allocation_ids = None
+        if include_diagnostics:
+            allocation_rows = db.list_allocations_with_live(limit=500)
+            allocation_by_id = {int(allocation["id"]): allocation for allocation in allocation_rows}
+            active_task_allocation_ids, active_exclusive_allocation_ids = scheduler.active_task_allocation_sets()
+        return [
+            task_json(
+                task,
+                derive_failure_message=False,
+                allocation_rows=allocation_rows,
+                allocation_by_id=allocation_by_id,
+                active_task_allocation_ids=active_task_allocation_ids,
+                active_exclusive_allocation_ids=active_exclusive_allocation_ids,
+                include_diagnostics=include_diagnostics,
+            )
+            for task in db.list_tasks_with_active()
+        ]
 
     @app.post("/api/tasks")
     async def api_create_task(request: Request) -> JSONResponse:
@@ -1017,6 +1352,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "timeout_seconds": max(0, int(payload.get("timeout_seconds") or payload.get("timeout") or 0)),
             "dedupe_key": str(payload.get("dedupe_key") or ""),
             "max_workers_per_node": max(0, int(payload.get("max_workers_per_node") or 0)),
+            "same_node_as_task_id": max(0, int(payload.get("same_node_as_task_id") or payload.get("same_node_as") or 0)),
             "payload_json": payload_json,
         }
         task_id, deduped = create_task_record(task_payload)
@@ -1043,7 +1379,32 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
 
     @app.get("/api/allocations")
     def api_allocations() -> list[dict]:
-        return db.list_allocations()
+        return annotate_allocation_fea_pressure(
+            annotate_allocation_node_metrics(db.list_allocations_with_live(), db.list_pestat_nodes()),
+            scheduler.fea_owned_node_pressures(),
+        )
+
+    @app.post("/api/allocations/{allocation_id}/close")
+    def api_close_allocation(allocation_id: int, force: bool = False) -> dict:
+        try:
+            return scheduler.request_close_allocation(allocation_id, force=force)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/scheduler/gpu-prewarm")
+    def api_get_gpu_prewarm() -> dict:
+        return {
+            "enabled": scheduler.gpu_prewarm_enabled,
+            "config_default": scheduler.gpu_prewarm_enabled_default,
+        }
+
+    @app.post("/api/scheduler/gpu-prewarm")
+    async def api_set_gpu_prewarm(request: Request) -> dict:
+        payload = await request.json()
+        scheduler.set_gpu_prewarm_enabled(bool(payload.get("enabled")))
+        return {"enabled": scheduler.gpu_prewarm_enabled}
 
     @app.get("/api/gpu-capacity")
     def api_gpu_capacity() -> list[dict]:
@@ -1077,7 +1438,24 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "exclusive_node": 0,
             "max_workers_per_node": max(0, max_workers_per_node),
         }
-        return scheduler.task_fit_capacity(task)
+        allocation_rows = db.list_allocations_with_live(limit=500)
+        active_task_allocation_ids, active_exclusive_allocation_ids = scheduler.active_task_allocation_sets()
+        capacity = scheduler.task_fit_capacity(
+            task,
+            allocation_rows=allocation_rows,
+            active_task_allocation_ids=active_task_allocation_ids,
+            active_exclusive_allocation_ids=active_exclusive_allocation_ids,
+        )
+        capacity.update(
+            scheduler.task_queue_diagnostics(
+                task,
+                capacity=capacity,
+                allocation_rows=allocation_rows,
+                active_task_allocation_ids=active_task_allocation_ids,
+                active_exclusive_allocation_ids=active_exclusive_allocation_ids,
+            )
+        )
+        return capacity
 
     @app.get("/api/health")
     def api_health() -> dict:
@@ -1097,7 +1475,13 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         return job
 
     @app.get("/api/jobs/{job_id}/remote-file")
-    def api_job_remote_file(job_id: int, path: str, base: str = "remote_path") -> Response:
+    def api_job_remote_file(
+        job_id: int,
+        path: str,
+        base: str = "remote_path",
+        tail_lines: int = 0,
+        max_bytes: int = 0,
+    ) -> Response:
         job = db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404)
@@ -1115,18 +1499,39 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         if not root:
             raise HTTPException(status_code=409, detail="job has no remote base path")
         remote_file = posixpath.join(root, path)
+        tail, byte_limit = bounded_remote_window(tail_lines=tail_lines, max_bytes=max_bytes)
         try:
-            text = SlurmAccountClient(account).read_text_file(remote_file)
+            text = remote_read(
+                ("job-remote-file", job_id, base, remote_file, tail, byte_limit),
+                lambda: SlurmAccountClient(account).read_text_file(
+                    remote_file,
+                    tail_lines=tail,
+                    max_bytes=byte_limit,
+                    timeout=remote_command_timeout(),
+                ),
+            )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
         return Response(text, media_type="text/plain")
 
     @app.get("/api/tasks/{task_id}")
-    def api_task(task_id: int, include_output: bool = False, output_limit: int = 65536) -> dict:
+    def api_task(
+        task_id: int,
+        include_output: bool = False,
+        output_limit: int = 65536,
+        include_diagnostics: bool = False,
+    ) -> dict:
         task = db.get_task(task_id)
         if not task:
             raise HTTPException(status_code=404)
-        return task_json(task, include_output=include_output, output_limit=max(0, output_limit))
+        return task_json(
+            task,
+            include_output=include_output,
+            output_limit=max(0, output_limit),
+            include_diagnostics=include_diagnostics,
+        )
 
     @app.post("/api/tasks/{task_id}/cancel")
     def api_cancel_task(task_id: int) -> dict:
@@ -1157,10 +1562,21 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         if not root:
             raise HTTPException(status_code=409, detail="task has no remote base path")
         remote_file = posixpath.join(root, path)
+        tail, byte_limit = bounded_remote_window(tail_lines=tail_lines, max_bytes=max_bytes)
         try:
-            text = SlurmAccountClient(account).read_text_file(remote_file)
+            text = remote_read(
+                ("task-remote-file", task_id, base, remote_file, tail, byte_limit),
+                lambda: SlurmAccountClient(account).read_text_file(
+                    remote_file,
+                    tail_lines=tail,
+                    max_bytes=byte_limit,
+                    timeout=remote_command_timeout(),
+                ),
+            )
         except FileNotFoundError:
             text = ""
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
         return Response(apply_text_window(text, tail_lines=max(0, tail_lines), max_bytes=max(0, max_bytes)), media_type="text/plain")
 
     @app.get("/api/tasks/{task_id}/remote-files")
@@ -1179,9 +1595,14 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         if not root:
             raise HTTPException(status_code=409, detail="task has no remote base path")
         try:
-            files = SlurmAccountClient(account).list_files(root, glob)
+            files = remote_read(
+                ("task-remote-files", task_id, base, root, glob),
+                lambda: SlurmAccountClient(account).list_files(root, glob, timeout=remote_command_timeout()),
+            )
         except FileNotFoundError:
             files = []
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
         return {"base": base, "glob": glob, "files": files}
 
     @app.get("/api/tasks/{task_id}/stdout")
@@ -1196,10 +1617,21 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         account = account_for_task(task)
         if not account:
             return Response("", media_type="text/plain")
+        tail, byte_limit = bounded_remote_window(tail_lines=tail_lines, max_bytes=max_bytes)
         try:
-            text = SlurmAccountClient(account).read_text_file(task["stdout_path"])
+            text = remote_read(
+                ("task-stdout", task_id, task["stdout_path"], tail, byte_limit),
+                lambda: SlurmAccountClient(account).read_text_file(
+                    task["stdout_path"],
+                    tail_lines=tail,
+                    max_bytes=byte_limit,
+                    timeout=remote_command_timeout(),
+                ),
+            )
         except FileNotFoundError:
             text = ""
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
         return Response(apply_text_window(text, tail_lines=max(0, tail_lines), max_bytes=max(0, max_bytes)), media_type="text/plain")
 
     @app.get("/api/tasks/{task_id}/stderr")
@@ -1214,10 +1646,21 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         account = account_for_task(task)
         if not account:
             return Response("", media_type="text/plain")
+        tail, byte_limit = bounded_remote_window(tail_lines=tail_lines, max_bytes=max_bytes)
         try:
-            text = SlurmAccountClient(account).read_text_file(task["stderr_path"])
+            text = remote_read(
+                ("task-stderr", task_id, task["stderr_path"], tail, byte_limit),
+                lambda: SlurmAccountClient(account).read_text_file(
+                    task["stderr_path"],
+                    tail_lines=tail,
+                    max_bytes=byte_limit,
+                    timeout=remote_command_timeout(),
+                ),
+            )
         except FileNotFoundError:
             text = ""
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
         return Response(apply_text_window(text, tail_lines=max(0, tail_lines), max_bytes=max(0, max_bytes)), media_type="text/plain")
 
     @app.get("/api/accounts/status")

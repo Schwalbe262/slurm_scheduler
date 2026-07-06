@@ -4,7 +4,13 @@
   <div class="title-row">
     <h1>Task {{ task.id }}: {{ task.name }}</h1>
     {% if task.status not in ["completed", "failed", "cancelled"] %}
-      <form method="post" action="/tasks/{{ task.id }}/cancel"><button class="danger" type="submit">Cancel</button></form>
+      <form
+        method="post"
+        action="/tasks/{{ task.id }}/cancel"
+        onsubmit="return confirm('Stop attached task {{ task.id }}?');"
+      >
+        <button class="danger" type="submit">Stop task</button>
+      </form>
     {% endif %}
   </div>
   <div class="table-scroll">
@@ -20,7 +26,10 @@
         <tr><th>Scheduling profile</th><td>{{ task.scheduling_profile or "standard" }}</td></tr>
         <tr><th>CPU / Memory</th><td>{{ task.cpus }} CPUs / {{ task.memory_mb }} MB</td></tr>
         <tr><th>GPU</th><td>{{ task.gpus or 0 }} {{ task.gpu_model or "" }}</td></tr>
-        <tr><th>Partition / Node</th><td>{{ task.partition or "" }} / {{ task.node_name or "" }}</td></tr>
+        <tr><th>Partition / Requested node</th><td>{{ task.partition or "" }} / {{ task.requested_node_name or "" }}</td></tr>
+        <tr><th>Allocation node</th><td>{{ task.allocation_node_name or "" }}</td></tr>
+        <tr><th>Same node as task</th><td>{{ task.same_node_as_task_id or "" }}{% if task.same_node_as_node_name %} / {{ task.same_node_as_node_name }}{% endif %}</td></tr>
+        <tr><th>Queue state / reason</th><td>{{ task.queue_state or "" }} / {{ task.queue_reason or "" }}</td></tr>
         <tr><th>Priority / Timeout</th><td>{{ task.priority or 0 }} / {{ task.timeout_seconds or 0 }} seconds</td></tr>
         <tr><th>Dedupe key</th><td class="mono-cell">{{ task.dedupe_key or "" }}</td></tr>
         <tr><th>Payload JSON</th><td class="mono-cell"><pre>{{ task.payload_json or "" }}</pre></td></tr>

@@ -280,8 +280,10 @@ def partition_rank(rows: list[dict], needs_gpu: bool) -> list[dict]:
             key=lambda item: (
                 item["gpu_score"],
                 item["gpu_count_per_node"],
-                item["available_nodes"],
+                item["cpu_score"],
                 item["max_cpus"],
+                item["free_gpus"],
+                item["available_nodes"],
                 item["max_memory_mb"],
             ),
             reverse=True,

@@ -73,7 +73,7 @@ The request exceeds the CPU limit allowed by the partition/QOS for one node.
 
 Actions:
 
-- Keep `allocation_cpus` at or below the per-node/QOS limit. Current policy uses 64 for CPU pools.
+- Keep `allocation_cpus` at or below the per-node/QOS limit. It is the target/cap for shared CPU pools; the scheduler avoids opening tiny CPU-only fragments, uses smaller CPU-only node sizes when needed, and can use GPU-node free CPUs after `gpu_cpu_reserve`.
 - Lower `cpus`, `cpus_per_simulation`, or `max_workers_per_job` for the submitted job.
 - Check the generated job request with `scontrol show job <jobid>`.
 
@@ -114,7 +114,7 @@ The request is valid but waiting behind higher-priority jobs. This is common on 
 Actions:
 
 - Keep at least one GPU warm allocation configured if the workload needs GPUs frequently.
-- Prefer A6000ADA first, then A6000 fallback.
+- Use A6000 for default GPU warm pools; A6000ADA is usually fully occupied on this cluster.
 - Avoid over-pinning `partition` and `node_name`.
 - Check `cluster_free_gpus` and `scheduler_free_gpus` from `/api/gpu-capacity`.
 
@@ -134,14 +134,19 @@ Tuning:
 allocation_pending_timeout_seconds: 1800
 allocation_pending_backoff_seconds: 1800
 gpu_prewarm:
-  preferred_models: ["a6000ada", "a6000"]
+  preferred_models: ["a6000"]
+  min_warm_allocations: 2
+  max_warm_allocations: 4
   gpus_per_allocation: 4
-  min_gpus_per_allocation: 2
+  min_gpus_per_allocation: 4
+  cpus_per_allocation: 4
+  stagger_seconds: 86400
+  pinned_pending_timeout_seconds: 300
 ```
 
-If pending reason repeatedly shows `(Resources)`, the A6000-class shape may not fit current nodes. The default warm policy tries four GPUs first, then three or two if that is all the selected node can provide. If it repeatedly shows `(Priority)`, the request is valid but queue priority is delaying it.
+If a node-pinned warm allocation remains pending, the scheduler retries a different node after `pinned_pending_timeout_seconds`. If an unpinned request repeatedly shows `(Resources)`, the 4-GPU/4-CPU A6000 warm shape may not fit current partitions. If it repeatedly shows `(Priority)`, the request is valid but queue priority is delaying it.
 
-GPU warm fallback stays inside `preferred_models`. With the default config the scheduler may keep A6000ADA and A6000 requests queued, but it does not open RTX 3090 or A10 warm pools just because A6000-class jobs are pending.
+GPU warm fallback stays inside `preferred_models`. With the default config the scheduler keeps A6000 requests queued, but it does not open A6000ADA, RTX 3090, or A10 warm pools just because A6000 jobs are pending.
 
 ## Git Clone Fails Before Slurm Starts
 

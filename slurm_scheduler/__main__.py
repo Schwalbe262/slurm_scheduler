@@ -14,6 +14,9 @@ def main() -> None:
         host=config.bind_host,
         port=config.bind_port,
         reload=False,
+        timeout_keep_alive=max(1, int(config.web_timeout_keep_alive_seconds or 5)),
+        timeout_graceful_shutdown=max(1, int(config.web_timeout_graceful_shutdown_seconds or 15)),
+        limit_concurrency=max(1, int(config.web_limit_concurrency or 64)),
     )
 
 

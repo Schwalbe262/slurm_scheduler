@@ -45,6 +45,14 @@ class AppConfig:
     poll_interval_seconds: int = 30
     bind_host: str = "127.0.0.1"
     bind_port: int = 8000
+    web_remote_file_default_max_bytes: int = 262144
+    web_remote_file_hard_max_bytes: int = 1048576
+    web_remote_command_timeout_seconds: int = 5
+    web_remote_read_concurrency: int = 2
+    web_remote_read_cache_seconds: int = 3
+    web_timeout_keep_alive_seconds: int = 5
+    web_timeout_graceful_shutdown_seconds: int = 15
+    web_limit_concurrency: int = 64
     cluster_refresh_interval_seconds: int = 120
     min_warm_allocations: int = 1
     allocation_partition: str = "auto"
@@ -59,28 +67,37 @@ class AppConfig:
     allocation_pending_timeout_seconds: int = 1800
     allocation_pending_backoff_seconds: int = 1800
     allocation_reserved_job_slots: int = 0
+    allocation_max_new_per_loop: int = 8
     cpu_pool_allow_gpu_partitions: bool = True
     warm_pool_preferred_accounts: list[str] = field(default_factory=list)
     gpu_warm_pool_preferred_accounts: list[str] = field(default_factory=list)
     single_job_per_node_partitions: list[str] = field(default_factory=lambda: ["cpu2"])
+    cpu_partition_allocation_limits: dict[str, int] = field(default_factory=lambda: {"cpu2": 2})
     gpu_cpu_reserve: int = 4
     gpu_prewarm_enabled: bool = True
-    gpu_prewarm_preferred_models: list[str] = field(default_factory=lambda: ["a6000ada", "a6000"])
-    gpu_prewarm_min_warm_allocations: int = 1
-    gpu_prewarm_max_warm_allocations: int = 3
-    gpu_prewarm_gpus_per_allocation: int = 4
+    gpu_prewarm_preferred_models: list[str] = field(default_factory=lambda: ["a6000"])
+    gpu_prewarm_min_warm_allocations: int = 2
+    gpu_prewarm_max_warm_allocations: int = 4
+    gpu_prewarm_gpus_per_allocation: int = 2
     gpu_prewarm_min_gpus_per_allocation: int = 2
+    gpu_prewarm_cpus_per_allocation: int = 0
     gpu_prewarm_cpu_reserve_per_free_gpu: int = 8
+    gpu_prewarm_stagger_seconds: int = 86400
+    gpu_prewarm_memory: str = "128G"
     gpu_prewarm_partition: str = "auto"
     gpu_prewarm_time_limit: str = "48:00:00"
+    gpu_prewarm_pinned_pending_timeout_seconds: int = 300
     fea_soft_memory_free_percent: float = 60.0
     fea_hard_memory_free_percent: float = 40.0
     fea_load_target: float = 0.75
-    fea_max_attach_per_loop: int = 8
+    fea_max_attach_per_loop: int = 24
+    fea_node_name_policy: str = "preferred"
+    fea_overload_scale_out_load_factor: float = 2.0
+    fea_overload_scale_out_seconds: int = 300
     cleanup_enabled: bool = True
     cleanup_interval_seconds: int = 3600
-    cleanup_finished_task_ttl_seconds: int = 604800
-    cleanup_finished_job_ttl_seconds: int = 604800
+    cleanup_finished_task_ttl_seconds: int = 259200
+    cleanup_finished_job_ttl_seconds: int = 259200
     cleanup_closed_allocation_ttl_seconds: int = 86400
     git_credentials: list[GitCredentialConfig] = field(default_factory=list)
 
@@ -107,9 +124,13 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
             "max_warm_allocations": "gpu_prewarm_max_warm_allocations",
             "gpus_per_allocation": "gpu_prewarm_gpus_per_allocation",
             "min_gpus_per_allocation": "gpu_prewarm_min_gpus_per_allocation",
+            "cpus_per_allocation": "gpu_prewarm_cpus_per_allocation",
             "cpu_reserve_per_free_gpu": "gpu_prewarm_cpu_reserve_per_free_gpu",
+            "stagger_seconds": "gpu_prewarm_stagger_seconds",
+            "memory": "gpu_prewarm_memory",
             "partition": "gpu_prewarm_partition",
             "time_limit": "gpu_prewarm_time_limit",
+            "pinned_pending_timeout_seconds": "gpu_prewarm_pinned_pending_timeout_seconds",
         }
         for source, target in mapping.items():
             if source in gpu_prewarm:
@@ -121,6 +142,9 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
             "hard_memory_free_percent": "fea_hard_memory_free_percent",
             "load_target": "fea_load_target",
             "max_attach_per_loop": "fea_max_attach_per_loop",
+            "node_name_policy": "fea_node_name_policy",
+            "overload_scale_out_load_factor": "fea_overload_scale_out_load_factor",
+            "overload_scale_out_seconds": "fea_overload_scale_out_seconds",
         }
         for source, target in mapping.items():
             if source in fea_bursty:

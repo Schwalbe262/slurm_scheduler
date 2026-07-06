@@ -50,10 +50,20 @@ class SSHSession:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.client.close()
 
-    def run(self, command: str) -> CommandResult:
-        stdin, stdout, stderr = self.client.exec_command(command)
+    def run(self, command: str, timeout: float | None = None) -> CommandResult:
+        stdin, stdout, stderr = self.client.exec_command(command, timeout=timeout)
         del stdin
-        exit_code = stdout.channel.recv_exit_status()
+        if timeout and timeout > 0:
+            deadline = time.monotonic() + timeout
+            channel = stdout.channel
+            while not channel.exit_status_ready():
+                if time.monotonic() >= deadline:
+                    channel.close()
+                    raise TimeoutError(f"remote command timed out after {timeout:g}s")
+                time.sleep(0.05)
+            exit_code = channel.recv_exit_status()
+        else:
+            exit_code = stdout.channel.recv_exit_status()
         return CommandResult(
             stdout=stdout.read().decode("utf-8", errors="replace"),
             stderr=stderr.read().decode("utf-8", errors="replace"),
@@ -95,6 +105,19 @@ class SSHSession:
 def command_failure_message(result: CommandResult, fallback: str) -> str:
     message = result.stderr.strip() or result.stdout.strip()
     return message or fallback
+
+
+def remote_text_command(path: str, tail_lines: int = 0, max_bytes: int = 0) -> str:
+    quoted = shlex.quote(path)
+    prefix = f"test -f {quoted} && "
+    if tail_lines > 0:
+        command = f"tail -n {int(tail_lines)} -- {quoted}"
+        if max_bytes > 0:
+            command = f"{command} | tail -c {int(max_bytes)}"
+        return prefix + command
+    if max_bytes > 0:
+        return prefix + f"tail -c {int(max_bytes)} -- {quoted}"
+    return prefix + f"cat {quoted}"
 
 
 def parse_squeue_counts(output: str) -> tuple[int, int]:
@@ -442,13 +465,7 @@ def build_srun_attach_command(
     gres = gpu_gres_value(str(allocation.get("gpu_model") or task.get("gpu_model") or ""), int(task.get("gpus") or 0))
     if gres:
         srun_parts.append(f"--gres={shlex.quote(gres)}")
-    cpu_shortage_gpu_task = (
-        int(task.get("gpus") or 0) > 0
-        and int(task.get("cpus") or 0) <= 4
-        and int(allocation.get("free_cpus") or 0) < int(task.get("cpus") or 0)
-    )
-    fea_bursty_task = normalize_scheduling_profile(str(task.get("scheduling_profile") or "")) == SchedulingProfile.FEA_BURSTY.value
-    if fea_bursty_task or cpu_shortage_gpu_task:
+    if task_attach_uses_overlap(task):
         srun_parts.append("--overlap")
     else:
         srun_parts.append("--exclusive")
@@ -457,6 +474,49 @@ def build_srun_attach_command(
     return (
         f"{srun_command} > {shlex.quote(stdout_path)} 2> {shlex.quote(stderr_path)}; "
         f"echo $? > {shlex.quote(exit_code_path)}"
+    )
+
+
+def task_attach_uses_overlap(task: dict) -> bool:
+    same_node_cpu_client = (
+        int(task.get("same_node_as_task_id") or task.get("same_node_as") or 0) > 0
+        and int(task.get("gpus") or 0) == 0
+        and int(task.get("cpus") or 0) <= 4
+    )
+    fea_bursty_task = normalize_scheduling_profile(str(task.get("scheduling_profile") or "")) == SchedulingProfile.FEA_BURSTY.value
+    return fea_bursty_task or same_node_cpu_client or task_is_vllm_service(task)
+
+
+def task_is_vllm_service(task: dict) -> bool:
+    if int(task.get("exclusive_node") or 0):
+        return False
+    if int(task.get("gpus") or 0) <= 0:
+        return False
+    name = str(task.get("name") or "").lower()
+    command = str(task.get("command") or "").lower()
+    if "vllm-service" in name:
+        return True
+    return "vllm" in name and "service_duration_seconds" in command
+
+
+def background_wrapper_command(wrapper: str, wrapper_path: str) -> str:
+    return f"nohup setsid bash -lc {shlex.quote(wrapper)} > {shlex.quote(wrapper_path)} 2>&1 & echo $!"
+
+
+def cancel_process_group_command(wrapper_pid: str, term_grace_seconds: int = 3) -> str:
+    pid = shlex.quote(str(wrapper_pid).strip())
+    grace = max(0, int(term_grace_seconds))
+    return (
+        f"pid={pid}; "
+        'if [ -n "$pid" ]; then '
+        'kill -TERM -- "-$pid" >/dev/null 2>&1 || true; '
+        'pkill -TERM -P "$pid" >/dev/null 2>&1 || true; '
+        'kill -TERM "$pid" >/dev/null 2>&1 || true; '
+        f"sleep {grace}; "
+        'kill -KILL -- "-$pid" >/dev/null 2>&1 || true; '
+        'pkill -KILL -P "$pid" >/dev/null 2>&1 || true; '
+        'kill -KILL "$pid" >/dev/null 2>&1 || true; '
+        "fi"
     )
 
 
@@ -643,7 +703,7 @@ class SlurmAccountClient:
         commands = [
             f"mkdir -p {shlex.quote(remote_dir)}",
             f"chmod +x {shlex.quote(script_path)}",
-            f"bash -lc {shlex.quote(f'nohup bash -lc {shlex.quote(wrapper)} > {shlex.quote(wrapper_path)} 2>&1 & echo $!')}",
+            f"bash -lc {shlex.quote(background_wrapper_command(wrapper, wrapper_path))}",
         ]
         with SSHSession(self.account) as ssh:
             result = ssh.run(commands[0])
@@ -779,10 +839,7 @@ class SlurmAccountClient:
         wrapper_pid = str(task.get("wrapper_pid") or "").strip()
         if not wrapper_pid:
             return
-        command = (
-            f"pkill -TERM -P {shlex.quote(wrapper_pid)} >/dev/null 2>&1 || true; "
-            f"kill -TERM {shlex.quote(wrapper_pid)} >/dev/null 2>&1 || true"
-        )
+        command = cancel_process_group_command(wrapper_pid)
         with SSHSession(self.account) as ssh:
             result = ssh.run(command)
         if result.exit_code != 0:
@@ -794,14 +851,35 @@ class SlurmAccountClient:
         if result.exit_code != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"failed to remove {remote_path}")
 
-    def read_text_file(self, path: str) -> str:
+    def remove_trees(self, remote_paths: list[str]) -> None:
+        paths = [str(path) for path in remote_paths if str(path or "").strip()]
+        if not paths:
+            return
         with SSHSession(self.account) as ssh:
-            result = ssh.run(f"test -f {shlex.quote(path)} && cat {shlex.quote(path)}")
+            for index in range(0, len(paths), 100):
+                chunk = paths[index : index + 100]
+                result = ssh.run("rm -rf -- " + " ".join(shlex.quote(path) for path in chunk))
+                if result.exit_code != 0:
+                    message = result.stderr.strip() or result.stdout.strip() or "failed to remove remote artifacts"
+                    raise RuntimeError(message)
+
+    def read_text_file(
+        self,
+        path: str,
+        tail_lines: int = 0,
+        max_bytes: int = 0,
+        timeout: float | None = None,
+    ) -> str:
+        with SSHSession(self.account) as ssh:
+            result = ssh.run(
+                remote_text_command(path, tail_lines=max(0, tail_lines), max_bytes=max(0, max_bytes)),
+                timeout=timeout,
+            )
         if result.exit_code != 0:
             raise FileNotFoundError(result.stderr.strip() or f"remote file not found: {path}")
         return result.stdout
 
-    def list_files(self, root: str, pattern: str) -> list[str]:
+    def list_files(self, root: str, pattern: str, timeout: float | None = None) -> list[str]:
         script = (
             "python - <<'PY'\n"
             "import glob, json, os\n"
@@ -815,7 +893,7 @@ class SlurmAccountClient:
             "PY"
         )
         with SSHSession(self.account) as ssh:
-            result = ssh.run(script)
+            result = ssh.run(script, timeout=timeout)
         if result.exit_code != 0:
             raise FileNotFoundError(result.stderr.strip() or f"remote files not found: {root}/{pattern}")
         try:
