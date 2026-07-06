@@ -5037,6 +5037,58 @@ class SchedulerTests(unittest.TestCase):
             uncapped.fea_effective_worker_limit(allocation, task, current_workers=10, base_limit=32), 32
         )
 
+    def test_enforce_fea_node_cpu_cap_drains_newest_workers_gradually(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=48,
+            total_memory_mb=380000,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="alloc-1")
+        task_ids = []
+        for index in range(20):
+            task_id = self.db.create_task(
+                TaskCreate(
+                    f"fea-{index}",
+                    "~/case",
+                    "run",
+                    cpus=4,
+                    memory_mb=4096,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                )
+            )
+            self.db.update_task(
+                task_id,
+                status=TaskStatus.RUNNING.value,
+                account_name="a",
+                allocation_id=allocation_id,
+                wrapper_pid=str(5000 + index),
+                attached_at=f"2026-01-01 00:{index:02d}:00",
+            )
+            task_ids.append(task_id)
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 48 4.0 380000 350000 busy\n"
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        # 20 workers x 4 cpus = 80 requested vs cap 48 -> 8 newest drained (== per-tick limit).
+        scheduler.enforce_fea_node_cpu_cap()
+        newest_eight = task_ids[-8:]
+        for task_id in newest_eight:
+            task = self.db.get_task(task_id)
+            self.assertEqual(task["status"], TaskStatus.QUEUED.value)
+            self.assertEqual(task["attempt_count"], 0)
+            self.assertIsNone(task["allocation_id"])
+        for task_id in task_ids[:-8]:
+            self.assertEqual(self.db.get_task(task_id)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(sorted(FakeClient.cancelled_tasks), sorted(newest_eight))
+        # 12 workers x 4 = 48 == cap: a second pass drains nothing further.
+        scheduler.enforce_fea_node_cpu_cap()
+        self.assertEqual(len(FakeClient.cancelled_tasks), 8)
+
     def test_fea_stale_pestat_blocks_when_last_row_was_pressured(self) -> None:
         self.db.replace_pestat_nodes(
             parse_pestat(

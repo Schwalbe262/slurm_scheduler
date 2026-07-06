@@ -572,6 +572,7 @@ class Scheduler:
                 self.refresh_tasks()
                 self.apply_allocation_lifecycle()
                 self.handle_fea_memory_pressure()
+                self.enforce_fea_node_cpu_cap()
                 self.update_fea_overload_state()
                 self.assign_queued_tasks(include_fea=False)
                 self.maintain_allocation_pool()
@@ -2829,6 +2830,116 @@ class Scheduler:
             limit = min(limit, current_workers + cap_remaining)
         return limit
 
+    def _node_cpu_total(self, node_name: str) -> int:
+        if not node_name:
+            return 0
+        row = self.pestat_node_for_allocation({"node_name": node_name}, max_age_seconds=float("inf"))
+        if row and int(row.get("cpu_total") or 0) > 0:
+            return int(row.get("cpu_total") or 0)
+        for inventory_row in self.db.list_node_inventory():
+            if str(inventory_row.get("node_name") or "") == node_name:
+                return int(inventory_row.get("cpus") or 0)
+        return 0
+
+    def enforce_fea_node_cpu_cap(self) -> None:
+        """Retroactive side of the node CPU cap: nodes that accumulated more
+        FEA-requested CPUs than cpu_total * factor (e.g. before the cap
+        existed) are drained newest-worker-first, a few per tick, by
+        requeueing the workers so the work reruns elsewhere."""
+        if self.fea_node_requested_cpu_factor <= 0:
+            return
+        pressures = self.fea_owned_node_pressures()
+        if not pressures:
+            return
+        live_states = {
+            AllocationStatus.WARM.value,
+            AllocationStatus.ACTIVE.value,
+            AllocationStatus.DRAINING.value,
+        }
+        node_by_allocation_id = {
+            int(allocation["id"]): str(allocation.get("node_name") or "")
+            for allocation in self.db.list_allocations(limit=500)
+            if allocation["state"] in live_states
+        }
+        tasks_by_node: dict[str, list[dict]] = {}
+        for task in self.db.list_tasks(limit=5000):
+            if task["status"] not in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
+                continue
+            if not self.task_is_fea_bursty(task):
+                continue
+            node_name = node_by_allocation_id.get(int(task.get("allocation_id") or 0))
+            if node_name:
+                tasks_by_node.setdefault(node_name, []).append(task)
+        rebalanced = False
+        for node_name, pressure in pressures.items():
+            requested = int(pressure.get("requested_cpus") or 0)
+            cpu_total = self._node_cpu_total(node_name)
+            if cpu_total <= 0:
+                continue
+            cap = cpu_total * self.fea_node_requested_cpu_factor
+            if requested <= cap:
+                continue
+            victims = sorted(
+                tasks_by_node.get(node_name, []),
+                key=lambda task: (
+                    task.get("attached_at") or task.get("started_at") or task.get("created_at") or "",
+                    int(task.get("id") or 0),
+                ),
+                reverse=True,
+            )
+            drained = 0
+            for task in victims:
+                if requested <= cap or drained >= self.fea_max_attach_per_node_per_loop:
+                    break
+                account = self.account_by_name(str(task.get("account_name") or ""))
+                if account:
+                    try:
+                        self._client(account).cancel_task(task)
+                    except Exception as exc:
+                        LOGGER.warning("failed to cancel FEA task %s for cap rebalance: %s", task["id"], exc)
+                self.requeue_task_for_rebalance(
+                    task, f"node {node_name} over FEA CPU cap ({requested}/{cap:.0f})"
+                )
+                requested -= int(task.get("cpus") or 0)
+                drained += 1
+                rebalanced = True
+            if drained:
+                LOGGER.info(
+                    "rebalanced %d FEA workers off %s (requested CPUs now %d, cap %.0f)",
+                    drained,
+                    node_name,
+                    requested,
+                    cap,
+                )
+        if rebalanced:
+            self.recalculate_allocation_capacity()
+
+    def requeue_task_for_rebalance(self, task: dict, reason: str) -> None:
+        """Requeue without touching attempt_count: the worker was placed by a
+        policy the scheduler has since corrected, not by its own failure."""
+        self._fea_pressures_cache = None
+        self._fea_footprint_cache = None
+        self.record_event(
+            "task_requeued",
+            f"task {task.get('name') or task['id']} requeued: {reason}",
+            entity_type="task",
+            entity_id=task["id"],
+            account_name=str(task.get("account_name") or ""),
+        )
+        self.db.update_task(
+            task["id"],
+            status=TaskStatus.QUEUED.value,
+            allocation_id=None,
+            remote_dir="",
+            stdout_path="",
+            stderr_path="",
+            exit_code_path="",
+            wrapper_pid="",
+            failure_message="",
+            attached_at=None,
+            started_at=None,
+        )
+
     def fea_node_cpu_cap_remaining(self, allocation: dict, task: dict) -> int | None:
         """How many more workers of this task fit under the node-wide cap of
         total FEA-requested CPUs <= cpu_total * fea_node_requested_cpu_factor.
@@ -2841,15 +2952,7 @@ class Scheduler:
         node_name = str(allocation.get("node_name") or "").strip()
         if not node_name:
             return None
-        cpu_total = 0
-        node = self.pestat_node_for_allocation(allocation, max_age_seconds=float("inf"))
-        if node:
-            cpu_total = int(node.get("cpu_total") or 0)
-        if cpu_total <= 0:
-            for row in self.db.list_node_inventory():
-                if str(row.get("node_name") or "") == node_name:
-                    cpu_total = int(row.get("cpus") or 0)
-                    break
+        cpu_total = self._node_cpu_total(node_name)
         if cpu_total <= 0:
             return None
         # fea_owned_node_pressures reads live DB rows (invalidated on every
