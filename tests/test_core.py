@@ -4177,7 +4177,10 @@ class SchedulerTests(unittest.TestCase):
                 status=TaskStatus.RUNNING.value,
                 allocation_id=allocation_id,
                 account_name="a",
-                started_at="CURRENT_TIMESTAMP",
+                # Mature workers: past the footprint window, so pestat readings
+                # are trusted for them.
+                started_at=days_ago(1),
+                attached_at=days_ago(1),
             )
         queued_id = self.db.create_task(
             TaskCreate(
@@ -4901,22 +4904,57 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(failed["attempt_count"], 3)
         self.assertIn("after 3 attempts", failed["failure_message"])
 
-    def test_fea_dynamic_extra_slots_discounts_attaches_since_pestat_snapshot(self) -> None:
+    def test_fea_dynamic_extra_slots_reserves_declared_footprint_of_young_workers(self) -> None:
         self.db.replace_pestat_nodes(
             parse_pestat(
                 "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
                 "n001 cpu1 mix 8 64 4.0 100000 90000 some_job\n"
             )
         )
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.WARM.value, slurm_job_id="alloc-1")
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
-        allocation = {"id": 1, "state": AllocationStatus.WARM.value, "node_name": "n001"}
+        allocation = self.db.get_allocation(allocation_id)
         task = {"id": 10, "cpus": 4, "memory_mb": 8192}
         baseline = scheduler.fea_dynamic_extra_slots(allocation, task)
         self.assertGreater(baseline, 0)
-        for _ in range(3):
-            scheduler._record_attach_delta(allocation, task)
+        # Freshly attached FEA workers have not grown into their footprint yet;
+        # their declared cpus/memory must be reserved out of the budgets.
+        for index in range(3):
+            task_id = self.db.create_task(
+                TaskCreate(
+                    f"fea-young-{index}",
+                    "~/case",
+                    "run",
+                    cpus=4,
+                    memory_mb=8192,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                )
+            )
+            self.db.update_task(
+                task_id,
+                status=TaskStatus.RUNNING.value,
+                account_name="a",
+                allocation_id=allocation_id,
+                wrapper_pid=str(4000 + index),
+                attached_at="CURRENT_TIMESTAMP",
+            )
+        scheduler._fea_footprint_cache = None
         discounted = scheduler.fea_dynamic_extra_slots(allocation, task)
         self.assertLess(discounted, baseline)
+        # Once workers are older than the maturity window, observed pestat
+        # numbers are trusted again.
+        with self.db.connect() as conn:
+            conn.execute("UPDATE tasks SET attached_at = datetime('now', '-2 hours')")
+        scheduler._fea_footprint_cache = None
+        matured = scheduler.fea_dynamic_extra_slots(allocation, task)
+        self.assertGreater(matured, discounted)
 
     def test_fea_dynamic_extra_slots_caps_attaches_per_node_per_tick(self) -> None:
         self.db.replace_pestat_nodes(

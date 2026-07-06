@@ -134,6 +134,7 @@ class Scheduler:
         fea_pressure_max_attempts: int = 3,
         fea_max_attach_per_node_per_loop: int = 8,
         fea_node_requested_cpu_factor: float = 1.0,
+        fea_footprint_maturity_seconds: int = 900,
         task_refresh_max_per_tick: int = 32,
         cleanup_enabled: bool = True,
         cleanup_interval_seconds: int = 3600,
@@ -218,9 +219,8 @@ class Scheduler:
         self.fea_pressure_max_attempts = max(1, int(fea_pressure_max_attempts))
         self.fea_max_attach_per_node_per_loop = max(1, int(fea_max_attach_per_node_per_loop))
         self.fea_node_requested_cpu_factor = max(0.0, float(fea_node_requested_cpu_factor))
-        # Attaches since the last pestat refresh, per node; discounts budgets
-        # so a stale pestat row cannot dogpile one node.
-        self._attach_delta_by_node: dict[str, dict[str, float]] = {}
+        self.fea_footprint_maturity_seconds = max(0, int(fea_footprint_maturity_seconds))
+        self._fea_footprint_cache: tuple[int, dict[str, dict[str, float]]] | None = None
         self._tick_attach_workers_by_node: dict[str, int] = {}
         self._fea_pressures_cache: tuple[int, dict[str, dict[str, int]]] | None = None
         self._fea_overload_since_by_node: dict[str, float] = {}
@@ -877,9 +877,6 @@ class Scheduler:
                     pestat_result = ssh.run("pestat")
                     if pestat_result.exit_code == 0 and pestat_result.stdout.strip():
                         self.db.replace_pestat_nodes(parse_pestat(pestat_result.stdout))
-                        # Fresh node data supersedes the attach discounts accumulated
-                        # against the previous snapshot.
-                        self._attach_delta_by_node.clear()
                 return
             except Exception as exc:
                 LOGGER.warning("failed to refresh cluster state through %s: %s", account.name, exc)
@@ -2534,11 +2531,10 @@ class Scheduler:
         node_name = str(allocation.get("node_name") or "").strip()
         if not node_name:
             return
-        delta = self._attach_delta_by_node.setdefault(node_name, {"cpus": 0.0, "memory_mb": 0.0})
-        delta["cpus"] += float(task.get("cpus") or 0)
-        delta["memory_mb"] += float(task.get("memory_mb") or 0)
         self._tick_attach_workers_by_node[node_name] = self._tick_attach_workers_by_node.get(node_name, 0) + 1
+        # New ATTACHING rows change both the pressure and young-footprint views.
         self._fea_pressures_cache = None
+        self._fea_footprint_cache = None
 
     def fea_stale_node_recently_ok(self, allocation: dict) -> bool:
         """Fresh pestat is missing; look at the last (up to 3x stale) row. If
@@ -2730,6 +2726,54 @@ class Scheduler:
         self._fea_overload_scaled_nodes.add(node_name)
         return True
 
+    def fea_immature_footprint(self, node_name: str) -> dict[str, float]:
+        """Declared cpus/memory of FEA workers younger than the maturity window
+        on this node. FEA consumes its resources late (meshing refines over
+        time), so observed pestat free capacity overstates what is really
+        available while young workers are still growing into their footprint."""
+        empty = {"cpus": 0.0, "memory_mb": 0.0}
+        if self.fea_footprint_maturity_seconds <= 0 or not node_name:
+            return empty
+        cached = self._fea_footprint_cache
+        if cached is not None and cached[0] == self._tick_seq:
+            return cached[1].get(node_name, empty)
+        by_node = self._compute_fea_immature_footprints()
+        self._fea_footprint_cache = (self._tick_seq, by_node)
+        return by_node.get(node_name, empty)
+
+    def _compute_fea_immature_footprints(self) -> dict[str, dict[str, float]]:
+        live_states = {
+            AllocationStatus.PENDING.value,
+            AllocationStatus.WARM.value,
+            AllocationStatus.ACTIVE.value,
+            AllocationStatus.DRAINING.value,
+        }
+        node_by_allocation_id = {
+            int(allocation["id"]): str(allocation.get("node_name") or "")
+            for allocation in self.db.list_allocations(limit=500)
+            if allocation["state"] in live_states
+        }
+        now = self._now()
+        out: dict[str, dict[str, float]] = {}
+        for task in self.db.list_tasks(limit=5000):
+            if task["status"] not in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
+                continue
+            if not self.task_is_fea_bursty(task):
+                continue
+            node_name = node_by_allocation_id.get(int(task.get("allocation_id") or 0))
+            if not node_name:
+                continue
+            started = self._timestamp(
+                task.get("attached_at") or task.get("started_at") or task.get("created_at")
+            )
+            # Unknown start time counts as young: overcounting is the safe side.
+            if started is not None and (now - started).total_seconds() >= self.fea_footprint_maturity_seconds:
+                continue
+            entry = out.setdefault(node_name, {"cpus": 0.0, "memory_mb": 0.0})
+            entry["cpus"] += float(task.get("cpus") or 0)
+            entry["memory_mb"] += float(task.get("memory_mb") or 0)
+        return out
+
     def fea_dynamic_extra_slots(self, allocation: dict, task: dict) -> int:
         if allocation.get("state") == AllocationStatus.PENDING.value:
             return self.fea_max_attach_per_loop
@@ -2744,15 +2788,18 @@ class Scheduler:
             return 1 if self.fea_allocation_accepts_task(allocation) else 0
         if not self.fea_allocation_accepts_task(allocation):
             return 0
-        delta = self._attach_delta_by_node.get(node_name, {}) if node_name else {}
+        # Discount workers still growing into their declared footprint: FEA
+        # consumes CPU/RAM late (mesh refinement), so observed free capacity
+        # overstates what is really available.
+        footprint = self.fea_immature_footprint(node_name)
         memory_total = max(1, int(node.get("memory_mb") or 1))
-        memory_free = max(0, int(node.get("free_memory_mb") or 0) - int(delta.get("memory_mb") or 0))
+        memory_free = max(0, int(node.get("free_memory_mb") or 0) - int(footprint.get("memory_mb") or 0))
         soft_floor = int(memory_total * (self.fea_soft_memory_free_percent / 100.0))
         memory_budget = max(0, memory_free - soft_floor)
         memory_slots = memory_budget // max(1, int(task.get("memory_mb") or 1))
 
         cpu_total = max(1, int(node.get("cpu_total") or 1))
-        cpu_load = max(0.0, float(node.get("cpu_load") or 0.0)) + float(delta.get("cpus") or 0.0)
+        cpu_load = max(0.0, float(node.get("cpu_load") or 0.0)) + float(footprint.get("cpus") or 0.0)
         load_budget = max(0.0, (cpu_total * self.fea_load_target) - cpu_load)
         cpu_slots = int(load_budget // max(1, int(task.get("cpus") or 1)))
 

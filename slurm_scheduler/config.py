@@ -103,6 +103,7 @@ class AppConfig:
     fea_pressure_max_attempts: int = 3
     fea_max_attach_per_node_per_loop: int = 8
     fea_node_requested_cpu_factor: float = 1.0
+    fea_footprint_maturity_seconds: int = 900
     cleanup_enabled: bool = True
     cleanup_interval_seconds: int = 3600
     cleanup_finished_task_ttl_seconds: int = 259200
@@ -167,6 +168,7 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
             "pressure_max_attempts": "fea_pressure_max_attempts",
             "max_attach_per_node_per_loop": "fea_max_attach_per_node_per_loop",
             "node_requested_cpu_factor": "fea_node_requested_cpu_factor",
+            "footprint_maturity_seconds": "fea_footprint_maturity_seconds",
         }
         for source, target in mapping.items():
             if source in fea_bursty:

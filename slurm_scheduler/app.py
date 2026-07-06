@@ -399,6 +399,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         fea_pressure_max_attempts=config.fea_pressure_max_attempts,
         fea_max_attach_per_node_per_loop=config.fea_max_attach_per_node_per_loop,
         fea_node_requested_cpu_factor=config.fea_node_requested_cpu_factor,
+        fea_footprint_maturity_seconds=config.fea_footprint_maturity_seconds,
         cleanup_enabled=config.cleanup_enabled,
         cleanup_interval_seconds=config.cleanup_interval_seconds,
         cleanup_finished_task_ttl_seconds=config.cleanup_finished_task_ttl_seconds,
