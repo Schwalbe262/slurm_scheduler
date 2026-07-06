@@ -3,15 +3,19 @@
 <section class="panel">
   <div class="title-row">
     <h1>Task {{ task.id }}: {{ task.name }}</h1>
-    {% if task.status not in ["completed", "failed", "cancelled"] %}
-      <form
-        method="post"
-        action="/tasks/{{ task.id }}/cancel"
-        onsubmit="return confirm('Stop attached task {{ task.id }}?');"
-      >
-        <button class="danger" type="submit">Stop task</button>
-      </form>
-    {% endif %}
+    <div>
+      <button type="button" id="clone-task-button">Clone</button>
+      {% if task.status not in ["completed", "failed", "cancelled"] %}
+        <form
+          class="inline-form"
+          method="post"
+          action="/tasks/{{ task.id }}/cancel"
+          onsubmit="return confirm('Stop attached task {{ task.id }}?');"
+        >
+          <button class="danger" type="submit">Stop task</button>
+        </form>
+      {% endif %}
+    </div>
   </div>
   <div class="table-scroll">
     <table>
@@ -44,6 +48,23 @@
   </div>
 </section>
 
+{% if task.stdout_path or task.stderr_path %}
+<section class="panel">
+  <div class="title-row">
+    <h2>Logs</h2>
+    <span class="muted" id="log-updated-at"></span>
+  </div>
+  {% if task.stdout_path %}
+    <h3>stdout (tail)</h3>
+    <pre class="mono-cell" id="stdout-tail" style="max-height: 320px; overflow: auto;">loading...</pre>
+  {% endif %}
+  {% if task.stderr_path %}
+    <h3>stderr (tail)</h3>
+    <pre class="mono-cell" id="stderr-tail" style="max-height: 320px; overflow: auto;">loading...</pre>
+  {% endif %}
+</section>
+{% endif %}
+
 <section class="panel">
   <h2>Submission Payload</h2>
   <p class="muted">The original HTTP client is not stored, but this payload recreates the same task through the scheduler API.</p>
@@ -54,4 +75,49 @@
   <h3>Python requests</h3>
   <pre class="mono-cell">{{ submission.python }}</pre>
 </section>
+
+<script>
+  (() => {
+    const taskId = {{ task.id }};
+    const isTerminal = {{ "true" if task.status in ["completed", "failed", "cancelled"] else "false" }};
+    const cloneButton = document.getElementById("clone-task-button");
+    if (cloneButton) {
+      cloneButton.addEventListener("click", () => {
+        try {
+          localStorage.setItem("slurmScheduler.cloneTaskPayload", {{ submission.json | tojson }});
+        } catch (err) { /* storage unavailable */ }
+        window.location.assign("/");
+      });
+    }
+
+    const targets = [
+      ["stdout-tail", "/api/tasks/" + taskId + "/stdout?tail_lines=200&max_bytes=65536"],
+      ["stderr-tail", "/api/tasks/" + taskId + "/stderr?tail_lines=200&max_bytes=65536"],
+    ];
+    const stamp = document.getElementById("log-updated-at");
+    let timer = null;
+    async function refreshLogs() {
+      let any = false;
+      for (const [elementId, url] of targets) {
+        const element = document.getElementById(elementId);
+        if (!element) continue;
+        any = true;
+        try {
+          const response = await fetch(url);
+          const text = await response.text();
+          element.textContent = response.ok ? (text || "(empty)") : "(unavailable: " + response.status + ")";
+          element.scrollTop = element.scrollHeight;
+        } catch (err) {
+          element.textContent = "(fetch failed)";
+        }
+      }
+      if (any && stamp) stamp.textContent = "updated " + new Date().toLocaleTimeString();
+      if (isTerminal && timer) clearInterval(timer);
+    }
+    if (targets.some(([elementId]) => document.getElementById(elementId))) {
+      refreshLogs();
+      if (!isTerminal) timer = setInterval(refreshLogs, 7000);
+    }
+  })();
+</script>
 {% endblock %}

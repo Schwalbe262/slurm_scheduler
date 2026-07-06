@@ -842,7 +842,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             int(task["id"]): task
             for task in (active_running_rows + visible_queued_rows)
         }
-        queued_diagnostics_remaining = 5
+        queued_diagnostics_remaining = 25
         active_task_items = []
         for task in attach_task_elapsed(list(active_task_rows.values())):
             include_diagnostics = False
@@ -1506,6 +1506,20 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     @app.get("/api/events")
     def api_events(limit: int = 200) -> list[dict]:
         return db.list_events(limit=max(1, min(1000, limit)))
+
+    @app.get("/api/dashboard-summary")
+    def api_dashboard_summary() -> dict:
+        active_rows = db.list_tasks_by_statuses(["running", "attaching"], limit=5000)
+        queued_rows = db.list_tasks_by_statuses(["queued"], limit=5000)
+        allocations = db.list_allocations_with_live(limit=500, live_limit=10000)
+        allocated_rows = [
+            item for item in allocations if item["state"] in {"active", "warm", "draining", "closing"}
+        ]
+        return {
+            "tasks": task_activity_summary(active_rows + queued_rows),
+            "allocations": allocation_usage_summary(allocated_rows),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
 
     @app.get("/api/jobs/{job_id}")
     def api_job(job_id: int) -> dict:

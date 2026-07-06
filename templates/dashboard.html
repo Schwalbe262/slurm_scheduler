@@ -1,13 +1,12 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="stack">
-<section class="panel">
-  <h1>작업 등록</h1>
-  <div class="mode-tabs" role="tablist" aria-label="작업 등록 방식">
+<details id="submit-forms" class="panel">
+  <summary>작업 등록 — 원격 경로 실행 / Git</summary>
+  <div class="mode-tabs" role="tablist" aria-label="작업 등록 방식" style="margin-top: 14px;">
     <button type="button" class="mode-tab" data-submit-mode="task" aria-selected="true">원격 경로 실행</button>
     <button type="button" class="mode-tab" data-submit-mode="git" aria-selected="false">Git에서 받아 실행</button>
   </div>
-</section>
 <div class="forms-grid">
   <section class="panel submit-panel" id="job-submit-panel" data-submit-panel="job" hidden>
     <h1>Git에서 받아 실행</h1>
@@ -243,6 +242,7 @@
     </form>
   </section>
 </div>
+</details>
 
   <script>
     (() => {
@@ -391,7 +391,7 @@
   <section class="panel">
     <div class="title-row">
       <h2>Accounts</h2>
-      <button type="button" onclick="refreshAccounts()">Refresh accounts</button>
+      <button type="button" id="refresh-accounts-button" onclick="refreshAccounts()">Refresh accounts</button>
     </div>
     {% if snapshot_error %}<p class="error">{{ snapshot_error }}</p>{% endif %}
     <div class="table-scroll">
@@ -420,25 +420,36 @@
     </div>
     <script>
       async function refreshAccounts() {
-        const res = await fetch('/api/accounts/status/live');
-        const rows = await res.json();
-        const tbody = document.querySelector('#accounts-table tbody');
-        tbody.innerHTML = '';
-        for (const item of rows) {
-          const used = item.running + item.pending;
-          const storage = item.storage_used_gb !== null && item.storage_quota_gb
-            ? `${item.storage_used_gb.toFixed(2)} / ${item.storage_quota_gb.toFixed(2)} GB`
-            : 'not configured';
-          tbody.insertAdjacentHTML('beforeend', `
-            <tr>
-              <td>${item.account_name}</td>
-              <td>${used} / ${item.max_total}</td>
-              <td>${item.running}</td>
-              <td>${item.pending}</td>
-              <td>${storage}</td>
-              <td>${item.available ? 'yes' : 'no'}</td>
-            </tr>
-          `);
+        const button = document.getElementById('refresh-accounts-button');
+        const original = button.textContent;
+        button.disabled = true;
+        button.textContent = 'Refreshing…';
+        try {
+          const res = await fetch('/api/accounts/status/live');
+          const rows = await res.json();
+          const tbody = document.querySelector('#accounts-table tbody');
+          tbody.innerHTML = '';
+          for (const item of rows) {
+            const used = item.running + item.pending;
+            const storage = item.storage_used_gb !== null && item.storage_quota_gb
+              ? `${item.storage_used_gb.toFixed(2)} / ${item.storage_quota_gb.toFixed(2)} GB`
+              : 'not configured';
+            tbody.insertAdjacentHTML('beforeend', `
+              <tr>
+                <td>${item.account_name}</td>
+                <td>${used} / ${item.max_total}</td>
+                <td>${item.running}</td>
+                <td>${item.pending}</td>
+                <td>${storage}</td>
+                <td>${item.available ? 'yes' : 'no'}</td>
+              </tr>
+            `);
+          }
+        } catch (err) {
+          console.warn('account refresh failed', err);
+        } finally {
+          button.disabled = false;
+          button.textContent = original;
         }
       }
     </script>
@@ -560,19 +571,22 @@
   </section>
 
   <section class="panel">
-    <h2>Allocation Pool</h2>
+    <div class="title-row">
+      <h2>Allocation Pool</h2>
+      <span class="muted" data-live-updated-at></span>
+    </div>
     <div class="summary-row" aria-label="Allocation pool usage summary">
       <div class="summary-item">
         <span class="summary-label">CPU Used</span>
-        <span class="summary-value">{{ allocation_summary.cpu_used }} / {{ allocation_summary.cpu_total }}</span>
+        <span class="summary-value" data-allocation-summary="cpu">{{ allocation_summary.cpu_used }} / {{ allocation_summary.cpu_total }}</span>
       </div>
       <div class="summary-item">
         <span class="summary-label">GPU Used</span>
-        <span class="summary-value">{{ allocation_summary.gpu_used }} / {{ allocation_summary.gpu_total }}</span>
+        <span class="summary-value" data-allocation-summary="gpu">{{ allocation_summary.gpu_used }} / {{ allocation_summary.gpu_total }}</span>
       </div>
       <div class="summary-item">
         <span class="summary-label">Mem Used</span>
-        <span class="summary-value">{{ allocation_summary.memory_used_gb }} / {{ allocation_summary.memory_total_gb }} GB</span>
+        <span class="summary-value" data-allocation-summary="mem">{{ allocation_summary.memory_used_gb }} / {{ allocation_summary.memory_total_gb }} GB</span>
       </div>
       <div class="summary-item">
         <span class="summary-label">GPU Warm Pool</span>
@@ -732,7 +746,10 @@
   </section>
 
   <section class="panel">
-    <h2>Attached Tasks</h2>
+    <div class="title-row">
+      <h2>Attached Tasks</h2>
+      <span class="muted" data-live-updated-at></span>
+    </div>
     <div class="summary-row" aria-label="Attached task summary">
       <div class="summary-item">
         <span class="summary-label">Total</span>
@@ -855,7 +872,7 @@
       <summary>Finished tasks: {% if attached_task_name_filter %}matching{% else %}recent{% endif %} {{ finished_tasks|length }}{% if finished_task_count > finished_tasks|length %} of {{ finished_task_count }}{% endif %}{% if attached_task_name_filter %} for "{{ attached_task_name_filter }}"{% endif %}</summary>
       <div class="table-scroll section-gap">
         <table id="finished-tasks-table">
-          <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Allocation</th><th>Capability</th><th>Env</th><th>Scheduling</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Elapsed</th></tr></thead>
+          <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Allocation</th><th>Capability</th><th>Env</th><th>Scheduling</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Elapsed</th><th>Failure</th></tr></thead>
           <tbody id="finished-tasks-body">
           {% for task in finished_tasks %}
             <tr
@@ -888,11 +905,14 @@
               <td>{{ task.gpus or 0 }} {{ task.gpu_model }}</td>
               <td>{{ task.memory_mb }} MB</td>
               <td class="mono-cell">{{ task.elapsed_text or "" }}</td>
+              <td class="mono-cell{% if task.status == 'failed' %} error{% endif %}" title="{{ task.failure_message or '' }}">
+                {{ (task.failure_message or "")[:120] }}
+              </td>
             </tr>
           {% else %}
-            <tr><td colspan="11" class="muted">No finished tasks.</td></tr>
+            <tr><td colspan="12" class="muted">No finished tasks.</td></tr>
           {% endfor %}
-            <tr id="finished-task-no-filter-match" hidden><td colspan="11" class="muted">No matching finished tasks.</td></tr>
+            <tr id="finished-task-no-filter-match" hidden><td colspan="12" class="muted">No matching finished tasks.</td></tr>
           </tbody>
         </table>
       </div>
@@ -1373,6 +1393,72 @@
       );
     });
 
+  })();
+</script>
+
+<script>
+  (() => {
+    // Live summary refresh: keeps the headline numbers current without a
+    // full page reload (tables still refresh via the Refresh buttons).
+    const attached = (key) => document.querySelector(`[data-attached-summary="${key}"]`);
+    const allocation = (key) => document.querySelector(`[data-allocation-summary="${key}"]`);
+    const stamps = document.querySelectorAll("[data-live-updated-at]");
+    async function refreshSummaries() {
+      try {
+        const response = await fetch("/api/dashboard-summary");
+        if (!response.ok) return;
+        const data = await response.json();
+        const tasks = data.tasks || {};
+        const setText = (element, value) => { if (element && value !== undefined) element.textContent = value; };
+        setText(attached("total"), tasks.total);
+        setText(attached("running"), tasks.running);
+        setText(attached("attaching"), tasks.attaching);
+        setText(attached("queued"), tasks.queued);
+        setText(attached("standard"), tasks.standard);
+        setText(attached("gpu"), tasks.gpu);
+        setText(attached("same_node"), tasks.same_node);
+        if (attached("fea") && tasks.fea !== undefined) {
+          attached("fea").textContent = `${tasks.fea_running} / ${tasks.fea}`;
+        }
+        const pool = data.allocations || {};
+        setText(allocation("cpu"), `${pool.cpu_used} / ${pool.cpu_total}`);
+        setText(allocation("gpu"), `${pool.gpu_used} / ${pool.gpu_total}`);
+        setText(allocation("mem"), `${pool.memory_used_gb} / ${pool.memory_total_gb} GB`);
+        const stampText = "updated " + new Date().toLocaleTimeString();
+        stamps.forEach((element) => { element.textContent = stampText; });
+      } catch (err) { /* transient network error; retry next interval */ }
+    }
+    refreshSummaries();
+    setInterval(refreshSummaries, 20000);
+
+    // Clone-from-task prefill (set by the task detail page).
+    let payload = null;
+    try {
+      const raw = localStorage.getItem("slurmScheduler.cloneTaskPayload");
+      if (raw) {
+        localStorage.removeItem("slurmScheduler.cloneTaskPayload");
+        payload = JSON.parse(raw);
+      }
+    } catch (err) { payload = null; }
+    if (payload && typeof payload === "object") {
+      const submitDetails = document.getElementById("submit-forms");
+      if (submitDetails) submitDetails.open = true;
+      const form = document.querySelector('#task-submit-panel form');
+      if (form) {
+        for (const [key, value] of Object.entries(payload)) {
+          const field = form.elements.namedItem(key);
+          if (!field || value === null || value === undefined) continue;
+          if (field.tagName === "SELECT" && typeof value === "boolean") {
+            field.value = value ? "true" : "false";
+          } else if (typeof value === "boolean") {
+            field.value = value ? "true" : "false";
+          } else {
+            field.value = value;
+          }
+        }
+        document.getElementById("task-submit-panel").scrollIntoView({ behavior: "smooth" });
+      }
+    }
   })();
 </script>
 {% endblock %}
