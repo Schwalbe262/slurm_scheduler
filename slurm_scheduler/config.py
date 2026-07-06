@@ -57,6 +57,7 @@ class AppConfig:
     ssh_slow_command_timeout_seconds: int = 300
     scheduler_watchdog_enabled: bool = True
     scheduler_watchdog_stall_seconds: int = 0
+    scheduler_ssh_parallelism: int = 4
     cluster_refresh_interval_seconds: int = 120
     min_warm_allocations: int = 1
     allocation_partition: str = "auto"

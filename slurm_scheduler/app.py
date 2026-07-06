@@ -390,6 +390,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         cleanup_closed_allocation_ttl_seconds=config.cleanup_closed_allocation_ttl_seconds,
         watchdog_enabled=config.scheduler_watchdog_enabled,
         watchdog_stall_seconds=config.scheduler_watchdog_stall_seconds,
+        ssh_parallelism=config.scheduler_ssh_parallelism,
     )
 
     app = FastAPI(title="Slurm Scheduler")

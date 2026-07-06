@@ -5,9 +5,10 @@ import re
 import shlex
 import time
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import paramiko
 
@@ -52,6 +53,16 @@ class SSHSession:
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     def __enter__(self) -> "SSHSession":
+        self.ensure_connected()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def ensure_connected(self) -> None:
+        transport = self.client.get_transport()
+        if transport is not None and transport.is_active():
+            return
         self.client.connect(
             hostname=self.account.host,
             port=self.account.port,
@@ -59,10 +70,19 @@ class SSHSession:
             key_filename=self.account.private_key_path,
             timeout=20,
         )
-        return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def close(self) -> None:
         self.client.close()
+
+    def force_close(self) -> None:
+        """Close the transport from another thread; safe to call on a session
+        whose owner is blocked in a read — the read raises and unblocks."""
+        try:
+            transport = self.client.get_transport()
+            if transport is not None:
+                transport.close()
+        except Exception:
+            pass
 
     def _resolve_timeout(self, timeout: float | None | object) -> float | None:
         if timeout is _UNSET:
@@ -147,6 +167,79 @@ def remote_text_command(path: str, tail_lines: int = 0, max_bytes: int = 0) -> s
     if max_bytes > 0:
         return prefix + f"tail -c {int(max_bytes)} -- {quoted}"
     return prefix + f"cat {quoted}"
+
+
+@dataclass(frozen=True)
+class JobStateInfo:
+    status: JobStatus
+    raw_state: str = ""
+    pending_reason: str = ""
+    node_name: str = ""
+
+
+@dataclass(frozen=True)
+class TaskProbe:
+    status: JobStatus
+    exit_code: int | None = None
+
+
+def parse_squeue_table(output: str) -> dict[str, tuple[str, str, str]]:
+    """Parse `squeue -h -o "%i|%T|%R|%N"` into job_id -> (state, reason, node)."""
+    table: dict[str, tuple[str, str, str]] = {}
+    for line in output.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) < 2 or not parts[0].strip():
+            continue
+        job_id = parts[0].strip()
+        state = parts[1].strip()
+        reason = parts[2].strip() if len(parts) > 2 else ""
+        node = parts[3].strip() if len(parts) > 3 else ""
+        if node in {"(None)", "N/A", "None"}:
+            node = ""
+        table[job_id] = (state, reason, node)
+    return table
+
+
+def parse_sacct_states(output: str) -> dict[str, str]:
+    """Parse `sacct -n -X -o JobID,State` into job_id -> first state word."""
+    states: dict[str, str] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        job_id = parts[0].strip()
+        if not job_id or "." in job_id:
+            continue
+        states[job_id] = parts[1].strip()
+    return states
+
+
+def _task_probe_from_value(value: str) -> TaskProbe:
+    # Mirrors task_state(): RUNNING/garbage -> running, integer -> finished.
+    if value == "RUNNING":
+        return TaskProbe(status=JobStatus.RUNNING)
+    try:
+        exit_code = int(value)
+    except ValueError:
+        return TaskProbe(status=JobStatus.RUNNING)
+    if exit_code == 0:
+        return TaskProbe(status=JobStatus.COMPLETED, exit_code=0)
+    return TaskProbe(status=JobStatus.FAILED, exit_code=exit_code)
+
+
+def parse_task_probe_output(output: str) -> dict[int, str]:
+    """Parse batched task probe lines of the form `<task_id>|<value>`."""
+    probes: dict[int, str] = {}
+    for line in output.splitlines():
+        head, sep, value = line.partition("|")
+        if not sep:
+            continue
+        try:
+            task_id = int(head.strip())
+        except ValueError:
+            continue
+        probes[task_id] = value.strip()
+    return probes
 
 
 def parse_squeue_counts(output: str) -> tuple[int, int]:
@@ -564,9 +657,21 @@ class SlurmAccountClient:
         self.git_source_accounts = {item.name: item for item in (git_source_accounts or [])}
         self.command_timeout = command_timeout
         self.slow_command_timeout = slow_command_timeout
+        self._shared_session: SSHSession | None = None
 
-    def _open_session(self) -> SSHSession:
-        return SSHSession(self.account, default_timeout=self.command_timeout)
+    def bind_shared_session(self, session: SSHSession) -> None:
+        """Reuse one SSH session across calls (per scheduler tick). The owner
+        of the session is responsible for closing it."""
+        self._shared_session = session
+
+    @contextmanager
+    def _open_session(self) -> Iterator[SSHSession]:
+        if self._shared_session is not None:
+            self._shared_session.ensure_connected()
+            yield self._shared_session
+            return
+        with SSHSession(self.account, default_timeout=self.command_timeout) as ssh:
+            yield ssh
 
     def snapshot(self, storage_used_gb: float | None = None) -> AccountSnapshot:
         with self._open_session() as ssh:
@@ -849,6 +954,79 @@ class SlurmAccountClient:
         if sacct.exit_code == 0 and sacct.stdout.strip():
             return map_slurm_state(sacct.stdout.splitlines()[0].strip().split()[0])
         return JobStatus.SUBMITTED
+
+    def job_states(self, slurm_job_ids: list[str]) -> dict[str, JobStateInfo]:
+        """Resolve state/reason/node for many jobs with one squeue and chunked sacct.
+
+        squeue is user-scoped rather than `-j id,...` because one purged id makes
+        squeue fail for the whole list on common Slurm versions. Jobs missing from
+        both squeue and sacct stay SUBMITTED, matching state().
+        """
+        ids = [str(job_id).strip() for job_id in slurm_job_ids if str(job_id or "").strip()]
+        if not ids:
+            return {}
+        out: dict[str, JobStateInfo] = {}
+        with self._open_session() as ssh:
+            result = ssh.run('squeue -h -u "$USER" -o "%i|%T|%R|%N"')
+            table = parse_squeue_table(result.stdout) if result.exit_code == 0 else {}
+            for job_id in ids:
+                row = table.get(job_id)
+                if not row:
+                    continue
+                state, reason, node = row
+                out[job_id] = JobStateInfo(
+                    status=map_slurm_state(state),
+                    raw_state=state,
+                    pending_reason=reason if state in {"PD", "PENDING"} else "",
+                    node_name=node,
+                )
+            missing = [job_id for job_id in ids if job_id not in out]
+            for index in range(0, len(missing), 100):
+                chunk = missing[index : index + 100]
+                sacct = ssh.run(
+                    "sacct -n -X -o JobID,State -j " + ",".join(shlex.quote(job_id) for job_id in chunk)
+                )
+                if sacct.exit_code != 0:
+                    continue
+                states = parse_sacct_states(sacct.stdout)
+                for job_id in chunk:
+                    if job_id in states:
+                        out[job_id] = JobStateInfo(status=map_slurm_state(states[job_id]), raw_state=states[job_id])
+        for job_id in ids:
+            out.setdefault(job_id, JobStateInfo(status=JobStatus.SUBMITTED))
+        return out
+
+    def task_probes(self, tasks: list[dict]) -> dict[int, TaskProbe]:
+        """Batched task_state + task_exit_code: one shell command per 50 tasks."""
+        out: dict[int, TaskProbe] = {}
+        remote: list[dict] = []
+        for task in tasks:
+            task_id = int(task["id"])
+            if not str(task.get("exit_code_path") or ""):
+                out[task_id] = TaskProbe(status=JobStatus.RUNNING)
+            else:
+                remote.append(task)
+        if not remote:
+            return out
+        with self._open_session() as ssh:
+            for index in range(0, len(remote), 50):
+                chunk = remote[index : index + 50]
+                pieces = []
+                for task in chunk:
+                    task_id = int(task["id"])
+                    exit_path = shlex.quote(str(task["exit_code_path"]))
+                    piece = f"printf '%s|' {task_id}; if test -f {exit_path}; then head -n1 -- {exit_path}"
+                    wrapper_pid = str(task.get("wrapper_pid") or "").strip()
+                    if wrapper_pid:
+                        piece += f"; elif ps -p {shlex.quote(wrapper_pid)} >/dev/null 2>&1; then echo RUNNING"
+                    piece += "; else echo UNKNOWN; fi; echo"
+                    pieces.append(piece)
+                result = ssh.run("; ".join(pieces))
+                values = parse_task_probe_output(result.stdout) if result.exit_code == 0 else {}
+                for task in chunk:
+                    task_id = int(task["id"])
+                    out[task_id] = _task_probe_from_value(values.get(task_id, "UNKNOWN"))
+        return out
 
     def pending_reason(self, slurm_job_id: str) -> str:
         command = f"squeue -h -j {shlex.quote(slurm_job_id)} -o \"%R\""

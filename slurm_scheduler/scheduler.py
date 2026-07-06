@@ -8,18 +8,77 @@ import sys
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Callable
+from typing import Any, Callable
 
 from .config import AccountConfig
 from .db import Database
 from .inventory import CPU_PROFILES_BY_PARTITION, GPU_PRIORITY, gpu_model_candidates, normalize_gpu_model, parse_scontrol_nodes, parse_sinfo_nodes, partition_rank
 from .models import AccountSnapshot, AllocationStatus, JobStatus, SchedulingProfile, TaskStatus, normalize_scheduling_profile
 from .pestat import PestatNode, parse_pestat
-from .slurm import RemoteExecutionError, SSHSession, SlurmAccountClient
+from .slurm import JobStateInfo, RemoteExecutionError, SSHSession, SlurmAccountClient, TaskProbe
 
 LOGGER = logging.getLogger(__name__)
 ClientFactory = Callable[[AccountConfig], SlurmAccountClient]
+
+
+class AccountUnavailableThisTick(RuntimeError):
+    """The account already failed once this tick; skip it until the next tick."""
+
+
+class _TickClientCache:
+    """Per-thread cache of clients (and their shared SSH sessions) for one tick.
+
+    Real clients get one SSH session reused across all their commands; fakes
+    without bind_shared_session are cached as-is.
+    """
+
+    def __init__(self, client_factory: ClientFactory):
+        self._client_factory = client_factory
+        self._clients: dict[str, Any] = {}
+        self._sessions: dict[str, SSHSession] = {}
+        self._failed: set[str] = set()
+
+    def client(self, account: AccountConfig) -> Any:
+        if account.name in self._failed:
+            raise AccountUnavailableThisTick(f"account {account.name} marked unavailable this tick")
+        cached = self._clients.get(account.name)
+        if cached is not None:
+            return cached
+        client = self._client_factory(account)
+        bind = getattr(client, "bind_shared_session", None)
+        if callable(bind):
+            session = SSHSession(account, default_timeout=getattr(client, "command_timeout", None))
+            bind(session)
+            self._sessions[account.name] = session
+        self._clients[account.name] = client
+        return client
+
+    def mark_failed(self, account_name: str) -> None:
+        self._failed.add(account_name)
+        self._clients.pop(account_name, None)
+        session = self._sessions.pop(account_name, None)
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def close_all(self) -> None:
+        for session in self._sessions.values():
+            try:
+                session.close()
+            except Exception:
+                pass
+        self._sessions.clear()
+        self._clients.clear()
+        self._failed.clear()
+
+    def force_close_all(self) -> None:
+        for session in list(self._sessions.values()):
+            session.force_close()
 
 
 class Scheduler:
@@ -78,6 +137,7 @@ class Scheduler:
         cleanup_closed_allocation_ttl_seconds: int = 86400,
         watchdog_enabled: bool = True,
         watchdog_stall_seconds: int = 0,
+        ssh_parallelism: int = 4,
     ):
         self.db = db
         self.accounts = accounts
@@ -158,6 +218,13 @@ class Scheduler:
         self._watchdog_exit: Callable[[int], None] = os._exit
         self._tick_started_at: float | None = None
         self._tick_seq = 0
+        self._tick_local = threading.local()
+        self._tick_caches: set[_TickClientCache] = set()
+        self._tick_caches_lock = threading.Lock()
+        self.ssh_parallelism = max(1, int(ssh_parallelism))
+        self._ssh_executor = ThreadPoolExecutor(
+            max_workers=self.ssh_parallelism, thread_name_prefix="ssh-fanout"
+        )
 
     @property
     def gpu_prewarm_enabled(self) -> bool:
@@ -184,6 +251,37 @@ class Scheduler:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=10)
+        self._ssh_executor.shutdown(wait=False, cancel_futures=True)
+
+    def _fan_out_by_account(
+        self,
+        items_by_account: dict[str, list],
+        probe: Callable[[str, list], Any],
+        budget_seconds: float = 120.0,
+    ) -> dict[str, Any]:
+        """Run one probe per account concurrently; SSH stays in the workers,
+        the caller applies DB writes sequentially. A probe failure (or budget
+        overrun) is returned as the Exception instead of raising."""
+        results: dict[str, Any] = {}
+        if not items_by_account:
+            return results
+        if len(items_by_account) == 1:
+            account_name, items = next(iter(items_by_account.items()))
+            try:
+                results[account_name] = probe(account_name, items)
+            except Exception as exc:
+                results[account_name] = exc
+            return results
+        futures = {
+            account_name: self._ssh_executor.submit(probe, account_name, items)
+            for account_name, items in items_by_account.items()
+        }
+        for account_name, future in futures.items():
+            try:
+                results[account_name] = future.result(timeout=budget_seconds)
+            except Exception as exc:
+                results[account_name] = exc
+        return results
 
     def run_forever(self) -> None:
         while not self._stop.is_set():
@@ -254,31 +352,62 @@ class Scheduler:
         LOGGER.critical("scheduler thread stack:\n%s", stack)
 
     def _tick_sessions_force_close(self) -> None:
-        # Populated by the per-tick session cache (Phase 2); nothing to close yet.
-        return
+        with self._tick_caches_lock:
+            caches = list(self._tick_caches)
+        for cache in caches:
+            cache.force_close_all()
+
+    def _client(self, account: AccountConfig) -> Any:
+        """Client for tick-path calls: reuses this thread's per-tick session
+        cache when one is active, otherwise falls back to a fresh client (web
+        threads and tests)."""
+        cache = getattr(self._tick_local, "cache", None)
+        if cache is not None:
+            return cache.client(account)
+        return self.client_factory(account)
+
+    def _mark_account_failed_this_tick(self, account_name: str) -> None:
+        cache = getattr(self._tick_local, "cache", None)
+        if cache is not None:
+            cache.mark_failed(account_name)
+
+    @contextmanager
+    def _tick_client_cache(self):
+        cache = _TickClientCache(self.client_factory)
+        with self._tick_caches_lock:
+            self._tick_caches.add(cache)
+        self._tick_local.cache = cache
+        try:
+            yield cache
+        finally:
+            self._tick_local.cache = None
+            with self._tick_caches_lock:
+                self._tick_caches.discard(cache)
+            cache.close_all()
 
     def tick(self) -> None:
         self._tick_seq += 1
         self._tick_started_at = time.monotonic()
         try:
-            self.fail_stale_same_node_tasks()
-            self.enforce_cpu_partition_allocation_limits()
-            self.update_fea_overload_state()
-            self.assign_ready_same_node_tasks()
-            self.assign_ready_gpu_tasks()
-            self.assign_ready_standard_tasks()
-            self.assign_ready_fea_tasks(background=True)
-            self.refresh_cluster_state_if_due()
-            self.refresh_allocations()
-            self.refresh_tasks()
-            self.apply_allocation_lifecycle()
-            self.handle_fea_memory_pressure()
-            self.update_fea_overload_state()
-            self.assign_queued_tasks(include_fea=False)
-            self.maintain_allocation_pool()
-            self.refresh_submitted_jobs()
-            self.submit_next_queued_job()
-            self.cleanup_remote_artifacts_if_due()
+            with self._tick_client_cache():
+                self.fail_stale_same_node_tasks()
+                self.enforce_cpu_partition_allocation_limits()
+                self.update_fea_overload_state()
+                self.assign_ready_same_node_tasks()
+                self.assign_ready_gpu_tasks()
+                self.assign_ready_standard_tasks()
+                self.assign_ready_fea_tasks(background=True)
+                self.refresh_cluster_state_if_due()
+                self.refresh_allocations()
+                self.refresh_tasks()
+                self.apply_allocation_lifecycle()
+                self.handle_fea_memory_pressure()
+                self.update_fea_overload_state()
+                self.assign_queued_tasks(include_fea=False)
+                self.maintain_allocation_pool()
+                self.refresh_submitted_jobs()
+                self.submit_next_queued_job()
+                self.cleanup_remote_artifacts_if_due()
         finally:
             self._tick_started_at = None
 
@@ -383,7 +512,7 @@ class Scheduler:
         if not account or not self.is_safe_scheduler_artifact_path(account, remote_path, prefixes):
             return False
         try:
-            self.client_factory(account).remove_tree(remote_path)
+            self._client(account).remove_tree(remote_path)
         except Exception as exc:
             LOGGER.warning("failed to clean remote artifact %s on %s: %s", remote_path, account.name, exc)
             return False
@@ -398,7 +527,7 @@ class Scheduler:
         if not safe_paths:
             return set()
         try:
-            client = self.client_factory(account)
+            client = self._client(account)
             remove_trees = getattr(client, "remove_trees", None)
             if callable(remove_trees):
                 remove_trees(safe_paths)
@@ -624,6 +753,31 @@ class Scheduler:
             for node_name in candidate_nodes
         )
 
+    def _job_states(self, client, slurm_job_ids: list[str]) -> dict[str, JobStateInfo]:
+        """Batched job-state lookup with a per-id fallback for clients (fakes)
+        that only implement the singular methods."""
+        batched = getattr(client, "job_states", None)
+        if callable(batched):
+            return batched(slurm_job_ids)
+        out: dict[str, JobStateInfo] = {}
+        for slurm_job_id in slurm_job_ids:
+            status = client.state(slurm_job_id)
+            reason = client.pending_reason(slurm_job_id) if status == JobStatus.SUBMITTED else ""
+            node_name = client.allocation_node_name(slurm_job_id) if status == JobStatus.RUNNING else ""
+            out[slurm_job_id] = JobStateInfo(status=status, pending_reason=reason, node_name=node_name)
+        return out
+
+    def _task_probes(self, client, tasks: list[dict]) -> dict[int, TaskProbe]:
+        batched = getattr(client, "task_probes", None)
+        if callable(batched):
+            return batched(tasks)
+        out: dict[int, TaskProbe] = {}
+        for task in tasks:
+            status = client.task_state(task)
+            exit_code = client.task_exit_code(task) if status in {JobStatus.COMPLETED, JobStatus.FAILED} else None
+            out[int(task["id"])] = TaskProbe(status=status, exit_code=exit_code)
+        return out
+
     def refresh_allocations(self) -> None:
         accounts_by_name = {account.name: account for account in self.accounts}
         active_states = {
@@ -633,53 +787,58 @@ class Scheduler:
             AllocationStatus.DRAINING.value,
             AllocationStatus.CLOSING.value,
         }
+        by_account: dict[str, list[dict]] = {}
         for allocation in self.db.list_allocations_with_live(limit=500, live_limit=10000):
             if allocation["state"] not in active_states or not allocation.get("slurm_job_id"):
                 continue
-            account = accounts_by_name.get(allocation["account_name"])
-            if not account:
+            if allocation["account_name"] not in accounts_by_name:
                 continue
-            try:
-                client = self.client_factory(account)
-                status = client.state(allocation["slurm_job_id"])
-            except Exception as exc:
-                LOGGER.warning("failed to refresh allocation %s: %s", allocation["id"], exc)
-                continue
-            if status == JobStatus.RUNNING and allocation["state"] == AllocationStatus.PENDING.value:
-                node_name = str(allocation.get("node_name") or "")
-                if not node_name:
-                    try:
-                        node_name = client.allocation_node_name(allocation["slurm_job_id"])
-                    except Exception as exc:
-                        LOGGER.debug("failed to read allocation %s node name: %s", allocation["id"], exc)
-                self.db.update_allocation(
-                    allocation["id"],
-                    state=AllocationStatus.WARM.value,
-                    started_at="CURRENT_TIMESTAMP",
-                    pending_reason="",
-                    node_name=node_name or allocation.get("node_name") or "",
+            by_account.setdefault(allocation["account_name"], []).append(allocation)
+        outcomes = self._fan_out_by_account(
+            by_account,
+            lambda account_name, allocations: self._job_states(
+                self._client(accounts_by_name[account_name]),
+                [str(item["slurm_job_id"]) for item in allocations],
+            ),
+        )
+        for account_name, outcome in outcomes.items():
+            if isinstance(outcome, Exception):
+                LOGGER.warning(
+                    "failed to refresh %d allocations on %s: %s",
+                    len(by_account[account_name]),
+                    account_name,
+                    outcome,
                 )
-            elif status == JobStatus.RUNNING and not allocation.get("node_name"):
-                try:
-                    node_name = client.allocation_node_name(allocation["slurm_job_id"])
-                except Exception as exc:
-                    LOGGER.debug("failed to read allocation %s node name: %s", allocation["id"], exc)
-                    node_name = ""
-                if node_name:
-                    self.db.update_allocation(allocation["id"], node_name=node_name)
-            elif status == JobStatus.SUBMITTED and allocation["state"] == AllocationStatus.PENDING.value:
-                try:
-                    reason = client.pending_reason(allocation["slurm_job_id"])
-                except Exception as exc:
-                    LOGGER.debug("failed to read pending reason for allocation %s: %s", allocation["id"], exc)
-                    reason = ""
-                if reason and reason != (allocation.get("pending_reason") or ""):
-                    self.db.update_allocation(allocation["id"], pending_reason=reason)
-            elif status in {JobStatus.COMPLETED, JobStatus.CANCELLED}:
-                self.db.update_allocation(allocation["id"], state=AllocationStatus.CLOSED.value, closed_at="CURRENT_TIMESTAMP")
-            elif status == JobStatus.FAILED:
-                self.db.update_allocation(allocation["id"], state=AllocationStatus.FAILED.value, closed_at="CURRENT_TIMESTAMP")
+                self._mark_account_failed_this_tick(account_name)
+                continue
+            for allocation in by_account[account_name]:
+                info = outcome.get(str(allocation["slurm_job_id"]))
+                if info is None:
+                    continue
+                self._apply_allocation_state(allocation, info)
         self.recalculate_allocation_capacity()
+
+    def _apply_allocation_state(self, allocation: dict, info: JobStateInfo) -> None:
+        status = info.status
+        if status == JobStatus.RUNNING and allocation["state"] == AllocationStatus.PENDING.value:
+            self.db.update_allocation(
+                allocation["id"],
+                state=AllocationStatus.WARM.value,
+                started_at="CURRENT_TIMESTAMP",
+                pending_reason="",
+                node_name=allocation.get("node_name") or info.node_name or "",
+            )
+        elif status == JobStatus.RUNNING and not allocation.get("node_name"):
+            if info.node_name:
+                self.db.update_allocation(allocation["id"], node_name=info.node_name)
+        elif status == JobStatus.SUBMITTED and allocation["state"] == AllocationStatus.PENDING.value:
+            reason = info.pending_reason
+            if reason and reason != (allocation.get("pending_reason") or ""):
+                self.db.update_allocation(allocation["id"], pending_reason=reason)
+        elif status in {JobStatus.COMPLETED, JobStatus.CANCELLED}:
+            self.db.update_allocation(allocation["id"], state=AllocationStatus.CLOSED.value, closed_at="CURRENT_TIMESTAMP")
+        elif status == JobStatus.FAILED:
+            self.db.update_allocation(allocation["id"], state=AllocationStatus.FAILED.value, closed_at="CURRENT_TIMESTAMP")
 
     def refresh_tasks(self, max_tasks: int | None = None) -> None:
         accounts_by_name = {account.name: account for account in self.accounts}
@@ -688,43 +847,65 @@ class Scheduler:
             for task in self.db.list_tasks(limit=5000)
             if task["status"] in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}
         ]
+        by_account: dict[str, list[dict]] = {}
         for task in self.tasks_to_refresh(candidates, max_tasks=max_tasks):
             if self.task_timed_out(task):
                 self.cancel_timed_out_task(task)
                 continue
             if task["status"] == TaskStatus.ATTACHING.value and not task.get("exit_code_path"):
                 continue
-            if not task.get("account_name"):
+            if not task.get("account_name") or task["account_name"] not in accounts_by_name:
                 continue
-            account = accounts_by_name.get(task["account_name"])
-            if not account:
-                continue
-            try:
-                status = self.client_factory(account).task_state(task)
-            except Exception as exc:
-                LOGGER.warning("failed to refresh task %s: %s", task["id"], exc)
-                continue
-            if status == JobStatus.RUNNING:
-                if task["status"] != TaskStatus.RUNNING.value:
-                    self.db.update_task(task["id"], status=TaskStatus.RUNNING.value, started_at="CURRENT_TIMESTAMP")
-                continue
-            exit_code = self.client_factory(account).task_exit_code(task) if status in {JobStatus.COMPLETED, JobStatus.FAILED} else None
-            if status == JobStatus.COMPLETED:
-                self.db.update_task(task["id"], status=TaskStatus.COMPLETED.value, exit_code=exit_code, finished_at="CURRENT_TIMESTAMP")
-                self.close_allocation_after_exclusive_task(task)
-            elif status == JobStatus.CANCELLED:
-                self.db.update_task(task["id"], status=TaskStatus.CANCELLED.value, finished_at="CURRENT_TIMESTAMP")
-                self.close_allocation_after_exclusive_task(task)
-            elif status == JobStatus.FAILED:
-                self.db.update_task(
-                    task["id"],
-                    status=TaskStatus.FAILED.value,
-                    exit_code=exit_code,
-                    failure_message=task.get("failure_message") or self.task_stderr_failure_message(task, self.client_factory(account)),
-                    finished_at="CURRENT_TIMESTAMP",
+            by_account.setdefault(task["account_name"], []).append(task)
+        outcomes = self._fan_out_by_account(
+            by_account,
+            lambda account_name, tasks: self._task_probes(
+                self._client(accounts_by_name[account_name]), tasks
+            ),
+        )
+        for account_name, outcome in outcomes.items():
+            if isinstance(outcome, Exception):
+                LOGGER.warning(
+                    "failed to refresh %d tasks on %s: %s",
+                    len(by_account[account_name]),
+                    account_name,
+                    outcome,
                 )
-                self.close_allocation_after_exclusive_task(task)
+                self._mark_account_failed_this_tick(account_name)
+                continue
+            client = self._client(accounts_by_name[account_name])
+            for task in by_account[account_name]:
+                probe = outcome.get(int(task["id"]))
+                if probe is None:
+                    continue
+                self._apply_task_probe(task, probe, client)
         self.recalculate_allocation_capacity()
+
+    def _apply_task_probe(self, task: dict, probe: TaskProbe, client) -> None:
+        status = probe.status
+        if status == JobStatus.RUNNING:
+            if task["status"] != TaskStatus.RUNNING.value:
+                self.db.update_task(task["id"], status=TaskStatus.RUNNING.value, started_at="CURRENT_TIMESTAMP")
+            return
+        if status == JobStatus.COMPLETED:
+            self.db.update_task(task["id"], status=TaskStatus.COMPLETED.value, exit_code=probe.exit_code, finished_at="CURRENT_TIMESTAMP")
+            self.close_allocation_after_exclusive_task(task)
+        elif status == JobStatus.CANCELLED:
+            self.db.update_task(task["id"], status=TaskStatus.CANCELLED.value, finished_at="CURRENT_TIMESTAMP")
+            self.close_allocation_after_exclusive_task(task)
+        elif status == JobStatus.FAILED:
+            try:
+                failure_message = task.get("failure_message") or self.task_stderr_failure_message(task, client)
+            except Exception:
+                failure_message = task.get("failure_message") or ""
+            self.db.update_task(
+                task["id"],
+                status=TaskStatus.FAILED.value,
+                exit_code=probe.exit_code,
+                failure_message=failure_message,
+                finished_at="CURRENT_TIMESTAMP",
+            )
+            self.close_allocation_after_exclusive_task(task)
 
     def tasks_to_refresh(self, tasks: list[dict], max_tasks: int | None = None) -> list[dict]:
         limit = self.task_refresh_max_per_tick if max_tasks is None else int(max_tasks)
@@ -775,7 +956,7 @@ class Scheduler:
         account = self.account_by_name(str(task.get("account_name") or ""))
         if account:
             try:
-                self.client_factory(account).cancel_task(task)
+                self._client(account).cancel_task(task)
             except Exception as exc:
                 LOGGER.warning("failed to cancel timed out task %s remotely: %s", task["id"], exc)
         self.db.update_task(
@@ -978,7 +1159,7 @@ class Scheduler:
         self.db.update_allocation(allocation["id"], state=AllocationStatus.CLOSING.value, drain_reason=reason)
         if account and allocation.get("slurm_job_id"):
             try:
-                self.client_factory(account).cancel(allocation["slurm_job_id"])
+                self._client(account).cancel(allocation["slurm_job_id"])
             except Exception as exc:
                 self.db.update_allocation(
                     allocation["id"],
@@ -1204,7 +1385,7 @@ class Scheduler:
 
     def finish_reserved_task_attach(self, task: dict, allocation: dict, account: AccountConfig) -> bool:
         try:
-            result = self.client_factory(account).attach_task(task, allocation)
+            result = self._client(account).attach_task(task, allocation)
         except RemoteExecutionError as exc:
             self.db.update_task(
                 task["id"],
@@ -2091,7 +2272,7 @@ class Scheduler:
             account = self.account_by_name(str(task.get("account_name") or allocation.get("account_name") or ""))
             if account:
                 try:
-                    self.client_factory(account).cancel_task(task)
+                    self._client(account).cancel_task(task)
                 except Exception as exc:
                     LOGGER.warning("failed to cancel FEA task %s under memory pressure: %s", task["id"], exc)
             self.db.update_task(
@@ -2955,7 +3136,7 @@ class Scheduler:
             return None
         try:
             time_limit = self.gpu_prewarm_time_limit if resource_pool.startswith("gpu:") else self.allocation_time_limit
-            result = self.client_factory(account).submit_allocation(allocation, time_limit)
+            result = self._client(account).submit_allocation(allocation, time_limit)
         except Exception as exc:
             self.db.update_allocation(
                 allocation_id,
@@ -3694,14 +3875,22 @@ class Scheduler:
         now = time.time()
         if self._snapshot_cache and now - self._snapshot_cache[0] < self.poll_interval_seconds:
             return self._snapshot_cache[1]
+        accounts_by_name = {account.name: account for account in self.accounts}
+
+        def probe(account_name: str, _items: list) -> AccountSnapshot:
+            account = accounts_by_name[account_name]
+            client = self._client(account)
+            storage_used = self.cached_storage(account, client, now)
+            return client.snapshot(storage_used_gb=storage_used)
+
+        outcomes = self._fan_out_by_account({account.name: [] for account in self.accounts}, probe)
         snapshots = []
         for account in self.accounts:
-            client = self.client_factory(account)
-            try:
-                storage_used = self.cached_storage(account, client, now)
-                snapshots.append(client.snapshot(storage_used_gb=storage_used))
-            except Exception as exc:
-                LOGGER.warning("failed to refresh account snapshot for %s: %s", account.name, exc)
+            outcome = outcomes.get(account.name)
+            if isinstance(outcome, Exception) or outcome is None:
+                LOGGER.warning("failed to refresh account snapshot for %s: %s", account.name, outcome)
+                continue
+            snapshots.append(outcome)
         self._snapshot_cache = (now, snapshots)
         return snapshots
 
@@ -3767,7 +3956,7 @@ class Scheduler:
         self.db.update_job(job["id"], status=JobStatus.SUBMITTING.value, account_name=account.name)
         job = self.apply_dynamic_env_profile(job, account)
         try:
-            result = self.client_factory(account).submit(job)
+            result = self._client(account).submit(job)
         except RemoteExecutionError as exc:
             self.db.update_job(
                 job["id"],
@@ -3881,23 +4070,37 @@ class Scheduler:
 
     def refresh_submitted_jobs(self) -> None:
         accounts_by_name = {account.name: account for account in self.accounts}
+        by_account: dict[str, list[dict]] = {}
         for job in self.db.list_jobs(limit=500):
             if job["status"] not in {JobStatus.SUBMITTED.value, JobStatus.RUNNING.value}:
                 continue
             if not job["account_name"] or not job["slurm_job_id"]:
                 continue
-            account = accounts_by_name.get(job["account_name"])
-            if not account:
+            if job["account_name"] not in accounts_by_name:
                 continue
-            try:
-                status = self.client_factory(account).state(job["slurm_job_id"])
-            except Exception as exc:
-                LOGGER.warning("failed to refresh job %s: %s", job["id"], exc)
+            by_account.setdefault(job["account_name"], []).append(job)
+        outcomes = self._fan_out_by_account(
+            by_account,
+            lambda account_name, jobs: self._job_states(
+                self._client(accounts_by_name[account_name]),
+                [str(job["slurm_job_id"]) for job in jobs],
+            ),
+        )
+        for account_name, outcome in outcomes.items():
+            if isinstance(outcome, Exception):
+                LOGGER.warning(
+                    "failed to refresh %d jobs on %s: %s", len(by_account[account_name]), account_name, outcome
+                )
+                self._mark_account_failed_this_tick(account_name)
                 continue
-            updates = {"status": status.value}
-            if status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}:
-                updates["finished_at"] = "CURRENT_TIMESTAMP"
-            self.db.update_job(job["id"], **updates)
+            for job in by_account[account_name]:
+                info = outcome.get(str(job["slurm_job_id"]))
+                if info is None:
+                    continue
+                updates = {"status": info.status.value}
+                if info.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}:
+                    updates["finished_at"] = "CURRENT_TIMESTAMP"
+                self.db.update_job(job["id"], **updates)
 
     def cancel(self, job_id: int) -> None:
         job = self.db.get_job(job_id)
@@ -3909,7 +4112,7 @@ class Scheduler:
         account = next((item for item in self.accounts if item.name == job["account_name"]), None)
         if not account:
             raise ValueError("account not found")
-        self.client_factory(account).cancel(job["slurm_job_id"])
+        self._client(account).cancel(job["slurm_job_id"])
         self.db.update_job(job_id, status=JobStatus.CANCELLED.value, finished_at="CURRENT_TIMESTAMP")
 
     def cancel_task(self, task_id: int) -> None:
@@ -3921,7 +4124,7 @@ class Scheduler:
         account = self.account_by_name(str(task.get("account_name") or ""))
         if account and task["status"] in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
             try:
-                self.client_factory(account).cancel_task(task)
+                self._client(account).cancel_task(task)
             except Exception as exc:
                 LOGGER.warning("failed to cancel task %s remotely: %s", task_id, exc)
         self.db.update_task(task_id, status=TaskStatus.CANCELLED.value, finished_at="CURRENT_TIMESTAMP")
@@ -3948,7 +4151,7 @@ class Scheduler:
         if not account:
             return
         try:
-            self.client_factory(account).cancel_task(task)
+            self._client(account).cancel_task(task)
         except Exception as exc:
             LOGGER.warning("failed to cancel task %s remotely: %s", task.get("id"), exc)
 

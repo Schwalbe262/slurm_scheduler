@@ -17,9 +17,11 @@ from slurm_scheduler.inventory import parse_scontrol_nodes, parse_sinfo_nodes, p
 from slurm_scheduler.pestat import parse_pestat, plan_dynamic_allocations
 from slurm_scheduler.task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, TASK_ID_PLACEHOLDER, build_git_task_command
 from slurm_scheduler.slurm import (
+    JobStateInfo,
     RemoteCommandTimeout,
     RemoteExecutionError,
     SSHSession,
+    TaskProbe,
     apply_env_profile,
     background_wrapper_command,
     build_allocation_script,
@@ -28,8 +30,11 @@ from slurm_scheduler.slurm import (
     build_task_script,
     cancel_process_group_command,
     parse_du_gb,
+    parse_sacct_states,
     parse_sbatch_job_id,
     parse_squeue_counts,
+    parse_squeue_table,
+    parse_task_probe_output,
     remote_text_command,
     remote_execution_path,
     resolve_task_placeholders,
@@ -699,6 +704,25 @@ class FakeClient:
 
     def remove_trees(self, remote_paths: list[str]) -> None:
         self.removed.extend(remote_paths)
+
+    def job_states(self, slurm_job_ids: list[str]) -> dict[str, JobStateInfo]:
+        out = {}
+        for slurm_job_id in slurm_job_ids:
+            status = self.state(slurm_job_id)
+            out[slurm_job_id] = JobStateInfo(
+                status=status,
+                pending_reason=self.pending_reasons.get(slurm_job_id, "") if status == JobStatus.SUBMITTED else "",
+                node_name=self.allocation_node_name(slurm_job_id) if status == JobStatus.RUNNING else "",
+            )
+        return out
+
+    def task_probes(self, tasks: list[dict]) -> dict[int, TaskProbe]:
+        out = {}
+        for task in tasks:
+            status = self.task_state(task)
+            exit_code = self.task_exit_code(task) if status in {JobStatus.COMPLETED, JobStatus.FAILED} else None
+            out[int(task["id"])] = TaskProbe(status=status, exit_code=exit_code)
+        return out
 
 
 class BlockingAttachClient(FakeClient):
@@ -5065,6 +5089,82 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(summary["single_node_max_free_gpus"], 4)
         self.assertEqual(summary["single_node_max_free_cpus"], 4)
         self.assertEqual(summary["single_node_max_free_gpu_node"], "gpu-a6000")
+
+
+class BatchParserTests(unittest.TestCase):
+    def test_parse_squeue_table(self) -> None:
+        output = "\n".join(
+            [
+                "101|RUNNING|None|n001",
+                "102|PENDING|(Resources)|(None)",
+                "garbage-line",
+                "103|COMPLETING||n002",
+            ]
+        )
+        table = parse_squeue_table(output)
+        self.assertEqual(table["101"], ("RUNNING", "None", "n001"))
+        self.assertEqual(table["102"], ("PENDING", "(Resources)", ""))
+        self.assertEqual(table["103"], ("COMPLETING", "", "n002"))
+        self.assertNotIn("garbage-line", table)
+
+    def test_parse_sacct_states_skips_substeps_and_keeps_first_word(self) -> None:
+        output = "\n".join(
+            [
+                "201  COMPLETED",
+                "201.batch  COMPLETED",
+                "202  CANCELLED by 1000",
+                "",
+            ]
+        )
+        states = parse_sacct_states(output)
+        self.assertEqual(states, {"201": "COMPLETED", "202": "CANCELLED"})
+
+    def test_parse_task_probe_output(self) -> None:
+        output = "17|0\n18|RUNNING\n\n19|2\n20|UNKNOWN\nnoise\n"
+        probes = parse_task_probe_output(output)
+        self.assertEqual(probes, {17: "0", 18: "RUNNING", 19: "2", 20: "UNKNOWN"})
+
+
+class LegacyClientFallbackTests(unittest.TestCase):
+    """Scheduler must keep working with clients that only implement the
+    singular state/task_state methods (external fakes)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(f"{self.tmp.name}/scheduler.db")
+        self.db.init()
+        self.accounts = [AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)]
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_job_states_falls_back_to_singular_calls(self) -> None:
+        class LegacyClient:
+            def state(self, slurm_job_id: str) -> JobStatus:
+                return JobStatus.SUBMITTED
+
+            def pending_reason(self, slurm_job_id: str) -> str:
+                return "(Priority)"
+
+            def allocation_node_name(self, slurm_job_id: str) -> str:
+                return ""
+
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        states = scheduler._job_states(LegacyClient(), ["1", "2"])
+        self.assertEqual(states["1"].status, JobStatus.SUBMITTED)
+        self.assertEqual(states["1"].pending_reason, "(Priority)")
+
+    def test_task_probes_falls_back_to_singular_calls(self) -> None:
+        class LegacyClient:
+            def task_state(self, task: dict) -> JobStatus:
+                return JobStatus.FAILED
+
+            def task_exit_code(self, task: dict) -> int | None:
+                return 9
+
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        probes = scheduler._task_probes(LegacyClient(), [{"id": 5}])
+        self.assertEqual(probes[5], TaskProbe(status=JobStatus.FAILED, exit_code=9))
 
 
 class _FakeSSHChannel:
