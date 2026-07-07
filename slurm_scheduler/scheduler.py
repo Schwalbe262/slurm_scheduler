@@ -2624,16 +2624,20 @@ class Scheduler:
             slots = self.fea_max_attach_per_loop
             reserved_slots = int(allocation.get("_reserved_fea_slots") or 0)
             max_workers = int(task.get("max_workers_per_node") or 0)
-            if max_workers > 0:
-                node_name = str(allocation.get("node_name") or "")
-                if node_name:
-                    node_workers = self.allocation_worker_count_for_task(allocation, task)
-                    node_reserved_slots = self.reserved_fea_slots_for_node(reservation_allocations, node_name)
-                    dynamic_limit = self.fea_effective_worker_limit(allocation, task, node_workers, max_workers)
-                    slots = min(slots, max(0, dynamic_limit - node_workers - node_reserved_slots))
-                    reserved_slots = 0
-                else:
-                    slots = min(slots, max(0, max_workers - self.allocation_worker_count(int(allocation["id"]))))
+            node_name = str(allocation.get("node_name") or "")
+            if node_name:
+                # Always bound by the node-level dynamic limit (load/memory
+                # headroom, young-worker footprint, node CPU cap) — tasks
+                # without max_workers_per_node used to bypass it entirely,
+                # which both dogpiled nodes and made capacity look infinite
+                # to the demand scale-out.
+                node_workers = self.allocation_worker_count_for_task(allocation, task)
+                node_reserved_slots = self.reserved_fea_slots_for_node(reservation_allocations, node_name)
+                dynamic_limit = self.fea_effective_worker_limit(allocation, task, node_workers, max_workers)
+                slots = min(slots, max(0, dynamic_limit - node_workers - node_reserved_slots))
+                reserved_slots = 0
+            elif max_workers > 0:
+                slots = min(slots, max(0, max_workers - self.allocation_worker_count(int(allocation["id"]))))
             if self.task_requires_gpu(task):
                 gpu_slots = int(allocation.get("free_gpus") or 0) // max(1, int(task.get("gpus") or 1))
                 slots = min(slots, gpu_slots)

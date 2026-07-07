@@ -4015,7 +4015,7 @@ class SchedulerTests(unittest.TestCase):
         self.db.replace_pestat_nodes(
             parse_pestat(
                 "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
-                "n001 cpu1 mix 8 64 12.0 100000 65000 some_job\n"
+                "n001 cpu1 mix 8 64 12.0 100000 90000 some_job\n"
             )
         )
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, fea_max_attach_per_loop=8)
@@ -4024,10 +4024,13 @@ class SchedulerTests(unittest.TestCase):
             **standard,
             "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
         }
+        # Allocation-level hard slots (free_cpus=0/free_mem=0) are ignored for
+        # FEA, but the node-level budget (free memory above the soft floor,
+        # load headroom) always applies: (90000-60000)//8192 = 3 slots.
         self.assertIsNone(scheduler.best_allocation_for_task(standard))
         self.assertEqual(scheduler.best_allocation_for_task(fea)["id"], allocation_id)
         capacity = scheduler.task_fit_capacity(fea)
-        self.assertEqual(capacity["fit_slots"], 8)
+        self.assertEqual(capacity["fit_slots"], 3)
         self.assertEqual(capacity["memory_pressure_state"], "ok")
 
     def test_fea_bursty_max_workers_is_enforced_per_physical_node_for_reservations(self) -> None:
@@ -4986,6 +4989,54 @@ class SchedulerTests(unittest.TestCase):
         task = {"id": 10, "cpus": 4, "memory_mb": 8192}
         self.assertIsNone(scheduler.pestat_node_for_allocation(allocation))
         self.assertEqual(scheduler.fea_dynamic_extra_slots(allocation, task), 1)
+
+    def test_fea_fit_respects_node_cap_without_max_workers_per_node(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=48,
+            total_memory_mb=380000,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="alloc-1")
+        for index in range(12):
+            task_id = self.db.create_task(
+                TaskCreate(
+                    f"fea-{index}",
+                    "~/case",
+                    "run",
+                    cpus=4,
+                    memory_mb=4096,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                )
+            )
+            self.db.update_task(
+                task_id,
+                status=TaskStatus.RUNNING.value,
+                account_name="a",
+                allocation_id=allocation_id,
+                wrapper_pid=str(6000 + index),
+                attached_at=days_ago(1),
+                started_at=days_ago(1),
+            )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 48 4.0 380000 350000 busy\n"
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        allocation = self.db.get_allocation(allocation_id)
+        # 12 workers x 4 cpus = 48 == node cap: a max_workers_per_node=0 task
+        # must see zero fit slots here (it used to see fea_max_attach_per_loop).
+        queued = {
+            "id": 999,
+            "cpus": 4,
+            "memory_mb": 4096,
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+            "max_workers_per_node": 0,
+        }
+        self.assertEqual(scheduler.fit_slots_for_allocation(allocation, queued), 0)
 
     def test_fea_node_cpu_cap_limits_total_requested_cpus(self) -> None:
         allocation_id = self.db.create_allocation(
