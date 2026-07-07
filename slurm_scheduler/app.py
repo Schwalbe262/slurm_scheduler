@@ -438,6 +438,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         license_monitor_license_server=config.license_monitor_license_server,
         license_monitor_interval_seconds=config.license_monitor_interval_seconds,
         license_monitor_watch_features=config.license_monitor_watch_features,
+        license_monitor_display=config.license_monitor_display,
         cleanup_db_row_ttl_seconds=config.cleanup_db_row_ttl_seconds,
         cleanup_event_ttl_seconds=config.cleanup_event_ttl_seconds,
         watchdog_enabled=config.scheduler_watchdog_enabled,

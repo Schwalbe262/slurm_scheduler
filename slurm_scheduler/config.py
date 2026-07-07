@@ -129,6 +129,7 @@ class AppConfig:
     license_monitor_license_server: str = ""
     license_monitor_interval_seconds: int = 300
     license_monitor_watch_features: list[str] = field(default_factory=list)
+    license_monitor_display: dict[str, str] = field(default_factory=dict)
     cleanup_db_row_ttl_seconds: int = 1209600
     cleanup_event_ttl_seconds: int = 604800
     git_credentials: list[GitCredentialConfig] = field(default_factory=list)
@@ -194,6 +195,7 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
             "license_server": "license_monitor_license_server",
             "interval_seconds": "license_monitor_interval_seconds",
             "watch_features": "license_monitor_watch_features",
+            "display": "license_monitor_display",
         }.items():
             if source in license_monitor:
                 data[target] = license_monitor[source]

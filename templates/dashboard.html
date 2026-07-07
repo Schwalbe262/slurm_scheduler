@@ -749,25 +749,44 @@
       {% if license_usage.error %}
         <p class="error section-gap">{{ license_usage.error }}</p>
       {% endif %}
-      {% set watched = license_usage.features | default([]) | selectattr("feature", "in", license_watch_features) | list %}
-      {% set shown = (license_usage.in_use | default([])) + (watched | rejectattr("used", "gt", 0) | list) %}
-      {% if shown %}
-        <div class="table-scroll section-gap">
-          <table>
-            <thead><tr><th>Feature</th><th>Used</th><th>Total</th></tr></thead>
-            <tbody>
-            {% for item in shown %}
-              <tr>
-                <td class="mono-cell">{{ item.feature }}</td>
-                <td>{{ item.used }}</td>
-                <td>{{ item.total }}</td>
-              </tr>
-            {% endfor %}
-            </tbody>
-          </table>
+      {% if license_usage.display %}
+        <div class="summary-row section-gap" aria-label="ANSYS license usage">
+          {% for item in license_usage.display %}
+            <div class="summary-item">
+              <span class="summary-label">{{ item.label }}</span>
+              <span class="summary-value">{{ item.used }} / {{ item.total }}</span>
+            </div>
+          {% endfor %}
         </div>
-      {% elif license_usage and not license_usage.error %}
-        <p class="muted section-gap">No licenses in use ({{ license_usage.features|length }} features on {{ license_usage.server }}).</p>
+        {% set covered = license_usage.display | map(attribute="feature") | list %}
+        {% set extra = license_usage.in_use | default([]) | rejectattr("feature", "in", covered) | list %}
+        {% if extra %}
+          <p class="muted section-gap">
+            Other features in use:
+            {% for item in extra %}{{ item.feature }} {{ item.used }}/{{ item.total }}{% if not loop.last %}, {% endif %}{% endfor %}
+          </p>
+        {% endif %}
+      {% else %}
+        {% set watched = license_usage.features | default([]) | selectattr("feature", "in", license_watch_features) | list %}
+        {% set shown = (license_usage.in_use | default([])) + (watched | rejectattr("used", "gt", 0) | list) %}
+        {% if shown %}
+          <div class="table-scroll section-gap">
+            <table>
+              <thead><tr><th>Feature</th><th>Used</th><th>Total</th></tr></thead>
+              <tbody>
+              {% for item in shown %}
+                <tr>
+                  <td class="mono-cell">{{ item.feature }}</td>
+                  <td>{{ item.used }}</td>
+                  <td>{{ item.total }}</td>
+                </tr>
+              {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% elif license_usage and not license_usage.error %}
+          <p class="muted section-gap">No licenses in use ({{ license_usage.features|length }} features on {{ license_usage.server }}).</p>
+        {% endif %}
       {% endif %}
     </details>
   </section>

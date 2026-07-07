@@ -184,6 +184,7 @@ class Scheduler:
         license_monitor_license_server: str = "",
         license_monitor_interval_seconds: int = 300,
         license_monitor_watch_features: list[str] | None = None,
+        license_monitor_display: dict[str, str] | None = None,
         cleanup_db_row_ttl_seconds: int = 1209600,
         cleanup_event_ttl_seconds: int = 604800,
         watchdog_enabled: bool = True,
@@ -291,6 +292,7 @@ class Scheduler:
         self.license_monitor_license_server = license_monitor_license_server
         self.license_monitor_interval_seconds = max(60, int(license_monitor_interval_seconds))
         self.license_monitor_watch_features = list(license_monitor_watch_features or [])
+        self.license_monitor_display = dict(license_monitor_display or {})
         self._license_usage: dict = {}
         self._last_license_refresh_at = 0.0
         self._license_refresh_inflight = False
@@ -830,17 +832,42 @@ class Scheduler:
             )
             with SSHSession(account, default_timeout=90) as ssh:
                 result = ssh.run(command)
-            features = parse_lmstat_features(result.stdout)
+                features = parse_lmstat_features(result.stdout)
+                # The vendor daemon intermittently answers without the feature
+                # block while license checkouts churn; retry before trusting an
+                # empty snapshot, and fall back to the last good one.
+                for _attempt in range(2):
+                    if features:
+                        break
+                    time.sleep(5)
+                    result = ssh.run(command)
+                    features = parse_lmstat_features(result.stdout)
+            if not features and self._license_usage.get("features"):
+                previous = dict(self._license_usage)
+                previous["error"] = "lmstat returned no feature block; showing the last good snapshot"
+                self._license_usage = previous
+                return
             server_up = "license server UP" in result.stdout
             error = ""
             if not features and not server_up:
                 error = result.stdout.strip().splitlines()[-1][:200] if result.stdout.strip() else "no lmstat output"
+            by_name = {item["feature"]: item for item in features}
+            display = [
+                {
+                    "label": label,
+                    "feature": feature,
+                    "used": int(by_name.get(feature, {}).get("used") or 0),
+                    "total": int(by_name.get(feature, {}).get("total") or 0),
+                }
+                for label, feature in self.license_monitor_display.items()
+            ]
             self._license_usage = {
                 "checked_at": self._now().isoformat(),
                 "server": self.license_monitor_license_server,
                 "server_up": server_up,
                 "features": features,
                 "in_use": [item for item in features if item["used"] > 0],
+                "display": display,
                 "error": error,
             }
         except Exception as exc:
