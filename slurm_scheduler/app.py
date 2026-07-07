@@ -259,7 +259,9 @@ def allocation_sort_key(allocation: dict) -> tuple[int, int]:
     return (state_rank.get(str(allocation.get("state") or ""), 9), -int(allocation.get("id") or 0))
 
 
-def allocation_usage_summary(allocations: list[dict]) -> dict[str, int]:
+def allocation_usage_summary(allocations: list[dict], pending: int = 0) -> dict[str, int]:
+    node_names = {str(item.get("node_name") or "").strip() for item in allocations}
+    node_names.discard("")
     total_cpus = sum(int(item.get("total_cpus") or 0) for item in allocations)
     free_cpus = sum(int(item.get("free_cpus") or 0) for item in allocations)
     total_gpus = sum(int(item.get("total_gpus") or 0) for item in allocations)
@@ -275,6 +277,9 @@ def allocation_usage_summary(allocations: list[dict]) -> dict[str, int]:
         "memory_total_mb": total_memory_mb,
         "memory_used_gb": round(max(0, total_memory_mb - free_memory_mb) / 1024),
         "memory_total_gb": round(total_memory_mb / 1024),
+        "nodes": len(node_names),
+        "allocations": len(allocations),
+        "pending": max(0, int(pending)),
     }
 
 
@@ -860,7 +865,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             for item in active_allocations
             if item["state"] in {"active", "warm", "draining", "closing"}
         ]
-        allocation_summary = allocation_usage_summary(allocated_summary_rows)
+        allocation_summary = allocation_usage_summary(
+            allocated_summary_rows,
+            pending=sum(1 for item in active_allocations if item["state"] == "pending"),
+        )
         closed_allocations = [item for item in allocations if item["state"] in terminal_allocation_states]
         active_running_rows = db.list_tasks_by_statuses(
             ["running", "attaching"],
@@ -1652,9 +1660,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         allocated_rows = [
             item for item in allocations if item["state"] in {"active", "warm", "draining", "closing"}
         ]
+        pending_count = sum(1 for item in allocations if item["state"] == "pending")
         return {
             "tasks": task_activity_summary(active_rows + queued_rows),
-            "allocations": allocation_usage_summary(allocated_rows),
+            "allocations": allocation_usage_summary(allocated_rows, pending=pending_count),
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
 

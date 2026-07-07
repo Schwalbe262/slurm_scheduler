@@ -595,6 +595,10 @@
     </div>
     <div class="summary-row" aria-label="Allocation pool usage summary">
       <div class="summary-item">
+        <span class="summary-label">Nodes</span>
+        <span class="summary-value" data-allocation-summary="nodes">{{ allocation_summary.nodes }} ({{ allocation_summary.allocations }} pools{% if allocation_summary.pending %}, {{ allocation_summary.pending }} pending{% endif %})</span>
+      </div>
+      <div class="summary-item">
         <span class="summary-label">CPU Used</span>
         <span class="summary-value" data-allocation-summary="cpu">{{ allocation_summary.cpu_used }} / {{ allocation_summary.cpu_total }}</span>
       </div>
@@ -1534,6 +1538,11 @@
           attached("fea").textContent = `${tasks.fea_running} / ${tasks.fea}`;
         }
         const pool = data.allocations || {};
+        if (allocation("nodes") && pool.nodes !== undefined) {
+          let nodesText = `${pool.nodes} (${pool.allocations} pools`;
+          if (pool.pending) nodesText += `, ${pool.pending} pending`;
+          allocation("nodes").textContent = nodesText + ")";
+        }
         setText(allocation("cpu"), `${pool.cpu_used} / ${pool.cpu_total}`);
         setText(allocation("gpu"), `${pool.gpu_used} / ${pool.gpu_total}`);
         setText(allocation("mem"), `${pool.memory_used_gb} / ${pool.memory_total_gb} GB`);
