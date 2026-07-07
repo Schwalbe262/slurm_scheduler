@@ -89,6 +89,10 @@
           <input id="same_node_as_task_id" name="same_node_as_task_id" type="number" min="0" value="0">
         </div>
         <div>
+          <label for="job_priority">Priority</label>
+          <input id="job_priority" name="priority" type="number" value="0" title="높을수록 먼저 배정됩니다. 같은 값이면 먼저 제출한 순서.">
+        </div>
+        <div>
           <label for="exclusive_node">Exclusive node</label>
           <select id="exclusive_node" name="exclusive_node">
             <option value="false">No</option>
@@ -227,6 +231,11 @@
         <div>
           <label for="task_same_node_as_task_id">Same node as task ID</label>
           <input id="task_same_node_as_task_id" name="same_node_as_task_id" type="number" min="0" value="0">
+        </div>
+
+        <div>
+          <label for="task_priority">Priority</label>
+          <input id="task_priority" name="priority" type="number" value="0" title="높을수록 먼저 배정됩니다. 같은 값이면 먼저 제출한 순서.">
         </div>
 
         <div>
@@ -820,7 +829,7 @@
     </div>
     <div class="table-scroll">
       <table id="attached-tasks-table">
-        <thead><tr><th><input type="checkbox" id="select-all-tasks" aria-label="Select all visible tasks"></th><th>ID</th><th>Name</th><th>Status</th><th>Allocation</th><th>Capability</th><th>Env</th><th>Scheduling</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Queue reason</th><th>Elapsed</th><th>Action</th></tr></thead>
+        <thead><tr><th><input type="checkbox" id="select-all-tasks" aria-label="Select all visible tasks"></th><th>ID</th><th>Name</th><th>Status</th><th>Prio</th><th>Allocation</th><th>Capability</th><th>Env</th><th>Scheduling</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Queue reason</th><th>Elapsed</th><th>Action</th></tr></thead>
         <tbody id="attached-tasks-body">
         {% for task in tasks %}
           <tr
@@ -848,6 +857,23 @@
               {% endif %}
             </td>
             <td>{{ task.status }}</td>
+            <td>
+              {% if task.status == "queued" %}
+                <form class="inline-form" method="post" action="/tasks/{{ task.id }}/priority">
+                  <input
+                    class="compact-input"
+                    style="width: 58px;"
+                    name="priority"
+                    type="number"
+                    value="{{ task.priority or 0 }}"
+                    aria-label="Priority for task {{ task.id }}"
+                    onchange="this.form.submit()"
+                  >
+                </form>
+              {% else %}
+                {{ task.priority or 0 }}
+              {% endif %}
+            </td>
             <td>{{ task.allocation_id or "" }}</td>
             <td>{{ task.required_capability or "" }}</td>
             <td>{{ task.env_profile or "" }}</td>
@@ -870,9 +896,9 @@
             </td>
           </tr>
         {% else %}
-          <tr><td colspan="14" class="muted">No active attached tasks.</td></tr>
+          <tr><td colspan="15" class="muted">No active attached tasks.</td></tr>
         {% endfor %}
-          <tr id="attached-task-no-filter-match" hidden><td colspan="14" class="muted">No matching attached tasks.</td></tr>
+          <tr id="attached-task-no-filter-match" hidden><td colspan="15" class="muted">No matching attached tasks.</td></tr>
         </tbody>
       </table>
     </div>

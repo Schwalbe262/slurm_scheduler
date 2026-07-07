@@ -460,6 +460,15 @@ curl -sS -X POST "$SCHEDULER_URL/api/tasks/cancel?name_contains=crypto-sweep&sta
 curl -sS -X POST "$SCHEDULER_URL/api/tasks/cancel?task_ids=101,102,103"
 ```
 
+### `POST /api/tasks/{task_id}/priority`
+
+Changes the priority of a queued task (higher runs first; ties are FIFO). Returns `409` for tasks that already left the queue. The dashboard's queued rows expose the same control inline.
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/tasks/123/priority" \
+  -H "Content-Type: application/json" -d '{"priority": 10}'
+```
+
 ### `GET /api/tasks/{task_id}/remote-file`
 
 Reads a safe relative file path from the task account over SSH. `base` can be `remote_cwd`, `remote_dir`, `stdout`, `stderr`, `git_workdir`, or `git_repo`.

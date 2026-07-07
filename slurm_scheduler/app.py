@@ -1155,6 +1155,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         node_name: str = Form(""),
         exclusive_node: bool = Form(False),
         same_node_as_task_id: int = Form(0),
+        priority: int = Form(0),
     ) -> Response:
         task_id = db.create_task(
             TaskCreate(
@@ -1174,6 +1175,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 node_name=node_name,
                 exclusive_node=exclusive_node,
                 same_node_as_task_id=max(0, same_node_as_task_id),
+                priority=priority,
             )
         )
         maybe_assign_same_node_task(task_id)
@@ -1200,6 +1202,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         node_name: str = Form(""),
         exclusive_node: bool = Form(False),
         same_node_as_task_id: int = Form(0),
+        priority: int = Form(0),
     ) -> Response:
         command, payload_json = git_task_fields(repo_url, git_ref, entrypoint, arguments, git_credential_id)
         task_id = db.create_task(
@@ -1221,6 +1224,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 exclusive_node=exclusive_node,
                 same_node_as_task_id=max(0, same_node_as_task_id),
                 payload_json=payload_json,
+                priority=priority,
             )
         )
         maybe_assign_same_node_task(task_id)
@@ -1265,6 +1269,28 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     def set_gpu_prewarm_form(enabled: str = Form(...)) -> Response:
         scheduler.set_gpu_prewarm_enabled(enabled.strip().lower() in {"1", "true", "on", "yes"})
         return RedirectResponse("/", status_code=303)
+
+    @app.post("/tasks/{task_id}/priority")
+    def set_task_priority(task_id: int, priority: int = Form(...)) -> Response:
+        task = db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404)
+        if task["status"] != "queued":
+            raise HTTPException(status_code=409, detail="only queued tasks can be reprioritized")
+        db.update_task(task_id, priority=priority)
+        return RedirectResponse("/", status_code=303)
+
+    @app.post("/api/tasks/{task_id}/priority")
+    async def api_set_task_priority(task_id: int, request: Request) -> dict:
+        task = db.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404)
+        if task["status"] != "queued":
+            raise HTTPException(status_code=409, detail="only queued tasks can be reprioritized")
+        payload = await request.json()
+        priority = int(payload.get("priority") or 0)
+        db.update_task(task_id, priority=priority)
+        return {"id": task_id, "priority": priority}
 
     @app.post("/allocations/{allocation_id}/close")
     def close_allocation(allocation_id: int, force: bool = Form(False)) -> Response:

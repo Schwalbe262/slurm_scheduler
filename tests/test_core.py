@@ -5037,6 +5037,18 @@ class SchedulerTests(unittest.TestCase):
             uncapped.fea_effective_worker_limit(allocation, task, current_workers=10, base_limit=32), 32
         )
 
+    def test_reprioritized_task_moves_to_front_of_queue(self) -> None:
+        first = self.db.create_task(
+            TaskCreate("first", "~/case", "run", cpus=4, scheduling_profile=SchedulingProfile.FEA_BURSTY.value)
+        )
+        second = self.db.create_task(
+            TaskCreate("second", "~/case", "run", cpus=4, scheduling_profile=SchedulingProfile.FEA_BURSTY.value)
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        self.assertEqual([task["id"] for task in scheduler.queued_fea_tasks()], [first, second])
+        self.db.update_task(second, priority=10)
+        self.assertEqual([task["id"] for task in scheduler.queued_fea_tasks()], [second, first])
+
     def test_enforce_fea_node_cpu_cap_drains_newest_workers_gradually(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",
