@@ -100,6 +100,7 @@ class TaskCreate:
     max_workers_per_node: int = 0
     same_node_as_task_id: int = 0
     payload_json: str = ""
+    cleanup_globs: str = ""
 
 
 @dataclass(frozen=True)

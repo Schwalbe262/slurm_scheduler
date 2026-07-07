@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     max_workers_per_node INTEGER NOT NULL DEFAULT 0,
     same_node_as_task_id INTEGER NOT NULL DEFAULT 0,
     payload_json TEXT NOT NULL DEFAULT '',
+    cleanup_globs TEXT NOT NULL DEFAULT '',
     exit_code INTEGER,
     attempt_count INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL,
@@ -406,6 +407,7 @@ class Database:
                 "max_workers_per_node": "INTEGER NOT NULL DEFAULT 0",
                 "same_node_as_task_id": "INTEGER NOT NULL DEFAULT 0",
                 "payload_json": "TEXT NOT NULL DEFAULT ''",
+                "cleanup_globs": "TEXT NOT NULL DEFAULT ''",
                 "exit_code": "INTEGER",
                 "attempt_count": "INTEGER NOT NULL DEFAULT 0",
             },
@@ -482,8 +484,8 @@ class Database:
                 INSERT INTO tasks (
                     name, remote_cwd, command, env_setup, required_capability, env_profile, account_name, cpus, memory_mb,
                     scheduling_profile, gpus, gpu_model, partition, node_name, exclusive_node, priority, timeout_seconds, dedupe_key,
-                    max_workers_per_node, same_node_as_task_id, payload_json, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    max_workers_per_node, same_node_as_task_id, payload_json, cleanup_globs, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.name,
@@ -507,6 +509,7 @@ class Database:
                     task.max_workers_per_node,
                     max(0, int(task.same_node_as_task_id or 0)),
                     task.payload_json,
+                    task.cleanup_globs,
                     TaskStatus.QUEUED.value,
                 ),
             )
@@ -613,6 +616,20 @@ class Database:
                 (*statuses, *name_params),
             ).fetchone()
             return int(row["count"]) if row else 0
+
+    def count_tasks_grouped_by_status(self, name_prefix: str = "") -> dict[str, int]:
+        prefix_filter = ""
+        params: tuple[Any, ...] = ()
+        if name_prefix:
+            escaped = name_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            prefix_filter = " WHERE name LIKE ? ESCAPE '\\'"
+            params = (f"{escaped}%",)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT status, COUNT(*) AS count FROM tasks{prefix_filter} GROUP BY status",
+                params,
+            ).fetchall()
+            return {str(row["status"]): int(row["count"]) for row in rows}
 
     def next_queued_task(self) -> dict[str, Any] | None:
         with self.connect() as conn:

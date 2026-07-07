@@ -20,7 +20,15 @@ from .db import Database
 from .inventory import CPU_PROFILES_BY_PARTITION, GPU_PRIORITY, gpu_model_candidates, normalize_gpu_model, parse_scontrol_nodes, parse_sinfo_nodes, partition_rank
 from .models import AccountSnapshot, AllocationStatus, JobStatus, SchedulingProfile, TaskStatus, normalize_scheduling_profile
 from .pestat import PestatNode, parse_pestat
-from .slurm import JobStateInfo, RemoteExecutionError, SSHSession, SlurmAccountClient, TaskProbe
+from .slurm import (
+    JobStateInfo,
+    RemoteExecutionError,
+    SSHSession,
+    SlurmAccountClient,
+    TaskProbe,
+    resolve_task_placeholders,
+    shell_path,
+)
 
 LOGGER = logging.getLogger(__name__)
 ClientFactory = Callable[[AccountConfig], SlurmAccountClient]
@@ -153,6 +161,9 @@ class Scheduler:
         cleanup_workspace_prune_globs: list[str] | None = None,
         cleanup_workspace_prune_interval_seconds: int = 21600,
         cleanup_workspace_prune_min_age_seconds: int = 86400,
+        cleanup_finished_task_log_max_bytes: int = 0,
+        cleanup_finished_task_log_trim_after_seconds: int = 86400,
+        storage_guard_min_free_gb: float = 0.0,
         cleanup_db_row_ttl_seconds: int = 1209600,
         cleanup_event_ttl_seconds: int = 604800,
         watchdog_enabled: bool = True,
@@ -250,6 +261,10 @@ class Scheduler:
         self.cleanup_workspace_prune_interval_seconds = max(3600, int(cleanup_workspace_prune_interval_seconds))
         self.cleanup_workspace_prune_min_age_seconds = max(3600, int(cleanup_workspace_prune_min_age_seconds))
         self._last_workspace_prune_at = 0.0
+        self.cleanup_finished_task_log_max_bytes = max(0, int(cleanup_finished_task_log_max_bytes))
+        self.cleanup_finished_task_log_trim_after_seconds = max(3600, int(cleanup_finished_task_log_trim_after_seconds))
+        self.storage_guard_min_free_gb = max(0.0, float(storage_guard_min_free_gb))
+        self._storage_guard_warned_at: dict[str, float] = {}
         self.reconcile_on_start = reconcile_on_start
         self._needs_reconcile = False
         self.backup_enabled = backup_enabled
@@ -637,8 +652,40 @@ class Scheduler:
         self.cleanup_finished_jobs()
         self.cleanup_closed_allocations()
         self.prune_database_rows()
+        self.trim_finished_task_logs()
         self.sweep_orphan_remote_artifacts_if_due()
         self.prune_workspace_artifacts_if_due()
+
+    def trim_finished_task_logs(self) -> None:
+        """Terminal tasks keep full stdout/stderr (used for CSV harvesting)
+        only briefly; after the trim window the logs are truncated to a tail
+        so the TTL window does not accumulate multi-MB logs per task."""
+        max_bytes = self.cleanup_finished_task_log_max_bytes
+        if max_bytes <= 0:
+            return
+        cutoff = self._cleanup_cutoff_timestamp(self.cleanup_finished_task_log_trim_after_seconds)
+        terminal = [TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value]
+        by_account: dict[str, tuple[AccountConfig, list[str]]] = {}
+        for task in self.db.list_finished_tasks_for_cleanup(terminal, cutoff, limit=500):
+            account = self.account_by_name(str(task.get("account_name") or ""))
+            remote_dir = str(task.get("remote_dir") or "")
+            if not account or not self.is_safe_scheduler_artifact_path(account, remote_dir, ("task-",)):
+                continue
+            paths = [str(path) for path in (task.get("stdout_path"), task.get("stderr_path")) if path]
+            if paths:
+                by_account.setdefault(account.name, (account, []))[1].extend(paths)
+        for account, paths in by_account.values():
+            pieces = [
+                f'f={shlex.quote(path)}; if [ -f "$f" ] && [ "$(wc -c < "$f")" -gt {max_bytes} ]; '
+                f'then tail -c {max_bytes} "$f" > "$f.trim" && mv "$f.trim" "$f"; fi'
+                for path in paths
+            ]
+            try:
+                with SSHSession(account, default_timeout=300) as ssh:
+                    for index in range(0, len(pieces), 100):
+                        ssh.run("; ".join(pieces[index : index + 100]))
+            except Exception as exc:
+                LOGGER.warning("failed to trim finished task logs on %s: %s", account.name, exc)
 
     @staticmethod
     def _workspace_prune_glob_ok(glob_pattern: str) -> bool:
@@ -1304,9 +1351,11 @@ class Scheduler:
                 entity_id=task["id"],
                 account_name=str(task.get("account_name") or ""),
             )
+            self.on_task_terminal(task, "completed")
             self.close_allocation_after_exclusive_task(task)
         elif status == JobStatus.CANCELLED:
             self.db.update_task(task["id"], status=TaskStatus.CANCELLED.value, finished_at="CURRENT_TIMESTAMP")
+            self.on_task_terminal(task, "cancelled")
             self.close_allocation_after_exclusive_task(task)
         elif status == JobStatus.FAILED:
             try:
@@ -1327,6 +1376,7 @@ class Scheduler:
                 entity_id=task["id"],
                 account_name=str(task.get("account_name") or ""),
             )
+            self.on_task_terminal(task, "failed")
             self.close_allocation_after_exclusive_task(task)
 
     def tasks_to_refresh(self, tasks: list[dict], max_tasks: int | None = None) -> list[dict]:
@@ -1388,6 +1438,7 @@ class Scheduler:
             exit_code=124,
             finished_at="CURRENT_TIMESTAMP",
         )
+        self.on_task_terminal(task, "timed out")
         self.close_allocation_after_exclusive_task(task)
         self.recalculate_allocation_capacity()
 
@@ -1543,6 +1594,7 @@ class Scheduler:
                     failure_message=message,
                     finished_at="CURRENT_TIMESTAMP",
                 )
+                self.on_task_terminal(task, "allocation lost")
 
     def fail_stale_same_node_tasks(self) -> None:
         terminal = {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}
@@ -1570,6 +1622,7 @@ class Scheduler:
                 failure_message=message,
                 finished_at="CURRENT_TIMESTAMP",
             )
+            self.on_task_terminal(task, "failed")
             if task.get("allocation_id"):
                 self.recalculate_allocation_capacity()
 
@@ -1772,6 +1825,37 @@ class Scheduler:
             if self.assign_queued_task(task, background=background):
                 attached += 1
 
+    def account_storage_blocked(self, account: AccountConfig) -> bool:
+        """Quota guard: hold new attaches when the account's storage headroom
+        is below the threshold, instead of letting tasks start and cascade
+        into disk-quota-exceeded failures."""
+        if self.storage_guard_min_free_gb <= 0 or not account.storage_quota_gb:
+            return False
+        cached = self._storage_cache.get(account.name)
+        used = cached[1] if cached else None
+        if used is None:
+            return False
+        free_gb = float(account.storage_quota_gb) - float(used)
+        if free_gb >= self.storage_guard_min_free_gb:
+            return False
+        now = time.monotonic()
+        if now - self._storage_guard_warned_at.get(account.name, 0.0) > 3600:
+            self._storage_guard_warned_at[account.name] = now
+            LOGGER.warning(
+                "storage guard holding attaches on %s: %.1f GB free (< %.1f GB)",
+                account.name,
+                free_gb,
+                self.storage_guard_min_free_gb,
+            )
+            self.record_event(
+                "storage_guard",
+                f"attaches held: {free_gb:.1f} GB free is below the {self.storage_guard_min_free_gb:g} GB threshold",
+                entity_type="account",
+                entity_id=account.name,
+                account_name=account.name,
+            )
+        return True
+
     def assign_queued_task(self, task: dict, background: bool = False) -> bool:
         if task.get("status") != TaskStatus.QUEUED.value:
             return False
@@ -1780,6 +1864,8 @@ class Scheduler:
             return False
         account = next((item for item in self.accounts if item.name == allocation["account_name"]), None)
         if not account:
+            return False
+        if self.account_storage_blocked(account):
             return False
         task = self.reserve_task_on_allocation(task, allocation, account)
         if background:
@@ -1821,7 +1907,7 @@ class Scheduler:
         try:
             result = self._client(account).attach_task(task, allocation)
         except RemoteExecutionError as exc:
-            if not self.db.update_task_if_status(
+            if self.db.update_task_if_status(
                 task["id"],
                 [TaskStatus.ATTACHING.value],
                 status=TaskStatus.FAILED.value,
@@ -1829,17 +1915,21 @@ class Scheduler:
                 finished_at="CURRENT_TIMESTAMP",
                 **exc.result_fields,
             ):
+                self.on_task_terminal(task, "attach failed")
+            else:
                 LOGGER.info("attach failure for task %s ignored; task already transitioned", task["id"])
             self.recalculate_allocation_capacity()
             return False
         except Exception as exc:
-            if not self.db.update_task_if_status(
+            if self.db.update_task_if_status(
                 task["id"],
                 [TaskStatus.ATTACHING.value],
                 status=TaskStatus.FAILED.value,
                 failure_message=str(exc),
                 finished_at="CURRENT_TIMESTAMP",
             ):
+                self.on_task_terminal(task, "attach failed")
+            else:
                 LOGGER.info("attach failure for task %s ignored; task already transitioned", task["id"])
             self.recalculate_allocation_capacity()
             return False
@@ -3028,6 +3118,52 @@ class Scheduler:
         if rebalanced:
             self.recalculate_allocation_capacity()
 
+    def on_task_terminal(self, task: dict, state: str = "terminal") -> None:
+        """Run the task's declared cleanup on EVERY terminal path (completed,
+        failed, cancelled, timed out, allocation lost) — shell-level cleanup
+        inside the task command cannot cover cancel/kill because nothing after
+        the killed process runs. Only the scheduler sees all exits."""
+        globs = [
+            g.strip()
+            for g in str(task.get("cleanup_globs") or "").split(",")
+            if g.strip() and self._workspace_prune_glob_ok(g)
+        ]
+        if not globs:
+            return
+        account = self.account_by_name(str(task.get("account_name") or ""))
+        if not account:
+            return
+        threading.Thread(
+            target=self._cleanup_task_workdir,
+            args=(dict(task), account, globs, state),
+            name=f"task-cleanup-{task.get('id')}",
+            daemon=True,
+        ).start()
+
+    def _cleanup_task_workdir(self, task: dict, account: AccountConfig, globs: list[str], state: str) -> None:
+        try:
+            resolved = resolve_task_placeholders(task, account)
+            cwd = str(resolved.get("remote_cwd") or "").strip()
+            normalized = self._normalize_remote_path(cwd)
+            if not cwd or normalized in {"", ".", "/", "~"}:
+                return
+            name_expr = " -o ".join(f"-name {shlex.quote(g)}" for g in globs)
+            command = (
+                f"find {shell_path(cwd)} -mindepth 1 -maxdepth 1 \\( {name_expr} \\) -prune "
+                "-exec rm -rf {} + 2>/dev/null; true"
+            )
+            with SSHSession(account, default_timeout=600) as ssh:
+                ssh.run(command)
+            self.record_event(
+                "task_cleanup",
+                f"cleaned {', '.join(globs)} in {cwd} after task {task.get('name') or task.get('id')} ended ({state})",
+                entity_type="task",
+                entity_id=task.get("id") or "",
+                account_name=account.name,
+            )
+        except Exception as exc:
+            LOGGER.warning("terminal cleanup failed for task %s: %s", task.get("id"), exc)
+
     def requeue_task_for_rebalance(self, task: dict, reason: str) -> None:
         """Requeue without touching attempt_count: the worker was placed by a
         policy the scheduler has since corrected, not by its own failure."""
@@ -3113,6 +3249,7 @@ class Scheduler:
                 failure_message=f"memory pressure hard limit after {attempts} attempts",
                 finished_at="CURRENT_TIMESTAMP",
             )
+            self.on_task_terminal(task, "failed")
             return
         LOGGER.info(
             "requeueing FEA task %s after memory-pressure kill (attempt %d/%d)",
@@ -5059,6 +5196,7 @@ class Scheduler:
             except Exception as exc:
                 LOGGER.warning("failed to cancel task %s remotely: %s", task_id, exc)
         self.db.update_task(task_id, status=TaskStatus.CANCELLED.value, finished_at="CURRENT_TIMESTAMP")
+        self.on_task_terminal(task, "cancelled")
         if task.get("allocation_id"):
             self.recalculate_allocation_capacity()
 
@@ -5070,6 +5208,7 @@ class Scheduler:
         if previous_status in {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}:
             return {"ok": True, "id": task_id, "previous_status": previous_status, "status": previous_status}
         self.db.update_task(task_id, status=TaskStatus.CANCELLED.value, finished_at="CURRENT_TIMESTAMP")
+        self.on_task_terminal(task, "cancelled")
         if task.get("allocation_id"):
             self.recalculate_allocation_capacity()
         if previous_status in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:

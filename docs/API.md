@@ -412,6 +412,7 @@ Fields:
 - `dedupe_key`: if another non-terminal task has the same key, the API returns that task instead of creating a duplicate.
 - `max_workers_per_node`: baseline per-node worker limit. For `fea_bursty`, the scheduler can exceed this baseline when live `pestat` CPU load and free-memory budget show the node can safely accept more tasks.
 - `same_node_as_task_id`: co-locates this task with the referenced running task's actual node. `same_node_as` is accepted as a shorter alias.
+- `cleanup_globs`: list (or comma string) of basename patterns, e.g. `["simulation", "aedt_temp"]`. When the task reaches ANY terminal state — completed, failed, cancelled, timed out, or its allocation was lost — the scheduler deletes matching entries directly under the task's working directory. Use this instead of shell-level `rm` at the end of your command: a killed process never reaches its trailing cleanup, but the scheduler sees every exit path. Bare wildcards and path separators are rejected.
 
 ### `GET /api/tasks/{task_id}`
 
@@ -459,6 +460,20 @@ Bulk-cancels tasks matching a name substring and status list, or an explicit id 
 curl -sS -X POST "$SCHEDULER_URL/api/tasks/cancel?name_contains=crypto-sweep&statuses=queued,attaching,running"
 curl -sS -X POST "$SCHEDULER_URL/api/tasks/cancel?task_ids=101,102,103"
 ```
+
+### `GET /api/tasks/summary`
+
+Counts by status, optionally scoped to a campaign name prefix. Use this for progress polling instead of listing every task.
+
+```bash
+curl -sS "$SCHEDULER_URL/api/tasks/summary?name_prefix=mft-camp-w1"
+```
+
+```json
+{"name_prefix": "mft-camp-w1", "total": 400, "statuses": {"queued": 120, "running": 40, "completed": 235, "failed": 5}}
+```
+
+`GET /api/tasks` also accepts `limit` and `name_prefix` query parameters for bounded campaign harvesting.
 
 ### `POST /api/tasks/{task_id}/priority`
 

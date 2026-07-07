@@ -31,6 +31,19 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
+def normalize_cleanup_globs(value: object) -> str:
+    """Accept a list or comma string of basename globs; keep only safe ones."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        parts = [str(part).strip() for part in value]
+    else:
+        return ""
+    return ",".join(part for part in parts if part and Scheduler._workspace_prune_glob_ok(part))
+
+
 def cleanup_local_temp_artifacts() -> None:
     """Remove conda-env-sync tarballs orphaned by a crash mid-sync."""
     import glob
@@ -416,6 +429,9 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         cleanup_workspace_prune_globs=config.cleanup_workspace_prune_globs,
         cleanup_workspace_prune_interval_seconds=config.cleanup_workspace_prune_interval_seconds,
         cleanup_workspace_prune_min_age_seconds=config.cleanup_workspace_prune_min_age_seconds,
+        cleanup_finished_task_log_max_bytes=config.cleanup_finished_task_log_max_bytes,
+        cleanup_finished_task_log_trim_after_seconds=config.cleanup_finished_task_log_trim_after_seconds,
+        storage_guard_min_free_gb=config.storage_guard_min_free_gb,
         cleanup_db_row_ttl_seconds=config.cleanup_db_row_ttl_seconds,
         cleanup_event_ttl_seconds=config.cleanup_event_ttl_seconds,
         watchdog_enabled=config.scheduler_watchdog_enabled,
@@ -788,6 +804,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             max_workers_per_node=max(0, int(payload.get("max_workers_per_node") or 0)),
             same_node_as_task_id=max(0, int(payload.get("same_node_as_task_id") or payload.get("same_node_as") or 0)),
             payload_json=payload_json,
+            cleanup_globs=normalize_cleanup_globs(payload.get("cleanup_globs")),
         )
         if not task.remote_cwd:
             raise HTTPException(status_code=422, detail="remote_cwd is required")
@@ -1159,6 +1176,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         exclusive_node: bool = Form(False),
         same_node_as_task_id: int = Form(0),
         priority: int = Form(0),
+        cleanup_globs: str = Form(""),
     ) -> Response:
         task_id = db.create_task(
             TaskCreate(
@@ -1179,6 +1197,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 exclusive_node=exclusive_node,
                 same_node_as_task_id=max(0, same_node_as_task_id),
                 priority=priority,
+                cleanup_globs=normalize_cleanup_globs(cleanup_globs),
             )
         )
         maybe_assign_same_node_task(task_id)
@@ -1206,6 +1225,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         exclusive_node: bool = Form(False),
         same_node_as_task_id: int = Form(0),
         priority: int = Form(0),
+        cleanup_globs: str = Form(""),
     ) -> Response:
         command, payload_json = git_task_fields(repo_url, git_ref, entrypoint, arguments, git_credential_id)
         task_id = db.create_task(
@@ -1228,6 +1248,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 same_node_as_task_id=max(0, same_node_as_task_id),
                 payload_json=payload_json,
                 priority=priority,
+                cleanup_globs=normalize_cleanup_globs(cleanup_globs),
             )
         )
         maybe_assign_same_node_task(task_id)
@@ -1354,7 +1375,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         return db.list_jobs()
 
     @app.get("/api/tasks")
-    def api_tasks(include_diagnostics: bool = False) -> list[dict]:
+    def api_tasks(include_diagnostics: bool = False, limit: int = 0, name_prefix: str = "") -> list[dict]:
         allocation_rows = None
         allocation_by_id = None
         active_task_allocation_ids = None
@@ -1363,6 +1384,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             allocation_rows = db.list_allocations_with_live(limit=500)
             allocation_by_id = {int(allocation["id"]): allocation for allocation in allocation_rows}
             active_task_allocation_ids, active_exclusive_allocation_ids = scheduler.active_task_allocation_sets()
+        # limit/name_prefix: large-campaign harvesting without shipping every row.
+        # An explicit limit means "newest N rows", without the active-task merge.
+        tasks = db.list_tasks(limit=max(1, min(int(limit), 10000))) if limit else db.list_tasks_with_active()
+        if name_prefix:
+            tasks = [task for task in tasks if str(task.get("name") or "").startswith(name_prefix)]
         return [
             task_json(
                 task,
@@ -1373,8 +1399,15 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 active_exclusive_allocation_ids=active_exclusive_allocation_ids,
                 include_diagnostics=include_diagnostics,
             )
-            for task in db.list_tasks_with_active()
+            for task in tasks
         ]
+
+    @app.get("/api/tasks/summary")
+    def api_tasks_summary(name_prefix: str = "") -> dict:
+        """Counts by status, optionally for one campaign prefix — replaces
+        client-side full-list scans."""
+        counts = db.count_tasks_grouped_by_status(name_prefix=name_prefix)
+        return {"name_prefix": name_prefix, "total": sum(counts.values()), "statuses": counts}
 
     @app.post("/api/tasks")
     async def api_create_task(request: Request) -> JSONResponse:
@@ -1431,6 +1464,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "max_workers_per_node": max(0, int(payload.get("max_workers_per_node") or 0)),
             "same_node_as_task_id": max(0, int(payload.get("same_node_as_task_id") or payload.get("same_node_as") or 0)),
             "payload_json": payload_json,
+            "cleanup_globs": payload.get("cleanup_globs"),
         }
         task_id, deduped = create_task_record(task_payload)
         task = db.get_task(task_id)

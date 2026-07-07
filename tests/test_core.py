@@ -5068,6 +5068,43 @@ class SchedulerTests(unittest.TestCase):
         # The freshly started remote worker was cancelled again.
         self.assertIn(task_id, FakeClient.cancelled_tasks)
 
+    def test_cleanup_globs_persist_and_parse_for_terminal_hook(self) -> None:
+        task_id = self.db.create_task(
+            TaskCreate("with-cleanup", "~/case", "run", cleanup_globs="simulation,aedt_temp")
+        )
+        task = self.db.get_task(task_id)
+        self.assertEqual(task["cleanup_globs"], "simulation,aedt_temp")
+
+    def test_count_tasks_grouped_by_status_with_prefix(self) -> None:
+        for index in range(3):
+            self.db.create_task(TaskCreate(f"mft-camp-w1-{index}", "~/case", "run"))
+        other = self.db.create_task(TaskCreate("other-job", "~/case", "run"))
+        self.db.update_task(other, status=TaskStatus.COMPLETED.value)
+        done = self.db.create_task(TaskCreate("mft-camp-w1-done", "~/case", "run"))
+        self.db.update_task(done, status=TaskStatus.COMPLETED.value)
+        counts = self.db.count_tasks_grouped_by_status(name_prefix="mft-camp-w1")
+        self.assertEqual(counts, {"queued": 3, "completed": 1})
+        all_counts = self.db.count_tasks_grouped_by_status()
+        self.assertEqual(all_counts["completed"], 2)
+
+    def test_storage_guard_blocks_attach_below_threshold(self) -> None:
+        account = AccountConfig(
+            "a", "host", 22, "a", "key", "/work", 4, 10, 10, storage_path="/work", storage_quota_gb=100.0
+        )
+        scheduler = Scheduler(
+            self.db, [account], 30, client_factory=FakeClient, storage_guard_min_free_gb=5.0
+        )
+        scheduler._storage_cache["a"] = (time.time(), 97.0)
+        self.assertTrue(scheduler.account_storage_blocked(account))
+        scheduler._storage_cache["a"] = (time.time(), 50.0)
+        self.assertFalse(scheduler.account_storage_blocked(account))
+        # Guard disabled or quota unknown -> never blocks.
+        scheduler._storage_cache["a"] = (time.time(), None)
+        self.assertFalse(scheduler.account_storage_blocked(account))
+        unguarded = Scheduler(self.db, [account], 30, client_factory=FakeClient)
+        unguarded._storage_cache["a"] = (time.time(), 99.0)
+        self.assertFalse(unguarded.account_storage_blocked(account))
+
     def test_workspace_prune_glob_validation(self) -> None:
         ok = Scheduler._workspace_prune_glob_ok
         self.assertTrue(ok("*.aedtresults"))

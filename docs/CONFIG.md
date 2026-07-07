@@ -98,6 +98,7 @@ Field meanings:
 - `scheduler_ssh_parallelism`: bounded thread pool for per-account state refreshes so one slow account does not serialize the others.
 - `reconcile_on_start`: on startup, cancel Slurm jobs named `pool` that the database no longer tracks (orphaned warm pools after a DB reset or lost rows).
 - `backup_*`: online SQLite backup into `backup_dir` every `backup_interval_seconds`, keeping the newest `backup_keep` files.
+- `storage_guard_min_free_gb`: hold new task attaches on an account whose storage headroom (`storage_quota_gb` minus measured usage) drops below this, and record a `storage_guard` event, instead of letting tasks start into disk-quota-exceeded cascades. Requires `storage_quota_gb` to be set on the account in `accounts.yaml`; `0` disables.
 - `min_warm_allocations`: minimum CPU warm allocation count.
 - `allocation_partition`: `auto` lets the scheduler rank partitions from inventory.
 - `allocation_cpus`: CPU target/cap for shared CPU pool allocations. CPU-only nodes avoid tiny fragments by requiring this many usable CPUs when the node can provide it, smaller CPU-only nodes use their full node size, and GPU nodes use their currently free CPUs after leaving `gpu_cpu_reserve` cores unrequested for other GPU users.
@@ -173,6 +174,7 @@ Meanings:
 - `closed_allocation_ttl_seconds`: how long closed allocation directories are kept. Default is 1 day.
 - `orphan_sweep_*`: a daily sweep lists `task-*`/`job-*`/`allocation-*` (and `env-sync/job-*`) directories in each account workspace and removes the ones no database row references and whose mtime is older than `orphan_min_age_seconds` (default 7 days). This catches directories left behind by DB resets, deleted rows, or wedged tasks that the TTL cleanups above cannot see.
 - `db_row_ttl_seconds`: terminal task/job/allocation rows whose remote directories were already cleaned are deleted from the database after this long (default 14 days), followed by a WAL checkpoint. Older run history disappears from the finished lists after this window.
+- `finished_task_log_max_bytes`: when nonzero, stdout/stderr of terminal tasks older than `finished_task_log_trim_after_seconds` (default 1 day) are truncated to this many tail bytes, so per-task multi-MB harvest logs do not accumulate for the full TTL window.
 - `workspace_prune_globs`: name patterns of disposable artifacts that user jobs leave anywhere in the workspace — e.g. `["*.aedtresults"]` for ANSYS AEDT solution directories, which otherwise grow tens of GB per campaign. Only these explicit basename globs are deleted (never bare `*`, never paths), every `workspace_prune_interval_seconds` (default 6h), and only when nothing inside was modified within `workspace_prune_min_age_seconds` (default 24h) — so running simulations are never touched. Empty by default.
 - `event_ttl_seconds`: retention for `scheduler_events` rows.
 
