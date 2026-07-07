@@ -838,7 +838,7 @@
     </div>
     <div class="table-scroll">
       <table id="attached-tasks-table">
-        <thead><tr><th><input type="checkbox" id="select-all-tasks" aria-label="Select all visible tasks"></th><th>ID</th><th>Name</th><th>Status</th><th>Prio</th><th>Allocation</th><th>Capability</th><th>Env</th><th>Scheduling</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Queue reason</th><th>Elapsed</th><th>Action</th></tr></thead>
+        <thead><tr><th><input type="checkbox" id="select-all-tasks" aria-label="Select all visible tasks"></th><th>ID</th><th>Name</th><th>Status</th><th>Prio</th><th>Allocation</th><th>Capability</th><th>Env</th><th>Scheduling</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Elapsed</th><th>Action</th></tr></thead>
         <tbody id="attached-tasks-body">
         {% for task in tasks %}
           <tr
@@ -890,7 +890,6 @@
             <td>{{ task.cpus }}</td>
             <td>{{ task.gpus or 0 }} {{ task.gpu_model }}</td>
             <td>{{ task.memory_mb }} MB</td>
-            <td>{{ task.queue_reason or "" }}</td>
             <td class="mono-cell">{{ task.elapsed_text or "" }}</td>
             <td>
               {% if task.status not in ["completed", "failed", "cancelled"] %}
@@ -905,9 +904,9 @@
             </td>
           </tr>
         {% else %}
-          <tr><td colspan="15" class="muted">No active attached tasks.</td></tr>
+          <tr><td colspan="14" class="muted">No active attached tasks.</td></tr>
         {% endfor %}
-          <tr id="attached-task-no-filter-match" hidden><td colspan="15" class="muted">No matching attached tasks.</td></tr>
+          <tr id="attached-task-no-filter-match" hidden><td colspan="14" class="muted">No matching attached tasks.</td></tr>
         </tbody>
       </table>
     </div>

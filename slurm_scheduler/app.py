@@ -875,7 +875,9 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             int(task["id"]): task
             for task in (active_running_rows + visible_queued_rows)
         }
-        queued_diagnostics_remaining = 25
+        # Queue reasons are shown on the task detail page only; computing them
+        # for the dashboard list was the most expensive part of the render.
+        queued_diagnostics_remaining = 0
         active_task_items = []
         for task in attach_task_elapsed(list(active_task_rows.values())):
             include_diagnostics = False
