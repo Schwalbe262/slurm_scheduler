@@ -123,6 +123,12 @@ class AppConfig:
     cleanup_finished_task_log_max_bytes: int = 0
     cleanup_finished_task_log_trim_after_seconds: int = 86400
     storage_guard_min_free_gb: float = 0.0
+    license_monitor_enabled: bool = False
+    license_monitor_account: str = ""
+    license_monitor_lmutil_path: str = ""
+    license_monitor_license_server: str = ""
+    license_monitor_interval_seconds: int = 300
+    license_monitor_watch_features: list[str] = field(default_factory=list)
     cleanup_db_row_ttl_seconds: int = 1209600
     cleanup_event_ttl_seconds: int = 604800
     git_credentials: list[GitCredentialConfig] = field(default_factory=list)
@@ -179,6 +185,18 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
         for source, target in mapping.items():
             if source in fea_bursty:
                 data[target] = fea_bursty[source]
+    license_monitor = data.pop("license_monitor", None)
+    if isinstance(license_monitor, dict):
+        for source, target in {
+            "enabled": "license_monitor_enabled",
+            "account": "license_monitor_account",
+            "lmutil_path": "license_monitor_lmutil_path",
+            "license_server": "license_monitor_license_server",
+            "interval_seconds": "license_monitor_interval_seconds",
+            "watch_features": "license_monitor_watch_features",
+        }.items():
+            if source in license_monitor:
+                data[target] = license_monitor[source]
     cleanup = data.pop("cleanup", None)
     if isinstance(cleanup, dict):
         mapping = {

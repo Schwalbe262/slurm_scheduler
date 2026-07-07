@@ -98,6 +98,7 @@ Field meanings:
 - `scheduler_ssh_parallelism`: bounded thread pool for per-account state refreshes so one slow account does not serialize the others.
 - `reconcile_on_start`: on startup, cancel Slurm jobs named `pool` that the database no longer tracks (orphaned warm pools after a DB reset or lost rows).
 - `backup_*`: online SQLite backup into `backup_dir` every `backup_interval_seconds`, keeping the newest `backup_keep` files.
+- `license_monitor`: FlexLM license polling for the dashboard's ANSYS Licenses panel and `GET /api/licenses`. Runs `<lmutil_path> lmstat -c <license_server> -a` over SSH from `account` every `interval_seconds` (default 300) on a background thread. The panel lists features currently in use plus any `watch_features`.
 - `storage_guard_min_free_gb`: hold new task attaches on an account whose storage headroom (`storage_quota_gb` minus measured usage) drops below this, and record a `storage_guard` event, instead of letting tasks start into disk-quota-exceeded cascades. Requires `storage_quota_gb` to be set on the account in `accounts.yaml`; `0` disables.
 - `min_warm_allocations`: minimum CPU warm allocation count.
 - `allocation_partition`: `auto` lets the scheduler rank partitions from inventory.

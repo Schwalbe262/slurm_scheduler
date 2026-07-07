@@ -38,6 +38,18 @@ Returns recent scheduler events (allocation open/warm/close/fail, task complete/
 curl -sS "$SCHEDULER_URL/api/events?limit=100"
 ```
 
+### `GET /api/licenses`
+
+Latest FlexLM license snapshot from the license monitor (empty object until the first check completes).
+
+```bash
+curl -sS "$SCHEDULER_URL/api/licenses"
+```
+
+```json
+{"checked_at": "...", "server": "1055@...", "server_up": true, "in_use": [{"feature": "electronics_desktop", "total": 550, "used": 12}], "features": [...], "error": ""}
+```
+
 ### `GET /api/dashboard-summary`
 
 Lightweight aggregate used by the dashboard's live headline refresh: task activity counters and allocation pool usage.

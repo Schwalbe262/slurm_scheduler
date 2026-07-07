@@ -432,6 +432,12 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         cleanup_finished_task_log_max_bytes=config.cleanup_finished_task_log_max_bytes,
         cleanup_finished_task_log_trim_after_seconds=config.cleanup_finished_task_log_trim_after_seconds,
         storage_guard_min_free_gb=config.storage_guard_min_free_gb,
+        license_monitor_enabled=config.license_monitor_enabled,
+        license_monitor_account=config.license_monitor_account,
+        license_monitor_lmutil_path=config.license_monitor_lmutil_path,
+        license_monitor_license_server=config.license_monitor_license_server,
+        license_monitor_interval_seconds=config.license_monitor_interval_seconds,
+        license_monitor_watch_features=config.license_monitor_watch_features,
         cleanup_db_row_ttl_seconds=config.cleanup_db_row_ttl_seconds,
         cleanup_event_ttl_seconds=config.cleanup_event_ttl_seconds,
         watchdog_enabled=config.scheduler_watchdog_enabled,
@@ -966,6 +972,9 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 "env_overlays": env_overlays,
                 "scheduler_events": db.list_events(limit=50),
                 "scheduler_health": scheduler.health_status(),
+                "license_usage": scheduler.license_usage(),
+                "license_monitor_enabled": scheduler.license_monitor_enabled,
+                "license_watch_features": scheduler.license_monitor_watch_features,
             },
         )
 
@@ -1629,6 +1638,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "max_workers_per_node": max(0, max_workers_per_node),
         }
         return scheduler.placement_dry_run(task)
+
+    @app.get("/api/licenses")
+    def api_licenses() -> dict:
+        return scheduler.license_usage()
 
     @app.get("/api/dashboard-summary")
     def api_dashboard_summary() -> dict:

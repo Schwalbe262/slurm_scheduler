@@ -34,6 +34,20 @@ LOGGER = logging.getLogger(__name__)
 ClientFactory = Callable[[AccountConfig], SlurmAccountClient]
 
 
+LMSTAT_FEATURE_RE = re.compile(
+    r"Users of (\S+):\s+\(Total of (\d+) licenses? issued;\s+Total of (\d+) licenses? in use\)"
+)
+
+
+def parse_lmstat_features(output: str) -> list[dict]:
+    features = []
+    for match in LMSTAT_FEATURE_RE.finditer(output or ""):
+        features.append(
+            {"feature": match.group(1), "total": int(match.group(2)), "used": int(match.group(3))}
+        )
+    return features
+
+
 class AccountUnavailableThisTick(RuntimeError):
     """The account already failed once this tick; skip it until the next tick."""
 
@@ -164,6 +178,12 @@ class Scheduler:
         cleanup_finished_task_log_max_bytes: int = 0,
         cleanup_finished_task_log_trim_after_seconds: int = 86400,
         storage_guard_min_free_gb: float = 0.0,
+        license_monitor_enabled: bool = False,
+        license_monitor_account: str = "",
+        license_monitor_lmutil_path: str = "",
+        license_monitor_license_server: str = "",
+        license_monitor_interval_seconds: int = 300,
+        license_monitor_watch_features: list[str] | None = None,
         cleanup_db_row_ttl_seconds: int = 1209600,
         cleanup_event_ttl_seconds: int = 604800,
         watchdog_enabled: bool = True,
@@ -265,6 +285,15 @@ class Scheduler:
         self.cleanup_finished_task_log_trim_after_seconds = max(3600, int(cleanup_finished_task_log_trim_after_seconds))
         self.storage_guard_min_free_gb = max(0.0, float(storage_guard_min_free_gb))
         self._storage_guard_warned_at: dict[str, float] = {}
+        self.license_monitor_enabled = license_monitor_enabled
+        self.license_monitor_account = license_monitor_account
+        self.license_monitor_lmutil_path = license_monitor_lmutil_path
+        self.license_monitor_license_server = license_monitor_license_server
+        self.license_monitor_interval_seconds = max(60, int(license_monitor_interval_seconds))
+        self.license_monitor_watch_features = list(license_monitor_watch_features or [])
+        self._license_usage: dict = {}
+        self._last_license_refresh_at = 0.0
+        self._license_refresh_inflight = False
         self.reconcile_on_start = reconcile_on_start
         self._needs_reconcile = False
         self.backup_enabled = backup_enabled
@@ -603,6 +632,7 @@ class Scheduler:
                 self.submit_next_queued_job()
                 self.cleanup_remote_artifacts_if_due()
                 self.backup_database_if_due()
+                self.refresh_license_usage_if_due()
         finally:
             started = self._tick_started_at
             if started is not None:
@@ -764,6 +794,67 @@ class Scheduler:
                 entity_id=account.name,
                 account_name=account.name,
             )
+
+    def license_usage(self) -> dict:
+        return dict(self._license_usage)
+
+    def refresh_license_usage_if_due(self) -> None:
+        if not self.license_monitor_enabled:
+            return
+        if not (self.license_monitor_lmutil_path and self.license_monitor_license_server):
+            return
+        now = time.time()
+        if now - self._last_license_refresh_at < self.license_monitor_interval_seconds:
+            return
+        if self._license_refresh_inflight:
+            return
+        self._last_license_refresh_at = now
+        account = self.account_by_name(self.license_monitor_account) or (
+            self.accounts[0] if self.accounts else None
+        )
+        if not account:
+            return
+        self._license_refresh_inflight = True
+        threading.Thread(
+            target=self._refresh_license_usage,
+            args=(account,),
+            name="license-monitor",
+            daemon=True,
+        ).start()
+
+    def _refresh_license_usage(self, account: AccountConfig) -> None:
+        try:
+            command = (
+                f"{shlex.quote(self.license_monitor_lmutil_path)} lmstat "
+                f"-c {shlex.quote(self.license_monitor_license_server)} -a 2>&1"
+            )
+            with SSHSession(account, default_timeout=90) as ssh:
+                result = ssh.run(command)
+            features = parse_lmstat_features(result.stdout)
+            server_up = "license server UP" in result.stdout
+            error = ""
+            if not features and not server_up:
+                error = result.stdout.strip().splitlines()[-1][:200] if result.stdout.strip() else "no lmstat output"
+            self._license_usage = {
+                "checked_at": self._now().isoformat(),
+                "server": self.license_monitor_license_server,
+                "server_up": server_up,
+                "features": features,
+                "in_use": [item for item in features if item["used"] > 0],
+                "error": error,
+            }
+        except Exception as exc:
+            self._license_usage = {
+                "checked_at": self._now().isoformat(),
+                "server": self.license_monitor_license_server,
+                "server_up": False,
+                "features": [],
+                "in_use": [],
+                "error": str(exc)[:200],
+            }
+            LOGGER.warning("license monitor refresh failed: %s", exc)
+        finally:
+            self._license_refresh_inflight = False
 
     def backup_database_if_due(self) -> None:
         if not self.backup_enabled:

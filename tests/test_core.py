@@ -5701,6 +5701,32 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(self.force_closes, [True, True])
 
 
+class LicenseMonitorTests(unittest.TestCase):
+    def test_parse_lmstat_features(self) -> None:
+        from slurm_scheduler.scheduler import parse_lmstat_features
+
+        output = "\n".join(
+            [
+                "License server status: 1055@172.16.10.81",
+                "172.16.10.81: license server UP v11.19.9",
+                "Users of ansys:  (Total of 550 licenses issued;  Total of 2 licenses in use)",
+                "Users of electronics_desktop:  (Total of 550 licenses issued;  Total of 12 licenses in use)",
+                "Users of single_lic:  (Total of 1 license issued;  Total of 1 license in use)",
+                "garbage line",
+            ]
+        )
+        features = parse_lmstat_features(output)
+        self.assertEqual(
+            features,
+            [
+                {"feature": "ansys", "total": 550, "used": 2},
+                {"feature": "electronics_desktop", "total": 550, "used": 12},
+                {"feature": "single_lic", "total": 1, "used": 1},
+            ],
+        )
+        self.assertEqual(parse_lmstat_features(""), [])
+
+
 class ObservabilityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

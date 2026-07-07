@@ -730,6 +730,49 @@
     </details>
   </section>
 
+  {% if license_monitor_enabled %}
+  <section class="panel">
+    <details id="ansys-licenses">
+      <summary>
+        ANSYS Licenses
+        {% if license_usage.in_use %}
+          — {{ license_usage.in_use|length }} feature{{ "" if license_usage.in_use|length == 1 else "s" }} in use
+        {% elif license_usage.error %}
+          — <span class="error">check failed</span>
+        {% elif not license_usage %}
+          — waiting for first check
+        {% else %}
+          — idle
+        {% endif %}
+        {% if license_usage.checked_at %}<span class="muted">({{ license_usage.checked_at[:19] }} UTC)</span>{% endif %}
+      </summary>
+      {% if license_usage.error %}
+        <p class="error section-gap">{{ license_usage.error }}</p>
+      {% endif %}
+      {% set watched = license_usage.features | default([]) | selectattr("feature", "in", license_watch_features) | list %}
+      {% set shown = (license_usage.in_use | default([])) + (watched | rejectattr("used", "gt", 0) | list) %}
+      {% if shown %}
+        <div class="table-scroll section-gap">
+          <table>
+            <thead><tr><th>Feature</th><th>Used</th><th>Total</th></tr></thead>
+            <tbody>
+            {% for item in shown %}
+              <tr>
+                <td class="mono-cell">{{ item.feature }}</td>
+                <td>{{ item.used }}</td>
+                <td>{{ item.total }}</td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% elif license_usage and not license_usage.error %}
+        <p class="muted section-gap">No licenses in use ({{ license_usage.features|length }} features on {{ license_usage.server }}).</p>
+      {% endif %}
+    </details>
+  </section>
+  {% endif %}
+
   <section class="panel">
     <h2>Scheduler Events</h2>
     <div class="summary-row" aria-label="Scheduler health">
