@@ -117,6 +117,9 @@ class AppConfig:
     cleanup_orphan_sweep_enabled: bool = True
     cleanup_orphan_sweep_interval_seconds: int = 86400
     cleanup_orphan_min_age_seconds: int = 604800
+    cleanup_workspace_prune_globs: list[str] = field(default_factory=list)
+    cleanup_workspace_prune_interval_seconds: int = 21600
+    cleanup_workspace_prune_min_age_seconds: int = 86400
     cleanup_db_row_ttl_seconds: int = 1209600
     cleanup_event_ttl_seconds: int = 604800
     git_credentials: list[GitCredentialConfig] = field(default_factory=list)
@@ -184,6 +187,9 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
             "orphan_sweep_enabled": "cleanup_orphan_sweep_enabled",
             "orphan_sweep_interval_seconds": "cleanup_orphan_sweep_interval_seconds",
             "orphan_min_age_seconds": "cleanup_orphan_min_age_seconds",
+            "workspace_prune_globs": "cleanup_workspace_prune_globs",
+            "workspace_prune_interval_seconds": "cleanup_workspace_prune_interval_seconds",
+            "workspace_prune_min_age_seconds": "cleanup_workspace_prune_min_age_seconds",
             "db_row_ttl_seconds": "cleanup_db_row_ttl_seconds",
             "event_ttl_seconds": "cleanup_event_ttl_seconds",
         }

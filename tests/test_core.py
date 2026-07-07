@@ -5068,6 +5068,35 @@ class SchedulerTests(unittest.TestCase):
         # The freshly started remote worker was cancelled again.
         self.assertIn(task_id, FakeClient.cancelled_tasks)
 
+    def test_workspace_prune_glob_validation(self) -> None:
+        ok = Scheduler._workspace_prune_glob_ok
+        self.assertTrue(ok("*.aedtresults"))
+        self.assertTrue(ok("scratch_*"))
+        self.assertFalse(ok("*"))
+        self.assertFalse(ok("?"))
+        self.assertFalse(ok("*.*"))
+        self.assertFalse(ok("../evil"))
+        self.assertFalse(ok("a/b"))
+        self.assertFalse(ok(""))
+        self.assertFalse(ok("  "))
+
+    def test_workspace_prune_config_parses_from_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "app.yaml"
+            path.write_text(
+                "\n".join(
+                    [
+                        "cleanup:",
+                        "  workspace_prune_globs: ['*.aedtresults', '*.asol']",
+                        "  workspace_prune_min_age_seconds: 43200",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config = load_app_config(path)
+        self.assertEqual(config.cleanup_workspace_prune_globs, ["*.aedtresults", "*.asol"])
+        self.assertEqual(config.cleanup_workspace_prune_min_age_seconds, 43200)
+
     def test_reprioritized_task_moves_to_front_of_queue(self) -> None:
         first = self.db.create_task(
             TaskCreate("first", "~/case", "run", cpus=4, scheduling_profile=SchedulingProfile.FEA_BURSTY.value)

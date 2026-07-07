@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import logging
 import os
 import posixpath
@@ -149,6 +150,9 @@ class Scheduler:
         cleanup_orphan_sweep_enabled: bool = True,
         cleanup_orphan_sweep_interval_seconds: int = 86400,
         cleanup_orphan_min_age_seconds: int = 604800,
+        cleanup_workspace_prune_globs: list[str] | None = None,
+        cleanup_workspace_prune_interval_seconds: int = 21600,
+        cleanup_workspace_prune_min_age_seconds: int = 86400,
         cleanup_db_row_ttl_seconds: int = 1209600,
         cleanup_event_ttl_seconds: int = 604800,
         watchdog_enabled: bool = True,
@@ -242,6 +246,10 @@ class Scheduler:
         self.cleanup_db_row_ttl_seconds = max(86400, int(cleanup_db_row_ttl_seconds))
         self.cleanup_event_ttl_seconds = max(3600, int(cleanup_event_ttl_seconds))
         self._last_orphan_sweep_at = 0.0
+        self.cleanup_workspace_prune_globs = list(cleanup_workspace_prune_globs or [])
+        self.cleanup_workspace_prune_interval_seconds = max(3600, int(cleanup_workspace_prune_interval_seconds))
+        self.cleanup_workspace_prune_min_age_seconds = max(3600, int(cleanup_workspace_prune_min_age_seconds))
+        self._last_workspace_prune_at = 0.0
         self.reconcile_on_start = reconcile_on_start
         self._needs_reconcile = False
         self.backup_enabled = backup_enabled
@@ -630,6 +638,85 @@ class Scheduler:
         self.cleanup_closed_allocations()
         self.prune_database_rows()
         self.sweep_orphan_remote_artifacts_if_due()
+        self.prune_workspace_artifacts_if_due()
+
+    @staticmethod
+    def _workspace_prune_glob_ok(glob_pattern: str) -> bool:
+        pattern = (glob_pattern or "").strip()
+        if not pattern or "/" in pattern or "\\" in pattern or ".." in pattern:
+            return False
+        # Require real characters beyond wildcards so a bare '*' cannot slip in.
+        return bool(set(pattern) - {"*", "?", ".", "["})
+
+    def prune_workspace_artifacts_if_due(self) -> None:
+        """Delete user-declared disposable artifacts (e.g. FEA solution dirs
+        like *.aedtresults) anywhere in the workspace. Only explicitly
+        configured name globs are touched, and anything containing a file
+        modified within the min-age window is skipped so running simulations
+        are never disturbed."""
+        globs = [g.strip() for g in self.cleanup_workspace_prune_globs if self._workspace_prune_glob_ok(g)]
+        if not globs:
+            return
+        now = time.time()
+        if now - self._last_workspace_prune_at < self.cleanup_workspace_prune_interval_seconds:
+            return
+        self._last_workspace_prune_at = now
+        minutes = max(60, int(self.cleanup_workspace_prune_min_age_seconds // 60))
+        # Deleting tens of GB can take minutes; keep it off the tick thread so
+        # the watchdog never mistakes it for a stalled tick.
+        threading.Thread(
+            target=self._prune_workspace_artifacts,
+            args=(globs, minutes),
+            name="workspace-prune",
+            daemon=True,
+        ).start()
+
+    def _prune_workspace_artifacts(self, globs: list[str], minutes: int) -> None:
+        name_expr = " -o ".join(f"-name {shlex.quote(g)}" for g in globs)
+        for account in self.accounts:
+            workspace = str(account.remote_workspace or "").strip()
+            if not workspace:
+                continue
+            list_command = (
+                f"find {shlex.quote(workspace)} -mindepth 1 \\( {name_expr} \\) -prune -print 2>/dev/null | "
+                "while IFS= read -r d; do "
+                f"if [ -z \"$(find \"$d\" -mmin -{minutes} -print -quit 2>/dev/null)\" ]; "
+                "then printf '%s\\n' \"$d\"; fi; done"
+            )
+            try:
+                with SSHSession(account, default_timeout=600) as ssh:
+                    result = ssh.run(list_command)
+                    if result.exit_code != 0:
+                        continue
+                    candidates = []
+                    workspace_prefix = self._normalize_remote_path(workspace).rstrip("/") + "/"
+                    for line in result.stdout.splitlines():
+                        path = line.strip()
+                        if not path:
+                            continue
+                        normalized = self._normalize_remote_path(path)
+                        if not normalized.startswith(workspace_prefix):
+                            continue
+                        basename = posixpath.basename(normalized.rstrip("/"))
+                        if not any(fnmatch.fnmatch(basename, g) for g in globs):
+                            continue
+                        candidates.append(path)
+                    if not candidates:
+                        continue
+                    for index in range(0, len(candidates), 20):
+                        chunk = candidates[index : index + 20]
+                        ssh.run("rm -rf -- " + " ".join(shlex.quote(path) for path in chunk), timeout=600)
+            except Exception as exc:
+                LOGGER.warning("workspace prune failed on %s: %s", account.name, exc)
+                continue
+            LOGGER.info("workspace prune removed %d artifacts on %s", len(candidates), account.name)
+            self.record_event(
+                "workspace_prune",
+                f"removed {len(candidates)} disposable artifacts matching {', '.join(globs)}",
+                entity_type="account",
+                entity_id=account.name,
+                account_name=account.name,
+            )
 
     def backup_database_if_due(self) -> None:
         if not self.backup_enabled:
