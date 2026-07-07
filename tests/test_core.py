@@ -5037,6 +5037,37 @@ class SchedulerTests(unittest.TestCase):
             uncapped.fea_effective_worker_limit(allocation, task, current_workers=10, base_limit=32), 32
         )
 
+    def test_attach_completion_does_not_stomp_concurrent_requeue(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=48,
+            total_memory_mb=380000,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="alloc-1")
+        task_id = self.db.create_task(
+            TaskCreate("racy", "~/case", "run", cpus=4, scheduling_profile=SchedulingProfile.FEA_BURSTY.value)
+        )
+        self.db.update_task(
+            task_id,
+            status=TaskStatus.ATTACHING.value,
+            account_name="a",
+            allocation_id=allocation_id,
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        allocation = self.db.get_allocation(allocation_id)
+        task = self.db.get_task(task_id)
+        # A rebalance requeues the task while its attach is still in flight.
+        scheduler.requeue_task_for_rebalance(task, "test rebalance")
+        finished = scheduler.finish_reserved_task_attach(task, allocation, self.accounts[0])
+        self.assertFalse(finished)
+        after = self.db.get_task(task_id)
+        self.assertEqual(after["status"], TaskStatus.QUEUED.value)
+        self.assertIsNone(after["allocation_id"])
+        # The freshly started remote worker was cancelled again.
+        self.assertIn(task_id, FakeClient.cancelled_tasks)
+
     def test_reprioritized_task_moves_to_front_of_queue(self) -> None:
         first = self.db.create_task(
             TaskCreate("first", "~/case", "run", cpus=4, scheduling_profile=SchedulingProfile.FEA_BURSTY.value)

@@ -625,6 +625,31 @@ class Database:
     def update_task(self, task_id: int, **fields: Any) -> None:
         self._update_row("tasks", task_id, fields)
 
+    def update_task_if_status(self, task_id: int, expected_statuses: list[str], **fields: Any) -> bool:
+        """Optimistic update: apply only while the task is still in one of the
+        expected statuses. Returns False when a concurrent transition (requeue,
+        cancel) won the race."""
+        if not fields or not expected_statuses:
+            return False
+        fields["updated_at"] = fields.get("updated_at", "CURRENT_TIMESTAMP")
+        assignments = []
+        values: list[Any] = []
+        for key, value in fields.items():
+            if value == "CURRENT_TIMESTAMP":
+                assignments.append(f"{key} = CURRENT_TIMESTAMP")
+            else:
+                assignments.append(f"{key} = ?")
+                values.append(value)
+        placeholders = ",".join("?" for _ in expected_statuses)
+        values.append(task_id)
+        values.extend(expected_statuses)
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ? AND status IN ({placeholders})",
+                values,
+            )
+            return cursor.rowcount > 0
+
     def create_allocation(
         self,
         account_name: str,

@@ -1727,28 +1727,53 @@ class Scheduler:
             return self.finish_reserved_task_attach(task, allocation, account)
 
     def finish_reserved_task_attach(self, task: dict, allocation: dict, account: AccountConfig) -> bool:
+        """Complete a reserved attach. All task updates are conditional on the
+        task still being ATTACHING: a concurrent requeue (rebalance, pressure
+        drain) or cancel owns the row once it transitions, and stomping it left
+        tasks running with no allocation."""
         try:
             result = self._client(account).attach_task(task, allocation)
         except RemoteExecutionError as exc:
-            self.db.update_task(
+            if not self.db.update_task_if_status(
                 task["id"],
+                [TaskStatus.ATTACHING.value],
                 status=TaskStatus.FAILED.value,
                 failure_message=str(exc),
                 finished_at="CURRENT_TIMESTAMP",
                 **exc.result_fields,
-            )
+            ):
+                LOGGER.info("attach failure for task %s ignored; task already transitioned", task["id"])
             self.recalculate_allocation_capacity()
             return False
         except Exception as exc:
-            self.db.update_task(
+            if not self.db.update_task_if_status(
                 task["id"],
+                [TaskStatus.ATTACHING.value],
                 status=TaskStatus.FAILED.value,
                 failure_message=str(exc),
                 finished_at="CURRENT_TIMESTAMP",
-            )
+            ):
+                LOGGER.info("attach failure for task %s ignored; task already transitioned", task["id"])
             self.recalculate_allocation_capacity()
             return False
-        self.db.update_task(task["id"], status=TaskStatus.RUNNING.value, started_at="CURRENT_TIMESTAMP", **result)
+        if not self.db.update_task_if_status(
+            task["id"],
+            [TaskStatus.ATTACHING.value],
+            status=TaskStatus.RUNNING.value,
+            started_at="CURRENT_TIMESTAMP",
+            **result,
+        ):
+            # The task was requeued or cancelled while the attach was in
+            # flight; the remote worker just started, so stop it again.
+            LOGGER.warning(
+                "task %s transitioned during attach; cancelling the freshly started worker", task["id"]
+            )
+            try:
+                self._client(account).cancel_task({**task, **result})
+            except Exception as exc:
+                LOGGER.warning("failed to cancel raced attach for task %s: %s", task["id"], exc)
+            self.recalculate_allocation_capacity()
+            return False
         return True
 
     def best_allocation_for_task(self, task: dict) -> dict | None:
@@ -2863,7 +2888,9 @@ class Scheduler:
         }
         tasks_by_node: dict[str, list[dict]] = {}
         for task in self.db.list_tasks(limit=5000):
-            if task["status"] not in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
+            # RUNNING only: draining a task whose attach is still in flight
+            # races the background attach thread.
+            if task["status"] != TaskStatus.RUNNING.value:
                 continue
             if not self.task_is_fea_bursty(task):
                 continue
@@ -3034,7 +3061,9 @@ class Scheduler:
             task
             for task in self.db.list_tasks(limit=5000)
             if int(task.get("allocation_id") or 0) == allocation_id
-            and task["status"] in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}
+            # RUNNING only: killing a task whose attach is still in flight
+            # races the background attach thread.
+            and task["status"] == TaskStatus.RUNNING.value
             and self.task_is_fea_bursty(task)
         ]
         if not candidates:
