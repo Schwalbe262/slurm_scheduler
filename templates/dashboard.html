@@ -629,10 +629,14 @@
           <tbody>
           {% for project in projects %}
             <tr>
-              <td class="mono-cell">{{ project.name }}{% if project.auto_pull %}<br><span class="muted">auto-pull</span>{% endif %}</td>
+              <td class="mono-cell">{{ project.name }}
+                {% if project.auto_pull %}<br><span class="muted">auto-pull</span>{% endif %}
+                {% if project.cleanup_globs %}<br><span class="muted">청소 glob: {{ project.cleanup_globs }}</span>{% endif %}
+                <br><span class="muted">sim: {{ project.sim_subdir }}</span>
+              </td>
               <td class="mono-cell">{% for r in project.repos %}{{ r.url }}{% if r.subdir %} → {{ r.subdir }}{% endif %}<br>{% endfor %}</td>
               <td class="mono-cell">{% for e in project.entrypoints %}{{ e.path }} → {{ e.conda_env or "-" }}<br>{% endfor %}</td>
-              <td class="mono-cell">{% for d in project.deployments %}{{ d.account_name }}: {{ d.status }}{% if d.failure_message %} ⚠{% endif %}<br>{% endfor %}</td>
+              <td class="mono-cell">{% for d in project.deployments %}{{ d.account_name }}: {{ d.status }}{% if d.failure_message %} <span title="{{ d.failure_message }}" style="cursor:help">⚠</span>{% endif %}<br>{% endfor %}</td>
               <td>
                 <form method="post" action="/projects/{{ project.name }}/deploy" style="display:inline">
                   <input name="target_accounts" placeholder="dhj02, dw16" style="width:130px">
