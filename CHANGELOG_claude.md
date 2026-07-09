@@ -6,3 +6,6 @@
 
 ## 2026-07-09 (Claude)
 - docs/env_profile_MFT_1MW_2026v1.md: MFT 캠페인용 env_profile 추가 요청 문서 (accounts.yaml 반영 + 재시작 필요)
+
+## 2026-07-09 (Claude) - 추가
+- docs/bug_packed_cancel_leaks_children.md: 태스크 취소가 AEDT 자식 트리를 회수하지 못하는 버그 리포트 (노드당 세션 44-86개 잔존 실측)
