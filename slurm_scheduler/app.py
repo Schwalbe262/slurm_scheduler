@@ -16,13 +16,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from .allocation_metrics import annotate_allocation_fea_pressure, annotate_allocation_node_metrics
-from .conda_sync import CondaEnvSyncManager
+from .conda_sync import CondaEnvSyncManager, conda_bootstrap
 from .config import AppConfig, load_accounts, load_app_config
 from .db import Database
 from .git_auth import find_git_credential, git_task_payload
 from .models import JobCreate, SchedulingProfile, TaskCreate, normalize_scheduling_profile
 from .inventory import partition_rank
 from .pestat import PestatNode, plan_dynamic_allocations
+from .project_env import ProjectEnvManager, repo_dir_name
 from .scheduler import Scheduler
 from .slurm import SlurmAccountClient
 from .task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, build_git_task_command
@@ -457,6 +458,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     app.state.scheduler = scheduler
     env_sync_manager = CondaEnvSyncManager(db, accounts)
     app.state.env_sync_manager = env_sync_manager
+    project_env_manager = ProjectEnvManager(
+        db, accounts, projects_root=getattr(config, "projects_root", "slurm_scheduler/projects")
+    )
+    app.state.project_env_manager = project_env_manager
     remote_read_limit = max(1, int(config.web_remote_read_concurrency or 1))
     remote_read_semaphore = threading.BoundedSemaphore(remote_read_limit)
     remote_read_cache_seconds = max(0, int(config.web_remote_read_cache_seconds or 0))
@@ -783,7 +788,147 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         if task:
             scheduler.assign_queued_task(task)
 
+    def project_json(project: dict, include_deployments: bool = True) -> dict:
+        def _loads(value, default):
+            try:
+                return json.loads(value) if value else default
+            except (TypeError, json.JSONDecodeError):
+                return default
+
+        payload = {
+            "id": int(project["id"]),
+            "name": project.get("name") or "",
+            "repos": _loads(project.get("repos"), []),
+            "setup": project.get("setup") or "",
+            "entrypoints": _loads(project.get("entrypoints"), []),
+            "cleanup_globs": project.get("cleanup_globs") or "",
+            "sim_subdir": project.get("sim_subdir") or "simulation",
+            "auto_pull": bool(project.get("auto_pull")),
+            "created_at": project.get("created_at"),
+            "updated_at": project.get("updated_at"),
+        }
+        if include_deployments:
+            payload["deployments"] = db.list_project_deployments(int(project["id"]))
+        return payload
+
+    def parse_repo_lines(text: str) -> list[dict]:
+        """One repo per line: ``url[|ref|subdir]``."""
+        repos = []
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = [part.strip() for part in line.split("|")]
+            repo = {"url": parts[0]}
+            if len(parts) > 1 and parts[1]:
+                repo["ref"] = parts[1]
+            if len(parts) > 2 and parts[2]:
+                repo["subdir"] = parts[2]
+            repos.append(repo)
+        return repos
+
+    def parse_entrypoint_lines(text: str) -> list[dict]:
+        """One entrypoint per line: ``path[|conda_env|workdir]``."""
+        entrypoints = []
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = [part.strip() for part in line.split("|")]
+            entrypoint = {"path": parts[0]}
+            if len(parts) > 1 and parts[1]:
+                entrypoint["conda_env"] = parts[1]
+            if len(parts) > 2 and parts[2]:
+                entrypoint["workdir"] = parts[2]
+            entrypoints.append(entrypoint)
+        return entrypoints
+
+    def upsert_project_from_payload(payload: dict) -> int:
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            raise ValueError("name is required")
+        repos = payload.get("repos") or []
+        if isinstance(repos, str):
+            repos = parse_repo_lines(repos)
+        entrypoints = payload.get("entrypoints") or []
+        if isinstance(entrypoints, str):
+            entrypoints = parse_entrypoint_lines(entrypoints)
+        setup = str(payload.get("setup") or "")
+        cleanup_globs = normalize_cleanup_globs(payload.get("cleanup_globs"))
+        sim_subdir = str(payload.get("sim_subdir") or "simulation").strip() or "simulation"
+        auto_pull = bool(payload.get("auto_pull") or False)
+        existing = db.get_project_by_name(name)
+        if existing:
+            db.update_project(
+                int(existing["id"]),
+                repos=json.dumps(repos, ensure_ascii=False),
+                setup=setup,
+                entrypoints=json.dumps(entrypoints, ensure_ascii=False),
+                cleanup_globs=cleanup_globs,
+                sim_subdir=sim_subdir,
+                auto_pull=1 if auto_pull else 0,
+            )
+            return int(existing["id"])
+        return db.create_project(
+            name,
+            repos=repos,
+            setup=setup,
+            entrypoints=entrypoints,
+            cleanup_globs=cleanup_globs,
+            sim_subdir=sim_subdir,
+            auto_pull=auto_pull,
+        )
+
+    def apply_project_to_payload(payload: dict) -> dict:
+        """When a task references a project + entrypoint, expand it into a concrete
+        env_setup (project setup + conda activate + optional git pull), remote_cwd,
+        and command — reusing the same env_setup channel env_profiles ride on."""
+        project_name = str(payload.get("project") or "").strip()
+        if not project_name:
+            return payload
+        project = db.get_project_by_name(project_name)
+        if not project:
+            raise HTTPException(status_code=422, detail=f"project not found: {project_name}")
+        entrypoint = str(payload.get("entrypoint") or "").strip()
+        rel_dir = project_env_manager.project_rel_dir(project_name)
+        project_dir = posixpath.join("$HOME", rel_dir)
+        try:
+            entrypoints = json.loads(project.get("entrypoints") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            entrypoints = []
+        match = next((item for item in entrypoints if str(item.get("path")) == entrypoint), None)
+        conda_env = str((match or {}).get("conda_env") or "")
+        workdir = str((match or {}).get("workdir") or "").strip().strip("/")
+        remote_cwd = posixpath.join(project_dir, workdir) if workdir else project_dir
+        parts = []
+        setup = str(project.get("setup") or "").strip()
+        if setup:
+            parts.append(setup)
+        parts.append(conda_bootstrap())
+        if conda_env:
+            parts.append(f"conda activate {shlex.quote(conda_env)}")
+        if project.get("auto_pull"):
+            try:
+                repos = json.loads(project.get("repos") or "[]")
+            except (TypeError, json.JSONDecodeError):
+                repos = []
+            for index, repo in enumerate(repos):
+                repo_rel = posixpath.join(rel_dir, repo_dir_name(repo, index))
+                parts.append(f'git -C "$HOME/"{shlex.quote(repo_rel)} pull -q --ff-only || true')
+        generated_setup = "\n".join(parts)
+        existing_setup = str(payload.get("env_setup") or "").strip()
+        merged_setup = generated_setup if not existing_setup else f"{generated_setup}\n{existing_setup}"
+        updated = {**payload, "env_setup": merged_setup}
+        if not str(payload.get("remote_cwd") or "").strip():
+            updated["remote_cwd"] = remote_cwd
+        if not str(payload.get("command") or "").strip() and entrypoint:
+            updated["command"] = f"python {shlex.quote(entrypoint)}"
+        if not payload.get("cleanup_globs") and project.get("cleanup_globs"):
+            updated["cleanup_globs"] = project.get("cleanup_globs")
+        return updated
+
     def create_task_record(payload: dict) -> tuple[int, bool]:
+        payload = apply_project_to_payload(payload)
         dedupe_key = str(payload.get("dedupe_key") or "").strip()
         if dedupe_key:
             existing = db.find_active_task_by_dedupe_key(dedupe_key)
@@ -817,6 +962,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             same_node_as_task_id=max(0, int(payload.get("same_node_as_task_id") or payload.get("same_node_as") or 0)),
             payload_json=payload_json,
             cleanup_globs=normalize_cleanup_globs(payload.get("cleanup_globs")),
+            project=str(payload.get("project") or ""),
+            entrypoint=str(payload.get("entrypoint") or ""),
         )
         if not task.remote_cwd:
             raise HTTPException(status_code=422, detail="remote_cwd is required")
@@ -979,6 +1126,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 "capabilities": capabilities,
                 "env_sync_jobs": [env_sync_job_json(job) for job in db.list_env_sync_jobs(limit=10)],
                 "env_overlays": env_overlays,
+                "projects": [project_json(project) for project in db.list_projects()],
                 "scheduler_events": db.list_events(limit=50),
                 "scheduler_health": scheduler.health_status(),
                 "license_usage": scheduler.license_usage(),
@@ -1908,6 +2056,116 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         job = db.get_env_sync_job(sync_job_id)
         return env_sync_job_json(job) if job else {"id": sync_job_id, "status": "cancelled"}
+
+    async def _json_body(request: Request) -> dict:
+        try:
+            data = await request.json()
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @app.get("/api/projects")
+    def api_projects() -> list[dict]:
+        return [project_json(project) for project in db.list_projects()]
+
+    @app.get("/api/projects/{name}")
+    def api_get_project(name: str) -> dict:
+        project = db.get_project_by_name(name)
+        if not project:
+            raise HTTPException(status_code=404)
+        return project_json(project)
+
+    @app.post("/api/projects")
+    async def api_create_project(request: Request) -> JSONResponse:
+        payload = await _json_body(request)
+        try:
+            project_id = upsert_project_from_payload(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse(project_json(db.get_project(project_id)), status_code=201)
+
+    @app.delete("/api/projects/{name}")
+    def api_delete_project(name: str) -> dict:
+        project = db.get_project_by_name(name)
+        if not project:
+            raise HTTPException(status_code=404)
+        db.delete_project(int(project["id"]))
+        return {"deleted": name}
+
+    @app.post("/api/projects/{name}/deploy")
+    async def api_deploy_project(name: str, request: Request) -> dict:
+        payload = await _json_body(request)
+        try:
+            count = project_env_manager.deploy(name, parse_account_list(payload.get("target_accounts") or []))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"project": name, "deploying": count}
+
+    @app.post("/api/projects/{name}/update")
+    async def api_update_project(name: str, request: Request) -> dict:
+        payload = await _json_body(request)
+        targets = parse_account_list(payload.get("target_accounts") or []) or None
+        try:
+            count = project_env_manager.update(name, targets)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"project": name, "updating": count}
+
+    @app.get("/api/projects/{name}/deployments")
+    def api_project_deployments(name: str) -> list[dict]:
+        project = db.get_project_by_name(name)
+        if not project:
+            raise HTTPException(status_code=404)
+        return db.list_project_deployments(int(project["id"]))
+
+    @app.post("/projects")
+    def create_project_form(
+        name: str = Form(...),
+        repos: str = Form(""),
+        setup: str = Form(""),
+        entrypoints: str = Form(""),
+        cleanup_globs: str = Form(""),
+        sim_subdir: str = Form("simulation"),
+        auto_pull: str = Form(""),
+    ) -> Response:
+        try:
+            upsert_project_from_payload(
+                {
+                    "name": name,
+                    "repos": repos,
+                    "setup": setup,
+                    "entrypoints": entrypoints,
+                    "cleanup_globs": cleanup_globs,
+                    "sim_subdir": sim_subdir,
+                    "auto_pull": bool(auto_pull),
+                }
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return RedirectResponse("/", status_code=303)
+
+    @app.post("/projects/{name}/deploy")
+    def deploy_project_form(name: str, target_accounts: str = Form(...)) -> Response:
+        try:
+            project_env_manager.deploy(name, parse_account_list(target_accounts))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return RedirectResponse("/", status_code=303)
+
+    @app.post("/projects/{name}/update")
+    def update_project_form(name: str, target_accounts: str = Form("")) -> Response:
+        try:
+            project_env_manager.update(name, parse_account_list(target_accounts) or None)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return RedirectResponse("/", status_code=303)
+
+    @app.post("/projects/{name}/delete")
+    def delete_project_form(name: str) -> Response:
+        project = db.get_project_by_name(name)
+        if project:
+            db.delete_project(int(project["id"]))
+        return RedirectResponse("/", status_code=303)
 
     @app.get("/api/token-usage")
     def api_token_usage() -> list[dict]:

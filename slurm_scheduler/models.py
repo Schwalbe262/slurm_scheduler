@@ -101,6 +101,8 @@ class TaskCreate:
     same_node_as_task_id: int = 0
     payload_json: str = ""
     cleanup_globs: str = ""
+    project: str = ""
+    entrypoint: str = ""
 
 
 @dataclass(frozen=True)
