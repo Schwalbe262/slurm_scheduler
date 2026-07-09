@@ -1,13 +1,12 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="stack">
-<section class="panel">
-  <h1>작업 등록</h1>
-  <div class="mode-tabs" role="tablist" aria-label="작업 등록 방식">
+<details id="submit-forms" class="panel">
+  <summary>작업 등록 — 원격 경로 실행 / Git</summary>
+  <div class="mode-tabs" role="tablist" aria-label="작업 등록 방식" style="margin-top: 14px;">
     <button type="button" class="mode-tab" data-submit-mode="task" aria-selected="true">원격 경로 실행</button>
     <button type="button" class="mode-tab" data-submit-mode="git" aria-selected="false">Git에서 받아 실행</button>
   </div>
-</section>
 <div class="forms-grid">
   <section class="panel submit-panel" id="job-submit-panel" data-submit-panel="job" hidden>
     <h1>Git에서 받아 실행</h1>
@@ -84,6 +83,18 @@
         <div>
           <label for="node_name">Node name</label>
           <input id="node_name" name="node_name" placeholder="optional exact node">
+        </div>
+        <div>
+          <label for="same_node_as_task_id">Same node as task ID</label>
+          <input id="same_node_as_task_id" name="same_node_as_task_id" type="number" min="0" value="0">
+        </div>
+        <div>
+          <label for="job_priority">Priority</label>
+          <input id="job_priority" name="priority" type="number" value="0" title="높을수록 먼저 배정됩니다. 같은 값이면 먼저 제출한 순서.">
+        </div>
+        <div>
+          <label for="job_cleanup_globs">Cleanup globs</label>
+          <input id="job_cleanup_globs" name="cleanup_globs" placeholder="simulation, aedt_temp" title="태스크가 어떤 상태로든 종료되면 워크디렉토리에서 이 이름 패턴들을 삭제합니다.">
         </div>
         <div>
           <label for="exclusive_node">Exclusive node</label>
@@ -222,6 +233,21 @@
         </div>
 
         <div>
+          <label for="task_same_node_as_task_id">Same node as task ID</label>
+          <input id="task_same_node_as_task_id" name="same_node_as_task_id" type="number" min="0" value="0">
+        </div>
+
+        <div>
+          <label for="task_priority">Priority</label>
+          <input id="task_priority" name="priority" type="number" value="0" title="높을수록 먼저 배정됩니다. 같은 값이면 먼저 제출한 순서.">
+        </div>
+
+        <div>
+          <label for="task_cleanup_globs">Cleanup globs</label>
+          <input id="task_cleanup_globs" name="cleanup_globs" placeholder="simulation, aedt_temp" title="태스크가 어떤 상태로든 종료되면 워크디렉토리에서 이 이름 패턴들을 삭제합니다.">
+        </div>
+
+        <div>
           <label for="task_exclusive_node">Exclusive node</label>
           <select id="task_exclusive_node" name="exclusive_node">
             <option value="false">No</option>
@@ -234,6 +260,7 @@
     </form>
   </section>
 </div>
+</details>
 
   <script>
     (() => {
@@ -254,6 +281,7 @@
         gpus: ["GPU 수", "0이면 GPU를 요청하지 않습니다. 1 이상이면 GPU partition 또는 GPU node가 필요합니다."],
         gpu_model: ["GPU 모델", "특정 GPU가 필요할 때 a6000ada 또는 a6000처럼 입력합니다. 여러 후보는 a6000ada,a6000처럼 입력합니다. 비워두면 모델을 고정하지 않습니다."],
         node_name: ["노드 이름", "특정 노드에서만 실행해야 할 때만 입력합니다. 비워두면 스케줄러가 선택합니다."],
+        same_node_as_task_id: ["Same node as task ID", "지정한 running task와 같은 노드에 붙입니다. 서비스 task의 localhost endpoint를 같은 노드에서 호출할 때 사용합니다."],
         exclusive_node: ["노드 독점", "Yes이면 Slurm --exclusive를 요청합니다. 공유 가능한 작업이면 No를 유지합니다."],
         total_simulations: ["전체 시뮬레이션 수", "등록할 simulation id 총 개수입니다."],
         simulations_per_job: ["Job당 시뮬레이션 수", "직접 Slurm batch 제출용 고급 필드입니다. 기본 작업 등록에서는 사용하지 않습니다."],
@@ -281,6 +309,7 @@
         task_gpu_model: ["GPU 모델", "특정 GPU가 필요하면 a6000ada 또는 a6000처럼 입력합니다. 여러 후보는 a6000ada,a6000처럼 입력합니다. 비워두면 모델을 고정하지 않습니다."],
         task_partition: ["파티션", "auto이면 스케줄러가 인벤토리를 보고 고릅니다. 특정 파티션이 필요하면 입력합니다."],
         task_node_name: ["노드 이름", "특정 노드에서만 실행해야 할 때만 입력합니다. 비워두면 스케줄러가 선택합니다."],
+        task_same_node_as_task_id: ["Same node as task ID", "지정한 running task와 같은 노드에 붙입니다. 서비스 task의 localhost endpoint를 같은 노드에서 호출할 때 사용합니다."],
         task_exclusive_node: ["노드 독점", "Yes이면 빈 전용 allocation에만 붙습니다. 공유 가능한 작업이면 No를 유지합니다."]
       };
 
@@ -319,6 +348,7 @@
         "gpus",
         "gpu_model",
         "node_name",
+        "same_node_as_task_id",
         "exclusive_node"
       ]);
       const allGitFormFields = [
@@ -379,7 +409,7 @@
   <section class="panel">
     <div class="title-row">
       <h2>Accounts</h2>
-      <button type="button" onclick="refreshAccounts()">Refresh accounts</button>
+      <button type="button" id="refresh-accounts-button" onclick="refreshAccounts()">Refresh accounts</button>
     </div>
     {% if snapshot_error %}<p class="error">{{ snapshot_error }}</p>{% endif %}
     <div class="table-scroll">
@@ -408,25 +438,36 @@
     </div>
     <script>
       async function refreshAccounts() {
-        const res = await fetch('/api/accounts/status/live');
-        const rows = await res.json();
-        const tbody = document.querySelector('#accounts-table tbody');
-        tbody.innerHTML = '';
-        for (const item of rows) {
-          const used = item.running + item.pending;
-          const storage = item.storage_used_gb !== null && item.storage_quota_gb
-            ? `${item.storage_used_gb.toFixed(2)} / ${item.storage_quota_gb.toFixed(2)} GB`
-            : 'not configured';
-          tbody.insertAdjacentHTML('beforeend', `
-            <tr>
-              <td>${item.account_name}</td>
-              <td>${used} / ${item.max_total}</td>
-              <td>${item.running}</td>
-              <td>${item.pending}</td>
-              <td>${storage}</td>
-              <td>${item.available ? 'yes' : 'no'}</td>
-            </tr>
-          `);
+        const button = document.getElementById('refresh-accounts-button');
+        const original = button.textContent;
+        button.disabled = true;
+        button.textContent = 'Refreshing…';
+        try {
+          const res = await fetch('/api/accounts/status/live');
+          const rows = await res.json();
+          const tbody = document.querySelector('#accounts-table tbody');
+          tbody.innerHTML = '';
+          for (const item of rows) {
+            const used = item.running + item.pending;
+            const storage = item.storage_used_gb !== null && item.storage_quota_gb
+              ? `${item.storage_used_gb.toFixed(2)} / ${item.storage_quota_gb.toFixed(2)} GB`
+              : 'not configured';
+            tbody.insertAdjacentHTML('beforeend', `
+              <tr>
+                <td>${item.account_name}</td>
+                <td>${used} / ${item.max_total}</td>
+                <td>${item.running}</td>
+                <td>${item.pending}</td>
+                <td>${storage}</td>
+                <td>${item.available ? 'yes' : 'no'}</td>
+              </tr>
+            `);
+          }
+        } catch (err) {
+          console.warn('account refresh failed', err);
+        } finally {
+          button.disabled = false;
+          button.textContent = original;
         }
       }
     </script>
@@ -523,7 +564,7 @@
         </tbody>
       </table>
     </div>
-    <details class="section-gap">
+    <details class="section-gap" {% if attached_task_name_filter %}open{% endif %}>
       <summary>Synced conda overlays: {{ env_overlays|length }}</summary>
       <div class="table-scroll section-gap">
         <table>
@@ -548,40 +589,120 @@
   </section>
 
   <section class="panel">
-    <h2>Allocation Pool</h2>
+    <div class="title-row">
+      <h2>Allocation Pool</h2>
+      <span class="muted" data-live-updated-at></span>
+    </div>
     <div class="summary-row" aria-label="Allocation pool usage summary">
       <div class="summary-item">
+        <span class="summary-label">Nodes</span>
+        <span class="summary-value" data-allocation-summary="nodes">{{ allocation_summary.nodes }} ({{ allocation_summary.allocations }} pools{% if allocation_summary.pending %}, {{ allocation_summary.pending }} pending{% endif %})</span>
+      </div>
+      <div class="summary-item">
         <span class="summary-label">CPU Used</span>
-        <span class="summary-value">{{ allocation_summary.cpu_used }} / {{ allocation_summary.cpu_total }}</span>
+        <span class="summary-value" data-allocation-summary="cpu">{{ allocation_summary.cpu_used }} / {{ allocation_summary.cpu_total }}</span>
       </div>
       <div class="summary-item">
         <span class="summary-label">GPU Used</span>
-        <span class="summary-value">{{ allocation_summary.gpu_used }} / {{ allocation_summary.gpu_total }}</span>
+        <span class="summary-value" data-allocation-summary="gpu">{{ allocation_summary.gpu_used }} / {{ allocation_summary.gpu_total }}</span>
       </div>
       <div class="summary-item">
         <span class="summary-label">Mem Used</span>
-        <span class="summary-value">{{ allocation_summary.memory_used_gb }} / {{ allocation_summary.memory_total_gb }} GB</span>
+        <span class="summary-value" data-allocation-summary="mem">{{ allocation_summary.memory_used_gb }} / {{ allocation_summary.memory_total_gb }} GB</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">GPU Warm Pool</span>
+        <span class="summary-value">
+          {{ "ON" if gpu_prewarm_enabled else "OFF" }}
+          {% if gpu_prewarm_enabled %}
+            <form
+              class="inline-form"
+              method="post"
+              action="/scheduler/gpu-prewarm"
+              onsubmit="return confirm('Turn off GPU warm pool? Idle warm GPU allocations will be scaled in and no new prewarm allocations will open.');"
+            >
+              <input type="hidden" name="enabled" value="off">
+              <button class="danger compact" type="submit">Turn off</button>
+            </form>
+          {% else %}
+            <form class="inline-form" method="post" action="/scheduler/gpu-prewarm">
+              <input type="hidden" name="enabled" value="on">
+              <button class="compact" type="submit">Turn on</button>
+            </form>
+          {% endif %}
+        </span>
       </div>
     </div>
     <div class="table-scroll">
       <table>
-        <thead><tr><th>ID</th><th>State</th><th>Pool</th><th>Account</th><th>Node</th><th>CPU Used</th><th>GPU Used</th><th>Mem Used</th><th>Slurm ID</th><th>Reason</th></tr></thead>
+        <thead><tr><th>ID</th><th>State</th><th>Pool</th><th>Account</th><th>Node</th><th>Node FEA</th><th>Owned FEA CPU</th><th>Node Load</th><th>Node RAM</th><th>CPU Used</th><th>GPU Used</th><th>Mem Used</th><th>Slurm ID</th><th>Time</th><th>Action</th></tr></thead>
         <tbody>
         {% for allocation in allocations %}
-          <tr>
+          <tr class="{{ 'warm-pool-row' if allocation.is_warm_pool else '' }}">
             <td>{{ allocation.id }}</td>
             <td>{{ allocation.state }}</td>
-            <td>{{ allocation.resource_pool or "cpu" }}</td>
+            <td>
+              {{ allocation.resource_pool or "cpu" }}
+              {% if allocation.is_warm_pool %}<span class="warm-pool-tag">warm</span>{% endif %}
+              <div class="muted mono-cell" title="partition">{{ allocation.partition }}</div>
+            </td>
             <td>{{ allocation.account_name }}</td>
-            <td>{{ allocation.node_name or allocation.partition }}</td>
+            <td>
+              {{ allocation.node_name or "-" }}
+              {% if allocation.node_name and allocation.partition and "," not in allocation.partition %}
+                <div class="muted">{{ allocation.partition }}</div>
+              {% endif %}
+            </td>
+            <td title="FEA tasks on physical node {{ allocation.node_name }}">{{ allocation.node_fea_worker_count if allocation.node_name else "" }}</td>
+            <td class="mono-cell" title="Scheduler-owned running/attaching FEA requested CPU on {{ allocation.node_name }} / scheduler-owned CPU allocation cores on that node">
+              {% if allocation.node_fea_owned_cpus is not none %}
+                {{ allocation.node_fea_requested_cpus }} / {{ allocation.node_fea_owned_cpus }}
+                {% if allocation.node_fea_cpu_percent is not none %}<span class="muted">({{ allocation.node_fea_cpu_percent }}%)</span>{% endif %}
+              {% elif allocation.node_name %}
+                <span class="muted">-</span>
+              {% endif %}
+            </td>
+            <td class="mono-cell" title="pestat CPUload on physical node {{ allocation.node_name }}">
+              {% if allocation.node_cpu_total %}
+                {{ allocation.node_cpu_load }} / {{ allocation.node_cpu_total }}
+                {% if allocation.node_cpu_load_percent is not none %}<span class="muted">({{ allocation.node_cpu_load_percent }}%)</span>{% endif %}
+              {% else %}
+                <span class="muted">-</span>
+              {% endif %}
+            </td>
+            <td class="mono-cell" title="pestat actual RAM used on physical node {{ allocation.node_name }}">
+              {% if allocation.node_memory_total_mb %}
+                {{ allocation.node_memory_used_gb }} / {{ allocation.node_memory_total_gb }} GB
+                {% if allocation.node_memory_used_percent is not none %}<span class="muted">({{ allocation.node_memory_used_percent }}%)</span>{% endif %}
+              {% else %}
+                <span class="muted">-</span>
+              {% endif %}
+            </td>
             <td>{{ allocation.total_cpus - allocation.free_cpus }} / {{ allocation.total_cpus }}</td>
             <td>{{ (allocation.total_gpus or 0) - (allocation.free_gpus or 0) }} / {{ allocation.total_gpus or 0 }} {{ allocation.gpu_model }}</td>
             <td>{{ allocation.total_memory_mb - allocation.free_memory_mb }} / {{ allocation.total_memory_mb }} MB</td>
             <td class="mono-cell">{{ allocation.slurm_job_id or "" }}</td>
-            <td class="mono-cell">{{ allocation.pending_reason or allocation.drain_reason or allocation.failure_message or "" }}</td>
+            <td class="mono-cell pool-time-cell">
+              <div><span class="pool-time-label">req</span>{{ allocation.request_elapsed_text or "" }}</div>
+              {% if allocation.held_elapsed_text %}
+                <div><span class="pool-time-label">held</span>{{ allocation.held_elapsed_text }}</div>
+              {% endif %}
+            </td>
+            <td>
+              {% if allocation.state not in ["closed", "failed", "closing"] %}
+                <form
+                  class="inline-form"
+                  method="post"
+                  action="/allocations/{{ allocation.id }}/close"
+                  onsubmit="return confirm('Close allocation {{ allocation.id }}? Running tasks must be stopped first.');"
+                >
+                  <button class="danger compact" type="submit">Close</button>
+                </form>
+              {% endif %}
+            </td>
           </tr>
         {% else %}
-          <tr><td colspan="10" class="muted">No active allocations.</td></tr>
+          <tr><td colspan="15" class="muted">No active allocations.</td></tr>
         {% endfor %}
         </tbody>
       </table>
@@ -613,14 +734,190 @@
     </details>
   </section>
 
+  {% if license_monitor_enabled %}
   <section class="panel">
-    <h2>Attached Tasks</h2>
+    <details id="ansys-licenses">
+      <summary>
+        ANSYS Licenses
+        {% if license_usage.in_use %}
+          — {{ license_usage.in_use|length }} feature{{ "" if license_usage.in_use|length == 1 else "s" }} in use
+        {% elif license_usage.error %}
+          — <span class="error">check failed</span>
+        {% elif not license_usage %}
+          — waiting for first check
+        {% else %}
+          — idle
+        {% endif %}
+        {% if license_usage.checked_at %}<span class="muted">({{ license_usage.checked_at[:19] }} UTC)</span>{% endif %}
+      </summary>
+      {% if license_usage.error %}
+        <p class="error section-gap">{{ license_usage.error }}</p>
+      {% endif %}
+      {% if license_usage.display %}
+        <div class="summary-row section-gap" aria-label="ANSYS license usage">
+          {% for item in license_usage.display %}
+            <div class="summary-item">
+              <span class="summary-label">{{ item.label }}</span>
+              <span class="summary-value">{{ item.used }} / {{ item.total }}</span>
+            </div>
+          {% endfor %}
+        </div>
+        {% set covered = license_usage.display | map(attribute="feature") | list %}
+        {% set extra = license_usage.in_use | default([]) | rejectattr("feature", "in", covered) | list %}
+        {% if extra %}
+          <p class="muted section-gap">
+            Other features in use:
+            {% for item in extra %}{{ item.feature }} {{ item.used }}/{{ item.total }}{% if not loop.last %}, {% endif %}{% endfor %}
+          </p>
+        {% endif %}
+      {% else %}
+        {% set watched = license_usage.features | default([]) | selectattr("feature", "in", license_watch_features) | list %}
+        {% set shown = (license_usage.in_use | default([])) + (watched | rejectattr("used", "gt", 0) | list) %}
+        {% if shown %}
+          <div class="table-scroll section-gap">
+            <table>
+              <thead><tr><th>Feature</th><th>Used</th><th>Total</th></tr></thead>
+              <tbody>
+              {% for item in shown %}
+                <tr>
+                  <td class="mono-cell">{{ item.feature }}</td>
+                  <td>{{ item.used }}</td>
+                  <td>{{ item.total }}</td>
+                </tr>
+              {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% elif license_usage and not license_usage.error %}
+          <p class="muted section-gap">No licenses in use ({{ license_usage.features|length }} features on {{ license_usage.server }}).</p>
+        {% endif %}
+      {% endif %}
+    </details>
+  </section>
+  {% endif %}
+
+  <section class="panel">
+    <h2>Scheduler Events</h2>
+    <div class="summary-row" aria-label="Scheduler health">
+      <div class="summary-item">
+        <span class="summary-label">Scheduler</span>
+        <span class="summary-value">{{ "OK" if scheduler_health.scheduler_ok else "STALLED" }}</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Last tick</span>
+        <span class="summary-value">{{ scheduler_health.last_tick_duration_seconds ~ "s" if scheduler_health.last_tick_duration_seconds is not none else "-" }}</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Tick failures</span>
+        <span class="summary-value">{{ scheduler_health.consecutive_tick_failures }}</span>
+      </div>
+    </div>
+    <details>
+      <summary>Recent events: {{ scheduler_events|length }}</summary>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Time</th><th>Kind</th><th>Entity</th><th>Account</th><th>Message</th></tr></thead>
+          <tbody>
+          {% for event in scheduler_events %}
+            <tr>
+              <td class="mono-cell">{{ event.created_at }}</td>
+              <td>{{ event.kind }}</td>
+              <td class="mono-cell">{{ event.entity_type }} {{ event.entity_id }}</td>
+              <td>{{ event.account_name }}</td>
+              <td>{{ event.message }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="5" class="muted">No events yet.</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </details>
+  </section>
+
+  <section class="panel">
+    <div class="title-row">
+      <h2>Attached Tasks</h2>
+      <span class="muted" data-live-updated-at></span>
+    </div>
+    <div class="summary-row" aria-label="Attached task summary">
+      <div class="summary-item">
+        <span class="summary-label">Total</span>
+        <span class="summary-value" data-attached-summary="total">{{ task_summary.total }}</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Running</span>
+        <span class="summary-value" data-attached-summary="running">{{ task_summary.running }}</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Attaching</span>
+        <span class="summary-value" data-attached-summary="attaching">{{ task_summary.attaching }}</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Queued</span>
+        <span class="summary-value" data-attached-summary="queued">{{ task_summary.queued }}</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">FEA</span>
+        <span class="summary-value" data-attached-summary="fea">{{ task_summary.fea_running }} / {{ task_summary.fea }}</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Standard</span>
+        <span class="summary-value" data-attached-summary="standard">{{ task_summary.standard }}</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">GPU</span>
+        <span class="summary-value" data-attached-summary="gpu">{{ task_summary.gpu }}</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Same Node</span>
+        <span class="summary-value" data-attached-summary="same_node">{{ task_summary.same_node }}</span>
+      </div>
+    </div>
+    <div class="table-controls" aria-label="Attached task table controls">
+      <div>
+        <label for="attached-task-name-filter">Name contains</label>
+        <input id="attached-task-name-filter" type="search" autocomplete="off" placeholder="ipmsm, factorio, b48" value="{{ attached_task_name_filter }}">
+      </div>
+      <div>
+        <label for="attached-task-sort-key">Sort by</label>
+        <select id="attached-task-sort-key">
+          <option value="id">ID</option>
+          <option value="name">Name</option>
+          <option value="status">Status</option>
+          <option value="allocation">Allocation</option>
+          <option value="scheduling">Scheduling</option>
+        </select>
+      </div>
+      <div>
+        <label for="attached-task-sort-direction">Order</label>
+        <select id="attached-task-sort-direction">
+          <option value="desc">Descending</option>
+          <option value="asc">Ascending</option>
+        </select>
+      </div>
+      <div class="actions">
+        <button type="button" class="secondary" id="attached-task-refresh">Refresh</button>
+        <button type="button" class="secondary" id="attached-task-clear">Clear</button>
+        <button type="button" class="danger" id="cancel-selected-tasks" disabled>Cancel selected</button>
+      </div>
+    </div>
     <div class="table-scroll">
-      <table>
-        <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Allocation</th><th>Capability</th><th>Env</th><th>Scheduling</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Elapsed</th></tr></thead>
-        <tbody>
+      <table id="attached-tasks-table">
+        <thead><tr><th><input type="checkbox" id="select-all-tasks" aria-label="Select all visible tasks"></th><th>ID</th><th>Name</th><th>Status</th><th>Prio</th><th>Allocation</th><th>Capability</th><th>Env</th><th>Scheduling</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Elapsed</th><th>Action</th></tr></thead>
+        <tbody id="attached-tasks-body">
         {% for task in tasks %}
-          <tr>
+          <tr
+            data-task-row
+            data-id="{{ task.id }}"
+            data-name="{{ task.name }}"
+            data-status="{{ task.status }}"
+            data-allocation="{{ task.allocation_id or '' }}"
+            data-scheduling="{{ task.scheduling_profile or 'standard' }}"
+            data-gpus="{{ task.gpus or 0 }}"
+            data-same-node="{{ task.same_node_as_task_id or 0 }}"
+          >
+            <td><input type="checkbox" class="task-select" value="{{ task.id }}" aria-label="Select task {{ task.id }}"></td>
             <td>{{ task.id }}</td>
             <td>
               <a href="/tasks/{{ task.id }}">{{ task.name }}</a>
@@ -635,6 +932,23 @@
               {% endif %}
             </td>
             <td>{{ task.status }}</td>
+            <td>
+              {% if task.status == "queued" %}
+                <form class="inline-form" method="post" action="/tasks/{{ task.id }}/priority">
+                  <input
+                    class="compact-input"
+                    style="width: 58px;"
+                    name="priority"
+                    type="number"
+                    value="{{ task.priority or 0 }}"
+                    aria-label="Priority for task {{ task.id }}"
+                    onchange="this.form.submit()"
+                  >
+                </form>
+              {% else %}
+                {{ task.priority or 0 }}
+              {% endif %}
+            </td>
             <td>{{ task.allocation_id or "" }}</td>
             <td>{{ task.required_capability or "" }}</td>
             <td>{{ task.env_profile or "" }}</td>
@@ -643,21 +957,40 @@
             <td>{{ task.gpus or 0 }} {{ task.gpu_model }}</td>
             <td>{{ task.memory_mb }} MB</td>
             <td class="mono-cell">{{ task.elapsed_text or "" }}</td>
+            <td>
+              {% if task.status not in ["completed", "failed", "cancelled"] %}
+                <form
+                  method="post"
+                  action="/tasks/{{ task.id }}/cancel"
+                  onsubmit="return confirm('Stop attached task {{ task.id }}?');"
+                >
+                  <button class="danger" type="submit">Stop</button>
+                </form>
+              {% endif %}
+            </td>
           </tr>
         {% else %}
-          <tr><td colspan="11" class="muted">No active attached tasks.</td></tr>
+          <tr><td colspan="14" class="muted">No active attached tasks.</td></tr>
         {% endfor %}
+          <tr id="attached-task-no-filter-match" hidden><td colspan="14" class="muted">No matching attached tasks.</td></tr>
         </tbody>
       </table>
     </div>
     <details class="section-gap">
-      <summary>Finished tasks: recent {{ finished_tasks|length }}{% if finished_task_count > finished_tasks|length %} of {{ finished_task_count }}{% endif %}</summary>
+      <summary>Finished tasks: {% if attached_task_name_filter %}matching{% else %}recent{% endif %} {{ finished_tasks|length }}{% if finished_task_count > finished_tasks|length %} of {{ finished_task_count }}{% endif %}{% if attached_task_name_filter %} for "{{ attached_task_name_filter }}"{% endif %}</summary>
       <div class="table-scroll section-gap">
-        <table>
-          <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Allocation</th><th>Capability</th><th>Env</th><th>Scheduling</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Elapsed</th></tr></thead>
-          <tbody>
+        <table id="finished-tasks-table">
+          <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Allocation</th><th>Capability</th><th>Env</th><th>Scheduling</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Elapsed</th><th>Failure</th></tr></thead>
+          <tbody id="finished-tasks-body">
           {% for task in finished_tasks %}
-            <tr>
+            <tr
+              data-finished-task-row
+              data-id="{{ task.id }}"
+              data-name="{{ task.name }}"
+              data-status="{{ task.status }}"
+              data-allocation="{{ task.allocation_id or '' }}"
+              data-scheduling="{{ task.scheduling_profile or 'standard' }}"
+            >
               <td>{{ task.id }}</td>
               <td>
                 <a href="/tasks/{{ task.id }}">{{ task.name }}</a>
@@ -680,15 +1013,199 @@
               <td>{{ task.gpus or 0 }} {{ task.gpu_model }}</td>
               <td>{{ task.memory_mb }} MB</td>
               <td class="mono-cell">{{ task.elapsed_text or "" }}</td>
+              <td class="mono-cell{% if task.status == 'failed' %} error{% endif %}" title="{{ task.failure_message or '' }}">
+                {{ (task.failure_message or "")[:120] }}
+              </td>
             </tr>
           {% else %}
-            <tr><td colspan="11" class="muted">No finished tasks.</td></tr>
+            <tr><td colspan="12" class="muted">No finished tasks.</td></tr>
           {% endfor %}
+            <tr id="finished-task-no-filter-match" hidden><td colspan="12" class="muted">No matching finished tasks.</td></tr>
           </tbody>
         </table>
       </div>
+      <div class="section-gap" style="display: flex; gap: 10px; align-items: center;">
+        {% if finished_page > 0 %}
+          <a class="button" href="/?finished_page={{ finished_page - 1 }}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">&laquo; Prev</a>
+        {% endif %}
+        <span class="muted">Page {{ finished_page + 1 }} / {{ finished_page_count }} ({{ finished_task_count }} tasks)</span>
+        {% if finished_page + 1 < finished_page_count %}
+          <a class="button" href="/?finished_page={{ finished_page + 1 }}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">Next &raquo;</a>
+        {% endif %}
+      </div>
     </details>
     <script>
+      (() => {
+        const storageKey = "slurmScheduler.attachedTasks.tableState";
+        const filterInput = document.getElementById("attached-task-name-filter");
+        const sortKeySelect = document.getElementById("attached-task-sort-key");
+        const sortDirectionSelect = document.getElementById("attached-task-sort-direction");
+        const refreshButton = document.getElementById("attached-task-refresh");
+        const clearButton = document.getElementById("attached-task-clear");
+        const tbody = document.getElementById("attached-tasks-body");
+        const noMatchRow = document.getElementById("attached-task-no-filter-match");
+        const finishedTbody = document.getElementById("finished-tasks-body");
+        const finishedNoMatchRow = document.getElementById("finished-task-no-filter-match");
+        if (!filterInput || !sortKeySelect || !sortDirectionSelect || !tbody || !noMatchRow) return;
+
+        const rows = Array.from(tbody.querySelectorAll("[data-task-row]"));
+        const finishedRows = finishedTbody ? Array.from(finishedTbody.querySelectorAll("[data-finished-task-row]")) : [];
+        const defaultState = { filter: "", sortKey: "id", direction: "desc" };
+        const serverFilter = {{ attached_task_name_filter|tojson }};
+
+        function loadState() {
+          try {
+            return { ...defaultState, ...JSON.parse(localStorage.getItem(storageKey) || "{}") };
+          } catch {
+            return { ...defaultState };
+          }
+        }
+
+        function currentState() {
+          return {
+            filter: filterInput.value,
+            sortKey: sortKeySelect.value,
+            direction: sortDirectionSelect.value,
+          };
+        }
+
+        function saveState() {
+          localStorage.setItem(storageKey, JSON.stringify(currentState()));
+        }
+
+        function numericValue(row, key) {
+          const value = Number(row.dataset[key] || 0);
+          return Number.isFinite(value) ? value : 0;
+        }
+
+        function stringValue(row, key) {
+          return (row.dataset[key] || "").toLowerCase();
+        }
+
+        function compareRows(a, b, key) {
+          if (key === "id" || key === "allocation") {
+            return numericValue(a, key) - numericValue(b, key);
+          }
+          const left = stringValue(a, key);
+          const right = stringValue(b, key);
+          return left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
+        }
+
+        function applyRows(rowSet, rowTbody, noRow, state, filter, direction) {
+          const sortedRows = [...rowSet].sort((a, b) => {
+            const primary = compareRows(a, b, state.sortKey);
+            if (primary !== 0) return primary * direction;
+            return compareRows(a, b, "id") * -1;
+          });
+          let visibleCount = 0;
+          const visibleRows = [];
+          for (const row of sortedRows) {
+            const visible = !filter || stringValue(row, "name").includes(filter);
+            row.hidden = !visible;
+            if (visible) {
+              visibleCount += 1;
+              visibleRows.push(row);
+            }
+            rowTbody.insertBefore(row, noRow);
+          }
+          noRow.hidden = rowSet.length === 0 || visibleCount > 0;
+          return visibleRows;
+        }
+
+        function setSummaryValue(key, value) {
+          const element = document.querySelector(`[data-attached-summary="${key}"]`);
+          if (element) element.textContent = String(value);
+        }
+
+        function updateAttachedSummary(visibleRows) {
+          const counts = {
+            total: 0,
+            running: 0,
+            attaching: 0,
+            queued: 0,
+            fea: 0,
+            feaRunning: 0,
+            standard: 0,
+            gpu: 0,
+            sameNode: 0,
+          };
+          for (const row of visibleRows) {
+            const status = row.dataset.status || "";
+            const scheduling = row.dataset.scheduling || "standard";
+            counts.total += 1;
+            if (status === "running") counts.running += 1;
+            if (status === "attaching") counts.attaching += 1;
+            if (status === "queued") counts.queued += 1;
+            if (scheduling === "fea_bursty") {
+              counts.fea += 1;
+              if (status === "running") counts.feaRunning += 1;
+            } else {
+              counts.standard += 1;
+            }
+            if (numericValue(row, "gpus") > 0) counts.gpu += 1;
+            if (numericValue(row, "sameNode") > 0) counts.sameNode += 1;
+          }
+          setSummaryValue("total", counts.total);
+          setSummaryValue("running", counts.running);
+          setSummaryValue("attaching", counts.attaching);
+          setSummaryValue("queued", counts.queued);
+          setSummaryValue("fea", `${counts.feaRunning} / ${counts.fea}`);
+          setSummaryValue("standard", counts.standard);
+          setSummaryValue("gpu", counts.gpu);
+          setSummaryValue("same_node", counts.sameNode);
+        }
+
+        function urlForState(state) {
+          const url = new URL(window.location.href);
+          const filter = state.filter.trim();
+          if (filter) {
+            url.searchParams.set("task_name_contains", filter);
+          } else {
+            url.searchParams.delete("task_name_contains");
+          }
+          return url.toString();
+        }
+
+        function applyTableState() {
+          const state = currentState();
+          const filter = state.filter.trim().toLowerCase();
+          const direction = state.direction === "asc" ? 1 : -1;
+          const visibleRows = applyRows(rows, tbody, noMatchRow, state, filter, direction);
+          updateAttachedSummary(visibleRows);
+          if (finishedTbody && finishedNoMatchRow) {
+            applyRows(finishedRows, finishedTbody, finishedNoMatchRow, state, filter, direction);
+          }
+          saveState();
+        }
+
+        const saved = loadState();
+        filterInput.value = serverFilter || saved.filter || "";
+        sortKeySelect.value = saved.sortKey || "id";
+        sortDirectionSelect.value = saved.direction || "desc";
+
+        filterInput.addEventListener("input", applyTableState);
+        sortKeySelect.addEventListener("change", applyTableState);
+        sortDirectionSelect.addEventListener("change", applyTableState);
+        refreshButton?.addEventListener("click", () => {
+          saveState();
+          window.location.assign(urlForState(currentState()));
+        });
+        clearButton?.addEventListener("click", () => {
+          filterInput.value = "";
+          sortKeySelect.value = "id";
+          sortDirectionSelect.value = "desc";
+          saveState();
+          const url = new URL(window.location.href);
+          if (url.searchParams.has("task_name_contains")) {
+            url.searchParams.delete("task_name_contains");
+            window.location.assign(url.toString());
+            return;
+          }
+          applyTableState();
+        });
+        applyTableState();
+      })();
+
       for (const button of document.querySelectorAll("[data-copy-log]")) {
         button.addEventListener("click", async () => {
           const path = button.dataset.copyLog || "";
@@ -817,7 +1334,7 @@
   <h2>GPU Capacity</h2>
   <div class="table-scroll">
     <table>
-      <thead><tr><th>Model</th><th>Cluster Total</th><th>Cluster Used</th><th>Cluster Free</th><th>Scheduler Owned</th><th>Scheduler Free</th><th>Pending</th><th>Nodes</th></tr></thead>
+      <thead><tr><th>Model</th><th>Cluster Total</th><th>Cluster Used</th><th>Cluster Free</th><th>Max Free / Node</th><th>CPU at Max</th><th>Best Node</th><th>Scheduler Owned</th><th>Scheduler Free</th><th>Pending</th><th>Nodes</th></tr></thead>
       <tbody>
       {% for item in gpu_capacity %}
         <tr>
@@ -825,6 +1342,9 @@
           <td>{{ item.cluster_total_gpus }}</td>
           <td>{{ item.cluster_used_gpus }}</td>
           <td>{{ item.cluster_free_gpus }}</td>
+          <td>{{ item.single_node_max_free_gpus }}</td>
+          <td>{{ item.single_node_max_free_cpus }}</td>
+          <td>{{ item.single_node_max_free_gpu_node or "-" }}{% if item.single_node_max_free_gpu_partition %} / {{ item.single_node_max_free_gpu_partition }}{% endif %}</td>
           <td>{{ item.scheduler_owned_gpus }}</td>
           <td>{{ item.scheduler_free_gpus }}</td>
           <td>{{ item.pending_gpu_tasks + item.pending_gpu_jobs }}</td>
@@ -883,10 +1403,7 @@
 </div>
 <script>
   (() => {
-    const refreshMs = 15000;
     const stateKey = "slurmSchedulerDashboardState";
-    let formDirty = false;
-    const editableSelector = "input, textarea, select";
 
     function detailKey(details, index) {
       const summary = details.querySelector("summary");
@@ -911,7 +1428,7 @@
       try {
         localStorage.setItem(stateKey, JSON.stringify(state));
       } catch (_error) {
-        // Ignore storage failures; auto-refresh should still work.
+        // Ignore storage failures; manual reload should still work.
       }
     }
 
@@ -993,32 +1510,118 @@
       );
     });
 
-    for (const field of document.querySelectorAll(editableSelector)) {
-      field.addEventListener("input", () => {
-        formDirty = true;
+  })();
+</script>
+
+<script>
+  (() => {
+    // Live summary refresh: keeps the headline numbers current without a
+    // full page reload (tables still refresh via the Refresh buttons).
+    const attached = (key) => document.querySelector(`[data-attached-summary="${key}"]`);
+    const allocation = (key) => document.querySelector(`[data-allocation-summary="${key}"]`);
+    const stamps = document.querySelectorAll("[data-live-updated-at]");
+    async function refreshSummaries() {
+      try {
+        const response = await fetch("/api/dashboard-summary");
+        if (!response.ok) return;
+        const data = await response.json();
+        const tasks = data.tasks || {};
+        const setText = (element, value) => { if (element && value !== undefined) element.textContent = value; };
+        setText(attached("total"), tasks.total);
+        setText(attached("running"), tasks.running);
+        setText(attached("attaching"), tasks.attaching);
+        setText(attached("queued"), tasks.queued);
+        setText(attached("standard"), tasks.standard);
+        setText(attached("gpu"), tasks.gpu);
+        setText(attached("same_node"), tasks.same_node);
+        if (attached("fea") && tasks.fea !== undefined) {
+          attached("fea").textContent = `${tasks.fea_running} / ${tasks.fea}`;
+        }
+        const pool = data.allocations || {};
+        if (allocation("nodes") && pool.nodes !== undefined) {
+          let nodesText = `${pool.nodes} (${pool.allocations} pools`;
+          if (pool.pending) nodesText += `, ${pool.pending} pending`;
+          allocation("nodes").textContent = nodesText + ")";
+        }
+        setText(allocation("cpu"), `${pool.cpu_used} / ${pool.cpu_total}`);
+        setText(allocation("gpu"), `${pool.gpu_used} / ${pool.gpu_total}`);
+        setText(allocation("mem"), `${pool.memory_used_gb} / ${pool.memory_total_gb} GB`);
+        const stampText = "updated " + new Date().toLocaleTimeString();
+        stamps.forEach((element) => { element.textContent = stampText; });
+      } catch (err) { /* transient network error; retry next interval */ }
+    }
+    refreshSummaries();
+    setInterval(refreshSummaries, 20000);
+
+    // Bulk cancel: checkbox selection over the attached-tasks table.
+    const selectAll = document.getElementById("select-all-tasks");
+    const cancelSelected = document.getElementById("cancel-selected-tasks");
+    const taskChecks = () => Array.from(document.querySelectorAll("#attached-tasks-body .task-select"));
+    const selectedIds = () => taskChecks().filter((box) => box.checked).map((box) => box.value);
+    function updateCancelButton() {
+      if (!cancelSelected) return;
+      const count = selectedIds().length;
+      cancelSelected.disabled = count === 0;
+      cancelSelected.textContent = count ? `Cancel selected (${count})` : "Cancel selected";
+    }
+    if (selectAll) {
+      selectAll.addEventListener("change", () => {
+        taskChecks().forEach((box) => {
+          const row = box.closest("tr");
+          if (!row || row.hidden) return;
+          box.checked = selectAll.checked;
+        });
+        updateCancelButton();
       });
-      field.addEventListener("change", () => {
-        formDirty = true;
+    }
+    document.getElementById("attached-tasks-body")?.addEventListener("change", (event) => {
+      if (event.target && event.target.classList.contains("task-select")) updateCancelButton();
+    });
+    if (cancelSelected) {
+      cancelSelected.addEventListener("click", async () => {
+        const ids = selectedIds();
+        if (!ids.length) return;
+        if (!confirm(`Cancel ${ids.length} selected task(s)?`)) return;
+        cancelSelected.disabled = true;
+        cancelSelected.textContent = "Cancelling…";
+        try {
+          const response = await fetch(`/api/tasks/cancel?task_ids=${ids.join(",")}`, { method: "POST" });
+          if (!response.ok) alert(`Bulk cancel failed: HTTP ${response.status}`);
+        } catch (err) {
+          alert("Bulk cancel failed: " + err);
+        }
+        window.location.reload();
       });
     }
 
-    for (const form of document.querySelectorAll("form")) {
-      form.addEventListener("submit", () => {
-        formDirty = false;
-      });
+    // Clone-from-task prefill (set by the task detail page).
+    let payload = null;
+    try {
+      const raw = localStorage.getItem("slurmScheduler.cloneTaskPayload");
+      if (raw) {
+        localStorage.removeItem("slurmScheduler.cloneTaskPayload");
+        payload = JSON.parse(raw);
+      }
+    } catch (err) { payload = null; }
+    if (payload && typeof payload === "object") {
+      const submitDetails = document.getElementById("submit-forms");
+      if (submitDetails) submitDetails.open = true;
+      const form = document.querySelector('#task-submit-panel form');
+      if (form) {
+        for (const [key, value] of Object.entries(payload)) {
+          const field = form.elements.namedItem(key);
+          if (!field || value === null || value === undefined) continue;
+          if (field.tagName === "SELECT" && typeof value === "boolean") {
+            field.value = value ? "true" : "false";
+          } else if (typeof value === "boolean") {
+            field.value = value ? "true" : "false";
+          } else {
+            field.value = value;
+          }
+        }
+        document.getElementById("task-submit-panel").scrollIntoView({ behavior: "smooth" });
+      }
     }
-
-    window.setInterval(() => {
-      const active = document.activeElement;
-      if (active && active.matches && active.matches(editableSelector)) {
-        return;
-      }
-      if (formDirty) {
-        return;
-      }
-      captureState();
-      window.location.reload();
-    }, refreshMs);
   })();
 </script>
 {% endblock %}

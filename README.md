@@ -52,7 +52,7 @@ FEA 작업은 CPU와 메모리를 항상 고정량으로 점유하지 않는 경
 - 신규 FEA attach는 `pestat`의 node free memory와 CPU load를 보고 결정합니다.
 - free memory가 soft threshold 미만이면 새 FEA attach를 막습니다.
 - free memory가 hard threshold 미만이면 해당 allocation에서 가장 늦게 붙은 running FEA task를 실패 처리하고 cancel합니다.
-- FEA task의 `srun`은 `--overlap --cpus-per-task=<cpus> --mem=<memory_mb>M` 형태로 실행됩니다.
+- FEA task와 same-node CPU client, vLLM service task의 `srun`은 `--overlap --cpus-per-task=<cpus> --mem=<memory_mb>M` 형태로 실행됩니다.
 
 기본 정책:
 
@@ -62,6 +62,9 @@ fea_bursty:
   hard_memory_free_percent: 40
   load_target: 0.75
   max_attach_per_loop: 8
+  node_name_policy: preferred
+  overload_scale_out_load_factor: 2.0
+  overload_scale_out_seconds: 300
 ```
 
 예시:
@@ -294,8 +297,9 @@ cp config/accounts.example.yaml config/accounts.yaml
 
 - `cluster_refresh_interval_seconds`: inventory와 `pestat` refresh 주기
 - `min_warm_allocations`: CPU warm allocation 최소 개수
-- `allocation_cpus`: CPU warm pool allocation 크기
+- `allocation_cpus`: CPU warm pool 목표/상한. CPU-only 노드는 작은 fragment를 피하고 가능한 큰 pool로 요청하며, CPU-only 노드가 꽉 찬 경우 GPU 노드의 `gpu_cpu_reserve` 제외 빈 CPU에 맞춰 요청합니다.
 - `cpu_pool_allow_gpu_partitions`: CPU pool이 GPU partition의 CPU를 사용할 수 있는지
+- `cpu_partition_allocation_limits`: partition 내 물리 노드별 CPU pool live 상한. 기본적으로 `cpu2`는 한 노드에 CPU pool을 최대 2개까지만 둡니다.
 - `warm_pool_preferred_accounts`: CPU warm pool 선호 account
 - `gpu_prewarm`: GPU warm pool 정책
 - `fea_bursty`: bursty FEA pressure threshold

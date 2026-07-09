@@ -3,6 +3,14 @@ accounts_path: "config/accounts.yaml"
 poll_interval_seconds: 30
 bind_host: "127.0.0.1"
 bind_port: 8000
+web_remote_file_default_max_bytes: 262144
+web_remote_file_hard_max_bytes: 1048576
+web_remote_command_timeout_seconds: 5
+web_remote_read_concurrency: 2
+web_remote_read_cache_seconds: 3
+web_timeout_keep_alive_seconds: 5
+web_timeout_graceful_shutdown_seconds: 15
+web_limit_concurrency: 64
 cluster_refresh_interval_seconds: 120
 min_warm_allocations: 1
 allocation_partition: "auto"
@@ -17,31 +25,41 @@ allocation_force_cancel_after_seconds: 140400
 allocation_pending_timeout_seconds: 1800
 allocation_pending_backoff_seconds: 1800
 allocation_reserved_job_slots: 0
+allocation_max_new_per_loop: 8
 cpu_pool_allow_gpu_partitions: true
 warm_pool_preferred_accounts: ["account_a"]
 gpu_warm_pool_preferred_accounts: ["account_a"]
 single_job_per_node_partitions: ["cpu2"]
+cpu_partition_allocation_limits:
+  cpu2: 2
 gpu_cpu_reserve: 4
 gpu_prewarm:
   enabled: true
-  preferred_models: ["a6000ada", "a6000"]
-  min_warm_allocations: 1
-  max_warm_allocations: 3
+  preferred_models: ["a6000"]
+  min_warm_allocations: 2
+  max_warm_allocations: 4
   gpus_per_allocation: 4
-  min_gpus_per_allocation: 2
+  min_gpus_per_allocation: 4
+  cpus_per_allocation: 4
   cpu_reserve_per_free_gpu: 8
+  stagger_seconds: 86400
+  memory: "128G"
   partition: "auto"
   time_limit: "48:00:00"
+  pinned_pending_timeout_seconds: 300
 fea_bursty:
   soft_memory_free_percent: 60
   hard_memory_free_percent: 40
   load_target: 0.75
-  max_attach_per_loop: 8
+  max_attach_per_loop: 24
+  node_name_policy: "preferred"
+  overload_scale_out_load_factor: 2.0
+  overload_scale_out_seconds: 300
 cleanup:
   enabled: true
   interval_seconds: 3600
-  finished_task_ttl_seconds: 604800
-  finished_job_ttl_seconds: 604800
+  finished_task_ttl_seconds: 259200
+  finished_job_ttl_seconds: 259200
   closed_allocation_ttl_seconds: 86400
 git_credentials:
   - id: private-project

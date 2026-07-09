@@ -66,27 +66,30 @@ Default config:
 ```yaml
 gpu_prewarm:
   enabled: true
-  preferred_models: ["a6000ada", "a6000"]
-  min_warm_allocations: 1
-  max_warm_allocations: 3
+  preferred_models: ["a6000"]
+  min_warm_allocations: 2
+  max_warm_allocations: 4
   gpus_per_allocation: 4
-  min_gpus_per_allocation: 2
+  min_gpus_per_allocation: 4
+  cpus_per_allocation: 4
   cpu_reserve_per_free_gpu: 8
+  stagger_seconds: 86400
   partition: "auto"
   time_limit: "48:00:00"
+  pinned_pending_timeout_seconds: 300
 ```
 
-The scheduler keeps at least one A6000-class GPU allocation warm. By default each GPU warm allocation tries to request four GPUs on one node. If four are not free but three are, it requests three; if only two are free, it requests two. One GPU is below the warm-pool minimum and is left for direct task demand instead.
+The scheduler keeps two A6000 GPU warm allocations in rotation. By default each A6000 warm allocation requests four GPUs and 4 CPU cores. Additional same-model warm pools are staggered by `stagger_seconds` so two warm allocations do not age out together.
 
-GPU warm pool fallback stays inside the configured A6000-class models. With the default policy it may queue A6000ADA or A6000, but it will not open RTX 3090 or A10 warm pools just because A6000 jobs are pending.
+GPU warm pool fallback stays inside the configured models. With the default policy it queues A6000 only; it will not open A6000ADA, RTX 3090, or A10 warm pools just because A6000 jobs are pending.
 
-GPU warm placement prioritizes holding the GPU, but it should not make the remaining GPUs unusable. If a GPU warm allocation requests only part of a node's free GPUs, the scheduler leaves `gpu_cpu_reserve` CPU cores unrequested for other users of the remaining GPUs. For example, on a 48-core, 4-GPU node, a 2-GPU warm allocation requests 44 CPU cores rather than all 48.
+GPU warm placement prioritizes holding the GPU, while keeping CPU requests small enough to fit busy nodes. The default A6000 warm pool overrides the normal A6000 task CPU floor and requests 4 CPU cores for a 4-GPU warm allocation.
 
-If an A6000-class node has enough free GPUs but only four free CPU cores, the scheduler may still open the GPU warm allocation with those four CPU cores. This low-CPU exception keeps GPU capture possible when the node is otherwise nearly full.
+When a 4-GPU A6000 warm allocation can fit a node immediately, the scheduler pins that node first. If no current node has enough free GPUs, CPU, and memory, it submits an unpinned `gpu4,gpu5` request so Slurm can start it on either A6000 partition. If a pinned request stays pending longer than `pinned_pending_timeout_seconds`, the scheduler cancels that pinned request, avoids the node briefly, and tries another current-fit node or the unpinned queue path.
 
-For attached GPU tasks, GPU availability is treated as the scarce resource. If the requested GPU model and count match an already owned allocation, the scheduler may attach the task even when the allocation has fewer free CPU cores than requested. This exception is limited to GPU tasks requesting 4 CPU cores or fewer, and the attached `srun` step uses `--overlap` when it must share already allocated CPU capacity. CPU-only tasks still require enough borrowable CPU.
+Attached GPU tasks require enough free CPUs inside the selected allocation. CPU overlap is reserved for same-node CPU clients, FEA bursty tasks, and vLLM service tasks that need to coexist with localhost clients inside the same allocation. Other GPU tasks keep exclusive Slurm steps.
 
-If a GPU warm allocation stays Slurm `PENDING` longer than `allocation_pending_timeout_seconds`, the scheduler cancels it and applies `allocation_pending_backoff_seconds` to that GPU pool before trying again. The dashboard Allocation Pool reason column shows the Slurm pending reason, such as `(Resources)` or `(Priority)`.
+If an unpinned GPU warm allocation stays Slurm `PENDING` longer than `allocation_pending_timeout_seconds`, the scheduler normally cancels it and applies `allocation_pending_backoff_seconds` to that GPU pool before trying again. A6000 warm pools waiting with Slurm reason `(Priority)` are exempt and stay queued, because cancelling them would lose queue position. `(Resources)` pending still times out. The dashboard Allocation Pool reason column shows the Slurm pending reason.
 
 The account preference is configured separately:
 

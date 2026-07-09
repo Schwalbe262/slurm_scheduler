@@ -12,7 +12,7 @@ export SCHEDULER_URL=http://<scheduler-host>:8000
 
 ### `GET /api/health`
 
-Checks that the FastAPI service and local database are reachable.
+Checks the FastAPI service, local database, and the scheduler loop itself. Returns `503` with `"ok": false` when the scheduler thread is dead or a tick has stalled past the watchdog threshold.
 
 ```bash
 curl -sS "$SCHEDULER_URL/api/health"
@@ -21,7 +21,66 @@ curl -sS "$SCHEDULER_URL/api/health"
 Typical response:
 
 ```json
-{"ok": true, "accounts": 6, "jobs": 12, "tasks": 0, "allocations": 7}
+{
+  "ok": true, "accounts": 6, "jobs": 12, "tasks": 0, "allocations": 7,
+  "scheduler_thread_alive": true, "scheduler_stalled": false, "scheduler_ok": true,
+  "last_tick_completed_at": "2026-07-07T00:00:00+00:00",
+  "last_tick_duration_seconds": 2.6, "tick_in_progress_seconds": null,
+  "consecutive_tick_failures": 0
+}
+```
+
+### `GET /api/events`
+
+Returns recent scheduler events (allocation open/warm/close/fail, task complete/fail/requeue, account SSH failures, watchdog firings, reconcile actions, orphan sweeps), newest first.
+
+```bash
+curl -sS "$SCHEDULER_URL/api/events?limit=100"
+```
+
+### `GET /api/licenses`
+
+Latest FlexLM license snapshot from the license monitor (empty object until the first check completes).
+
+```bash
+curl -sS "$SCHEDULER_URL/api/licenses"
+```
+
+```json
+{"checked_at": "...", "server": "1055@...", "server_up": true, "in_use": [{"feature": "electronics_desktop", "total": 550, "used": 12}], "features": [...], "error": ""}
+```
+
+### `GET /api/dashboard-summary`
+
+Lightweight aggregate used by the dashboard's live headline refresh: task activity counters and allocation pool usage.
+
+```bash
+curl -sS "$SCHEDULER_URL/api/dashboard-summary"
+```
+
+### `POST /api/placement/dry-run`
+
+Explains where a hypothetical task would land without creating any state: aggregate queue diagnostics plus per-account eligibility and per-allocation fit slots with rejection reasons.
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/placement/dry-run" \
+  -F cpus=8 \
+  -F memory_mb=32768 \
+  -F gpus=1 \
+  -F gpu_model=a6000 \
+  -F partition=auto
+```
+
+Response shape: `{"queue_state", "queue_reason", "capacity", "accounts": [{"name", "eligible", "reasons"}], "allocations": [{"id", "state", "node_name", "fit_slots", "reasons"}]}`.
+
+### `GET /api/scheduler/gpu-prewarm` / `POST /api/scheduler/gpu-prewarm`
+
+Reads or sets the GPU warm pool toggle. The setting persists in the database and overrides `gpu_prewarm.enabled` from the config file.
+
+```bash
+curl -sS "$SCHEDULER_URL/api/scheduler/gpu-prewarm"
+curl -sS -X POST "$SCHEDULER_URL/api/scheduler/gpu-prewarm" \
+  -H "Content-Type: application/json" -d '{"enabled": false}'
 ```
 
 ### `GET /api/accounts/status`
@@ -112,6 +171,20 @@ Important fields:
 - `state`: `pending`, `warm`, `active`, `draining`, `closing`, `closed`, or `failed`.
 - `free_cpus`, `free_memory_mb`, `free_gpus`: currently attachable capacity.
 
+### `POST /api/allocations/{allocation_id}/close`
+
+Manually closes a scheduler-owned allocation pool and cancels the backing Slurm allocation job.
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/allocations/123/close"
+```
+
+By default, the scheduler rejects the close with `409` if the allocation has `attaching` or `running` tasks. Use `force=true` only when you intentionally want to fail those active tasks and release the allocation:
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/allocations/123/close?force=true"
+```
+
 ### `GET /api/gpu-capacity`
 
 Lists cluster and scheduler GPU capacity grouped by partition/model.
@@ -130,13 +203,15 @@ curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=4&memory_mb=32768&gpus=1&gpu_mod
 curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=4&memory_mb=32768&scheduling_profile=fea_bursty"
 ```
 
-The response includes total `fit_slots`, `memory_pressure_state`, and per-allocation free CPU, memory, GPU, and fit slots. For `scheduling_profile=fea_bursty`, `memory_pressure_state` is `ok`, `soft_blocked`, or `hard_pressure`.
+The response includes total ready `fit_slots`, `ready_fit_slots`, `pending_fit_slots`, `inflight_fit_slots`, `queue_state`, `queue_reason`, `preferred_node_relaxed`, `memory_pressure_state`, and per-allocation free CPU, memory, GPU, and fit slots. For `scheduling_profile=fea_bursty`, `memory_pressure_state` is `ok`, `soft_blocked`, or `hard_pressure`.
 
 Use:
 
 - `scheduler_free_gpus` for immediate placement.
 - `cluster_free_gpus` to estimate whether scale-out can acquire another GPU allocation.
 - `cluster_used_gpus` to understand capacity already consumed by all Slurm users.
+- `single_node_max_free_gpus` to see the largest free GPU count available on one node for that model.
+- `single_node_max_free_cpus` and `single_node_max_free_gpu_node` to see the best `pestat` scheduler-free CPU capacity among nodes with that largest one-node GPU opening.
 
 ## Submit Existing Remote Commands
 
@@ -172,6 +247,7 @@ Form fields:
 - `gpu_model`: optional normalized model such as `a6000ada` or `a6000`. Ordered candidates such as `a6000ada,a6000` are accepted.
 - `partition`: `auto` or a specific Slurm partition.
 - `node_name`: optional specific node constraint.
+- `same_node_as_task_id` or `same_node_as`: optional task id to co-locate this task on the same actual node as a currently `attaching` or `running` task. Use this for localhost-bound service tasks such as vLLM. If the reference task is not running or has no resolved node yet, the new task stays queued. Same-node CPU clients and vLLM service tasks are launched with Slurm step overlap so service and client steps can coexist.
 - `exclusive_node`: use only when a task cannot share a node.
 
 ## Submit Git-Based Commands
@@ -275,11 +351,16 @@ Reads a safe relative file path from the job account over SSH. `base=remote_job_
 curl -sS "$SCHEDULER_URL/api/jobs/123/remote-file?base=remote_job_dir&path=submit.stderr.log"
 ```
 
+The response is capped by `web_remote_file_default_max_bytes` unless `max_bytes` is supplied, and never exceeds `web_remote_file_hard_max_bytes` when that cap is nonzero. Slow SSH reads return `504`.
+
 ### `GET /api/tasks`
 
 ```bash
 curl -sS "$SCHEDULER_URL/api/tasks"
+curl -sS "$SCHEDULER_URL/api/tasks?include_diagnostics=true"
 ```
+
+By default this endpoint returns lightweight task metadata suitable for frequent polling. Use `include_diagnostics=true` only when you need queued capacity fields such as `queue_reason`, `ready_fit_slots`, `pending_fit_slots`, and `inflight_fit_slots`; that mode performs scheduler fit checks and is intentionally heavier.
 
 ### `POST /api/tasks`
 
@@ -304,6 +385,14 @@ curl -sS -X POST "$SCHEDULER_URL/api/tasks" \
   }'
 ```
 
+Co-locate a client task with a running service task's node:
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/tasks" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"vllm-client","remote_cwd":"/remote/project","command":"python call_local_vllm.py","cpus":1,"memory_mb":1024,"same_node_as_task_id":123}'
+```
+
 Response:
 
 ```json
@@ -323,6 +412,8 @@ Response:
 }
 ```
 
+`urls` contains scheduler API endpoints only. It is not an externally reachable URL for a service started by the task.
+
 Fields:
 
 - `payload_json`: optional JSON object, array, or string. The scheduler writes it to `payload.json` under the task remote directory and exports `SLURM_SCHEDULER_PAYLOAD_PATH`.
@@ -331,16 +422,19 @@ Fields:
 - `priority`: higher values attach before lower values.
 - `timeout_seconds`: nonzero value marks a running task failed with exit code `124` after timeout.
 - `dedupe_key`: if another non-terminal task has the same key, the API returns that task instead of creating a duplicate.
-- `max_workers_per_node`: caps the number of attaching/running tasks on the chosen allocation for this task.
+- `max_workers_per_node`: baseline per-node worker limit. For `fea_bursty`, the scheduler can exceed this baseline when live `pestat` CPU load and free-memory budget show the node can safely accept more tasks.
+- `same_node_as_task_id`: co-locates this task with the referenced running task's actual node. `same_node_as` is accepted as a shorter alias.
+- `cleanup_globs`: list (or comma string) of basename patterns, e.g. `["simulation", "aedt_temp"]`. When the task reaches ANY terminal state — completed, failed, cancelled, timed out, or its allocation was lost — the scheduler deletes matching entries directly under the task's working directory. Use this instead of shell-level `rm` at the end of your command: a killed process never reaches its trailing cleanup, but the scheduler sees every exit path. Bare wildcards and path separators are rejected.
 
 ### `GET /api/tasks/{task_id}`
 
 ```bash
 curl -sS "$SCHEDULER_URL/api/tasks/123"
 curl -sS "$SCHEDULER_URL/api/tasks/123?include_output=true"
+curl -sS "$SCHEDULER_URL/api/tasks/123?include_diagnostics=true"
 ```
 
-The JSON includes `state`, `status`, `exit_code`, `failure_message`, `assigned_allocation`, `slurm_job_id`, stdout/stderr paths, and timestamps. With `include_output=true`, it also includes `stdout`, `stderr`, and `result_json`, where `result_json` is parsed from the final JSON object or array in stdout.
+The JSON includes `state`, `status`, `exit_code`, `failure_message`, `assigned_allocation`, `slurm_job_id`, stdout/stderr paths, requested `node_name`, actual `allocation_node_name`/`actual_node_name`, `same_node_as_task_id`, and timestamps. With `include_diagnostics=true`, queued tasks also include computed capacity diagnostics and `queue_reason`. With `include_output=true`, it also includes `stdout`, `stderr`, and `result_json`, where `result_json` is parsed from the final JSON object or array in stdout. Included output is read with the requested `output_limit` and the configured web remote-file caps.
 
 The Web UI task detail page is available at `/tasks/{task_id}`. It shows the stored task fields and equivalent JSON/curl/Python examples for submitting the same task again.
 
@@ -372,10 +466,34 @@ Response:
 
 ### `POST /api/tasks/cancel`
 
-Bulk-cancels tasks matching a name substring and status list. This is intended for external agents that accidentally submitted duplicate task batches.
+Bulk-cancels tasks matching a name substring and status list, or an explicit id list. `task_ids` takes precedence when supplied (this is what the dashboard's "Cancel selected" checkboxes use).
 
 ```bash
 curl -sS -X POST "$SCHEDULER_URL/api/tasks/cancel?name_contains=crypto-sweep&statuses=queued,attaching,running"
+curl -sS -X POST "$SCHEDULER_URL/api/tasks/cancel?task_ids=101,102,103"
+```
+
+### `GET /api/tasks/summary`
+
+Counts by status, optionally scoped to a campaign name prefix. Use this for progress polling instead of listing every task.
+
+```bash
+curl -sS "$SCHEDULER_URL/api/tasks/summary?name_prefix=mft-camp-w1"
+```
+
+```json
+{"name_prefix": "mft-camp-w1", "total": 400, "statuses": {"queued": 120, "running": 40, "completed": 235, "failed": 5}}
+```
+
+`GET /api/tasks` also accepts `limit` and `name_prefix` query parameters for bounded campaign harvesting.
+
+### `POST /api/tasks/{task_id}/priority`
+
+Changes the priority of a queued task (higher runs first; ties are FIFO). Returns `409` for tasks that already left the queue. The dashboard's queued rows expose the same control inline.
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/tasks/123/priority" \
+  -H "Content-Type: application/json" -d '{"priority": 10}'
 ```
 
 ### `GET /api/tasks/{task_id}/remote-file`
@@ -395,6 +513,8 @@ If the file does not exist yet, task file endpoints return an empty body instead
 curl -sS "$SCHEDULER_URL/api/tasks/123/stdout?tail_lines=100"
 curl -sS "$SCHEDULER_URL/api/tasks/123/stderr?max_bytes=20000"
 ```
+
+Remote task file responses are capped by `web_remote_file_default_max_bytes` unless `max_bytes` is supplied, and never exceed `web_remote_file_hard_max_bytes` when that cap is nonzero. Slow SSH reads return `504`.
 
 ### `GET /api/tasks/{task_id}/remote-files`
 
