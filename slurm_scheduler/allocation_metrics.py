@@ -49,10 +49,13 @@ def annotate_allocation_node_metrics(allocations: list[dict], pestat_rows: list[
     return allocations
 
 
-def annotate_allocation_fea_pressure(allocations: list[dict], pressures: dict[str, dict[str, int]]) -> list[dict]:
+def annotate_allocation_fea_pressure(allocations: list[dict], pressures: dict[int, dict[str, int]]) -> list[dict]:
+    # pressures are keyed per allocation id (not per node): each Slurm allocation
+    # reserves its own cores, so its FEA pressure is independent of co-tenant
+    # allocations on the same physical node.
     for allocation in allocations:
-        node_name = str(allocation.get("node_name") or "")
-        pressure = pressures.get(node_name) if node_name else None
+        alloc_id = int(allocation.get("id") or 0)
+        pressure = pressures.get(alloc_id) if alloc_id else None
         if not pressure:
             allocation.update(
                 {

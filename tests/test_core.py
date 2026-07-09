@@ -158,7 +158,7 @@ class SlurmParsingTests(unittest.TestCase):
         allocations = [{"id": 1, "node_name": "n001"}, {"id": 2, "node_name": "n002"}]
         annotated = annotate_allocation_fea_pressure(
             allocations,
-            {"n001": {"workers": 32, "requested_cpus": 128, "owned_cpus": 64}},
+            {1: {"workers": 32, "requested_cpus": 128, "owned_cpus": 64}},
         )
         self.assertEqual(annotated[0]["node_fea_requested_cpus"], 128)
         self.assertEqual(annotated[0]["node_fea_owned_cpus"], 64)
@@ -4025,12 +4025,13 @@ class SchedulerTests(unittest.TestCase):
             "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
         }
         # Allocation-level hard slots (free_cpus=0/free_mem=0) are ignored for
-        # FEA, but the node-level budget (free memory above the soft floor,
-        # load headroom) always applies: (90000-60000)//8192 = 3 slots.
+        # FEA. The memory budget alone would give (90000-60000)//8192 = 3, but
+        # the per-allocation FEA CPU cap (total_cpus 8 * factor 1.0 = 8, at 4
+        # cpu/task) bounds it to 2 so FEA cannot overshoot the reservation.
         self.assertIsNone(scheduler.best_allocation_for_task(standard))
         self.assertEqual(scheduler.best_allocation_for_task(fea)["id"], allocation_id)
         capacity = scheduler.task_fit_capacity(fea)
-        self.assertEqual(capacity["fit_slots"], 3)
+        self.assertEqual(capacity["fit_slots"], 2)
         self.assertEqual(capacity["memory_pressure_state"], "ok")
 
     def test_fea_bursty_max_workers_is_enforced_per_physical_node_for_reservations(self) -> None:

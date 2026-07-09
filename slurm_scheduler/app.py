@@ -1004,13 +1004,15 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             finished_page = 0
         snapshots = scheduler.cached_snapshots()
         snapshot_error = "" if snapshots else "Account status will appear after the background scheduler refreshes."
+        alloc_fea_pressures = scheduler.fea_allocation_pressures()
         allocations = annotate_allocation_fea_pressure(
             annotate_allocation_node_metrics(db.list_allocations_with_live(limit=500), db.list_pestat_nodes()),
-            scheduler.fea_owned_node_pressures(),
+            alloc_fea_pressures,
         )
-        node_fea_worker_counts = scheduler.node_fea_worker_counts()
         for allocation in allocations:
-            allocation["node_fea_worker_count"] = node_fea_worker_counts.get(str(allocation.get("node_name") or ""), 0)
+            allocation["node_fea_worker_count"] = int(
+                (alloc_fea_pressures.get(int(allocation.get("id") or 0)) or {}).get("workers") or 0
+            )
         allocation_by_id = {int(allocation["id"]): allocation for allocation in allocations}
         active_task_allocation_ids, active_exclusive_allocation_ids = scheduler.active_task_allocation_sets()
         terminal_allocation_states = {"closed", "failed"}
@@ -1682,7 +1684,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     def api_allocations() -> list[dict]:
         return annotate_allocation_fea_pressure(
             annotate_allocation_node_metrics(db.list_allocations_with_live(), db.list_pestat_nodes()),
-            scheduler.fea_owned_node_pressures(),
+            scheduler.fea_allocation_pressures(),
         )
 
     @app.post("/api/allocations/{allocation_id}/close")

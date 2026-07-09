@@ -263,6 +263,7 @@ class Scheduler:
         self._fea_footprint_cache: tuple[int, dict[str, dict[str, float]]] | None = None
         self._tick_attach_workers_by_node: dict[str, int] = {}
         self._fea_pressures_cache: tuple[int, dict[str, dict[str, int]]] | None = None
+        self._fea_alloc_pressures_cache: tuple[int, dict[int, dict[str, int]]] | None = None
         self._fea_overload_since_by_node: dict[str, float] = {}
         self._fea_overload_scaled_nodes: set[str] = set()
         self.task_refresh_max_per_tick = max(1, int(task_refresh_max_per_tick))
@@ -2949,6 +2950,7 @@ class Scheduler:
         self._tick_attach_workers_by_node[node_name] = self._tick_attach_workers_by_node.get(node_name, 0) + 1
         # New ATTACHING rows change both the pressure and young-footprint views.
         self._fea_pressures_cache = None
+        self._fea_alloc_pressures_cache = None
         self._fea_footprint_cache = None
 
     def fea_stale_node_recently_ok(self, allocation: dict) -> bool:
@@ -3055,6 +3057,52 @@ class Scheduler:
                 "owned_cpus": owned_cpus_by_node.get(node_name, 0),
             }
         return pressures
+
+    def fea_allocation_pressures(self) -> dict[int, dict[str, int]]:
+        cached = self._fea_alloc_pressures_cache
+        if cached is not None and cached[0] == self._tick_seq:
+            return cached[1]
+        pressures = self._compute_fea_allocation_pressures()
+        self._fea_alloc_pressures_cache = (self._tick_seq, pressures)
+        return pressures
+
+    def _compute_fea_allocation_pressures(self) -> dict[int, dict[str, int]]:
+        # FEA cap is per Slurm allocation (job): each cpu allocation reserves its
+        # own cores and tasks attach to one allocation via srun --jobid. Keying
+        # per node would inflate the cap when several cpu2 allocations share a
+        # node (n allocations -> owned = n*64), letting FEA overshoot a single
+        # allocation's reservation.
+        owned_by_alloc: dict[int, int] = {}
+        for allocation in self.db.list_allocations(limit=500):
+            if allocation["state"] not in {
+                AllocationStatus.WARM.value,
+                AllocationStatus.ACTIVE.value,
+                AllocationStatus.DRAINING.value,
+            }:
+                continue
+            if (allocation.get("resource_pool") or "cpu") != "cpu":
+                continue
+            owned_by_alloc[int(allocation["id"])] = int(allocation.get("total_cpus") or 0)
+        requested_by_alloc: dict[int, int] = {}
+        workers_by_alloc: dict[int, int] = {}
+        for task in self.db.list_tasks(limit=5000):
+            if task["status"] not in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
+                continue
+            if not self.task_is_fea_bursty(task):
+                continue
+            alloc_id = int(task.get("allocation_id") or 0)
+            if alloc_id not in owned_by_alloc:
+                continue
+            workers_by_alloc[alloc_id] = workers_by_alloc.get(alloc_id, 0) + 1
+            requested_by_alloc[alloc_id] = requested_by_alloc.get(alloc_id, 0) + int(task.get("cpus") or 0)
+        return {
+            alloc_id: {
+                "workers": workers_by_alloc.get(alloc_id, 0),
+                "requested_cpus": requested_by_alloc.get(alloc_id, 0),
+                "owned_cpus": owned,
+            }
+            for alloc_id, owned in owned_by_alloc.items()
+        }
 
     def fea_owned_node_pressure_overloaded(self, pressure: dict[str, int]) -> bool:
         if self.fea_overload_scale_out_load_factor <= 0:
@@ -3339,13 +3387,13 @@ class Scheduler:
                 LOGGER.info("orphan process sweep on %s/%s: %s", account.name, node, last[0])
 
     def enforce_fea_node_cpu_cap(self) -> None:
-        """Retroactive side of the node CPU cap: nodes that accumulated more
-        FEA-requested CPUs than cpu_total * factor (e.g. before the cap
-        existed) are drained newest-worker-first, a few per tick, by
-        requeueing the workers so the work reruns elsewhere."""
+        """Retroactive side of the per-allocation FEA CPU cap: allocations that
+        accumulated more FEA-requested CPUs than their reserved cores * factor
+        are drained newest-worker-first, a few per tick, by requeueing the
+        workers so the work reruns elsewhere."""
         if self.fea_node_requested_cpu_factor <= 0:
             return
-        pressures = self.fea_owned_node_pressures()
+        pressures = self.fea_allocation_pressures()
         if not pressures:
             return
         live_states = {
@@ -3353,12 +3401,12 @@ class Scheduler:
             AllocationStatus.ACTIVE.value,
             AllocationStatus.DRAINING.value,
         }
-        node_by_allocation_id = {
-            int(allocation["id"]): str(allocation.get("node_name") or "")
+        allocation_by_id = {
+            int(allocation["id"]): allocation
             for allocation in self.db.list_allocations(limit=500)
             if allocation["state"] in live_states
         }
-        tasks_by_node: dict[str, list[dict]] = {}
+        tasks_by_alloc: dict[int, list[dict]] = {}
         for task in self.db.list_tasks(limit=5000):
             # RUNNING only: draining a task whose attach is still in flight
             # races the background attach thread.
@@ -3366,25 +3414,26 @@ class Scheduler:
                 continue
             if not self.task_is_fea_bursty(task):
                 continue
-            node_name = node_by_allocation_id.get(int(task.get("allocation_id") or 0))
-            if node_name:
-                tasks_by_node.setdefault(node_name, []).append(task)
+            alloc_id = int(task.get("allocation_id") or 0)
+            if alloc_id in allocation_by_id:
+                tasks_by_alloc.setdefault(alloc_id, []).append(task)
         rebalanced = False
-        for node_name, pressure in pressures.items():
+        for alloc_id, pressure in pressures.items():
             requested = int(pressure.get("requested_cpus") or 0)
-            # Cap on the CPUs the scheduler actually reserved on the node
-            # (allocation total_cpus = owned_cpus), NOT the node's physical core
-            # count: cpu2 nodes have 256 cores but our allocation reserves only
-            # 64, so capping on physical cpu_total let FEA overshoot our
-            # reservation ~4x (e.g. 84 requested on a 64-core allocation).
+            # Cap on the CPUs THIS allocation reserved (total_cpus), not the
+            # node's physical cores nor the sum across allocations on the node:
+            # tasks attach per allocation, so each allocation must stay within
+            # its own 64-core reservation regardless of node co-tenancy.
             owned = int(pressure.get("owned_cpus") or 0)
             if owned <= 0:
                 continue
             cap = owned * self.fea_node_requested_cpu_factor
             if requested <= cap:
                 continue
+            allocation = allocation_by_id.get(alloc_id, {})
+            node_name = str(allocation.get("node_name") or "")
             victims = sorted(
-                tasks_by_node.get(node_name, []),
+                tasks_by_alloc.get(alloc_id, []),
                 key=lambda task: (
                     task.get("attached_at") or task.get("started_at") or task.get("created_at") or "",
                     int(task.get("id") or 0),
@@ -3402,15 +3451,16 @@ class Scheduler:
                     except Exception as exc:
                         LOGGER.warning("failed to cancel FEA task %s for cap rebalance: %s", task["id"], exc)
                 self.requeue_task_for_rebalance(
-                    task, f"node {node_name} over FEA CPU cap ({requested}/{cap:.0f})"
+                    task, f"allocation {alloc_id} (node {node_name}) over FEA CPU cap ({requested}/{cap:.0f})"
                 )
                 requested -= int(task.get("cpus") or 0)
                 drained += 1
                 rebalanced = True
             if drained:
                 LOGGER.info(
-                    "rebalanced %d FEA workers off %s (requested CPUs now %d, cap %.0f)",
+                    "rebalanced %d FEA workers off allocation %d on %s (requested CPUs now %d, cap %.0f)",
                     drained,
+                    alloc_id,
                     node_name,
                     requested,
                     cap,
@@ -3468,6 +3518,7 @@ class Scheduler:
         """Requeue without touching attempt_count: the worker was placed by a
         policy the scheduler has since corrected, not by its own failure."""
         self._fea_pressures_cache = None
+        self._fea_alloc_pressures_cache = None
         self._fea_footprint_cache = None
         self.record_event(
             "task_requeued",
@@ -3491,25 +3542,22 @@ class Scheduler:
         )
 
     def fea_node_cpu_cap_remaining(self, allocation: dict, task: dict) -> int | None:
-        """How many more workers of this task fit under the node-wide cap of
-        total FEA-requested CPUs <= cpu_total * fea_node_requested_cpu_factor.
-        Load-based ramping alone lets idle-heavy simulations stack far past the
-        core count; this bounds the worst case. None = no cap applicable."""
+        """How many more workers of this task fit under the per-ALLOCATION cap:
+        FEA-requested CPUs in this Slurm allocation <= its reserved cores
+        (total_cpus) * fea_node_requested_cpu_factor. Per-allocation, not
+        per-node, so several cpu2 allocations sharing a node each stay bounded to
+        their own reservation. None = no cap applicable."""
         if self.fea_node_requested_cpu_factor <= 0:
             return None
         if allocation.get("state") == AllocationStatus.PENDING.value:
             return None
-        node_name = str(allocation.get("node_name") or "").strip()
-        if not node_name:
+        alloc_id = int(allocation.get("id") or 0)
+        owned = int(allocation.get("total_cpus") or 0)
+        if alloc_id <= 0 or owned <= 0:
             return None
-        # fea_owned_node_pressures reads live DB rows (invalidated on every
+        # fea_allocation_pressures reads live DB rows (invalidated on every
         # attach), so it already includes this tick's attaches.
-        pressure = self.fea_owned_node_pressures().get(node_name, {})
-        # Cap on CPUs the scheduler reserved on the node (owned_cpus), not the
-        # node's physical cpu_total: FEA must not exceed our own reservation.
-        owned = int(pressure.get("owned_cpus") or 0)
-        if owned <= 0:
-            return None
+        pressure = self.fea_allocation_pressures().get(alloc_id, {})
         requested = int(pressure.get("requested_cpus") or 0)
         budget = owned * self.fea_node_requested_cpu_factor - requested
         return max(0, int(budget // max(1, int(task.get("cpus") or 1))))
@@ -3560,6 +3608,7 @@ class Scheduler:
             self.fea_pressure_max_attempts,
         )
         self._fea_pressures_cache = None
+        self._fea_alloc_pressures_cache = None
         self.record_event(
             "task_requeued",
             f"task {task.get('name') or task['id']} requeued after memory-pressure kill (attempt {attempts}/{self.fea_pressure_max_attempts})",

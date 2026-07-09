@@ -711,7 +711,7 @@
     </div>
     <div class="table-scroll">
       <table>
-        <thead><tr><th>ID</th><th>State</th><th>Pool</th><th>Account</th><th>Node</th><th>Node FEA</th><th>Owned FEA CPU</th><th>Node Load</th><th>Node RAM</th><th>CPU Used</th><th>GPU Used</th><th>Mem Used</th><th>Slurm ID</th><th>Time</th><th>Action</th></tr></thead>
+        <thead><tr><th>ID</th><th>State</th><th>Pool</th><th>Account</th><th>Node</th><th>FEA (alloc)</th><th>FEA CPU / owned</th><th>Node Load</th><th>Node RAM</th><th>CPU Used</th><th>GPU Used</th><th>Mem Used</th><th>Slurm ID</th><th>Time</th><th>Action</th></tr></thead>
         <tbody>
         {% for allocation in allocations %}
           <tr class="{{ 'warm-pool-row' if allocation.is_warm_pool else '' }}">
@@ -729,7 +729,7 @@
                 <div class="muted">{{ allocation.partition }}</div>
               {% endif %}
             </td>
-            <td title="FEA tasks on physical node {{ allocation.node_name }}">{{ allocation.node_fea_worker_count if allocation.node_name else "" }}</td>
+            <td title="FEA tasks in this allocation (slurm job {{ allocation.slurm_job_id }})">{{ allocation.node_fea_worker_count if allocation.node_name else "" }}</td>
             <td class="mono-cell" title="Scheduler-owned running/attaching FEA requested CPU on {{ allocation.node_name }} / scheduler-owned CPU allocation cores on that node">
               {% if allocation.node_fea_owned_cpus is not none %}
                 {{ allocation.node_fea_requested_cpus }} / {{ allocation.node_fea_owned_cpus }}
