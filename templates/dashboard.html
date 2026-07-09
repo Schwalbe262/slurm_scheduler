@@ -602,62 +602,53 @@
     </div><!-- /Anaconda env panel -->
 
     <div data-env-panel="projects" hidden>
-      <h2>새 프로젝트 / 수정</h2>
-      <form method="post" action="/projects" class="two-column-grid">
-        <div>
-          <label for="project_name">이름</label>
-          <input id="project_name" name="name" placeholder="MFT_1MW_2026v1" required>
-          <label for="project_repos">저장소 (한 줄에 하나: url[|ref|subdir])</label>
-          <textarea id="project_repos" name="repos" rows="3" placeholder="https://github.com/Schwalbe262/MFT_1MW_2026.git|main|MFT_1MW_2026&#10;https://github.com/Schwalbe262/pyaedt_library.git|main|pyaedt_library"></textarea>
-          <label for="project_entrypoints">엔트리포인트 (한 줄에 하나: path|conda_env|workdir)</label>
-          <textarea id="project_entrypoints" name="entrypoints" rows="3" placeholder="run_simulation_260706.py|pyaedt2026v1|MFT_1MW_2026"></textarea>
-        </div>
-        <div>
-          <label for="project_setup">셋업 (module load / 라이선스 등)</label>
-          <textarea id="project_setup" name="setup" rows="3" placeholder="module load ansys-electronics/v252&#10;export FLEXLM_TIMEOUT=3000000"></textarea>
-          <label for="project_cleanup_globs">청소 globs</label>
-          <input id="project_cleanup_globs" name="cleanup_globs" placeholder="*.aedtresults, simulation">
-          <label for="project_sim_subdir">Sim 하위폴더</label>
-          <input id="project_sim_subdir" name="sim_subdir" value="simulation">
-          <label style="display:block;margin-top:8px;"><input type="checkbox" name="auto_pull" value="1"> 매 실행 전 자동 git pull</label>
-          <p><button type="submit">저장</button></p>
-        </div>
-      </form>
-      <div class="table-scroll section-gap">
+      <h2>프로젝트</h2>
+      <div class="table-scroll">
         <table>
-          <thead><tr><th>프로젝트</th><th>저장소</th><th>엔트리포인트→환경</th><th>배포 계정</th><th>배포/업데이트</th><th></th></tr></thead>
+          <thead><tr><th>프로젝트</th><th>실행 중 / 총</th><th>배포</th><th></th></tr></thead>
           <tbody>
           {% for project in projects %}
             <tr>
-              <td class="mono-cell">{{ project.name }}
-                {% if project.auto_pull %}<br><span class="muted">auto-pull</span>{% endif %}
-                {% if project.cleanup_globs %}<br><span class="muted">청소 glob: {{ project.cleanup_globs }}</span>{% endif %}
-                <br><span class="muted">sim: {{ project.sim_subdir }}</span>
+              <td class="mono-cell"><a href="/projects/{{ project.name }}"><b>{{ project.name }}</b></a>
+                {% if project.auto_pull %} <span class="muted">(auto-pull)</span>{% endif %}
+                <br><span class="muted">repo {{ project.repos|length }} · entry {{ project.entrypoints|length }}</span>
               </td>
-              <td class="mono-cell">{% for r in project.repos %}{{ r.url }}{% if r.subdir %} → {{ r.subdir }}{% endif %}<br>{% endfor %}</td>
-              <td class="mono-cell">{% for e in project.entrypoints %}{{ e.path }} → {{ e.conda_env or "-" }}<br>{% endfor %}</td>
-              <td class="mono-cell">{% for d in project.deployments %}{{ d.account_name }}: {{ d.status }}{% if d.failure_message %} <span title="{{ d.failure_message }}" style="cursor:help">⚠</span>{% endif %}<br>{% endfor %}</td>
-              <td>
-                <form method="post" action="/projects/{{ project.name }}/deploy" style="display:inline">
-                  <input name="target_accounts" placeholder="dhj02, dw16" style="width:130px">
-                  <button type="submit">Deploy</button>
-                </form>
-                <form method="post" action="/projects/{{ project.name }}/update" style="display:inline" title="배포된 계정 git pull">
-                  <button type="submit">Update</button>
-                </form>
-              </td>
-              <td>
-                <form method="post" action="/projects/{{ project.name }}/delete" style="display:inline" onsubmit="return confirm('{{ project.name }} 삭제?');">
-                  <button type="submit">삭제</button>
-                </form>
-              </td>
+              <td>{{ project.running_count }} <span class="muted">/ {{ project.total_count }}</span></td>
+              <td class="mono-cell">{% for d in project.deployments %}{{ d.account_name }}:{{ d.status }}{% if d.failure_message %} <span title="{{ d.failure_message }}" style="cursor:help">⚠</span>{% endif %} {% endfor %}</td>
+              <td><a href="/projects/{{ project.name }}"><button type="button">열기 / 실행</button></a></td>
             </tr>
           {% else %}
-            <tr><td colspan="6" class="muted">아직 프로젝트가 없습니다. 위에서 추가하세요.</td></tr>
+            <tr><td colspan="4" class="muted">아직 프로젝트가 없습니다. 아래에서 추가하세요.</td></tr>
           {% endfor %}
           </tbody>
         </table>
       </div>
+
+      <details class="section-gap">
+        <summary>+ 새 프로젝트 추가</summary>
+        <form method="post" action="/projects" class="two-column-grid" style="margin-top:12px;">
+          <div>
+            <label for="project_name">이름</label>
+            <input id="project_name" name="name" placeholder="MFT_1MW_2026v1" required>
+            <label for="project_repos">저장소 (한 줄에 하나: url[|ref|subdir])</label>
+            <textarea id="project_repos" name="repos" rows="3" placeholder="https://github.com/Schwalbe262/MFT_1MW_2026.git|main|MFT_1MW_2026&#10;https://github.com/Schwalbe262/pyaedt_library.git|main|pyaedt_library"></textarea>
+            <label for="project_entrypoints">엔트리포인트 (한 줄에 하나: path|conda_env|workdir)</label>
+            <textarea id="project_entrypoints" name="entrypoints" rows="3" placeholder="run_simulation_260706.py|pyaedt2026v1|MFT_1MW_2026"></textarea>
+          </div>
+          <div>
+            <label for="project_setup">셋업 (module load / 라이선스 등)</label>
+            <textarea id="project_setup" name="setup" rows="3" placeholder="module load ansys-electronics/v252&#10;export FLEXLM_TIMEOUT=3000000"></textarea>
+            <label for="project_cleanup_globs">청소 globs</label>
+            <input id="project_cleanup_globs" name="cleanup_globs" placeholder="*.aedtresults, simulation">
+            <label for="project_output_globs">output globs (결과 수집)</label>
+            <input id="project_output_globs" name="output_globs" placeholder="*_result.csv, *.csv">
+            <label for="project_sim_subdir">Sim 하위폴더</label>
+            <input id="project_sim_subdir" name="sim_subdir" value="simulation">
+            <label style="display:block;margin-top:8px;"><input type="checkbox" name="auto_pull" value="1"> 매 실행 전 자동 git pull</label>
+            <p><button type="submit">저장</button></p>
+          </div>
+        </form>
+      </details>
     </div><!-- /projects panel -->
   </section>
 

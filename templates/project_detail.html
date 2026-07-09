@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="stack">
+  <p><a href="/">← 대시보드</a></p>
+
+  <section class="panel">
+    <div class="title-row">
+      <h1>프로젝트: {{ project.name }}</h1>
+      <span class="status-pill">실행 중 {{ project.running_count }} · 총 {{ project.total_count }}</span>
+    </div>
+
+    <div class="two-column-grid section-gap">
+      <div>
+        <h2>실행</h2>
+        <form method="post" action="/projects/{{ project.name }}/run" class="form-grid">
+          <div>
+            <label for="run_parallel">병렬 개수</label>
+            <input id="run_parallel" name="parallel" type="number" min="1" max="1000" value="10">
+          </div>
+          <div>
+            <label for="run_entrypoint">엔트리포인트</label>
+            <select id="run_entrypoint" name="entrypoint">
+              {% for e in project.entrypoints %}
+                <option value="{{ e.path }}">{{ e.path }} → {{ e.conda_env or "-" }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div>
+            <label for="run_account">계정 (비우면 스케줄러 자동)</label>
+            <input id="run_account" name="account_name" placeholder="dhj02 또는 비움">
+          </div>
+          <div>
+            <label for="run_cpus">CPUs</label>
+            <input id="run_cpus" name="cpus" type="number" min="1" value="4">
+          </div>
+          <div>
+            <label for="run_mem">Memory MB</label>
+            <input id="run_mem" name="memory_mb" type="number" min="1" value="8192">
+          </div>
+          <div class="full">
+            <p><button type="submit">▶ 실행 (N개 병렬 제출)</button></p>
+          </div>
+        </form>
+      </div>
+      <div>
+        <h2>결과 수집</h2>
+        {% if project.output_globs %}
+          <p class="muted">output glob: <span class="mono-cell">{{ project.output_globs }}</span></p>
+          <p>
+            <a href="/projects/{{ project.name }}/harvest.csv"><button type="button">CSV 합쳐서 받기</button></a>
+            <a href="/projects/{{ project.name }}/harvest.zip"><button type="button">ZIP으로 받기</button></a>
+          </p>
+          <p class="muted">배포된 모든 계정의 프로젝트 폴더에서 위 패턴 파일을 모아 내려받습니다.</p>
+        {% else %}
+          <p class="muted">아래 설정에서 <b>output glob</b>을 지정하면 결과를 모아 받을 수 있습니다 (예: <span class="mono-cell">*_result.csv</span>).</p>
+        {% endif %}
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>배포 상태</h2>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>계정</th><th>상태</th><th>커밋</th><th>사유</th></tr></thead>
+        <tbody>
+        {% for d in project.deployments %}
+          <tr>
+            <td>{{ d.account_name }}</td>
+            <td>{{ d.status }}</td>
+            <td class="mono-cell">{{ d.deployed_refs or "" }}</td>
+            <td class="mono-cell">{{ d.failure_message or "" }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="4" class="muted">아직 배포된 계정이 없습니다.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <form method="post" action="/projects/{{ project.name }}/deploy" class="section-gap" style="display:inline">
+      <input name="target_accounts" placeholder="dhj02, dw16, ...">
+      <button type="submit">Deploy / Redeploy</button>
+    </form>
+    <form method="post" action="/projects/{{ project.name }}/update" style="display:inline">
+      <button type="submit" title="배포된 계정 git pull">Update (git pull)</button>
+    </form>
+  </section>
+
+  <section class="panel">
+    <h2>설정 (조회 / 수정)</h2>
+    <form method="post" action="/projects" class="two-column-grid">
+      <input type="hidden" name="name" value="{{ project.name }}">
+      <div>
+        <label>이름</label>
+        <input value="{{ project.name }}" disabled>
+        <label for="edit_repos">저장소 (url[|ref|subdir], 한 줄에 하나)</label>
+        <textarea id="edit_repos" name="repos" rows="3">{% for r in project.repos %}{{ r.url }}{% if r.ref %}|{{ r.ref }}{% endif %}{% if r.subdir %}|{{ r.subdir }}{% endif %}
+{% endfor %}</textarea>
+        <label for="edit_entrypoints">엔트리포인트 (path[|conda_env|workdir], 한 줄에 하나)</label>
+        <textarea id="edit_entrypoints" name="entrypoints" rows="3">{% for e in project.entrypoints %}{{ e.path }}{% if e.conda_env %}|{{ e.conda_env }}{% endif %}{% if e.workdir %}|{{ e.workdir }}{% endif %}
+{% endfor %}</textarea>
+        <label><input type="checkbox" name="auto_pull" value="1" {% if project.auto_pull %}checked{% endif %}> 매 실행 전 자동 git pull</label>
+      </div>
+      <div>
+        <label for="edit_setup">셋업 (module load / 라이선스 등)</label>
+        <textarea id="edit_setup" name="setup" rows="3">{{ project.setup }}</textarea>
+        <label for="edit_cleanup">청소 globs (sim 폴더 주기 삭제, basename)</label>
+        <input id="edit_cleanup" name="cleanup_globs" value="{{ project.cleanup_globs }}" placeholder="*.aedtresults, simulation">
+        <label for="edit_output">output globs (결과 수집 대상, basename)</label>
+        <input id="edit_output" name="output_globs" value="{{ project.output_globs }}" placeholder="*_result.csv, *.csv">
+        <label for="edit_sim">Sim 하위폴더</label>
+        <input id="edit_sim" name="sim_subdir" value="{{ project.sim_subdir }}">
+        <p><button type="submit">설정 저장</button></p>
+      </div>
+    </form>
+    <form method="post" action="/projects/{{ project.name }}/delete" onsubmit="return confirm('{{ project.name }} 삭제?');" class="section-gap">
+      <button type="submit">프로젝트 삭제</button>
+    </form>
+  </section>
+</div>
+{% endblock %}

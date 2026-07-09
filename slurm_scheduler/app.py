@@ -25,7 +25,7 @@ from .inventory import partition_rank
 from .pestat import PestatNode, plan_dynamic_allocations
 from .project_env import ProjectEnvManager, repo_dir_name
 from .scheduler import Scheduler
-from .slurm import SlurmAccountClient
+from .slurm import SlurmAccountClient, SSHSession
 from .task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, build_git_task_command
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -802,8 +802,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "setup": project.get("setup") or "",
             "entrypoints": _loads(project.get("entrypoints"), []),
             "cleanup_globs": project.get("cleanup_globs") or "",
+            "output_globs": project.get("output_globs") or "",
             "sim_subdir": project.get("sim_subdir") or "simulation",
             "auto_pull": bool(project.get("auto_pull")),
+            "running_count": db.count_tasks_by_project(str(project.get("name") or ""), ["attaching", "running"]),
+            "total_count": db.count_tasks_by_project(str(project.get("name") or "")),
             "created_at": project.get("created_at"),
             "updated_at": project.get("updated_at"),
         }
@@ -855,6 +858,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             entrypoints = parse_entrypoint_lines(entrypoints)
         setup = str(payload.get("setup") or "")
         cleanup_globs = normalize_cleanup_globs(payload.get("cleanup_globs"))
+        output_globs = str(payload.get("output_globs") or "").strip()
         sim_subdir = str(payload.get("sim_subdir") or "simulation").strip() or "simulation"
         auto_pull = bool(payload.get("auto_pull") or False)
         existing = db.get_project_by_name(name)
@@ -865,6 +869,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 setup=setup,
                 entrypoints=json.dumps(entrypoints, ensure_ascii=False),
                 cleanup_globs=cleanup_globs,
+                output_globs=output_globs,
                 sim_subdir=sim_subdir,
                 auto_pull=1 if auto_pull else 0,
             )
@@ -875,6 +880,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             setup=setup,
             entrypoints=entrypoints,
             cleanup_globs=cleanup_globs,
+            output_globs=output_globs,
             sim_subdir=sim_subdir,
             auto_pull=auto_pull,
         )
@@ -2125,6 +2131,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         setup: str = Form(""),
         entrypoints: str = Form(""),
         cleanup_globs: str = Form(""),
+        output_globs: str = Form(""),
         sim_subdir: str = Form("simulation"),
         auto_pull: str = Form(""),
     ) -> Response:
@@ -2136,13 +2143,14 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                     "setup": setup,
                     "entrypoints": entrypoints,
                     "cleanup_globs": cleanup_globs,
+                    "output_globs": output_globs,
                     "sim_subdir": sim_subdir,
                     "auto_pull": bool(auto_pull),
                 }
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return RedirectResponse("/", status_code=303)
+        return RedirectResponse(f"/projects/{name}", status_code=303)
 
     @app.post("/projects/{name}/deploy")
     def deploy_project_form(name: str, target_accounts: str = Form(...)) -> Response:
@@ -2166,6 +2174,153 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         if project:
             db.delete_project(int(project["id"]))
         return RedirectResponse("/", status_code=303)
+
+    @app.get("/projects/{name}")
+    def project_detail(request: Request, name: str) -> Response:
+        project = db.get_project_by_name(name)
+        if not project:
+            raise HTTPException(status_code=404)
+        return templates.TemplateResponse(
+            "project_detail.html",
+            {
+                "request": request,
+                "project": project_json(project),
+                "account_names": [account.name for account in accounts],
+            },
+        )
+
+    def submit_project_run(name: str, parallel: int, entrypoint: str, account_name: str, cpus: int, memory_mb: int) -> int:
+        project = db.get_project_by_name(name)
+        if not project:
+            raise HTTPException(status_code=404, detail=f"project not found: {name}")
+        try:
+            entrypoints = json.loads(project.get("entrypoints") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            entrypoints = []
+        chosen = (entrypoint or "").strip() or (str(entrypoints[0].get("path")) if entrypoints else "")
+        if not chosen:
+            raise HTTPException(status_code=422, detail="project has no entrypoint to run")
+        count = max(1, min(int(parallel or 1), 1000))
+        for index in range(count):
+            create_task_record(
+                {
+                    "name": f"{name}-run-{index}",
+                    "project": name,
+                    "entrypoint": chosen,
+                    "account_name": account_name or "",
+                    "cpus": max(1, int(cpus or 4)),
+                    "memory_mb": max(1, int(memory_mb or 8192)),
+                    "scheduling_profile": "fea_bursty",
+                }
+            )
+        return count
+
+    @app.post("/projects/{name}/run")
+    def run_project_form(
+        name: str,
+        parallel: int = Form(1),
+        entrypoint: str = Form(""),
+        account_name: str = Form(""),
+        cpus: int = Form(4),
+        memory_mb: int = Form(8192),
+    ) -> Response:
+        submit_project_run(name, parallel, entrypoint, account_name, cpus, memory_mb)
+        return RedirectResponse(f"/projects/{name}", status_code=303)
+
+    @app.post("/api/projects/{name}/run")
+    async def api_run_project(name: str, request: Request) -> dict:
+        payload = await _json_body(request)
+        count = submit_project_run(
+            name,
+            int(payload.get("parallel") or 1),
+            str(payload.get("entrypoint") or ""),
+            str(payload.get("account_name") or ""),
+            int(payload.get("cpus") or 4),
+            int(payload.get("memory_mb") or 8192),
+        )
+        return {"project": name, "submitted": count}
+
+    def collect_project_outputs(project: dict) -> list[tuple[str, str, bytes]]:
+        """Gather files matching the project's output_globs from each deployed
+        account's project tree. Returns (account, relative_path, content)."""
+        globs = [g.strip() for g in str(project.get("output_globs") or "").split(",") if g.strip()]
+        if not globs:
+            return []
+        project_rel = project_env_manager.project_rel_dir(str(project.get("name") or ""))
+        name_expr = " -o ".join(f"-name {shlex.quote(g)}" for g in globs)
+        collected: list[tuple[str, str, bytes]] = []
+        for deployment in db.list_project_deployments(int(project["id"])):
+            if deployment.get("status") != "deployed":
+                continue
+            account = next((item for item in accounts if item.name == deployment.get("account_name")), None)
+            if not account:
+                continue
+            find_cmd = (
+                f'cd "$HOME/"{shlex.quote(project_rel)} 2>/dev/null || exit 0; '
+                f"find . -type f \\( {name_expr} \\) 2>/dev/null"
+            )
+            try:
+                with SSHSession(account, default_timeout=300) as ssh:
+                    result = ssh.run(find_cmd)
+                    for line in result.stdout.splitlines():
+                        rel = line.strip()
+                        if rel.startswith("./"):
+                            rel = rel[2:]
+                        if not rel:
+                            continue
+                        try:
+                            text = ssh.read_text_file(posixpath.join(project_rel, rel))
+                        except Exception:
+                            continue
+                        collected.append((account.name, rel, text.encode("utf-8", "replace")))
+            except Exception:
+                # An unreachable/quota-full account just contributes no files.
+                continue
+        return collected
+
+    @app.get("/projects/{name}/harvest.csv")
+    def harvest_project_csv(name: str) -> Response:
+        project = db.get_project_by_name(name)
+        if not project:
+            raise HTTPException(status_code=404)
+        files = collect_project_outputs(project)
+        lines: list[str] = []
+        header: str | None = None
+        for _account, _rel, content in files:
+            rows = content.decode("utf-8", "replace").splitlines()
+            if not rows:
+                continue
+            if header is None:
+                header = rows[0]
+                lines.append(header)
+                lines.extend(rows[1:])
+            else:
+                lines.extend(rows[1:] if rows[0] == header else rows)
+        body = ("\n".join(lines) + "\n") if lines else ""
+        return Response(
+            content=body,
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{name}-results.csv"'},
+        )
+
+    @app.get("/projects/{name}/harvest.zip")
+    def harvest_project_zip(name: str) -> Response:
+        import io
+        import zipfile
+
+        project = db.get_project_by_name(name)
+        if not project:
+            raise HTTPException(status_code=404)
+        files = collect_project_outputs(project)
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for account_name, rel, content in files:
+                archive.writestr(f"{account_name}/{rel}", content)
+        return Response(
+            content=buffer.getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{name}-results.zip"'},
+        )
 
     @app.get("/api/token-usage")
     def api_token_usage() -> list[dict]:

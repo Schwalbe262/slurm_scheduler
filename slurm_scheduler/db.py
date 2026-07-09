@@ -246,6 +246,7 @@ CREATE TABLE IF NOT EXISTS projects (
     setup TEXT NOT NULL DEFAULT '',
     entrypoints TEXT NOT NULL DEFAULT '[]',
     cleanup_globs TEXT NOT NULL DEFAULT '',
+    output_globs TEXT NOT NULL DEFAULT '',
     sim_subdir TEXT NOT NULL DEFAULT 'simulation',
     auto_pull INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -456,6 +457,9 @@ class Database:
             },
             "node_inventory": {
                 "gpu_used_count": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "projects": {
+                "output_globs": "TEXT NOT NULL DEFAULT ''",
             },
         }
         for table, columns in table_columns.items():
@@ -958,6 +962,7 @@ class Database:
         setup: str = "",
         entrypoints: list[dict[str, Any]] | None = None,
         cleanup_globs: str = "",
+        output_globs: str = "",
         sim_subdir: str = "simulation",
         auto_pull: bool = False,
     ) -> int:
@@ -965,8 +970,8 @@ class Database:
             cursor = conn.execute(
                 """
                 INSERT INTO projects (
-                    name, repos, setup, entrypoints, cleanup_globs, sim_subdir, auto_pull
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    name, repos, setup, entrypoints, cleanup_globs, output_globs, sim_subdir, auto_pull
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name,
@@ -974,6 +979,7 @@ class Database:
                     setup,
                     json_dumps(entrypoints or []),
                     cleanup_globs,
+                    output_globs,
                     sim_subdir,
                     1 if auto_pull else 0,
                 ),
@@ -992,6 +998,20 @@ class Database:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM projects WHERE name = ?", (name,)).fetchone()
             return dict(row) if row else None
+
+    def count_tasks_by_project(self, project: str, statuses: list[str] | None = None) -> int:
+        if not project:
+            return 0
+        with self.connect() as conn:
+            if statuses:
+                placeholders = ",".join("?" for _ in statuses)
+                row = conn.execute(
+                    f"SELECT COUNT(*) FROM tasks WHERE project = ? AND status IN ({placeholders})",
+                    (project, *statuses),
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) FROM tasks WHERE project = ?", (project,)).fetchone()
+            return int(row[0]) if row else 0
 
     def list_projects(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
