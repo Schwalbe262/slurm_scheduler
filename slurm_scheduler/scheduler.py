@@ -3199,10 +3199,15 @@ class Scheduler:
         rebalanced = False
         for node_name, pressure in pressures.items():
             requested = int(pressure.get("requested_cpus") or 0)
-            cpu_total = self._node_cpu_total(node_name)
-            if cpu_total <= 0:
+            # Cap on the CPUs the scheduler actually reserved on the node
+            # (allocation total_cpus = owned_cpus), NOT the node's physical core
+            # count: cpu2 nodes have 256 cores but our allocation reserves only
+            # 64, so capping on physical cpu_total let FEA overshoot our
+            # reservation ~4x (e.g. 84 requested on a 64-core allocation).
+            owned = int(pressure.get("owned_cpus") or 0)
+            if owned <= 0:
                 continue
-            cap = cpu_total * self.fea_node_requested_cpu_factor
+            cap = owned * self.fea_node_requested_cpu_factor
             if requested <= cap:
                 continue
             victims = sorted(
@@ -3324,14 +3329,16 @@ class Scheduler:
         node_name = str(allocation.get("node_name") or "").strip()
         if not node_name:
             return None
-        cpu_total = self._node_cpu_total(node_name)
-        if cpu_total <= 0:
-            return None
         # fea_owned_node_pressures reads live DB rows (invalidated on every
         # attach), so it already includes this tick's attaches.
         pressure = self.fea_owned_node_pressures().get(node_name, {})
+        # Cap on CPUs the scheduler reserved on the node (owned_cpus), not the
+        # node's physical cpu_total: FEA must not exceed our own reservation.
+        owned = int(pressure.get("owned_cpus") or 0)
+        if owned <= 0:
+            return None
         requested = int(pressure.get("requested_cpus") or 0)
-        budget = cpu_total * self.fea_node_requested_cpu_factor - requested
+        budget = owned * self.fea_node_requested_cpu_factor - requested
         return max(0, int(budget // max(1, int(task.get("cpus") or 1))))
 
     def handle_fea_memory_pressure(self) -> None:
