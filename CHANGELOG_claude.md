@@ -9,3 +9,6 @@
 
 ## 2026-07-09 (Claude) - 추가
 - docs/bug_packed_cancel_leaks_children.md: 태스크 취소가 AEDT 자식 트리를 회수하지 못하는 버그 리포트 (노드당 세션 44-86개 잔존 실측)
+
+## 2026-07-09 (Claude) - 추가 2
+- docs/design_projects_runs_items.md: Project/Run/Work-Item 3층 구조 설계 제안 (RL 대응 포함)
