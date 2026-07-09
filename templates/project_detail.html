@@ -25,17 +25,21 @@
               {% endfor %}
             </select>
           </div>
+          <div class="full">
+            <label for="run_arguments">인자 (args) — 진입점 뒤에 그대로 붙습니다</label>
+            <input id="run_arguments" name="arguments" placeholder="--case 001 --config thermal.json">
+          </div>
           <div>
             <label for="run_account">계정 (비우면 스케줄러 자동)</label>
-            <input id="run_account" name="account_name" placeholder="dhj02 또는 비움">
+            <input id="run_account" name="account_name" placeholder="dw16 또는 비움">
           </div>
           <div>
             <label for="run_cpus">CPUs</label>
             <input id="run_cpus" name="cpus" type="number" min="1" value="4">
           </div>
           <div>
-            <label for="run_mem">Memory MB</label>
-            <input id="run_mem" name="memory_mb" type="number" min="1" value="8192">
+            <label for="run_mem">Memory MB (대형 thermal 권장 32768+)</label>
+            <input id="run_mem" name="memory_mb" type="number" min="1" value="32768">
           </div>
           <div class="full">
             <p><button type="submit">▶ 실행 (N개 병렬 제출)</button></p>

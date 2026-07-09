@@ -932,7 +932,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         if not str(payload.get("remote_cwd") or "").strip():
             updated["remote_cwd"] = remote_cwd
         if not str(payload.get("command") or "").strip() and entrypoint:
-            updated["command"] = f"python {shlex.quote(entrypoint)}"
+            args = str(payload.get("arguments") or "").strip()
+            updated["command"] = f"python {shlex.quote(entrypoint)}" + (f" {args}" if args else "")
         if not payload.get("cleanup_globs") and project.get("cleanup_globs"):
             updated["cleanup_globs"] = project.get("cleanup_globs")
         return updated
@@ -2193,7 +2194,15 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             },
         )
 
-    def submit_project_run(name: str, parallel: int, entrypoint: str, account_name: str, cpus: int, memory_mb: int) -> int:
+    def submit_project_run(
+        name: str,
+        parallel: int,
+        entrypoint: str,
+        account_name: str,
+        cpus: int,
+        memory_mb: int,
+        arguments: str = "",
+    ) -> int:
         project = db.get_project_by_name(name)
         if not project:
             raise HTTPException(status_code=404, detail=f"project not found: {name}")
@@ -2211,9 +2220,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                     "name": f"{name}-run-{index}",
                     "project": name,
                     "entrypoint": chosen,
+                    "arguments": str(arguments or "").strip(),
                     "account_name": account_name or "",
                     "cpus": max(1, int(cpus or 4)),
-                    "memory_mb": max(1, int(memory_mb or 8192)),
+                    "memory_mb": max(1, int(memory_mb or 32768)),
                     "scheduling_profile": "fea_bursty",
                 }
             )
@@ -2224,11 +2234,12 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         name: str,
         parallel: int = Form(1),
         entrypoint: str = Form(""),
+        arguments: str = Form(""),
         account_name: str = Form(""),
         cpus: int = Form(4),
-        memory_mb: int = Form(8192),
+        memory_mb: int = Form(32768),
     ) -> Response:
-        submit_project_run(name, parallel, entrypoint, account_name, cpus, memory_mb)
+        submit_project_run(name, parallel, entrypoint, account_name, cpus, memory_mb, arguments)
         return RedirectResponse(f"/projects/{name}", status_code=303)
 
     @app.post("/api/projects/{name}/run")
@@ -2240,7 +2251,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             str(payload.get("entrypoint") or ""),
             str(payload.get("account_name") or ""),
             int(payload.get("cpus") or 4),
-            int(payload.get("memory_mb") or 8192),
+            int(payload.get("memory_mb") or 32768),
+            str(payload.get("arguments") or ""),
         )
         return {"project": name, "submitted": count}
 
