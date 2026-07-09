@@ -164,6 +164,10 @@ class Scheduler:
         cleanup_finished_task_ttl_seconds: int = 259200,
         cleanup_finished_job_ttl_seconds: int = 259200,
         cleanup_closed_allocation_ttl_seconds: int = 86400,
+        orphan_process_sweep_enabled: bool = False,
+        orphan_process_sweep_interval_seconds: int = 600,
+        orphan_process_min_age_seconds: int = 1800,
+        orphan_process_name_patterns: list[str] | None = None,
         reconcile_on_start: bool = False,
         backup_enabled: bool = False,
         backup_interval_seconds: int = 86400,
@@ -278,6 +282,11 @@ class Scheduler:
         self.cleanup_db_row_ttl_seconds = max(86400, int(cleanup_db_row_ttl_seconds))
         self.cleanup_event_ttl_seconds = max(3600, int(cleanup_event_ttl_seconds))
         self._last_orphan_sweep_at = 0.0
+        self.orphan_process_sweep_enabled = bool(orphan_process_sweep_enabled)
+        self.orphan_process_sweep_interval_seconds = max(60, int(orphan_process_sweep_interval_seconds))
+        self.orphan_process_min_age_seconds = max(60, int(orphan_process_min_age_seconds))
+        self.orphan_process_name_patterns = list(orphan_process_name_patterns or [])
+        self._last_orphan_process_sweep_at = 0.0
         self.cleanup_workspace_prune_globs = list(cleanup_workspace_prune_globs or [])
         self.cleanup_workspace_prune_interval_seconds = max(3600, int(cleanup_workspace_prune_interval_seconds))
         self.cleanup_workspace_prune_min_age_seconds = max(3600, int(cleanup_workspace_prune_min_age_seconds))
@@ -633,6 +642,7 @@ class Scheduler:
                 self.refresh_submitted_jobs()
                 self.submit_next_queued_job()
                 self.cleanup_remote_artifacts_if_due()
+                self.sweep_orphan_processes_if_due()
                 self.backup_database_if_due()
                 self.refresh_license_usage_if_due()
         finally:
@@ -1626,7 +1636,7 @@ class Scheduler:
         account = self.account_by_name(str(task.get("account_name") or ""))
         if account:
             try:
-                self._client(account).cancel_task(task)
+                self._client(account).cancel_task(task, self._task_allocation_job_id(task))
             except Exception as exc:
                 LOGGER.warning("failed to cancel timed out task %s remotely: %s", task["id"], exc)
         self.db.update_task(
@@ -2144,7 +2154,7 @@ class Scheduler:
                 "task %s transitioned during attach; cancelling the freshly started worker", task["id"]
             )
             try:
-                self._client(account).cancel_task({**task, **result})
+                self._client(account).cancel_task({**task, **result}, self._task_allocation_job_id(task))
             except Exception as exc:
                 LOGGER.warning("failed to cancel raced attach for task %s: %s", task["id"], exc)
             self.recalculate_allocation_capacity()
@@ -3245,6 +3255,89 @@ class Scheduler:
                 return int(inventory_row.get("cpus") or 0)
         return 0
 
+    def _task_allocation_job_id(self, task: dict) -> str:
+        """Slurm job id of the task's allocation, so cancel can srun onto the
+        compute node to reap daemonized solver grandchildren."""
+        alloc_id = int(task.get("allocation_id") or 0)
+        if alloc_id <= 0:
+            return ""
+        allocation = self.db.get_allocation(alloc_id)
+        return str(allocation.get("slurm_job_id") or "") if allocation else ""
+
+    @staticmethod
+    def _orphan_process_sweep_shell(name_patterns: list[str], live_task_ids: list[str], min_age_seconds: int) -> str:
+        """On-node shell: for each solver process (own user), kill it if its
+        SLURM_SCHED_TASK_ID marker is not among the live task ids; if it carries
+        no marker, kill only when it has no python ancestor and is older than
+        min_age (ancestry fallback for markerless pre-fix orphans)."""
+        pats = " ".join(shlex.quote(p) for p in name_patterns)
+        live = " ".join(shlex.quote(str(t)) for t in live_task_ids)
+        minage = max(0, int(min_age_seconds))
+        return (
+            f'live=" {live} "; minage={minage}; killed=0; me=$(id -u); '
+            f'for pat in {pats}; do '
+            'for pid in $(pgrep -x -u "$me" "$pat" 2>/dev/null); do '
+            '[ -e /proc/$pid/environ ] || continue; '
+            'tid=$(tr "\\0" "\\n" < /proc/$pid/environ 2>/dev/null | sed -n "s/^SLURM_SCHED_TASK_ID=//p" | head -1); '
+            'if [ -n "$tid" ]; then '
+            'case "$live" in *" $tid "*) continue ;; esac; '
+            'kill -KILL "$pid" 2>/dev/null && killed=$((killed+1)); '
+            'else '
+            'age=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d " "); '
+            '[ -n "$age" ] && [ "$age" -ge "$minage" ] || continue; '
+            'p=$pid; haspy=0; '
+            'while [ "${p:-0}" -gt 1 ]; do '
+            'c=$(ps -o comm= -p "$p" 2>/dev/null); '
+            'case "$c" in *python*) haspy=1; break ;; esac; '
+            'p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d " "); [ -n "$p" ] || break; '
+            'done; '
+            '[ "$haspy" = 0 ] && { kill -KILL "$pid" 2>/dev/null && killed=$((killed+1)); }; '
+            'fi; '
+            'done; done; echo "orphan_killed=$killed"'
+        )
+
+    def sweep_orphan_processes_if_due(self) -> None:
+        """Reap daemonized solver grandchildren (ansysedt/3dedy) that left their
+        task's process group and survive on a node. Runs on each live
+        allocation's node via `srun --overlap`, sparing any process whose
+        SLURM_SCHED_TASK_ID marks a still-active task."""
+        if not self.orphan_process_sweep_enabled:
+            return
+        now = time.time()
+        if now - self._last_orphan_process_sweep_at < self.orphan_process_sweep_interval_seconds:
+            return
+        self._last_orphan_process_sweep_at = now
+        patterns = [p.strip() for p in self.orphan_process_name_patterns if p and p.strip()]
+        if not patterns:
+            return
+        live_ids = sorted(
+            {
+                str(task["id"])
+                for task in self.db.list_tasks_with_active(limit=5000)
+                if task.get("status") in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}
+            }
+        )
+        live_states = {AllocationStatus.WARM.value, AllocationStatus.ACTIVE.value, AllocationStatus.DRAINING.value}
+        command = self._orphan_process_sweep_shell(patterns, live_ids, self.orphan_process_min_age_seconds)
+        for allocation in self.db.list_allocations(limit=500):
+            if allocation["state"] not in live_states:
+                continue
+            node = str(allocation.get("node_name") or "").strip()
+            job_id = str(allocation.get("slurm_job_id") or "").strip()
+            account = self.account_by_name(str(allocation.get("account_name") or ""))
+            if not node or not job_id or not account:
+                continue
+            srun = f"srun --jobid={shlex.quote(job_id)} --overlap bash -lc {shlex.quote(command)}"
+            try:
+                with SSHSession(account, default_timeout=90) as ssh:
+                    result = ssh.run(srun, timeout=80)
+            except Exception as exc:
+                LOGGER.warning("orphan process sweep failed on %s/%s: %s", account.name, node, exc)
+                continue
+            last = (result.stdout or "").strip().splitlines()[-1:] or [""]
+            if last[0].startswith("orphan_killed=") and last[0] != "orphan_killed=0":
+                LOGGER.info("orphan process sweep on %s/%s: %s", account.name, node, last[0])
+
     def enforce_fea_node_cpu_cap(self) -> None:
         """Retroactive side of the node CPU cap: nodes that accumulated more
         FEA-requested CPUs than cpu_total * factor (e.g. before the cap
@@ -3305,7 +3398,7 @@ class Scheduler:
                 account = self.account_by_name(str(task.get("account_name") or ""))
                 if account:
                     try:
-                        self._client(account).cancel_task(task)
+                        self._client(account).cancel_task(task, self._task_allocation_job_id(task))
                     except Exception as exc:
                         LOGGER.warning("failed to cancel FEA task %s for cap rebalance: %s", task["id"], exc)
                 self.requeue_task_for_rebalance(
@@ -3438,7 +3531,7 @@ class Scheduler:
             account = self.account_by_name(str(task.get("account_name") or allocation.get("account_name") or ""))
             if account:
                 try:
-                    self._client(account).cancel_task(task)
+                    self._client(account).cancel_task(task, self._task_allocation_job_id(task))
                 except Exception as exc:
                     LOGGER.warning("failed to cancel FEA task %s under memory pressure: %s", task["id"], exc)
             self.requeue_pressure_killed_task(task)
@@ -5401,7 +5494,7 @@ class Scheduler:
         account = self.account_by_name(str(task.get("account_name") or ""))
         if account and task["status"] in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
             try:
-                self._client(account).cancel_task(task)
+                self._client(account).cancel_task(task, self._task_allocation_job_id(task))
             except Exception as exc:
                 LOGGER.warning("failed to cancel task %s remotely: %s", task_id, exc)
         self.db.update_task(task_id, status=TaskStatus.CANCELLED.value, finished_at="CURRENT_TIMESTAMP")
@@ -5430,7 +5523,7 @@ class Scheduler:
         if not account:
             return
         try:
-            self._client(account).cancel_task(task)
+            self._client(account).cancel_task(task, self._task_allocation_job_id(task))
         except Exception as exc:
             LOGGER.warning("failed to cancel task %s remotely: %s", task.get("id"), exc)
 

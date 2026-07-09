@@ -704,7 +704,7 @@ class FakeClient:
     def cancel(self, slurm_job_id: str) -> None:
         self.cancelled.append(slurm_job_id)
 
-    def cancel_task(self, task: dict) -> None:
+    def cancel_task(self, task: dict, allocation_job_id: str = "") -> None:
         self.cancelled_tasks.append(int(task["id"]))
 
     def remove_tree(self, remote_path: str) -> None:

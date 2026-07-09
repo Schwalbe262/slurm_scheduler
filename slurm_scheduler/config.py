@@ -122,6 +122,10 @@ class AppConfig:
     cleanup_workspace_prune_min_age_seconds: int = 86400
     cleanup_finished_task_log_max_bytes: int = 0
     cleanup_finished_task_log_trim_after_seconds: int = 86400
+    orphan_process_sweep_enabled: bool = False
+    orphan_process_sweep_interval_seconds: int = 600
+    orphan_process_min_age_seconds: int = 1800
+    orphan_process_name_patterns: list[str] = field(default_factory=list)
     storage_guard_min_free_gb: float = 0.0
     license_monitor_enabled: bool = False
     license_monitor_account: str = ""
@@ -221,6 +225,17 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
         for source, target in mapping.items():
             if source in cleanup:
                 data[target] = cleanup[source]
+    orphan_process = data.pop("orphan_process_sweep", None)
+    if isinstance(orphan_process, dict):
+        mapping = {
+            "enabled": "orphan_process_sweep_enabled",
+            "interval_seconds": "orphan_process_sweep_interval_seconds",
+            "min_age_seconds": "orphan_process_min_age_seconds",
+            "name_patterns": "orphan_process_name_patterns",
+        }
+        for source, target in mapping.items():
+            if source in orphan_process:
+                data[target] = orphan_process[source]
     credentials = data.pop("git_credentials", [])
     if credentials is None:
         credentials = []

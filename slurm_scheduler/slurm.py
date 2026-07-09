@@ -561,6 +561,11 @@ def build_task_script(task: dict) -> str:
         "#!/usr/bin/env bash",
         "set -euo pipefail",
     ]
+    if task.get("id") is not None and str(task.get("id")).strip():
+        # Marker inherited by every descendant (incl. daemonized AEDT/solver
+        # grandchildren that leave the wrapper's process group) so cancel and
+        # the orphan-process sweep can attribute and kill them on the node.
+        lines.append(f"export SLURM_SCHED_TASK_ID={shlex.quote(str(task['id']))}")
     if task.get("payload_json") and task.get("payload_path"):
         lines.extend(
             [
@@ -662,6 +667,21 @@ def cancel_process_group_command(wrapper_pid: str, term_grace_seconds: int = 3) 
         'pkill -KILL -P "$pid" >/dev/null 2>&1 || true; '
         'kill -KILL "$pid" >/dev/null 2>&1 || true; '
         "fi"
+    )
+
+
+def node_marker_kill_command(task_id: str) -> str:
+    """Compute-node kill of every process whose environment carries this task's
+    SLURM_SCHED_TASK_ID marker. Run via `srun --jobid=<alloc> --overlap` so it
+    executes on the node where the (possibly daemonized, re-parented) AEDT/solver
+    grandchildren actually run — the login-side killpg cannot reach them."""
+    tid = shlex.quote(str(task_id).strip())
+    return (
+        f"tid={tid}; "
+        "for e in /proc/[0-9]*/environ; do "
+        'tr "\\0" "\\n" < "$e" 2>/dev/null | grep -qx "SLURM_SCHED_TASK_ID=$tid" && '
+        'kill -KILL "$(basename "$(dirname "$e")")" 2>/dev/null || true; '
+        "done"
     )
 
 
@@ -1084,15 +1104,34 @@ class SlurmAccountClient:
         if result.exit_code != 0:
             raise RuntimeError(result.stderr.strip() or "scancel failed")
 
-    def cancel_task(self, task: dict) -> None:
+    def cancel_task(self, task: dict, allocation_job_id: str = "") -> None:
         wrapper_pid = str(task.get("wrapper_pid") or "").strip()
-        if not wrapper_pid:
-            return
-        command = cancel_process_group_command(wrapper_pid)
+        task_id = str(task.get("id") or "").strip()
+        job_id = str(allocation_job_id or "").strip()
+        error: str = ""
         with self._open_session() as ssh:
-            result = ssh.run(command, timeout=15)
-        if result.exit_code != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "task cancel failed")
+            # 1) Login-side: kill the wrapper's process group (wrapper + srun +
+            #    the step's python). Best effort but surfaced if it fails.
+            if wrapper_pid:
+                result = ssh.run(cancel_process_group_command(wrapper_pid), timeout=15)
+                if result.exit_code != 0:
+                    error = result.stderr.strip() or result.stdout.strip() or "task cancel failed"
+            # 2) Node-side: reap daemonized AEDT/solver grandchildren that left
+            #    the wrapper's process group, by SLURM_SCHED_TASK_ID marker.
+            #    Runs on the compute node via srun --overlap into the allocation.
+            if task_id and job_id:
+                srun = (
+                    f"srun --jobid={shlex.quote(job_id)} --overlap "
+                    f"bash -lc {shlex.quote(node_marker_kill_command(task_id))}"
+                )
+                try:
+                    ssh.run(srun, timeout=45)
+                except Exception:
+                    # A dead/closing allocation just means nothing to reap here;
+                    # the periodic orphan-process sweep is the backstop.
+                    pass
+        if error:
+            raise RuntimeError(error)
 
     def remove_tree(self, remote_path: str) -> None:
         with self._open_session() as ssh:
