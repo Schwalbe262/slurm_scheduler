@@ -687,6 +687,7 @@ class Scheduler:
         self.trim_finished_task_logs()
         self.sweep_orphan_remote_artifacts_if_due()
         self.prune_workspace_artifacts_if_due()
+        self.prune_project_sim_artifacts()
 
     def trim_finished_task_logs(self) -> None:
         """Terminal tasks keep full stdout/stderr (used for CSV harvesting)
@@ -796,6 +797,79 @@ class Scheduler:
                 entity_id=account.name,
                 account_name=account.name,
             )
+
+    def prune_project_sim_artifacts(self) -> None:
+        """For each deployed project, sweep its
+        <workspace>/projects/<name>/<sim_subdir> for the project's own cleanup
+        globs. mtime-guarded so files a running simulation still touches are
+        left alone. Scoped strictly inside the project's sim dir."""
+        minutes = max(1, int(self.cleanup_workspace_prune_min_age_seconds // 60))
+        for project in self.db.list_projects():
+            globs = [
+                g.strip()
+                for g in str(project.get("cleanup_globs") or "").split(",")
+                if self._workspace_prune_glob_ok(g.strip())
+            ]
+            if not globs:
+                continue
+            sim_subdir = str(project.get("sim_subdir") or "simulation").strip().strip("/")
+            if not sim_subdir:
+                continue
+            name = str(project.get("name") or "").strip()
+            if not name:
+                continue
+            name_expr = " -o ".join(f"-name {shlex.quote(g)}" for g in globs)
+            deployments = [
+                dep for dep in self.db.list_project_deployments(int(project["id"]))
+                if dep.get("status") == "deployed"
+            ]
+            for dep in deployments:
+                account = self.account_by_name(str(dep.get("account_name") or ""))
+                if not account:
+                    continue
+                workspace = str(account.remote_workspace or "").strip()
+                if not workspace:
+                    continue
+                projects_root = posixpath.join(workspace, "projects")
+                sim_dir = posixpath.join(projects_root, name, sim_subdir)
+                # Containment: the sweep dir must live under <workspace>/projects/.
+                projects_prefix = self._normalize_remote_path(projects_root).rstrip("/") + "/"
+                if not self._normalize_remote_path(sim_dir).startswith(projects_prefix):
+                    continue
+                list_command = (
+                    f"test -d {shlex.quote(sim_dir)} || exit 0; "
+                    f"find {shlex.quote(sim_dir)} -mindepth 1 \\( {name_expr} \\) -prune -print 2>/dev/null | "
+                    "while IFS= read -r d; do "
+                    f"if [ -z \"$(find \"$d\" -mmin -{minutes} -print -quit 2>/dev/null)\" ]; "
+                    "then printf '%s\\n' \"$d\"; fi; done"
+                )
+                try:
+                    with SSHSession(account, default_timeout=600) as ssh:
+                        result = ssh.run(list_command)
+                        if result.exit_code != 0:
+                            continue
+                        sim_prefix = self._normalize_remote_path(sim_dir).rstrip("/") + "/"
+                        candidates = []
+                        for line in result.stdout.splitlines():
+                            path = line.strip()
+                            if not path:
+                                continue
+                            normalized = self._normalize_remote_path(path)
+                            if not normalized.startswith(sim_prefix):
+                                continue
+                            basename = posixpath.basename(normalized.rstrip("/"))
+                            if not any(fnmatch.fnmatch(basename, g) for g in globs):
+                                continue
+                            candidates.append(path)
+                        if not candidates:
+                            continue
+                        for index in range(0, len(candidates), 20):
+                            chunk = candidates[index : index + 20]
+                            ssh.run("rm -rf -- " + " ".join(shlex.quote(path) for path in chunk), timeout=600)
+                except Exception as exc:
+                    LOGGER.warning("project sim prune failed on %s/%s: %s", account.name, name, exc)
+                    continue
+                LOGGER.info("project sim prune removed %d artifacts in %s on %s", len(candidates), name, account.name)
 
     def license_usage(self) -> dict:
         return dict(self._license_usage)
@@ -960,10 +1034,16 @@ class Scheduler:
             if not workspace:
                 continue
             env_sync_dir = posixpath.join(workspace, "env-sync")
+            runs_dir = posixpath.join(workspace, "runs")
+            artifact_names = "\\( -name 'task-*' -o -name 'job-*' -o -name 'allocation-*' \\)"
             command = (
-                f"find {shlex.quote(workspace)} -mindepth 1 -maxdepth 1 -type d "
-                f"\\( -name 'task-*' -o -name 'job-*' -o -name 'allocation-*' \\) -mmin +{age_minutes} 2>/dev/null; "
+                # Current layout: run artifacts live under runs/<date>/ (depth 2).
+                f"find {shlex.quote(runs_dir)} -mindepth 2 -maxdepth 2 -type d {artifact_names} -mmin +{age_minutes} 2>/dev/null; "
+                # Legacy layout: artifacts written directly under the workspace.
+                f"find {shlex.quote(workspace)} -mindepth 1 -maxdepth 1 -type d {artifact_names} -mmin +{age_minutes} 2>/dev/null; "
                 f"find {shlex.quote(env_sync_dir)} -mindepth 1 -maxdepth 1 -type d -name 'job-*' -mmin +{age_minutes} 2>/dev/null; "
+                # Reap now-empty dated run folders left behind by earlier sweeps.
+                f"find {shlex.quote(runs_dir)} -mindepth 1 -maxdepth 1 -type d -empty -exec rmdir {{}} + 2>/dev/null; "
                 "true"
             )
             try:

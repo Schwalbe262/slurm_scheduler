@@ -640,6 +640,14 @@ def background_wrapper_command(wrapper: str, wrapper_path: str) -> str:
     return f"nohup setsid bash -lc {shlex.quote(wrapper)} > {shlex.quote(wrapper_path)} 2>&1 & echo $!"
 
 
+def workspace_runs_dir(workspace: str, stamp: int) -> str:
+    """Run artifacts (task-/job-/allocation-*) live under <workspace>/runs/<date>/
+    to keep the workspace organized and prunable by day, kept separate from the
+    project trees under <workspace>/projects/."""
+    date = time.strftime("%Y-%m-%d", time.localtime(stamp))
+    return posixpath.join(workspace, "runs", date)
+
+
 def cancel_process_group_command(wrapper_pid: str, term_grace_seconds: int = 3) -> str:
     pid = shlex.quote(str(wrapper_pid).strip())
     grace = max(0, int(term_grace_seconds))
@@ -722,7 +730,9 @@ class SlurmAccountClient:
 
     def submit(self, job: dict) -> dict[str, str]:
         stamp = int(time.time())
-        remote_job_dir = posixpath.join(self.account.remote_workspace, f"job-{job['id']}-{stamp}")
+        remote_job_dir = posixpath.join(
+            workspace_runs_dir(self.account.remote_workspace, stamp), f"job-{job['id']}-{stamp}"
+        )
         run_script_path = posixpath.join(remote_job_dir, "run.sbatch")
         submit_stdout_path = posixpath.join(remote_job_dir, "submit.stdout.log")
         submit_stderr_path = posixpath.join(remote_job_dir, "submit.stderr.log")
@@ -787,7 +797,10 @@ class SlurmAccountClient:
         }
 
     def submit_allocation(self, allocation: dict, time_limit: str) -> dict[str, str]:
-        remote_dir = posixpath.join(self.account.remote_workspace, f"allocation-{allocation['id']}-{int(time.time())}")
+        stamp = int(time.time())
+        remote_dir = posixpath.join(
+            workspace_runs_dir(self.account.remote_workspace, stamp), f"allocation-{allocation['id']}-{stamp}"
+        )
         allocation = {
             **allocation,
             "remote_dir": remote_dir,
@@ -824,7 +837,9 @@ class SlurmAccountClient:
 
     def attach_task(self, task: dict, allocation: dict) -> dict[str, str]:
         stamp = int(time.time())
-        remote_dir = posixpath.join(self.account.remote_workspace, f"task-{task['id']}-{stamp}")
+        remote_dir = posixpath.join(
+            workspace_runs_dir(self.account.remote_workspace, stamp), f"task-{task['id']}-{stamp}"
+        )
         script_path = posixpath.join(remote_dir, "task.sh")
         script_exec_path = remote_execution_path(script_path)
         stdout_path = posixpath.join(remote_dir, "stdout.log")

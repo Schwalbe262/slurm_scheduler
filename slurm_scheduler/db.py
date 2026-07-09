@@ -164,6 +164,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     same_node_as_task_id INTEGER NOT NULL DEFAULT 0,
     payload_json TEXT NOT NULL DEFAULT '',
     cleanup_globs TEXT NOT NULL DEFAULT '',
+    project TEXT NOT NULL DEFAULT '',
+    entrypoint TEXT NOT NULL DEFAULT '',
     exit_code INTEGER,
     attempt_count INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL,
@@ -236,6 +238,37 @@ CREATE TABLE IF NOT EXISTS account_env_overlays (
 );
 
 CREATE INDEX IF NOT EXISTS idx_account_env_overlays_account ON account_env_overlays(account_name);
+
+CREATE TABLE IF NOT EXISTS projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    repos TEXT NOT NULL DEFAULT '[]',
+    setup TEXT NOT NULL DEFAULT '',
+    entrypoints TEXT NOT NULL DEFAULT '[]',
+    cleanup_globs TEXT NOT NULL DEFAULT '',
+    sim_subdir TEXT NOT NULL DEFAULT 'simulation',
+    auto_pull INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS project_deployments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    account_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    remote_dir TEXT NOT NULL DEFAULT '',
+    deployed_refs TEXT NOT NULL DEFAULT '{}',
+    log_path TEXT NOT NULL DEFAULT '',
+    failure_message TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    started_at TEXT,
+    finished_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(project_id, account_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_deployments_project ON project_deployments(project_id);
 
 CREATE TABLE IF NOT EXISTS scheduler_settings (
     key TEXT PRIMARY KEY,
@@ -408,6 +441,8 @@ class Database:
                 "same_node_as_task_id": "INTEGER NOT NULL DEFAULT 0",
                 "payload_json": "TEXT NOT NULL DEFAULT ''",
                 "cleanup_globs": "TEXT NOT NULL DEFAULT ''",
+                "project": "TEXT NOT NULL DEFAULT ''",
+                "entrypoint": "TEXT NOT NULL DEFAULT ''",
                 "exit_code": "INTEGER",
                 "attempt_count": "INTEGER NOT NULL DEFAULT 0",
             },
@@ -484,8 +519,8 @@ class Database:
                 INSERT INTO tasks (
                     name, remote_cwd, command, env_setup, required_capability, env_profile, account_name, cpus, memory_mb,
                     scheduling_profile, gpus, gpu_model, partition, node_name, exclusive_node, priority, timeout_seconds, dedupe_key,
-                    max_workers_per_node, same_node_as_task_id, payload_json, cleanup_globs, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    max_workers_per_node, same_node_as_task_id, payload_json, cleanup_globs, project, entrypoint, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.name,
@@ -510,6 +545,8 @@ class Database:
                     max(0, int(task.same_node_as_task_id or 0)),
                     task.payload_json,
                     task.cleanup_globs,
+                    task.project,
+                    task.entrypoint,
                     TaskStatus.QUEUED.value,
                 ),
             )
@@ -911,6 +948,98 @@ class Database:
             row = conn.execute(
                 "SELECT * FROM account_env_overlays WHERE account_name = ? AND env_name = ?",
                 (account_name, env_name),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def create_project(
+        self,
+        name: str,
+        repos: list[dict[str, Any]] | None = None,
+        setup: str = "",
+        entrypoints: list[dict[str, Any]] | None = None,
+        cleanup_globs: str = "",
+        sim_subdir: str = "simulation",
+        auto_pull: bool = False,
+    ) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO projects (
+                    name, repos, setup, entrypoints, cleanup_globs, sim_subdir, auto_pull
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    name,
+                    json_dumps(repos or []),
+                    setup,
+                    json_dumps(entrypoints or []),
+                    cleanup_globs,
+                    sim_subdir,
+                    1 if auto_pull else 0,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def update_project(self, project_id: int, **fields: Any) -> None:
+        self._update_row("projects", project_id, fields)
+
+    def get_project(self, project_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_project_by_name(self, name: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM projects WHERE name = ?", (name,)).fetchone()
+            return dict(row) if row else None
+
+    def list_projects(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM projects ORDER BY name").fetchall()
+            return [dict(row) for row in rows]
+
+    def delete_project(self, project_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM project_deployments WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+
+    def upsert_project_deployment(self, project_id: int, account_name: str, status: str = "queued") -> int:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO project_deployments (project_id, account_name, status)
+                VALUES (?, ?, ?)
+                ON CONFLICT(project_id, account_name) DO UPDATE SET
+                    status = excluded.status,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (project_id, account_name, status),
+            )
+            row = conn.execute(
+                "SELECT id FROM project_deployments WHERE project_id = ? AND account_name = ?",
+                (project_id, account_name),
+            ).fetchone()
+            return int(row["id"])
+
+    def update_project_deployment(self, deployment_id: int, **fields: Any) -> None:
+        self._update_row("project_deployments", deployment_id, fields)
+
+    def list_project_deployments(self, project_id: int | None = None) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if project_id is None:
+                rows = conn.execute("SELECT * FROM project_deployments ORDER BY id DESC").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM project_deployments WHERE project_id = ? ORDER BY account_name",
+                    (project_id,),
+                ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_project_deployment(self, project_id: int, account_name: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM project_deployments WHERE project_id = ? AND account_name = ?",
+                (project_id, account_name),
             ).fetchone()
             return dict(row) if row else None
 
