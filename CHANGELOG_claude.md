@@ -15,3 +15,10 @@
 
 ## 2026-07-09 (Claude) - 추가 3
 - slurm.py shell_path: $HOME/ 프리픽스 경로가 통째로 quote되어 project run의 cd가 실패하던 버그 수정 (재시작 필요)
+
+## 2026-07-10 (Codex) - MFT shared cleanup repair
+- `scripts/repair_mft_cleanup_globs.py`: scheduler tick 사이의 휴지 구간에서 온라인 DB 백업과
+  무결성 검사를 수행한 뒤, MFT active task/project의 공유 `simulation` cleanup glob을
+  `*.aedtresults`로 원자 교체하는 guarded maintenance 도구 추가.
+- 2026-07-10 05:48 KST 적용: active destructive rows 325 -> 0. 백업은
+  `data/backups/manual-pre-cleanup-glob-20260710-054839.db`.
