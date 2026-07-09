@@ -12,3 +12,6 @@
 
 ## 2026-07-09 (Claude) - 추가 2
 - docs/design_projects_runs_items.md: Project/Run/Work-Item 3층 구조 설계 제안 (RL 대응 포함)
+
+## 2026-07-09 (Claude) - 추가 3
+- slurm.py shell_path: $HOME/ 프리픽스 경로가 통째로 quote되어 project run의 cd가 실패하던 버그 수정 (재시작 필요)

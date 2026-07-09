@@ -522,6 +522,12 @@ def shell_path(path: str) -> str:
         return "$HOME"
     if value.startswith("~/"):
         return "$HOME/" + shlex.quote(value[2:])
+    if value == "$HOME":
+        return "$HOME"
+    if value.startswith("$HOME/"):
+        # project 태스크의 remote_cwd가 $HOME/... 형태 (app.apply_project_to_payload)
+        # - 통째로 quote하면 리터럴 '$HOME'을 찾다 cd 실패 (2026-07-09 실측)
+        return "$HOME/" + shlex.quote(value[len("$HOME/"):])
     return shlex.quote(value)
 
 
