@@ -295,6 +295,37 @@ class SlurmParsingTests(unittest.TestCase):
         )
         self.assertIn("'/remote/path with spaces/out.log'", remote_text_command("/remote/path with spaces/out.log", max_bytes=10))
 
+    def test_remote_file_expands_project_home_root_and_preserves_absolute_path(self) -> None:
+        self.assertIn("$HOME/slurm_scheduler/projects/result.json", remote_text_command("$HOME/slurm_scheduler/projects/result.json"))
+        self.assertIn("$HOME/'project files/result.json'", remote_text_command("~/project files/result.json"))
+        self.assertIn("/gpfs/home1/user/project/result.json", remote_text_command("/gpfs/home1/user/project/result.json"))
+        self.assertIn("'$OTHER/project/result.json'", remote_text_command("$OTHER/project/result.json"))
+
+    def test_remote_files_expands_project_home_root_and_preserves_absolute_path(self) -> None:
+        class CaptureSession:
+            command = ""
+
+            def ensure_connected(self) -> None:
+                pass
+
+            def run(self, command: str, timeout: float | None = None) -> CommandResult:
+                self.command = command
+                return CommandResult("[]", "", 0)
+
+        account = AccountConfig("a", "host", 22, "a", "key", "slurm_scheduler")
+        client = SlurmAccountClient(account)
+        session = CaptureSession()
+        client.bind_shared_session(session)  # type: ignore[arg-type]
+
+        client.list_files("$HOME/slurm_scheduler/projects/P/result", "*.json")
+        self.assertIn("root = os.path.expanduser('~') + '/' + 'slurm_scheduler/projects/P/result'", session.command)
+        client.list_files("~/slurm_scheduler/projects/P/result", "*.json")
+        self.assertIn("root = os.path.expanduser('~') + '/' + 'slurm_scheduler/projects/P/result'", session.command)
+        client.list_files("/gpfs/home1/a/project", "*.json")
+        self.assertIn("root = '/gpfs/home1/a/project'", session.command)
+        client.list_files("$OTHER/project", "*.json")
+        self.assertIn("root = '$OTHER/project'", session.command)
+
     def test_build_sbatch_script(self) -> None:
         job = {
             "job_name": "sleep-test",

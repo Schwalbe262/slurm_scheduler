@@ -157,7 +157,10 @@ def command_failure_message(result: CommandResult, fallback: str) -> str:
 
 
 def remote_text_command(path: str, tail_lines: int = 0, max_bytes: int = 0) -> str:
-    quoted = shlex.quote(path)
+    # Remote task roots may intentionally be anchored at the login account's
+    # home.  Preserve that one expansion while quoting every suffix/other path
+    # exactly; in particular, do not expand arbitrary environment variables.
+    quoted = shell_path(path)
     prefix = f"test -f {quoted} && "
     if tail_lines > 0:
         command = f"tail -n {int(tail_lines)} -- {quoted}"
@@ -1391,10 +1394,18 @@ class SlurmAccountClient:
         return result.stdout
 
     def list_files(self, root: str, pattern: str, timeout: float | None = None) -> list[str]:
+        if root in {"$HOME", "~"}:
+            root_expression = "os.path.expanduser('~')"
+        elif root.startswith("$HOME/"):
+            root_expression = f"os.path.expanduser('~') + '/' + {root[len('$HOME/'):]!r}"
+        elif root.startswith("~/"):
+            root_expression = f"os.path.expanduser('~') + '/' + {root[2:]!r}"
+        else:
+            root_expression = repr(root)
         script = (
             "python - <<'PY'\n"
             "import glob, json, os\n"
-            f"root = {root!r}\n"
+            f"root = {root_expression}\n"
             f"pattern = {pattern!r}\n"
             "matches = []\n"
             "for path in glob.glob(os.path.join(root, pattern), recursive=True):\n"
