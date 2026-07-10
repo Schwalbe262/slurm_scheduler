@@ -2843,7 +2843,11 @@ class Scheduler:
         requested_cpus = int(task.get("cpus") or 0)
         if requested_cpus <= 0:
             return ""
-        if self.choose_allocation_shape(resource_pool="cpu", requested_cpus=requested_cpus):
+        if self.choose_allocation_shape(
+            resource_pool="cpu",
+            requested_cpus=requested_cpus,
+            require_fea_eligible_node=self.task_is_fea_bursty(task),
+        ):
             return ""
 
         target_partition = self.allocation_partition
@@ -3282,6 +3286,7 @@ class Scheduler:
             required_capability=str(task.get("required_capability") or ""),
             env_profile=str(task.get("env_profile") or ""),
             account_name=str(task.get("account_name") or ""),
+            require_fea_eligible_node=True,
         )
         if not allocation:
             return False
@@ -4314,6 +4319,7 @@ class Scheduler:
                 account_name=str(task.get("account_name") or ""),
                 requested_cpus=int(task.get("cpus") or 0),
                 requested_memory_mb=int(task.get("memory_mb") or 0),
+                require_fea_eligible_node=self.task_is_fea_bursty(task),
             )
         if self.allocation_pool_in_backoff("cpu"):
             return None
@@ -4327,6 +4333,7 @@ class Scheduler:
             account_name=str(task.get("account_name") or ""),
             requested_cpus=int(task.get("cpus") or 0) if exclusive_node or not self.task_is_fea_bursty(task) else 0,
             requested_memory_mb=int(task.get("memory_mb") or 0) if exclusive_node else 0,
+            require_fea_eligible_node=self.task_is_fea_bursty(task),
         )
 
     def scale_in_idle_allocations(self) -> None:
@@ -4559,6 +4566,7 @@ class Scheduler:
         account_name: str = "",
         requested_cpus: int = 0,
         requested_memory_mb: int = 0,
+        require_fea_eligible_node: bool = False,
     ) -> bool:
         return self.open_allocation_record(
             reason=reason,
@@ -4572,6 +4580,7 @@ class Scheduler:
             account_name=account_name,
             requested_cpus=requested_cpus,
             requested_memory_mb=requested_memory_mb,
+            require_fea_eligible_node=require_fea_eligible_node,
         ) is not None
 
     def open_allocation_record(
@@ -4587,6 +4596,7 @@ class Scheduler:
         account_name: str = "",
         requested_cpus: int = 0,
         requested_memory_mb: int = 0,
+        require_fea_eligible_node: bool = False,
     ) -> dict | None:
         account = self.choose_account_for_allocation(
             preferred_accounts=preferred_accounts,
@@ -4603,6 +4613,7 @@ class Scheduler:
             exclusive_node=exclusive_node,
             requested_cpus=requested_cpus,
             requested_memory_mb=requested_memory_mb,
+            require_fea_eligible_node=require_fea_eligible_node,
         )
         if not shape:
             return None
@@ -5013,6 +5024,7 @@ class Scheduler:
         exclusive_node: bool = False,
         requested_cpus: int = 0,
         requested_memory_mb: int = 0,
+        require_fea_eligible_node: bool = False,
     ) -> dict | None:
         inventory_by_node = {row["node_name"]: row for row in self.db.list_node_inventory()}
         nodes = [
@@ -5066,6 +5078,8 @@ class Scheduler:
         for node in nodes:
             node_free_cpus_for_shape = node.sched_free_cpus if wants_gpu else node.effective_free_cpus
             if node.state not in {"idle", "mix"} or node_free_cpus_for_shape <= 0:
+                continue
+            if require_fea_eligible_node and not self.fea_allocation_accepts_task({"node_name": node.hostname}):
                 continue
             if not wants_gpu and self.cpu_partition_allocation_limit_reached(node.partition, node.hostname):
                 continue
@@ -5199,14 +5213,30 @@ class Scheduler:
                 node, cpus, memory_mb, chosen_gpu_model, gpu_free, _score, _cpu_score, _node_is_gpu_partition = candidate
                 chosen_gpus = min(target_gpu_count, gpu_free) if wants_gpu else 0
                 node_name = node.hostname
-                if not wants_gpu and not self.is_single_job_partition(node.partition) and not _node_is_gpu_partition:
+                if (
+                    not wants_gpu
+                    and not self.is_single_job_partition(node.partition)
+                    and not _node_is_gpu_partition
+                    and not require_fea_eligible_node
+                ):
                     node_name = ""
-                shape = None
+                single_partition_shape = {
+                    "partition": node.partition,
+                    "node_name": node_name,
+                    "cpus": cpus,
+                    "memory_mb": memory_mb,
+                    "gpus": chosen_gpus,
+                    "gpu_model": chosen_gpu_model if wants_gpu else "",
+                    "exclusive_node": exclusive_node,
+                }
+                shape = single_partition_shape
+                used_partition_spread = False
                 if (
                     wants_shared_cpu_pool
                     and _node_is_gpu_partition
                     and self.cpu_pool_partition_spread
                     and target_partition == "auto"
+                    and not require_fea_eligible_node
                 ):
                     spread, spread_cpus, spread_memory_mb = self.cpu_pool_spread(
                         cpus, memory_mb, requested_cpus=int(requested_cpus or 0)
@@ -5223,19 +5253,16 @@ class Scheduler:
                             "gpu_model": "",
                             "exclusive_node": exclusive_node,
                         }
-                if shape is None:
-                    shape = {
-                        "partition": node.partition,
-                        "node_name": node_name,
-                        "cpus": cpus,
-                        "memory_mb": memory_mb,
-                        "gpus": chosen_gpus,
-                        "gpu_model": chosen_gpu_model if wants_gpu else "",
-                        "exclusive_node": exclusive_node,
-                    }
+                        used_partition_spread = True
                 if self.allocation_shape_in_backoff(resource_pool, shape):
+                    if used_partition_spread and not self.allocation_shape_in_backoff(
+                        resource_pool, single_partition_shape
+                    ):
+                        return single_partition_shape
                     continue
                 return shape
+            return None
+        if require_fea_eligible_node and nodes:
             return None
         if target_partition != "auto" and self.is_single_job_partition(target_partition):
             return None

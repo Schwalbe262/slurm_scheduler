@@ -2747,7 +2747,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(allocation["state"], AllocationStatus.CLOSED.value)
         self.assertIn("qos-blocked", FakeClient.cancelled)
 
-    def test_qos_rejected_partition_spread_is_not_reopened_but_cpu2_remains_available(self) -> None:
+    def test_qos_rejected_partition_spread_falls_back_to_healthy_single_partition(self) -> None:
         inventory_text = (
             "NodeName=gpu-one CPUTot=48 RealMemory=384000 State=IDLE Partitions=gpu1 Gres=gpu:rtx3090:4\n"
             "NodeName=gpu-four CPUTot=56 RealMemory=512000 State=IDLE Partitions=gpu4 Gres=gpu:a6000:4\n"
@@ -2798,16 +2798,52 @@ class SchedulerTests(unittest.TestCase):
             )
         )
 
-        scheduler.maintain_allocation_pool()
+        scheduler.scale_in_idle_allocations()
 
         self.assertEqual(self.db.get_allocation(rejected_id)["state"], AllocationStatus.CLOSED.value)
+        fallback_shape = scheduler.choose_allocation_shape(resource_pool="cpu")
+        self.assertIsNotNone(fallback_shape)
+        self.assertEqual(fallback_shape["partition"], "gpu4")
+        self.assertEqual(fallback_shape["node_name"], "gpu-four")
+        self.assertEqual(scheduler.partition_spec_names(fallback_shape["partition"]), ["gpu4"])
+
+        scheduler._allocation_shape_backoff_until.clear()
+        fea_shape_after_backoff_expiry = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            require_fea_eligible_node=True,
+        )
+        self.assertEqual(fea_shape_after_backoff_expiry["partition"], "gpu4")
+        self.assertEqual(fea_shape_after_backoff_expiry["node_name"], "gpu-four")
+        self.assertEqual(
+            scheduler.partition_spec_names(fea_shape_after_backoff_expiry["partition"]),
+            ["gpu4"],
+        )
+
+        scheduler.prewarm_for_demand()
         live = [
             allocation
             for allocation in self.db.list_allocations()
             if allocation["state"] in {AllocationStatus.PENDING.value, AllocationStatus.WARM.value, AllocationStatus.ACTIVE.value}
         ]
-        self.assertEqual(live, [])
-        self.assertEqual(FakeClient.allocation_submits, [])
+        self.assertEqual(len(live), 1)
+        self.assertEqual(live[0]["partition"], "gpu4")
+        self.assertEqual(live[0]["node_name"], "gpu-four")
+        self.assertEqual(scheduler.partition_spec_names(live[0]["partition"]), ["gpu4"])
+        self.assertEqual(len(FakeClient.allocation_submits), 1)
+
+        self.db.update_allocation(
+            live[0]["id"],
+            state=AllocationStatus.WARM.value,
+            started_at="CURRENT_TIMESTAMP",
+        )
+        scheduler.scale_in_idle_allocations()
+        self.assertEqual(self.db.get_allocation(live[0]["id"])["state"], AllocationStatus.WARM.value)
+
+        self.db.update_allocation(
+            live[0]["id"],
+            state=AllocationStatus.CLOSED.value,
+            closed_at="CURRENT_TIMESTAMP",
+        )
 
         self.db.replace_node_inventory(
             parse_scontrol_nodes(
@@ -3149,6 +3185,65 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(shape["partition"], "cpu2")
         self.assertEqual(shape["node_name"], "mixed-cpu")
         self.assertEqual(shape["cpus"], 64)
+
+    def test_fea_demand_shape_uses_attach_memory_and_load_eligibility(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "memory-blocked cpu2 idle 0 256 0.0 1000000 599999\n"
+                "load-blocked cpu2 mix 64 256 193.0 1000000 900000 busy\n"
+                "healthy cpu2 mix 224 256 32.0 1000000 900000 busy\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            allocation_partition="cpu2",
+            allocation_cpus=32,
+            single_job_per_node_partitions=[],
+            fea_soft_memory_free_percent=60,
+            fea_load_target=0.75,
+        )
+
+        non_fea_shape = scheduler.choose_allocation_shape(resource_pool="cpu")
+        self.assertEqual(non_fea_shape["node_name"], "")
+        self.assertEqual(non_fea_shape["memory_mb"], 599999)
+
+        fea_shape = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            require_fea_eligible_node=True,
+        )
+        self.assertEqual(fea_shape["node_name"], "healthy")
+
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "memory-blocked cpu2 idle 0 256 0.0 1000000 599999\n"
+                "load-blocked cpu2 mix 64 256 193.0 1000000 900000 busy\n"
+            )
+        )
+        self.assertIsNone(
+            scheduler.choose_allocation_shape(
+                resource_pool="cpu",
+                require_fea_eligible_node=True,
+            )
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "memory-blocked cpu2 idle 0 256 0.0 1000000 599999\n"
+                "load-blocked cpu2 mix 64 256 193.0 1000000 900000 busy\n"
+                "healthy cpu2 mix 224 256 32.0 1000000 900000 busy\n"
+            )
+        )
+
+        task_id = self.create_queued_fea_task()
+        allocation = scheduler.open_allocation_for_task_record(self.db.get_task(task_id))
+        self.assertIsNotNone(allocation)
+        self.assertEqual(allocation["node_name"], "healthy")
 
     def test_cpu_partition_allocation_limit_is_per_node_for_shape_selection(self) -> None:
         self.db.replace_pestat_nodes(
