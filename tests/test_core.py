@@ -5982,6 +5982,61 @@ class SchedulerTests(unittest.TestCase):
         self.assertIsNone(scheduler.best_allocation_for_task(fea))
         self.assertEqual(scheduler.best_allocation_for_task(common)["id"], allocation_id)
 
+    def test_fea_attach_skips_quota_blocked_best_candidate_for_eligible_second(self) -> None:
+        blocked_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=200000,
+        )
+        eligible_id = self.db.create_allocation(
+            account_name="b",
+            partition="cpu1",
+            node_name="n002",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        for allocation_id, free_memory_mb in [(blocked_id, 200000), (eligible_id, 100000)]:
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.WARM.value,
+                slurm_job_id=f"alloc-{allocation_id}",
+                free_cpus=64,
+                free_memory_mb=free_memory_mb,
+            )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 12.0 200000 180000 some_job\n"
+                "n002 cpu1 mix 8 64 12.0 100000 90000 some_job\n"
+            )
+        )
+        task_id = self.create_queued_fea_task("quota-fallback")
+        scheduler = Scheduler(
+            self.db, self.accounts, 30, client_factory=FakeClient, storage_guard_min_free_gb=5.0
+        )
+        scheduler._storage_quota_cache["a"] = (
+            time.time(),
+            StorageQuotaProbe("gpfs", GpfsBlockQuota("gpfs", 97.0, 0.0, 100.0)),
+        )
+        scheduler._storage_quota_cache["b"] = (
+            time.time(),
+            StorageQuotaProbe("gpfs", GpfsBlockQuota("gpfs", 50.0, 0.0, 100.0)),
+        )
+        # Candidate collection must enforce quota independently of generic
+        # fit checks; otherwise the higher-memory blocked pool wins and the
+        # final attach guard starves the eligible second choice.
+        scheduler.allocation_can_run_task = (  # type: ignore[method-assign]
+            lambda allocation, task, include_pending, **kwargs: True
+        )
+        self.assertTrue(scheduler.assign_queued_task(self.db.get_task(task_id)))
+        attached = self.db.get_task(task_id)
+        self.assertEqual(attached["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(attached["account_name"], "b")
+        self.assertEqual(attached["allocation_id"], eligible_id)
+        self.assertIn(task_id, FakeClient.attached_tasks)
+
     def test_workspace_prune_glob_validation(self) -> None:
         ok = Scheduler._workspace_prune_glob_ok
         self.assertTrue(ok("*.aedtresults"))

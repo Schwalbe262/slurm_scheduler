@@ -2263,6 +2263,7 @@ class Scheduler:
     def best_allocation_for_effective_task(self, task: dict) -> dict | None:
         cpu_candidates = []
         gpu_candidates = []
+        is_fea = self.task_is_fea_bursty(task)
         active_task_allocation_ids, active_exclusive_allocation_ids = self.active_task_allocation_sets()
         for allocation in self.db.list_allocations(limit=500):
             if allocation["state"] not in {AllocationStatus.WARM.value, AllocationStatus.ACTIVE.value}:
@@ -2271,6 +2272,10 @@ class Scheduler:
                 continue
             if not allocation.get("slurm_job_id"):
                 continue
+            if is_fea:
+                account = self.account_by_name(str(allocation.get("account_name") or ""))
+                if not account or self.account_storage_blocked(account, for_fea=True):
+                    continue
             if not self.allocation_can_run_task(
                 allocation,
                 task,
@@ -2284,7 +2289,7 @@ class Scheduler:
             # per-allocation requested-CPU cap, though. Without this check the
             # background attach loop repeatedly overfills an allocation and
             # the retroactive rebalancer kills/requeues the same workers.
-            if self.task_is_fea_bursty(task):
+            if is_fea:
                 cap_remaining = self.fea_node_cpu_cap_remaining(allocation, task)
                 if cap_remaining is not None and cap_remaining <= 0:
                     continue
