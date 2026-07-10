@@ -1133,6 +1133,64 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual([int(task["id"]) for task in running], [running_id])
         self.assertEqual(self.db.count_tasks_by_statuses([TaskStatus.FAILED.value]), 20)
 
+    def test_best_allocation_reuses_one_active_task_snapshot_for_all_candidates(self) -> None:
+        for index in range(2):
+            allocation_id = self.db.create_allocation(
+                account_name="a",
+                partition="cpu1",
+                node_name=f"n00{index + 1}",
+                total_cpus=8,
+                total_memory_mb=65536,
+            )
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.WARM.value,
+                slurm_job_id=f"alloc-{index + 1}",
+            )
+        task_id = self.db.create_task(TaskCreate("standard", "~/case", "run", cpus=1, memory_mb=1024))
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        original_active_sets = scheduler.active_task_allocation_sets
+        snapshot_calls = 0
+
+        def counted_active_sets() -> tuple[set[int], set[int]]:
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            return original_active_sets()
+
+        def unexpected_per_candidate_scan(_allocation_id: int) -> bool:
+            raise AssertionError("per-candidate exclusive-task scan should use the shared snapshot")
+
+        scheduler.active_task_allocation_sets = counted_active_sets  # type: ignore[method-assign]
+        scheduler.allocation_has_active_exclusive_task = unexpected_per_candidate_scan  # type: ignore[method-assign]
+
+        self.assertIsNotNone(scheduler.best_allocation_for_task(self.db.get_task(task_id)))
+        self.assertEqual(snapshot_calls, 1)
+
+    def test_pestat_rows_are_loaded_once_during_a_tick(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 idle 0 64 0.0 262144 200000\n"
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        original_list_pestat_nodes = self.db.list_pestat_nodes
+        list_calls = 0
+
+        def counted_list_pestat_nodes() -> list[dict]:
+            nonlocal list_calls
+            list_calls += 1
+            return original_list_pestat_nodes()
+
+        self.db.list_pestat_nodes = counted_list_pestat_nodes  # type: ignore[method-assign]
+        scheduler._tick_seq = 7
+        scheduler._tick_started_at = time.monotonic()
+        allocation = {"node_name": "n001"}
+
+        self.assertIsNotNone(scheduler.pestat_node_for_allocation(allocation))
+        self.assertIsNotNone(scheduler.pestat_node_for_allocation(allocation))
+        self.assertEqual(list_calls, 1)
+
     def test_gpu_task_attaches_before_higher_priority_cpu_backlog(self) -> None:
         self.db.create_allocation(
             account_name="a",
@@ -2200,6 +2258,11 @@ class SchedulerTests(unittest.TestCase):
             gpu_cpu_reserve=4,
             allocation_memory="0",
         )
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE allocations SET created_at = datetime('now', '-61 seconds') WHERE id = ?",
+                (old_id,),
+            )
         scheduler.scale_in_idle_allocations()
         self.assertEqual(self.db.get_allocation(old_id)["state"], AllocationStatus.CLOSED.value)
         self.assertEqual(FakeClient.cancelled, ["old-cpu1"])
@@ -2212,6 +2275,57 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(len(live_allocations), 1)
         self.assertEqual(live_allocations[0]["partition"], "gpu4")
         self.assertEqual(live_allocations[0]["total_cpus"], 24)
+
+    def test_new_cpu_demand_pool_is_not_closed_in_same_maintenance_call(self) -> None:
+        self.db.replace_node_inventory(
+            parse_scontrol_nodes(
+                "NodeName=cpu2-free CPUTot=256 RealMemory=1031519 Gres=(null) State=IDLE Partitions=cpu2\n"
+                "NodeName=gpu-free CPUTot=56 RealMemory=1024000 Gres=gpu:a6000:4 GresUsed=gpu:a6000:0 State=IDLE Partitions=gpu4\n"
+            )
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "cpu2-free cpu2 idle 0 256 0.0 1031519 1000000\n"
+                "gpu-free gpu4 idle 0 56 0.0 1024000 900000\n"
+            )
+        )
+        self.db.create_task(
+            TaskCreate(
+                "waiting-fea",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            allocation_cpus=64,
+            cpu_pool_allow_gpu_partitions=True,
+            cpu_partition_allocation_limits={"cpu2": 1},
+        )
+
+        scheduler.maintain_allocation_pool()
+
+        demand = [
+            allocation
+            for allocation in self.db.list_allocations()
+            if allocation.get("drain_reason") == "queued CPU demand"
+        ]
+        self.assertEqual(len(demand), 1)
+        self.assertEqual(demand[0]["state"], AllocationStatus.PENDING.value)
+        self.assertEqual(demand[0]["partition"], "cpu2")
+        self.assertEqual(FakeClient.cancelled, [])
+
+        scheduler.scale_in_idle_allocations()
+        self.assertEqual(self.db.get_allocation(demand[0]["id"])["state"], AllocationStatus.PENDING.value)
+        self.assertEqual(FakeClient.cancelled, [])
 
     def test_cpu_partition_allocation_limit_closes_only_empty_excess_pools_on_same_node(self) -> None:
         allocation_ids = []
@@ -6081,6 +6195,8 @@ class ObservabilityTests(unittest.TestCase):
         health = scheduler.health_status()
         self.assertIsNotNone(health["last_tick_duration_seconds"])
         self.assertTrue(health["last_tick_completed_at"])
+        self.assertIn("assign_ready_fea", health["last_tick_stage_seconds"])
+        self.assertIn("maintain_allocation_pool", health["last_tick_stage_seconds"])
         self.assertEqual(health["consecutive_tick_failures"], 0)
 
 

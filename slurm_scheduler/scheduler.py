@@ -264,6 +264,7 @@ class Scheduler:
         self._tick_attach_workers_by_node: dict[str, int] = {}
         self._fea_pressures_cache: tuple[int, dict[str, dict[str, int]]] | None = None
         self._fea_alloc_pressures_cache: tuple[int, dict[int, dict[str, int]]] | None = None
+        self._pestat_nodes_cache: tuple[int, dict[str, dict]] | None = None
         self._fea_overload_since_by_node: dict[str, float] = {}
         self._fea_overload_scaled_nodes: set[str] = set()
         self.task_refresh_max_per_tick = max(1, int(task_refresh_max_per_tick))
@@ -316,6 +317,7 @@ class Scheduler:
         self._last_tick_completed_monotonic: float | None = None
         self._last_tick_completed_at: str = ""
         self._last_tick_duration: float | None = None
+        self._last_tick_stage_seconds: dict[str, float] = {}
         self._consecutive_tick_failures = 0
         self.watchdog_enabled = watchdog_enabled
         self.watchdog_stall_seconds = max(0, int(watchdog_stall_seconds))
@@ -443,6 +445,7 @@ class Scheduler:
             "last_tick_duration_seconds": round(self._last_tick_duration, 3)
             if self._last_tick_duration is not None
             else None,
+            "last_tick_stage_seconds": dict(self._last_tick_stage_seconds),
             "tick_in_progress_seconds": round(tick_in_progress_seconds, 1)
             if tick_in_progress_seconds is not None
             else None,
@@ -619,40 +622,67 @@ class Scheduler:
         self._tick_seq += 1
         self._tick_started_at = time.monotonic()
         self._tick_attach_workers_by_node.clear()
+        stage_seconds: dict[str, float] = {}
+
+        def run_stage(name: str, operation: Callable[[], Any]) -> Any:
+            stage_started_at = time.monotonic()
+            try:
+                return operation()
+            finally:
+                stage_seconds[name] = time.monotonic() - stage_started_at
+
         try:
             with self._tick_client_cache():
                 if self._needs_reconcile:
                     self._needs_reconcile = False
-                    self.reconcile_slurm_state()
-                self.fail_stale_same_node_tasks()
-                self.enforce_cpu_partition_allocation_limits()
-                self.update_fea_overload_state()
-                self.assign_ready_same_node_tasks()
-                self.assign_ready_gpu_tasks()
-                self.assign_ready_standard_tasks()
-                self.assign_ready_fea_tasks(background=True)
-                self.refresh_cluster_state_if_due()
-                self.refresh_allocations()
-                self.refresh_tasks()
-                self.apply_allocation_lifecycle()
-                self.handle_fea_memory_pressure()
-                self.enforce_fea_node_cpu_cap()
-                self.update_fea_overload_state()
-                self.assign_queued_tasks(include_fea=False)
-                self.maintain_allocation_pool()
-                self.refresh_submitted_jobs()
-                self.submit_next_queued_job()
-                self.cleanup_remote_artifacts_if_due()
-                self.sweep_orphan_processes_if_due()
-                self.backup_database_if_due()
-                self.refresh_license_usage_if_due()
+                    run_stage("reconcile_slurm_state", self.reconcile_slurm_state)
+                run_stage("fail_stale_same_node_tasks", self.fail_stale_same_node_tasks)
+                run_stage("enforce_cpu_partition_limits", self.enforce_cpu_partition_allocation_limits)
+                run_stage("update_fea_overload_before", self.update_fea_overload_state)
+                run_stage("assign_ready_same_node", self.assign_ready_same_node_tasks)
+                run_stage("assign_ready_gpu", self.assign_ready_gpu_tasks)
+                run_stage("assign_ready_standard", self.assign_ready_standard_tasks)
+                run_stage("assign_ready_fea", lambda: self.assign_ready_fea_tasks(background=True))
+                run_stage("refresh_cluster_state", self.refresh_cluster_state_if_due)
+                run_stage("refresh_allocations", self.refresh_allocations)
+                run_stage("refresh_tasks", self.refresh_tasks)
+                run_stage("allocation_lifecycle", self.apply_allocation_lifecycle)
+                run_stage("fea_memory_pressure", self.handle_fea_memory_pressure)
+                run_stage("fea_cpu_cap", self.enforce_fea_node_cpu_cap)
+                run_stage("update_fea_overload_after", self.update_fea_overload_state)
+                run_stage("assign_queued_standard", lambda: self.assign_queued_tasks(include_fea=False))
+                run_stage("maintain_allocation_pool", self.maintain_allocation_pool)
+                run_stage("refresh_submitted_jobs", self.refresh_submitted_jobs)
+                run_stage("submit_next_job", self.submit_next_queued_job)
+                run_stage("cleanup", self.cleanup_remote_artifacts_if_due)
+                run_stage("orphan_process_sweep", self.sweep_orphan_processes_if_due)
+                run_stage("backup", self.backup_database_if_due)
+                run_stage("license_refresh", self.refresh_license_usage_if_due)
         finally:
             started = self._tick_started_at
             if started is not None:
                 self._last_tick_duration = time.monotonic() - started
+            self._last_tick_stage_seconds = {
+                name: round(seconds, 3)
+                for name, seconds in stage_seconds.items()
+            }
             self._last_tick_completed_monotonic = time.monotonic()
             self._last_tick_completed_at = self._now().isoformat()
             self._tick_started_at = None
+            if self._last_tick_duration is not None and (
+                self._last_tick_duration >= self.poll_interval_seconds
+                or any(seconds >= 5.0 for seconds in stage_seconds.values())
+            ):
+                LOGGER.info(
+                    "scheduler tick %s completed in %.3fs; stages=%s",
+                    self._tick_seq,
+                    self._last_tick_duration,
+                    ", ".join(
+                        f"{name}:{seconds:.3f}s"
+                        for name, seconds in sorted(stage_seconds.items(), key=lambda item: item[1], reverse=True)
+                        if seconds >= 0.05
+                    ),
+                )
 
     def _now(self) -> datetime:
         return datetime.now(timezone.utc)
@@ -1221,6 +1251,7 @@ class Scheduler:
                     pestat_result = ssh.run("pestat")
                     if pestat_result.exit_code == 0 and pestat_result.stdout.strip():
                         self.db.replace_pestat_nodes(parse_pestat(pestat_result.stdout))
+                        self._pestat_nodes_cache = None
                 return
             except Exception as exc:
                 LOGGER.warning("failed to refresh cluster state through %s: %s", account.name, exc)
@@ -2171,6 +2202,7 @@ class Scheduler:
     def best_allocation_for_effective_task(self, task: dict) -> dict | None:
         cpu_candidates = []
         gpu_candidates = []
+        active_task_allocation_ids, active_exclusive_allocation_ids = self.active_task_allocation_sets()
         for allocation in self.db.list_allocations(limit=500):
             if allocation["state"] not in {AllocationStatus.WARM.value, AllocationStatus.ACTIVE.value}:
                 continue
@@ -2178,7 +2210,13 @@ class Scheduler:
                 continue
             if not allocation.get("slurm_job_id"):
                 continue
-            if not self.allocation_can_run_task(allocation, task, include_pending=False):
+            if not self.allocation_can_run_task(
+                allocation,
+                task,
+                include_pending=False,
+                active_task_allocation_ids=active_task_allocation_ids,
+                active_exclusive_allocation_ids=active_exclusive_allocation_ids,
+            ):
                 continue
             # FEA tasks intentionally ignore the allocation's bookkeeping
             # free_cpus/free_memory values. They must still respect the hard
@@ -2948,16 +2986,32 @@ class Scheduler:
         if not node_name:
             return None
         age_limit = self.pestat_stale_after_seconds() if max_age_seconds is None else max_age_seconds
-        for row in self.db.list_pestat_nodes():
-            if str(row.get("hostname") or "") != node_name:
-                continue
-            observed_at = self._timestamp(row.get("observed_at"))
-            if not observed_at:
-                return None
-            if (self._now() - observed_at).total_seconds() > age_limit:
-                return None
-            return row
-        return None
+        if self._tick_started_at is None:
+            rows_by_hostname = {
+                str(row.get("hostname") or ""): row
+                for row in self.db.list_pestat_nodes()
+            }
+        else:
+            cached = self._pestat_nodes_cache
+            if cached is None or cached[0] != self._tick_seq:
+                cached = (
+                    self._tick_seq,
+                    {
+                        str(row.get("hostname") or ""): row
+                        for row in self.db.list_pestat_nodes()
+                    },
+                )
+                self._pestat_nodes_cache = cached
+            rows_by_hostname = cached[1]
+        row = rows_by_hostname.get(node_name)
+        if not row:
+            return None
+        observed_at = self._timestamp(row.get("observed_at"))
+        if not observed_at:
+            return None
+        if (self._now() - observed_at).total_seconds() > age_limit:
+            return None
+        return row
 
     def _record_attach_delta(self, allocation: dict, task: dict) -> None:
         node_name = str(allocation.get("node_name") or "").strip()
@@ -3899,8 +3953,11 @@ class Scheduler:
     def maintain_allocation_pool(self) -> None:
         self.prewarm_gpu_for_minimum()
         self.prewarm_cpu_for_minimum()
-        self.prewarm_for_demand()
+        # Retire stale demand pools before opening replacements. Opening first
+        # let a new reservation change the current-fit shape, so scale-in
+        # could cancel the pool created a few lines earlier in the same tick.
         self.scale_in_idle_allocations()
+        self.prewarm_for_demand()
 
     def prewarm_cpu_for_minimum(self) -> None:
         live_count = sum(
@@ -4394,9 +4451,22 @@ class Scheduler:
                 continue
             if int(allocation["id"]) in reserved_allocation_ids:
                 continue
+            if queued_tasks and self.pending_demand_allocation_in_shape_grace(allocation):
+                continue
             if self.warm_demand_allocation_in_attach_grace(allocation, queued_tasks):
                 continue
             self.close_allocation(allocation, "demand allocation no longer needed")
+
+    def pending_demand_allocation_in_shape_grace(self, allocation: dict) -> bool:
+        if allocation.get("state") != AllocationStatus.PENDING.value:
+            return False
+        if not str(allocation.get("drain_reason") or "").startswith("queued "):
+            return False
+        created_at = self._timestamp(allocation.get("created_at"))
+        if created_at is None:
+            return False
+        grace_seconds = max(1, self.poll_interval_seconds * 2)
+        return (self._now() - created_at).total_seconds() < grace_seconds
 
     def warm_demand_allocation_in_attach_grace(self, allocation: dict, queued_tasks: list[dict]) -> bool:
         if allocation.get("state") != AllocationStatus.WARM.value:
@@ -4437,6 +4507,8 @@ class Scheduler:
         if int(allocation.get("exclusive_node") or 0):
             return False
         if not str(allocation.get("drain_reason") or "").startswith("queued "):
+            return False
+        if self.pending_demand_allocation_in_shape_grace(allocation):
             return False
         allocation_partitions = set(self.partition_spec_names(str(allocation.get("partition") or "")))
         desired_partitions = set(self.partition_spec_names(str(desired_shape.get("partition") or "")))
