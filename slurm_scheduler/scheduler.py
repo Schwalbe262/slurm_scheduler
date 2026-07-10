@@ -2133,7 +2133,9 @@ class Scheduler:
                 if free_gb >= self.storage_guard_min_free_gb:
                     return False
                 detail = (
-                    f"FEA work held: GPFS user block quota has {free_gb:.1f} GB free "
+                    f"FEA work held: GPFS {probe.quota.quota_type.lower()} block quota "
+                    f"for fileset {probe.fileset_name or probe.quota.fileset_name or 'unknown'} "
+                    f"has {free_gb:.1f} GB free "
                     f"(< {self.storage_guard_min_free_gb:g} GB; "
                     f"used+in_doubt {probe.quota.effective_used_gb:.1f} / "
                     f"{probe.quota.block_limit_gb:.1f} GB)"

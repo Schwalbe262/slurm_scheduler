@@ -269,11 +269,13 @@ def parse_du_gb(output: str) -> float:
 
 
 @dataclass(frozen=True)
-class GpfsUserQuota:
+class GpfsBlockQuota:
     filesystem_name: str
     block_used_gb: float
     block_in_doubt_gb: float
     block_limit_gb: float
+    quota_type: str = "USR"
+    fileset_name: str = ""
 
     @property
     def effective_used_gb(self) -> float:
@@ -291,16 +293,18 @@ class GpfsUserQuota:
 @dataclass(frozen=True)
 class StorageQuotaProbe:
     filesystem_type: str
-    quota: GpfsUserQuota | None = None
+    quota: GpfsBlockQuota | None = None
     error: str = ""
+    fileset_name: str = ""
+    user_quota_scope: str = ""
 
     @property
     def is_gpfs(self) -> bool:
         return self.filesystem_type.strip().lower().startswith("gpfs")
 
 
-def parse_mmlsquota_y(output: str) -> list[GpfsUserQuota]:
-    """Parse Storage Scale `mmlsquota -Y` user block quota records.
+def parse_mmlsquota_y(output: str) -> list[GpfsBlockQuota]:
+    """Parse Storage Scale `mmlsquota -Y` block quota records.
 
     The parseable format describes its columns in a HEADER row. Using those
     names avoids depending on the command subtype or reserved-column count.
@@ -318,7 +322,7 @@ def parse_mmlsquota_y(output: str) -> list[GpfsUserQuota]:
         else:
             rows.append(fields)
 
-    parsed: list[GpfsUserQuota] = []
+    parsed: list[GpfsBlockQuota] = []
     for fields in rows:
         indices = headers.get((fields[0], fields[1]))
         if not indices:
@@ -326,7 +330,8 @@ def parse_mmlsquota_y(output: str) -> list[GpfsUserQuota]:
         required = {"filesystemName", "quotaType", "blockUsage", "blockQuota", "blockLimit", "blockInDoubt"}
         if not required.issubset(indices) or max(indices[name] for name in required) >= len(fields):
             continue
-        if fields[indices["quotaType"]].strip().upper() != "USR":
+        quota_type = fields[indices["quotaType"]].strip().upper()
+        if quota_type not in {"USR", "FILESET"}:
             continue
         try:
             used_kib = float(fields[indices["blockUsage"]])
@@ -337,11 +342,17 @@ def parse_mmlsquota_y(output: str) -> list[GpfsUserQuota]:
             continue
         limit_kib = hard_kib if hard_kib > 0 else soft_kib
         parsed.append(
-            GpfsUserQuota(
+            GpfsBlockQuota(
                 filesystem_name=fields[indices["filesystemName"]].strip(),
                 block_used_gb=used_kib / 1024 / 1024,
                 block_in_doubt_gb=in_doubt_kib / 1024 / 1024,
                 block_limit_gb=limit_kib / 1024 / 1024,
+                quota_type=quota_type,
+                fileset_name=(
+                    fields[indices["filesetname"]].strip()
+                    if "filesetname" in indices and indices["filesetname"] < len(fields)
+                    else ""
+                ),
             )
         )
     return parsed
@@ -834,13 +845,16 @@ class SlurmAccountClient:
         return None
 
     def storage_quota_probe(self) -> StorageQuotaProbe:
-        """Read the actual user block quota for a GPFS-backed workspace."""
+        """Read user and fileset block quotas for a GPFS-backed workspace."""
         storage_path = self.account.storage_path or self.account.remote_workspace
         marker = "__SLURM_SCHEDULER_FS_TYPE__:"
+        fileset_marker = "__SLURM_SCHEDULER_FILESET__:"
+        user_scope_marker = "__SLURM_SCHEDULER_USER_QUOTA_SCOPE__:"
         quoted_path = shlex.quote(storage_path)
         command = (
             f"storage_path={quoted_path}; "
-            'mkdir -p "$storage_path" || exit $?; '
+            'export LC_ALL=C; '
+            'if [ ! -e "$storage_path" ]; then echo "storage path does not exist" >&2; exit 1; fi; '
             'fs_type=$(stat -f -c %T -- "$storage_path" 2>/dev/null); '
             'fs_status=$?; '
             f'printf "{marker}%s\\n" "$fs_type"; '
@@ -854,17 +868,45 @@ class SlurmAccountClient:
             'device=$(df -P -- "$storage_path" 2>/dev/null | awk \'END {print $1}\'); '
             'device=${device#/dev/}; '
             'if [ -z "$device" ]; then echo "GPFS device not found" >&2; exit 1; fi; '
-            '"$quota_cmd" -u "$USER" -v -Y "$device"'
+            'attr_cmd=$(command -v mmlsattr 2>/dev/null || true); '
+            'if [ -z "$attr_cmd" ] && [ -x /usr/lpp/mmfs/bin/mmlsattr ]; then '
+            'attr_cmd=/usr/lpp/mmfs/bin/mmlsattr; fi; '
+            'if [ -z "$attr_cmd" ]; then echo "mmlsattr not found" >&2; exit 127; fi; '
+            'attr_output=$("$attr_cmd" -L "$storage_path" 2>&1); attr_status=$?; '
+            'if [ "$attr_status" -ne 0 ]; then printf "%s\\n" "$attr_output" >&2; exit "$attr_status"; fi; '
+            "fileset=$(printf \"%s\\n\" \"$attr_output\" | "
+            "sed -n 's/^[[:space:]]*[Ff]ileset name[[:space:]]*:[[:space:]]*//p' | "
+            "sed 's/[[:space:]]*$//' | head -n 1); "
+            'if [ -z "$fileset" ]; then echo "workspace GPFS fileset unavailable" >&2; exit 1; fi; '
+            f'printf "{fileset_marker}%s\\n" "$fileset"; '
+            'quota_user=${USER:-$(id -un)}; '
+            'user_output=$("$quota_cmd" -u "$quota_user" -v -Y "${device}:${fileset}" 2>/dev/null); '
+            'user_status=$?; '
+            'if [ "$user_status" -eq 0 ]; then '
+            f'printf "{user_scope_marker}fileset\\n"; '
+            'else '
+            'user_output=$("$quota_cmd" -u "$quota_user" -v -Y "$device"); user_status=$?; '
+            f'printf "{user_scope_marker}filesystem\\n"; '
+            'fi; '
+            'printf "%s\\n" "$user_output"; '
+            '"$quota_cmd" -j "$fileset" -v -Y "$device"; fileset_status=$?; '
+            'if [ "$user_status" -ne 0 ] || [ "$fileset_status" -ne 0 ]; then '
+            'echo "workspace quota query failed" >&2; exit 1; fi'
         )
         with self._open_session() as ssh:
             result = ssh.run(command, timeout=self.slow_command_timeout)
         filesystem_type = ""
+        fileset_name = ""
+        user_quota_scope = ""
         marker_seen = False
         for line in result.stdout.splitlines():
             if line.startswith(marker):
                 marker_seen = True
                 filesystem_type = line[len(marker) :].strip()
-                break
+            elif line.startswith(fileset_marker):
+                fileset_name = line[len(fileset_marker) :].strip()
+            elif line.startswith(user_scope_marker):
+                user_quota_scope = line[len(user_scope_marker) :].strip()
         if not marker_seen or not filesystem_type:
             return StorageQuotaProbe(
                 filesystem_type=filesystem_type,
@@ -881,16 +923,53 @@ class SlurmAccountClient:
             return StorageQuotaProbe(
                 filesystem_type=filesystem_type,
                 error=command_failure_message(result, "mmlsquota failed"),
+                fileset_name=fileset_name,
+                user_quota_scope=user_quota_scope,
+            )
+        if not fileset_name:
+            return StorageQuotaProbe(
+                filesystem_type=filesystem_type,
+                error="workspace GPFS fileset unavailable",
+            )
+        if user_quota_scope not in {"fileset", "filesystem"}:
+            return StorageQuotaProbe(
+                filesystem_type=filesystem_type,
+                error="workspace GPFS user quota scope unavailable",
+                fileset_name=fileset_name,
             )
         quotas = parse_mmlsquota_y(result.stdout)
+        if user_quota_scope == "filesystem":
+            quotas = [
+                quota
+                for quota in quotas
+                if quota.quota_type != "USR"
+                or not quota.fileset_name
+                or quota.fileset_name == fileset_name
+            ]
         if not quotas:
             return StorageQuotaProbe(
                 filesystem_type=filesystem_type,
-                error="mmlsquota returned no parseable user quota record",
+                error="mmlsquota returned no parseable block quota record",
+                fileset_name=fileset_name,
+                user_quota_scope=user_quota_scope,
+            )
+        quota_types = {quota.quota_type for quota in quotas}
+        if not {"USR", "FILESET"}.issubset(quota_types):
+            missing = ",".join(sorted({"USR", "FILESET"} - quota_types))
+            return StorageQuotaProbe(
+                filesystem_type=filesystem_type,
+                error=f"mmlsquota returned no parseable {missing} quota record",
+                fileset_name=fileset_name,
+                user_quota_scope=user_quota_scope,
             )
         limited = [quota for quota in quotas if quota.free_gb is not None]
         quota = min(limited, key=lambda item: float(item.free_gb)) if limited else quotas[0]
-        return StorageQuotaProbe(filesystem_type=filesystem_type, quota=quota)
+        return StorageQuotaProbe(
+            filesystem_type=filesystem_type,
+            quota=quota,
+            fileset_name=fileset_name,
+            user_quota_scope=user_quota_scope,
+        )
 
     def submit(self, job: dict) -> dict[str, str]:
         stamp = int(time.time())

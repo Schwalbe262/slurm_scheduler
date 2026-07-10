@@ -23,7 +23,7 @@ from slurm_scheduler.pestat import parse_pestat, plan_dynamic_allocations
 from slurm_scheduler.task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, TASK_ID_PLACEHOLDER, build_git_task_command
 from slurm_scheduler.slurm import (
     CommandResult,
-    GpfsUserQuota,
+    GpfsBlockQuota,
     JobStateInfo,
     RemoteCommandTimeout,
     RemoteExecutionError,
@@ -188,21 +188,37 @@ class SlurmParsingTests(unittest.TestCase):
             "2097152:none:1:0:0:0:none::::\n"
             "mmlsquota:user:0:1:::gpfs:USR:1000:user:99614720:94371840:104857600:"
             "-1048576:none:1:0:0:0:none::::\n"
+            "mmlsquota:fileset:HEADER:version:reserved:reserved:filesystemName:quotaType:id:name:"
+            "blockUsage:blockQuota:blockLimit:blockInDoubt:blockGrace:filesUsage:filesQuota:"
+            "filesLimit:filesInDoubt:filesGrace:remarks:fid:filesetname:\n"
+            "mmlsquota:fileset:0:1:::gpfs:FILESET:0:root:98566144:0:100663296:0:"
+            "none:1:0:0:0:none::0:root:\n"
         )
         quotas = parse_mmlsquota_y(output)
-        self.assertEqual(len(quotas), 2)
+        self.assertEqual(len(quotas), 3)
         self.assertEqual(quotas[0].block_limit_gb, 100.0)
         self.assertEqual(quotas[0].effective_used_gb, 97.0)
         self.assertEqual(quotas[0].free_gb, 3.0)
         self.assertEqual(quotas[1].effective_used_gb, 95.0)
+        self.assertEqual(quotas[2].quota_type, "FILESET")
+        self.assertEqual(quotas[2].fileset_name, "root")
 
     def test_gpfs_storage_probe_prefers_actual_quota_for_workspace_device(self) -> None:
         output = (
             "__SLURM_SCHEDULER_FS_TYPE__:gpfs\n"
+            "__SLURM_SCHEDULER_FILESET__:root\n"
+            "__SLURM_SCHEDULER_USER_QUOTA_SCOPE__:filesystem\n"
             "mmlsquota:user:HEADER:version:reserved:reserved:filesystemName:quotaType:id:name:"
             "blockUsage:blockQuota:blockLimit:blockInDoubt:blockGrace:filesUsage:filesQuota:"
             "filesLimit:filesInDoubt:filesGrace:remarks:fid:filesetname:\n"
             "mmlsquota:user:0:1:::gpfs:USR:1000:user:99614720:94371840:104857600:"
+            "2097152:none:1:0:0:0:none::::\n"
+            "mmlsquota:user:0:1:::gpfs:USR:1000:user:104857600:94371840:104857600:"
+            "0:none:1:0:0:0:none::1:other:\n"
+            "mmlsquota:fileset:HEADER:version:reserved:reserved:filesystemName:quotaType:id:name:"
+            "blockUsage:blockQuota:blockLimit:blockInDoubt:blockGrace:filesUsage:filesQuota:"
+            "filesLimit:filesInDoubt:filesGrace:remarks:fid:filesetname:\n"
+            "mmlsquota:fileset:0:1:::gpfs:FILESET:0:root:100663296:0:104857600:"
             "2097152:none:1:0:0:0:none::::\n"
         )
 
@@ -222,9 +238,17 @@ class SlurmParsingTests(unittest.TestCase):
         client.bind_shared_session(session)  # type: ignore[arg-type]
         probe = client.storage_quota_probe()
         self.assertTrue(probe.is_gpfs)
-        self.assertEqual(probe.quota.free_gb, 3.0)
+        self.assertEqual(probe.fileset_name, "root")
+        self.assertEqual(probe.user_quota_scope, "filesystem")
+        self.assertEqual(probe.quota.quota_type, "FILESET")
+        self.assertEqual(probe.quota.free_gb, 2.0)
         self.assertIn('mmlsquota', session.command)
-        self.assertIn('-u "$USER" -v -Y "$device"', session.command)
+        self.assertIn('mmlsattr', session.command)
+        self.assertIn('export LC_ALL=C', session.command)
+        self.assertNotIn('mkdir -p', session.command)
+        self.assertIn('-u "$quota_user" -v -Y "${device}:${fileset}"', session.command)
+        self.assertIn('-u "$quota_user" -v -Y "$device"', session.command)
+        self.assertIn('-j "$fileset" -v -Y "$device"', session.command)
 
     def test_storage_probe_missing_filesystem_type_is_an_error(self) -> None:
         class ProbeSession:
@@ -240,6 +264,25 @@ class SlurmParsingTests(unittest.TestCase):
         probe = client.storage_quota_probe()
         self.assertFalse(probe.is_gpfs)
         self.assertEqual(probe.error, "stat failed")
+
+    def test_gpfs_storage_probe_requires_user_quota_scope(self) -> None:
+        class ProbeSession:
+            def ensure_connected(self) -> None:
+                pass
+
+            def run(self, command: str, timeout: float | None = None) -> CommandResult:
+                return CommandResult(
+                    "__SLURM_SCHEDULER_FS_TYPE__:gpfs\n"
+                    "__SLURM_SCHEDULER_FILESET__:root\n",
+                    "",
+                    0,
+                )
+
+        account = AccountConfig("a", "host", 22, "a", "key", "/work")
+        client = SlurmAccountClient(account)
+        client.bind_shared_session(ProbeSession())  # type: ignore[arg-type]
+        probe = client.storage_quota_probe()
+        self.assertEqual(probe.error, "workspace GPFS user quota scope unavailable")
 
     def test_remote_text_command_limits_on_remote_side(self) -> None:
         self.assertEqual(
@@ -5837,7 +5880,7 @@ class SchedulerTests(unittest.TestCase):
             time.time(),
             StorageQuotaProbe(
                 filesystem_type="gpfs",
-                quota=GpfsUserQuota(
+                quota=GpfsBlockQuota(
                     filesystem_name="gpfs",
                     block_used_gb=94.0,
                     block_in_doubt_gb=3.0,
@@ -5869,7 +5912,7 @@ class SchedulerTests(unittest.TestCase):
         )
         QuotaProbeClient.quota_probe_calls = 0
         QuotaProbeClient.quota_probe_value = StorageQuotaProbe(
-            "gpfs", GpfsUserQuota("gpfs", 50.0, 0.0, 100.0)
+            "gpfs", GpfsBlockQuota("gpfs", 50.0, 0.0, 100.0)
         )
         scheduler = Scheduler(
             self.db, [account], 30, client_factory=QuotaProbeClient, storage_guard_min_free_gb=5.0
@@ -5893,11 +5936,11 @@ class SchedulerTests(unittest.TestCase):
         )
         scheduler._storage_quota_cache["a"] = (
             time.time(),
-            StorageQuotaProbe("gpfs", GpfsUserQuota("gpfs", 97.0, 0.0, 100.0)),
+            StorageQuotaProbe("gpfs", GpfsBlockQuota("gpfs", 97.0, 0.0, 100.0)),
         )
         scheduler._storage_quota_cache["b"] = (
             time.time(),
-            StorageQuotaProbe("gpfs", GpfsUserQuota("gpfs", 50.0, 0.0, 100.0)),
+            StorageQuotaProbe("gpfs", GpfsBlockQuota("gpfs", 50.0, 0.0, 100.0)),
         )
         fea_account = scheduler.choose_account_for_allocation(
             preferred_accounts=["a", "b"], require_fea_storage_headroom=True
@@ -5932,7 +5975,7 @@ class SchedulerTests(unittest.TestCase):
         )
         scheduler._storage_quota_cache["a"] = (
             time.time(),
-            StorageQuotaProbe("gpfs", GpfsUserQuota("gpfs", 97.0, 0.0, 100.0)),
+            StorageQuotaProbe("gpfs", GpfsBlockQuota("gpfs", 97.0, 0.0, 100.0)),
         )
         common = {"cpus": 4, "memory_mb": 8192, "gpus": 0, "partition": "auto", "node_name": ""}
         fea = {**common, "scheduling_profile": SchedulingProfile.FEA_BURSTY.value}
