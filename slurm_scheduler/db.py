@@ -249,6 +249,7 @@ CREATE TABLE IF NOT EXISTS projects (
     output_globs TEXT NOT NULL DEFAULT '',
     sim_subdir TEXT NOT NULL DEFAULT 'simulation',
     auto_pull INTEGER NOT NULL DEFAULT 0,
+    max_active_tasks INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -460,6 +461,7 @@ class Database:
             },
             "projects": {
                 "output_globs": "TEXT NOT NULL DEFAULT ''",
+                "max_active_tasks": "INTEGER NOT NULL DEFAULT 0",
             },
         }
         for table, columns in table_columns.items():
@@ -965,13 +967,15 @@ class Database:
         output_globs: str = "",
         sim_subdir: str = "simulation",
         auto_pull: bool = False,
+        max_active_tasks: int = 0,
     ) -> int:
         with self.connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO projects (
-                    name, repos, setup, entrypoints, cleanup_globs, output_globs, sim_subdir, auto_pull
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    name, repos, setup, entrypoints, cleanup_globs, output_globs, sim_subdir, auto_pull,
+                    max_active_tasks
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name,
@@ -982,6 +986,7 @@ class Database:
                     output_globs,
                     sim_subdir,
                     1 if auto_pull else 0,
+                    max(0, int(max_active_tasks)),
                 ),
             )
             return int(cursor.lastrowid)

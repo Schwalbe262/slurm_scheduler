@@ -2161,8 +2161,29 @@ class Scheduler:
         )
         return True
 
+    def project_active_cap_reason(self, task: dict) -> str:
+        project_name = str(task.get("project") or "").strip()
+        if not project_name:
+            return ""
+        project = self.db.get_project_by_name(project_name)
+        limit = max(0, int((project or {}).get("max_active_tasks") or 0))
+        if limit <= 0:
+            return ""
+        active = self.db.count_tasks_by_project(
+            project_name,
+            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value],
+        )
+        if active < limit:
+            return ""
+        return f"project active cap reached for {project_name}: {active}/{limit} attaching+running"
+
     def assign_queued_task(self, task: dict, background: bool = False) -> bool:
         if task.get("status") != TaskStatus.QUEUED.value:
+            return False
+        # Normal assignment is serialized by the scheduler loop. The existing
+        # same-node web fast path can also call this method; strict enforcement
+        # across concurrent callers requires one transactional check/transition.
+        if self.project_active_cap_reason(task):
             return False
         allocation = self.best_allocation_for_task(task)
         if not allocation:
@@ -2688,6 +2709,11 @@ class Scheduler:
                     f"preferred node {task.get('node_name')} soft-blocked; "
                     "eligible fallback nodes available"
                 )
+
+        project_cap_reason = self.project_active_cap_reason(task)
+        if project_cap_reason:
+            queue_state = "blocked"
+            reason = project_cap_reason
 
         if not reason:
             if same_node_reference_id and not same_node_target:

@@ -671,6 +671,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "exit_code_path": task.get("exit_code_path") or "",
             "required_capability": task.get("required_capability") or "",
             "env_profile": task.get("env_profile") or "",
+            "project": task.get("project") or "",
+            "entrypoint": task.get("entrypoint") or "",
             "scheduling_profile": normalize_scheduling_profile(task.get("scheduling_profile") or ""),
             "priority": int(task.get("priority") or 0),
             "timeout_seconds": int(task.get("timeout_seconds") or 0),
@@ -809,6 +811,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "output_globs": project.get("output_globs") or "",
             "sim_subdir": project.get("sim_subdir") or "simulation",
             "auto_pull": bool(project.get("auto_pull")),
+            "max_active_tasks": max(0, int(project.get("max_active_tasks") or 0)),
             "running_count": db.count_tasks_by_project(str(project.get("name") or ""), ["attaching", "running"]),
             "total_count": db.count_tasks_by_project(str(project.get("name") or "")),
             "created_at": project.get("created_at"),
@@ -866,6 +869,20 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         sim_subdir = str(payload.get("sim_subdir") or "simulation").strip() or "simulation"
         auto_pull = bool(payload.get("auto_pull") or False)
         existing = db.get_project_by_name(name)
+        raw_max_active_tasks = payload.get(
+            "max_active_tasks",
+            existing.get("max_active_tasks") if existing else 0,
+        )
+        if isinstance(raw_max_active_tasks, bool):
+            raise ValueError("max_active_tasks must be a non-negative integer")
+        if isinstance(raw_max_active_tasks, int):
+            max_active_tasks = raw_max_active_tasks
+        elif isinstance(raw_max_active_tasks, str) and raw_max_active_tasks.strip().isdigit():
+            max_active_tasks = int(raw_max_active_tasks.strip())
+        else:
+            raise ValueError("max_active_tasks must be a non-negative integer")
+        if max_active_tasks < 0:
+            raise ValueError("max_active_tasks must be a non-negative integer")
         if existing:
             db.update_project(
                 int(existing["id"]),
@@ -876,6 +893,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 output_globs=output_globs,
                 sim_subdir=sim_subdir,
                 auto_pull=1 if auto_pull else 0,
+                max_active_tasks=max_active_tasks,
             )
             return int(existing["id"])
         return db.create_project(
@@ -887,6 +905,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             output_globs=output_globs,
             sim_subdir=sim_subdir,
             auto_pull=auto_pull,
+            max_active_tasks=max_active_tasks,
         )
 
     def apply_project_to_payload(payload: dict) -> dict:

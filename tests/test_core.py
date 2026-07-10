@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import os
 import threading
 import tempfile
 import time
@@ -1316,6 +1319,16 @@ class SchedulerTests(unittest.TestCase):
         self.assertIsNotNone(scheduler.best_allocation_for_task(self.db.get_task(task_id)))
         self.assertEqual(snapshot_calls, 1)
 
+    def test_legacy_projects_table_migrates_max_active_tasks_default_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(f"{tmpdir}/legacy.db")
+            with db.connect() as conn:
+                conn.execute("CREATE TABLE projects (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)")
+                conn.execute("INSERT INTO projects (id, name) VALUES (1, 'legacy')")
+            db.init()
+            project = db.get_project_by_name("legacy")
+        self.assertEqual(project["max_active_tasks"], 0)
+
     def test_pestat_rows_are_loaded_once_during_a_tick(self) -> None:
         self.db.replace_pestat_nodes(
             parse_pestat(
@@ -1867,6 +1880,116 @@ class SchedulerTests(unittest.TestCase):
         allocation = self.db.get_allocation(task["allocation_id"])
         self.assertEqual(task["status"], TaskStatus.RUNNING.value)
         self.assertEqual(allocation["free_cpus"], 4)
+
+    def test_project_active_cap_counts_attaching_and_running_but_not_queued(self) -> None:
+        self.db.create_project("limited", max_active_tasks=2)
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=16,
+            total_memory_mb=65536,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.WARM.value, slurm_job_id="alloc-1")
+        attaching_id = self.db.create_task(TaskCreate("attaching", "~/case", "run", project="limited"))
+        self.db.update_task(
+            attaching_id,
+            status=TaskStatus.ATTACHING.value,
+            allocation_id=allocation_id,
+            account_name="a",
+        )
+        first_id = self.db.create_task(TaskCreate("first", "~/case", "run", project="limited"))
+        second_id = self.db.create_task(TaskCreate("second", "~/case", "run", project="limited"))
+
+        Scheduler(self.db, self.accounts, 30, client_factory=FakeClient).assign_queued_tasks()
+
+        self.assertEqual(self.db.get_task(first_id)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(self.db.get_task(second_id)["status"], TaskStatus.QUEUED.value)
+        self.assertEqual(
+            self.db.count_tasks_by_project("limited", [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value]),
+            2,
+        )
+
+    def test_project_active_cap_blocks_central_assign_path_before_reservation(self) -> None:
+        self.db.create_project("limited", max_active_tasks=1)
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=8,
+            total_memory_mb=65536,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.WARM.value, slurm_job_id="alloc-1")
+        active_id = self.db.create_task(TaskCreate("active", "~/case", "run", project="limited"))
+        self.db.update_task(active_id, status=TaskStatus.RUNNING.value, account_name="a")
+        queued_id = self.db.create_task(TaskCreate("queued", "~/case", "run", project="limited"))
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+
+        self.assertFalse(scheduler.assign_queued_task(self.db.get_task(queued_id)))
+        self.assertEqual(self.db.get_task(queued_id)["status"], TaskStatus.QUEUED.value)
+        self.assertIsNone(self.db.get_task(queued_id)["allocation_id"])
+        self.assertEqual(FakeClient.attached_tasks, [])
+
+    def test_project_default_zero_does_not_limit_attach(self) -> None:
+        self.db.create_project("unlimited")
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=8,
+            total_memory_mb=65536,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.WARM.value, slurm_job_id="alloc-1")
+        task_ids = [
+            self.db.create_task(TaskCreate(f"task-{index}", "~/case", "run", project="unlimited"))
+            for index in range(2)
+        ]
+
+        Scheduler(self.db, self.accounts, 30, client_factory=FakeClient).assign_queued_tasks()
+
+        self.assertEqual([self.db.get_task(task_id)["status"] for task_id in task_ids], ["running", "running"])
+
+    def test_project_cap_does_not_bypass_physical_fit(self) -> None:
+        self.db.create_project("limited", max_active_tasks=10)
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=4,
+            total_memory_mb=4096,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.WARM.value, slurm_job_id="alloc-1")
+        task_id = self.db.create_task(
+            TaskCreate("too-large", "~/case", "run", cpus=8, memory_mb=8192, project="limited")
+        )
+
+        Scheduler(self.db, self.accounts, 30, client_factory=FakeClient).assign_queued_tasks()
+
+        self.assertEqual(self.db.get_task(task_id)["status"], TaskStatus.QUEUED.value)
+
+    def test_project_active_cap_has_clear_queue_diagnostic(self) -> None:
+        self.db.create_project("limited", max_active_tasks=1)
+        active_id = self.db.create_task(TaskCreate("active", "~/case", "run", project="limited"))
+        self.db.update_task(active_id, status=TaskStatus.RUNNING.value, account_name="a")
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=8,
+            total_memory_mb=65536,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.WARM.value, slurm_job_id="alloc-1")
+        queued_id = self.db.create_task(TaskCreate("queued", "~/case", "run", project="limited"))
+        diagnostics = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient).task_queue_diagnostics(
+            self.db.get_task(queued_id)
+        )
+
+        self.assertGreater(diagnostics["ready_fit_slots"], 0)
+        self.assertEqual(diagnostics["queue_state"], "blocked")
+        self.assertEqual(
+            diagnostics["queue_reason"],
+            "project active cap reached for limited: 1/1 attaching+running",
+        )
 
     def test_gpu_task_accepts_ordered_gpu_model_candidates(self) -> None:
         allocation_id = self.db.create_allocation(
@@ -6449,6 +6572,110 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(summary["single_node_max_free_gpus"], 4)
         self.assertEqual(summary["single_node_max_free_cpus"], 4)
         self.assertEqual(summary["single_node_max_free_gpu_node"], "gpu-a6000")
+
+
+class ProjectApiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        accounts_path = root / "accounts.yaml"
+        accounts_path.write_text(
+            "\n".join(
+                [
+                    "accounts:",
+                    "  - name: a",
+                    "    host: invalid",
+                    "    port: 22",
+                    "    username: a",
+                    "    private_key_path: key",
+                    "    remote_workspace: /work",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        config_path = root / "app.yaml"
+        config_path.write_text(
+            "\n".join(
+                [
+                    f'database_path: "{(root / "scheduler.db").as_posix()}"',
+                    f'accounts_path: "{accounts_path.as_posix()}"',
+                    "min_warm_allocations: 0",
+                    "cluster_refresh_interval_seconds: 0",
+                    "reconcile_on_start: false",
+                    "backup_enabled: false",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        previous_config = os.environ.get("SLURM_SCHEDULER_CONFIG")
+        os.environ["SLURM_SCHEDULER_CONFIG"] = str(config_path)
+        try:
+            from slurm_scheduler.app import create_app
+        finally:
+            if previous_config is None:
+                os.environ.pop("SLURM_SCHEDULER_CONFIG", None)
+            else:
+                os.environ["SLURM_SCHEDULER_CONFIG"] = previous_config
+        self.app = create_app(str(config_path))
+        self.app.router.on_startup.clear()
+        self.app.router.on_shutdown.clear()
+        self.create_project = self._route_endpoint("/api/projects", "POST")
+        self.get_project = self._route_endpoint("/api/projects/{name}", "GET")
+        self.get_task = self._route_endpoint("/api/tasks/{task_id}", "GET")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _route_endpoint(self, path: str, method: str):
+        return next(
+            route.endpoint
+            for route in self.app.routes
+            if getattr(route, "path", "") == path and method in getattr(route, "methods", set())
+        )
+
+    @staticmethod
+    def _request(payload: dict):
+        class JsonRequest:
+            async def json(self) -> dict:
+                return payload
+
+        return JsonRequest()
+
+    def _post_project(self, payload: dict) -> dict:
+        response = asyncio.run(self.create_project(self._request(payload)))
+        self.assertEqual(response.status_code, 201)
+        return json.loads(response.body)
+
+    def test_project_api_round_trips_and_updates_max_active_tasks(self) -> None:
+        created = self._post_project({"name": "motor", "max_active_tasks": 7})
+        self.assertEqual(created["max_active_tasks"], 7)
+
+        preserved = self._post_project({"name": "motor", "setup": "module load ansys"})
+        self.assertEqual(preserved["max_active_tasks"], 7)
+
+        updated = self._post_project({"name": "motor", "max_active_tasks": "9"})
+        self.assertEqual(updated["max_active_tasks"], 9)
+        self.assertEqual(self.get_project("motor")["max_active_tasks"], 9)
+
+    def test_project_api_rejects_invalid_max_active_tasks(self) -> None:
+        from fastapi import HTTPException
+
+        for invalid in (-1, 1.5, True, ""):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(HTTPException) as raised:
+                    self._post_project(
+                        {"name": f"invalid-{type(invalid).__name__}", "max_active_tasks": invalid}
+                    )
+                self.assertEqual(raised.exception.status_code, 422)
+                self.assertEqual(raised.exception.detail, "max_active_tasks must be a non-negative integer")
+
+    def test_task_api_exposes_project_and_entrypoint(self) -> None:
+        task_id = self.app.state.db.create_task(
+            TaskCreate("motor-task", "~/case", "run", project="motor", entrypoint="run.py")
+        )
+        payload = self.get_task(task_id)
+        self.assertEqual(payload["project"], "motor")
+        self.assertEqual(payload["entrypoint"], "run.py")
 
 
 class BatchParserTests(unittest.TestCase):
