@@ -1791,6 +1791,41 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(FakeClient.cancelled, [])
         self.assertFalse(scheduler.allocation_pool_in_backoff("gpu:a6000"))
 
+    def test_stale_pending_cpu_priority_is_cancelled_without_pool_backoff(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="normal",
+            node_name="",
+            total_cpus=64,
+            total_memory_mb=131072,
+            resource_pool="cpu",
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.PENDING.value,
+            slurm_job_id="pending-cpu-priority",
+            drain_reason="queued task demand",
+            pending_reason="(Priority)",
+            submitted_at="2000-01-01 00:00:00",
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            allocation_pending_timeout_seconds=1,
+            allocation_pending_backoff_seconds=3600,
+        )
+
+        scheduler.apply_allocation_lifecycle()
+
+        allocation = self.db.get_allocation(allocation_id)
+        self.assertEqual(allocation["state"], AllocationStatus.CLOSED.value)
+        self.assertIn("pending timeout", allocation["drain_reason"])
+        self.assertEqual(FakeClient.cancelled, ["pending-cpu-priority"])
+        self.assertFalse(scheduler.allocation_pool_in_backoff("cpu"))
+
     def test_assigns_task_to_warm_allocation(self) -> None:
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, allocation_cpus=8)
         scheduler.maintain_allocation_pool()

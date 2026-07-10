@@ -1786,7 +1786,11 @@ class Scheduler:
         pool = allocation.get("resource_pool") or "cpu"
         if self.pending_allocation_timeout_exempt(allocation, reason):
             return
-        self._allocation_backoff_until_by_pool[pool] = time.monotonic() + max(0, self.allocation_pending_backoff_seconds)
+        normalized_reason = (reason or "").strip().lower()
+        if pool != "cpu" or "priority" not in normalized_reason:
+            self._allocation_backoff_until_by_pool[pool] = time.monotonic() + max(
+                0, self.allocation_pending_backoff_seconds
+            )
         self.close_allocation(allocation, f"pending timeout after {int(age)}s: {reason}")
 
     def retry_pinned_gpu_warm_allocation(self, allocation: dict, age: float, reason: str) -> bool:
