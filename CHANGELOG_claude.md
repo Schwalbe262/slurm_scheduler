@@ -22,3 +22,10 @@
   `*.aedtresults`로 원자 교체하는 guarded maintenance 도구 추가.
 - 2026-07-10 05:48 KST 적용: active destructive rows 325 -> 0. 백업은
   `data/backups/manual-pre-cleanup-glob-20260710-054839.db`.
+
+## 2026-07-10 (Codex) - MFT jji0930 capability repair
+- Git에서 제외되는 운영 `config/accounts.yaml`의 `jji0930` 계정에 기존
+  `pyaedt2026v1` 환경과 일치하는 `conda:pyaedt2026v1` capability를 추가.
+- 설정 파싱과 scheduler 테스트 255개를 통과한 뒤 native worker만 재시작했다.
+  기존 비-b630 태스크 16개와 allocation 4개는 보존됐고, placement dry-run에서
+  `jji0930`이 eligible로 확인되어 대기 중이던 태스크 6개가 새 64 CPU pool에 연결됐다.
