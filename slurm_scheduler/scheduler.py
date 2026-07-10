@@ -2180,6 +2180,15 @@ class Scheduler:
                 continue
             if not self.allocation_can_run_task(allocation, task, include_pending=False):
                 continue
+            # FEA tasks intentionally ignore the allocation's bookkeeping
+            # free_cpus/free_memory values. They must still respect the hard
+            # per-allocation requested-CPU cap, though. Without this check the
+            # background attach loop repeatedly overfills an allocation and
+            # the retroactive rebalancer kills/requeues the same workers.
+            if self.task_is_fea_bursty(task):
+                cap_remaining = self.fea_node_cpu_cap_remaining(allocation, task)
+                if cap_remaining is not None and cap_remaining <= 0:
+                    continue
             if self.task_requires_gpu(task):
                 gpu_candidates.append(allocation)
             elif int(allocation.get("total_gpus") or 0) > 0:

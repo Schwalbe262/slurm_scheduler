@@ -5038,6 +5038,66 @@ class SchedulerTests(unittest.TestCase):
             "max_workers_per_node": 0,
         }
         self.assertEqual(scheduler.fit_slots_for_allocation(allocation, queued), 0)
+        self.assertIsNone(scheduler.best_allocation_for_task(queued))
+
+    def test_fea_best_allocation_skips_full_cpu_cap_and_uses_spare_allocation(self) -> None:
+        full_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=8,
+            total_memory_mb=100000,
+        )
+        spare_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n002",
+            total_cpus=8,
+            total_memory_mb=100000,
+        )
+        for allocation_id, job_id in ((full_id, "alloc-full"), (spare_id, "alloc-spare")):
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.ACTIVE.value,
+                slurm_job_id=job_id,
+            )
+        for index in range(2):
+            task_id = self.db.create_task(
+                TaskCreate(
+                    f"running-fea-{index}",
+                    "~/case",
+                    "run",
+                    cpus=4,
+                    memory_mb=4096,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                )
+            )
+            self.db.update_task(
+                task_id,
+                status=TaskStatus.RUNNING.value,
+                account_name="a",
+                allocation_id=full_id,
+                wrapper_pid=str(7000 + index),
+            )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 8 1.0 100000 90000 busy\n"
+                "n002 cpu1 mix 8 8 1.0 100000 90000 idle\n"
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        queued = {
+            "id": 999,
+            "cpus": 4,
+            "memory_mb": 4096,
+            "gpus": 0,
+            "partition": "auto",
+            "node_name": "",
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+            "max_workers_per_node": 0,
+        }
+        self.assertEqual(scheduler.best_allocation_for_task(queued)["id"], spare_id)
 
     def test_fea_node_cpu_cap_limits_total_requested_cpus(self) -> None:
         allocation_id = self.db.create_allocation(
