@@ -2840,6 +2840,13 @@ class Scheduler:
             if allocation.get("state") != AllocationStatus.PENDING.value and not self.fea_allocation_accepts_task(allocation):
                 return 0
             slots = self.fea_max_attach_per_loop
+            if (
+                allocation.get("state") == AllocationStatus.PENDING.value
+                and (allocation.get("resource_pool") or "cpu") == "cpu"
+                and self.fea_node_requested_cpu_factor > 0
+            ):
+                cpu_cap = int(int(allocation.get("total_cpus") or 0) * self.fea_node_requested_cpu_factor)
+                slots = min(slots, cpu_cap // max(1, int(task.get("cpus") or 1)))
             reserved_slots = int(allocation.get("_reserved_fea_slots") or 0)
             max_workers = int(task.get("max_workers_per_node") or 0)
             node_name = str(allocation.get("node_name") or "")
@@ -4387,7 +4394,26 @@ class Scheduler:
                 continue
             if int(allocation["id"]) in reserved_allocation_ids:
                 continue
+            if self.warm_demand_allocation_in_attach_grace(allocation, queued_tasks):
+                continue
             self.close_allocation(allocation, "demand allocation no longer needed")
+
+    def warm_demand_allocation_in_attach_grace(self, allocation: dict, queued_tasks: list[dict]) -> bool:
+        if allocation.get("state") != AllocationStatus.WARM.value:
+            return False
+        if not str(allocation.get("drain_reason") or "").startswith("queued "):
+            return False
+        started_at = self._timestamp(allocation.get("started_at"))
+        if started_at is None:
+            return False
+        grace_seconds = max(1, self.poll_interval_seconds * 2)
+        if (self._now() - started_at).total_seconds() >= grace_seconds:
+            return False
+        return any(
+            self.allocation_can_run_task(allocation, effective_task, include_pending=True)
+            for task in queued_tasks
+            for effective_task, _relaxed in self.effective_task_variants(task)
+        )
 
     def pinned_gpu_cpu_demand_allocation_covers_queue(self, allocation: dict, reserved_allocation_ids: set[int]) -> bool:
         if int(allocation.get("id") or 0) not in reserved_allocation_ids:
@@ -4481,7 +4507,7 @@ class Scheduler:
         allocation_id = self.db.create_allocation(
             account_name=account.name,
             partition=shape["partition"],
-            node_name="",
+            node_name=shape["node_name"] if (resource_pool or "cpu") == "cpu" else "",
             total_cpus=shape["cpus"],
             total_memory_mb=shape["memory_mb"],
             total_gpus=shape["gpus"],

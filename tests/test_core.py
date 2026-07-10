@@ -1222,6 +1222,10 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(response["previous_status"], TaskStatus.RUNNING.value)
         self.assertEqual(response["status"], TaskStatus.CANCELLED.value)
         self.assertEqual(self.db.get_task(task_id)["status"], TaskStatus.CANCELLED.value)
+        deadline = time.monotonic() + 1
+        while task_id not in FakeClient.cancelled_tasks and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIn(task_id, FakeClient.cancelled_tasks)
 
     def test_cancel_tasks_filters_by_name_and_status(self) -> None:
         first = self.db.create_task(TaskCreate("crypto-sweep-a", "~/case", "run"))
@@ -1947,6 +1951,59 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(allocation["total_cpus"], 48)
         self.assertEqual(allocation["total_memory_mb"], 768000)
 
+    def test_cpu_demand_allocation_preserves_selected_shape_node(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "cpu2-capped cpu2 mix 128 256 8.0 1031519 550000 busy\n"
+                "cpu2-good cpu2 mix 64 256 4.0 1031519 950000 available\n"
+            )
+        )
+        for index in range(2):
+            allocation_id = self.db.create_allocation(
+                account_name="a",
+                partition="cpu2",
+                node_name="cpu2-capped",
+                total_cpus=64,
+                total_memory_mb=262144,
+                resource_pool="cpu",
+            )
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.ACTIVE.value,
+                slurm_job_id=f"capped-{index}",
+            )
+        self.db.create_task(
+            TaskCreate(
+                "fea-demand",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            allocation_partition="cpu2",
+            allocation_cpus=64,
+            cpu_partition_allocation_limits={"cpu2": 2},
+        )
+        scheduler.maintain_allocation_pool()
+        demand = [
+            allocation
+            for allocation in self.db.list_allocations()
+            if allocation.get("drain_reason") == "queued CPU demand"
+        ]
+        self.assertEqual(len(demand), 1)
+        self.assertEqual(demand[0]["node_name"], "cpu2-good")
+        script = build_allocation_script(demand[0], "48:00:00")
+        self.assertIn("#SBATCH --nodelist=cpu2-good", script)
+
     def test_non_exclusive_cpu_demand_uses_gpu_reserve_on_gpu_nodes(self) -> None:
         self.db.replace_node_inventory(
             parse_scontrol_nodes(
@@ -2493,12 +2550,66 @@ class SchedulerTests(unittest.TestCase):
             state=AllocationStatus.WARM.value,
             slurm_job_id="warm-demand",
             drain_reason="queued CPU demand",
+            started_at="CURRENT_TIMESTAMP",
         )
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, min_warm_allocations=0)
         scheduler.scale_in_idle_allocations()
         allocation = self.db.get_allocation(allocation_id)
         self.assertEqual(allocation["state"], AllocationStatus.CLOSED.value)
         self.assertIn("warm-demand", FakeClient.cancelled)
+
+    def test_just_warm_demand_allocation_gets_one_attach_poll_before_scale_in(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu2",
+            node_name="cpu2-soft-blocked",
+            total_cpus=64,
+            total_memory_mb=262144,
+            resource_pool="cpu",
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="warm-demand",
+            drain_reason="queued CPU demand",
+            started_at="CURRENT_TIMESTAMP",
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "cpu2-soft-blocked cpu2 mix 64 256 4.0 100000 55000 busy\n"
+            )
+        )
+        self.db.create_task(
+            TaskCreate(
+                "waiting-fea",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+        self.assertEqual(scheduler.queued_task_allocation_reservations(), {})
+        scheduler.scale_in_idle_allocations()
+        self.assertEqual(self.db.get_allocation(allocation_id)["state"], AllocationStatus.WARM.value)
+        self.assertEqual(FakeClient.cancelled, [])
+
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE allocations SET started_at = datetime('now', '-61 seconds') WHERE id = ?",
+                (allocation_id,),
+            )
+        scheduler.scale_in_idle_allocations()
+        self.assertEqual(self.db.get_allocation(allocation_id)["state"], AllocationStatus.CLOSED.value)
+        self.assertEqual(FakeClient.cancelled, ["warm-demand"])
 
     def test_warm_demand_allocation_stays_when_queued_task_needs_it(self) -> None:
         allocation_id = self.db.create_allocation(
@@ -4689,6 +4800,40 @@ class SchedulerTests(unittest.TestCase):
             if allocation["state"] in {AllocationStatus.PENDING.value, AllocationStatus.WARM.value, AllocationStatus.ACTIVE.value}
         ]
         self.assertEqual(len(live_allocations), 2)
+
+    def test_pending_fea_fit_slots_respect_allocation_cpu_cap(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu2",
+            node_name="",
+            total_cpus=64,
+            total_memory_mb=262144,
+            resource_pool="cpu",
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.PENDING.value,
+            slurm_job_id="pending-cpu",
+            drain_reason="queued CPU demand",
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            fea_max_attach_per_loop=24,
+            fea_node_requested_cpu_factor=1.0,
+        )
+        task = {
+            "id": 999,
+            "cpus": 4,
+            "memory_mb": 32768,
+            "gpus": 0,
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+            "max_workers_per_node": 0,
+        }
+        self.assertEqual(scheduler.fit_slots_for_allocation(self.db.get_allocation(allocation_id), task), 16)
 
     def test_fea_overload_state_ignores_node_wide_pestat_load(self) -> None:
         allocation_id = self.create_fea_allocation("n001", total_cpus=64)
