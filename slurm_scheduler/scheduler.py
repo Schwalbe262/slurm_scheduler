@@ -25,6 +25,7 @@ from .slurm import (
     RemoteExecutionError,
     SSHSession,
     SlurmAccountClient,
+    StorageQuotaProbe,
     TaskProbe,
     resolve_task_placeholders,
     shell_path,
@@ -203,7 +204,9 @@ class Scheduler:
         self._thread: threading.Thread | None = None
         self._snapshot_cache: tuple[float, list[AccountSnapshot]] | None = None
         self._storage_cache: dict[str, tuple[float, float | None]] = {}
+        self._storage_quota_cache: dict[str, tuple[float, StorageQuotaProbe]] = {}
         self._storage_refresh_interval_seconds = max(900, poll_interval_seconds * 20)
+        self._storage_quota_refresh_interval_seconds = max(10, min(30, poll_interval_seconds))
         self.cluster_refresh_interval_seconds = cluster_refresh_interval_seconds
         self._last_cluster_refresh_at = 0.0
         self.min_warm_allocations = min_warm_allocations
@@ -2094,11 +2097,50 @@ class Scheduler:
             if self.assign_queued_task(task, background=background):
                 attached += 1
 
-    def account_storage_blocked(self, account: AccountConfig) -> bool:
+    def _warn_storage_guard(self, account: AccountConfig, detail: str) -> None:
+        now = time.monotonic()
+        if now - self._storage_guard_warned_at.get(account.name, 0.0) <= 3600:
+            return
+        self._storage_guard_warned_at[account.name] = now
+        LOGGER.warning("storage guard holding work on %s: %s", account.name, detail)
+        self.record_event(
+            "storage_guard",
+            detail,
+            entity_type="account",
+            entity_id=account.name,
+            account_name=account.name,
+        )
+
+    def account_storage_blocked(self, account: AccountConfig, *, for_fea: bool = False) -> bool:
         """Quota guard: hold new attaches when the account's storage headroom
         is below the threshold, instead of letting tasks start and cascade
         into disk-quota-exceeded failures."""
-        if self.storage_guard_min_free_gb <= 0 or not account.storage_quota_gb:
+        if self.storage_guard_min_free_gb <= 0:
+            return False
+        if for_fea:
+            probe = self.cached_storage_quota(account, self._client(account), time.time())
+            if probe.error:
+                detail = f"FEA work held: storage quota probe failed ({probe.error[:200]})"
+                self._warn_storage_guard(account, detail)
+                return True
+            if probe.is_gpfs:
+                if probe.quota is None:
+                    self._warn_storage_guard(account, "FEA work held: GPFS quota status is unavailable")
+                    return True
+                free_gb = probe.quota.free_gb
+                if free_gb is None:
+                    return False
+                if free_gb >= self.storage_guard_min_free_gb:
+                    return False
+                detail = (
+                    f"FEA work held: GPFS user block quota has {free_gb:.1f} GB free "
+                    f"(< {self.storage_guard_min_free_gb:g} GB; "
+                    f"used+in_doubt {probe.quota.effective_used_gb:.1f} / "
+                    f"{probe.quota.block_limit_gb:.1f} GB)"
+                )
+                self._warn_storage_guard(account, detail)
+                return True
+        if not account.storage_quota_gb:
             return False
         cached = self._storage_cache.get(account.name)
         used = cached[1] if cached else None
@@ -2107,22 +2149,10 @@ class Scheduler:
         free_gb = float(account.storage_quota_gb) - float(used)
         if free_gb >= self.storage_guard_min_free_gb:
             return False
-        now = time.monotonic()
-        if now - self._storage_guard_warned_at.get(account.name, 0.0) > 3600:
-            self._storage_guard_warned_at[account.name] = now
-            LOGGER.warning(
-                "storage guard holding attaches on %s: %.1f GB free (< %.1f GB)",
-                account.name,
-                free_gb,
-                self.storage_guard_min_free_gb,
-            )
-            self.record_event(
-                "storage_guard",
-                f"attaches held: {free_gb:.1f} GB free is below the {self.storage_guard_min_free_gb:g} GB threshold",
-                entity_type="account",
-                entity_id=account.name,
-                account_name=account.name,
-            )
+        self._warn_storage_guard(
+            account,
+            f"attaches held: {free_gb:.1f} GB free is below the {self.storage_guard_min_free_gb:g} GB threshold",
+        )
         return True
 
     def assign_queued_task(self, task: dict, background: bool = False) -> bool:
@@ -2134,7 +2164,7 @@ class Scheduler:
         account = next((item for item in self.accounts if item.name == allocation["account_name"]), None)
         if not account:
             return False
-        if self.account_storage_blocked(account):
+        if self.account_storage_blocked(account, for_fea=self.task_is_fea_bursty(task)):
             return False
         task = self.reserve_task_on_allocation(task, allocation, account)
         if background:
@@ -3890,6 +3920,8 @@ class Scheduler:
             str(task.get("env_profile") or ""),
         ):
             return False
+        if self.task_is_fea_bursty(task) and account and self.account_storage_blocked(account, for_fea=True):
+            return False
         max_workers = int(task.get("max_workers_per_node") or 0)
         if max_workers > 0 and not include_pending:
             worker_count = self.allocation_worker_count_for_task(allocation, task)
@@ -4603,6 +4635,7 @@ class Scheduler:
             required_capability=required_capability,
             env_profile=env_profile,
             account_name=account_name,
+            require_fea_storage_headroom=require_fea_eligible_node,
         )
         if not account:
             return None
@@ -4664,6 +4697,7 @@ class Scheduler:
         required_capability: str = "",
         env_profile: str = "",
         account_name: str = "",
+        require_fea_storage_headroom: bool = False,
     ) -> AccountConfig | None:
         snapshots_by_name = {snapshot.account_name: snapshot for snapshot in self.snapshots()}
         open_by_account: dict[str, int] = {}
@@ -4685,6 +4719,8 @@ class Scheduler:
             if requested_accounts and account.name not in requested_accounts:
                 continue
             if not self.account_supports(account, required_capability, env_profile):
+                continue
+            if require_fea_storage_headroom and self.account_storage_blocked(account, for_fea=True):
                 continue
             snapshot = snapshots_by_name.get(account.name)
             if not snapshot:
@@ -5495,6 +5531,25 @@ class Scheduler:
         except Exception:
             value = cached[1] if cached else None
         self._storage_cache[account.name] = (now, value)
+        return value
+
+    def cached_storage_quota(
+        self, account: AccountConfig, client: SlurmAccountClient, now: float
+    ) -> StorageQuotaProbe:
+        cached = self._storage_quota_cache.get(account.name)
+        if cached and now - cached[0] < self._storage_quota_refresh_interval_seconds:
+            return cached[1]
+        probe_method = getattr(client, "storage_quota_probe", None)
+        if not callable(probe_method):
+            value = StorageQuotaProbe(filesystem_type="unsupported")
+        else:
+            try:
+                value = probe_method()
+            except Exception as exc:
+                # FEA placement treats a real probe failure as blocked. Do not
+                # retain an old successful reading and silently fail open.
+                value = StorageQuotaProbe(filesystem_type="", error=str(exc) or type(exc).__name__)
+        self._storage_quota_cache[account.name] = (now, value)
         return value
 
     def cached_snapshots(self) -> list[AccountSnapshot]:

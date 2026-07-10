@@ -22,10 +22,14 @@ from slurm_scheduler.inventory import parse_scontrol_nodes, parse_sinfo_nodes, p
 from slurm_scheduler.pestat import parse_pestat, plan_dynamic_allocations
 from slurm_scheduler.task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, TASK_ID_PLACEHOLDER, build_git_task_command
 from slurm_scheduler.slurm import (
+    CommandResult,
+    GpfsUserQuota,
     JobStateInfo,
     RemoteCommandTimeout,
     RemoteExecutionError,
     SSHSession,
+    SlurmAccountClient,
+    StorageQuotaProbe,
     TaskProbe,
     apply_env_profile,
     background_wrapper_command,
@@ -35,6 +39,7 @@ from slurm_scheduler.slurm import (
     build_task_script,
     cancel_process_group_command,
     parse_du_gb,
+    parse_mmlsquota_y,
     parse_sacct_states,
     parse_sbatch_job_id,
     parse_squeue_counts,
@@ -173,6 +178,68 @@ class SlurmParsingTests(unittest.TestCase):
 
     def test_parse_du_gb(self) -> None:
         self.assertAlmostEqual(parse_du_gb("1048576\t/path\n"), 1.0)
+
+    def test_parse_mmlsquota_y_uses_hard_limit_and_in_doubt_blocks(self) -> None:
+        output = (
+            "mmlsquota:user:HEADER:version:reserved:reserved:filesystemName:quotaType:id:name:"
+            "blockUsage:blockQuota:blockLimit:blockInDoubt:blockGrace:filesUsage:filesQuota:"
+            "filesLimit:filesInDoubt:filesGrace:remarks:fid:filesetname:\n"
+            "mmlsquota:user:0:1:::gpfs:USR:1000:user:99614720:94371840:104857600:"
+            "2097152:none:1:0:0:0:none::::\n"
+            "mmlsquota:user:0:1:::gpfs:USR:1000:user:99614720:94371840:104857600:"
+            "-1048576:none:1:0:0:0:none::::\n"
+        )
+        quotas = parse_mmlsquota_y(output)
+        self.assertEqual(len(quotas), 2)
+        self.assertEqual(quotas[0].block_limit_gb, 100.0)
+        self.assertEqual(quotas[0].effective_used_gb, 97.0)
+        self.assertEqual(quotas[0].free_gb, 3.0)
+        self.assertEqual(quotas[1].effective_used_gb, 95.0)
+
+    def test_gpfs_storage_probe_prefers_actual_quota_for_workspace_device(self) -> None:
+        output = (
+            "__SLURM_SCHEDULER_FS_TYPE__:gpfs\n"
+            "mmlsquota:user:HEADER:version:reserved:reserved:filesystemName:quotaType:id:name:"
+            "blockUsage:blockQuota:blockLimit:blockInDoubt:blockGrace:filesUsage:filesQuota:"
+            "filesLimit:filesInDoubt:filesGrace:remarks:fid:filesetname:\n"
+            "mmlsquota:user:0:1:::gpfs:USR:1000:user:99614720:94371840:104857600:"
+            "2097152:none:1:0:0:0:none::::\n"
+        )
+
+        class ProbeSession:
+            command = ""
+
+            def ensure_connected(self) -> None:
+                pass
+
+            def run(self, command: str, timeout: float | None = None) -> CommandResult:
+                self.command = command
+                return CommandResult(output, "", 0)
+
+        account = AccountConfig("a", "host", 22, "a", "key", "/work")
+        client = SlurmAccountClient(account)
+        session = ProbeSession()
+        client.bind_shared_session(session)  # type: ignore[arg-type]
+        probe = client.storage_quota_probe()
+        self.assertTrue(probe.is_gpfs)
+        self.assertEqual(probe.quota.free_gb, 3.0)
+        self.assertIn('mmlsquota', session.command)
+        self.assertIn('-u "$USER" -v -Y "$device"', session.command)
+
+    def test_storage_probe_missing_filesystem_type_is_an_error(self) -> None:
+        class ProbeSession:
+            def ensure_connected(self) -> None:
+                pass
+
+            def run(self, command: str, timeout: float | None = None) -> CommandResult:
+                return CommandResult("__SLURM_SCHEDULER_FS_TYPE__:\n", "stat failed", 1)
+
+        account = AccountConfig("a", "host", 22, "a", "key", "/work")
+        client = SlurmAccountClient(account)
+        client.bind_shared_session(ProbeSession())  # type: ignore[arg-type]
+        probe = client.storage_quota_probe()
+        self.assertFalse(probe.is_gpfs)
+        self.assertEqual(probe.error, "stat failed")
 
     def test_remote_text_command_limits_on_remote_side(self) -> None:
         self.assertEqual(
@@ -731,6 +798,15 @@ class FakeClient:
             exit_code = self.task_exit_code(task) if status in {JobStatus.COMPLETED, JobStatus.FAILED} else None
             out[int(task["id"])] = TaskProbe(status=status, exit_code=exit_code)
         return out
+
+
+class QuotaProbeClient(FakeClient):
+    quota_probe_calls = 0
+    quota_probe_value = StorageQuotaProbe("ext2/ext3")
+
+    def storage_quota_probe(self) -> StorageQuotaProbe:
+        type(self).quota_probe_calls += 1
+        return type(self).quota_probe_value
 
 
 class BlockingAttachClient(FakeClient):
@@ -5751,6 +5827,117 @@ class SchedulerTests(unittest.TestCase):
         unguarded = Scheduler(self.db, [account], 30, client_factory=FakeClient)
         unguarded._storage_cache["a"] = (time.time(), 99.0)
         self.assertFalse(unguarded.account_storage_blocked(account))
+
+    def test_gpfs_quota_guard_is_fea_only_and_counts_in_doubt(self) -> None:
+        account = AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)
+        scheduler = Scheduler(
+            self.db, [account], 30, client_factory=FakeClient, storage_guard_min_free_gb=5.0
+        )
+        scheduler._storage_quota_cache["a"] = (
+            time.time(),
+            StorageQuotaProbe(
+                filesystem_type="gpfs",
+                quota=GpfsUserQuota(
+                    filesystem_name="gpfs",
+                    block_used_gb=94.0,
+                    block_in_doubt_gb=3.0,
+                    block_limit_gb=100.0,
+                ),
+            ),
+        )
+        self.assertTrue(scheduler.account_storage_blocked(account, for_fea=True))
+        self.assertFalse(scheduler.account_storage_blocked(account, for_fea=False))
+
+    def test_gpfs_quota_probe_failure_holds_fea_but_non_gpfs_does_not(self) -> None:
+        account = AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)
+        scheduler = Scheduler(
+            self.db, [account], 30, client_factory=FakeClient, storage_guard_min_free_gb=5.0
+        )
+        scheduler._storage_quota_cache["a"] = (
+            time.time(), StorageQuotaProbe(filesystem_type="gpfs", error="parse failed")
+        )
+        self.assertTrue(scheduler.account_storage_blocked(account, for_fea=True))
+        scheduler._storage_quota_cache["a"] = (
+            time.time(), StorageQuotaProbe(filesystem_type="ext2/ext3")
+        )
+        self.assertFalse(scheduler.account_storage_blocked(account, for_fea=True))
+
+    def test_gpfs_quota_probe_is_lazy_and_uses_short_fea_cache(self) -> None:
+        account = AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)
+        FakeClient.snapshots["a"] = AccountSnapshot(
+            "a", running=0, pending=0, max_running=4, max_pending=10, max_total=10
+        )
+        QuotaProbeClient.quota_probe_calls = 0
+        QuotaProbeClient.quota_probe_value = StorageQuotaProbe(
+            "gpfs", GpfsUserQuota("gpfs", 50.0, 0.0, 100.0)
+        )
+        scheduler = Scheduler(
+            self.db, [account], 30, client_factory=QuotaProbeClient, storage_guard_min_free_gb=5.0
+        )
+        scheduler.snapshots()
+        self.assertEqual(QuotaProbeClient.quota_probe_calls, 0)
+        self.assertFalse(scheduler.account_storage_blocked(account, for_fea=True))
+        self.assertFalse(scheduler.account_storage_blocked(account, for_fea=True))
+        self.assertEqual(QuotaProbeClient.quota_probe_calls, 1)
+        cached_probe = scheduler._storage_quota_cache["a"][1]
+        scheduler._storage_quota_cache["a"] = (
+            time.time() - scheduler._storage_quota_refresh_interval_seconds - 1,
+            cached_probe,
+        )
+        self.assertFalse(scheduler.account_storage_blocked(account, for_fea=True))
+        self.assertEqual(QuotaProbeClient.quota_probe_calls, 2)
+
+    def test_fea_allocation_account_skips_gpfs_quota_block(self) -> None:
+        scheduler = Scheduler(
+            self.db, self.accounts, 30, client_factory=FakeClient, storage_guard_min_free_gb=5.0
+        )
+        scheduler._storage_quota_cache["a"] = (
+            time.time(),
+            StorageQuotaProbe("gpfs", GpfsUserQuota("gpfs", 97.0, 0.0, 100.0)),
+        )
+        scheduler._storage_quota_cache["b"] = (
+            time.time(),
+            StorageQuotaProbe("gpfs", GpfsUserQuota("gpfs", 50.0, 0.0, 100.0)),
+        )
+        fea_account = scheduler.choose_account_for_allocation(
+            preferred_accounts=["a", "b"], require_fea_storage_headroom=True
+        )
+        standard_account = scheduler.choose_account_for_allocation(preferred_accounts=["a", "b"])
+        self.assertEqual(fea_account.name, "b")
+        self.assertEqual(standard_account.name, "a")
+
+    def test_fea_attach_capacity_excludes_gpfs_quota_blocked_allocation(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="alloc-1",
+            free_cpus=64,
+            free_memory_mb=100000,
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 12.0 100000 90000 some_job\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db, self.accounts, 30, client_factory=FakeClient, storage_guard_min_free_gb=5.0
+        )
+        scheduler._storage_quota_cache["a"] = (
+            time.time(),
+            StorageQuotaProbe("gpfs", GpfsUserQuota("gpfs", 97.0, 0.0, 100.0)),
+        )
+        common = {"cpus": 4, "memory_mb": 8192, "gpus": 0, "partition": "auto", "node_name": ""}
+        fea = {**common, "scheduling_profile": SchedulingProfile.FEA_BURSTY.value}
+        self.assertIsNone(scheduler.best_allocation_for_task(fea))
+        self.assertEqual(scheduler.best_allocation_for_task(common)["id"], allocation_id)
 
     def test_workspace_prune_glob_validation(self) -> None:
         ok = Scheduler._workspace_prune_glob_ok
