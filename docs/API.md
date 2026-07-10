@@ -452,21 +452,28 @@ curl -sS "$SCHEDULER_URL/api/tasks/123/stderr"
 
 ### `POST /api/tasks/{task_id}/cancel`
 
-Cancels a queued, attaching, or running attached task. The API marks the task cancelled first and returns quickly; remote wrapper termination is best-effort in the background.
+Cancels a queued, attaching, or running attached task. The API marks the task cancelled first and returns quickly; remote wrapper termination is best-effort in the background. Pass `expected_statuses` to make cancellation conditional on the task still having one of the statuses observed by the caller.
 
 ```bash
 curl -sS -X POST "$SCHEDULER_URL/api/tasks/123/cancel"
+curl -sS -X POST "$SCHEDULER_URL/api/tasks/123/cancel?expected_statuses=queued"
 ```
 
 Response:
 
 ```json
-{"ok": true, "id": 123, "previous_status": "running", "status": "cancelled"}
+{"ok": true, "cancelled": true, "id": 123, "previous_status": "running", "status": "cancelled"}
+```
+
+If a conditional cancellation loses a status race, the task is left unchanged:
+
+```json
+{"ok": true, "cancelled": false, "id": 123, "previous_status": "running", "status": "running", "reason": "status_mismatch"}
 ```
 
 ### `POST /api/tasks/cancel`
 
-Bulk-cancels tasks matching a name substring and status list, or an explicit id list. `task_ids` takes precedence when supplied (this is what the dashboard's "Cancel selected" checkboxes use).
+Bulk-cancels tasks matching a name substring and status list, or an explicit id list. `task_ids` takes precedence when supplied (this is what the dashboard's "Cancel selected" checkboxes use). In both modes, `statuses` is checked atomically when each task is cancelled.
 
 ```bash
 curl -sS -X POST "$SCHEDULER_URL/api/tasks/cancel?name_contains=crypto-sweep&statuses=queued,attaching,running"

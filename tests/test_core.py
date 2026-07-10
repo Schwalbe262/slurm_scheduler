@@ -1218,6 +1218,7 @@ class SchedulerTests(unittest.TestCase):
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
         response = scheduler.request_cancel_task(task_id)
         self.assertEqual(response["ok"], True)
+        self.assertEqual(response["cancelled"], True)
         self.assertEqual(response["id"], task_id)
         self.assertEqual(response["previous_status"], TaskStatus.RUNNING.value)
         self.assertEqual(response["status"], TaskStatus.CANCELLED.value)
@@ -1226,6 +1227,103 @@ class SchedulerTests(unittest.TestCase):
         while task_id not in FakeClient.cancelled_tasks and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertIn(task_id, FakeClient.cancelled_tasks)
+
+    def test_request_cancel_task_queued_cas_does_not_cancel_task_that_became_running(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=8,
+            total_memory_mb=65536,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="alloc-1")
+        task_id = self.db.create_task(TaskCreate("queued-race", "~/case", "run"))
+        original_update = self.db.update_task_if_status
+        raced = False
+
+        def race_before_cas(changing_task_id: int, expected_statuses: list[str], **fields: object) -> bool:
+            nonlocal raced
+            if not raced:
+                raced = True
+                self.db.update_task(
+                    changing_task_id,
+                    status=TaskStatus.RUNNING.value,
+                    account_name="a",
+                    allocation_id=allocation_id,
+                    wrapper_pid="1234",
+                )
+            return original_update(changing_task_id, expected_statuses, **fields)
+
+        self.db.update_task_if_status = race_before_cas  # type: ignore[method-assign]
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        response = scheduler.request_cancel_task(task_id, expected_statuses={TaskStatus.QUEUED.value})
+
+        self.assertEqual(response["ok"], True)
+        self.assertEqual(response["cancelled"], False)
+        self.assertEqual(response["reason"], "status_mismatch")
+        self.assertEqual(response["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(self.db.get_task(task_id)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(FakeClient.cancelled_tasks, [])
+
+    def test_request_cancel_task_broad_cas_retries_with_running_remote_identifiers(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=8,
+            total_memory_mb=65536,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="alloc-1")
+        task_id = self.db.create_task(TaskCreate("queued-broad-race", "~/case", "run"))
+        original_update = self.db.update_task_if_status
+        raced = False
+
+        def race_before_cas(changing_task_id: int, expected_statuses: list[str], **fields: object) -> bool:
+            nonlocal raced
+            if not raced:
+                raced = True
+                self.db.update_task(
+                    changing_task_id,
+                    status=TaskStatus.RUNNING.value,
+                    account_name="a",
+                    allocation_id=allocation_id,
+                    wrapper_pid="1234",
+                )
+            return original_update(changing_task_id, expected_statuses, **fields)
+
+        self.db.update_task_if_status = race_before_cas  # type: ignore[method-assign]
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        response = scheduler.request_cancel_task(task_id)
+
+        self.assertEqual(response["cancelled"], True)
+        self.assertEqual(response["previous_status"], TaskStatus.RUNNING.value)
+        self.assertEqual(self.db.get_task(task_id)["status"], TaskStatus.CANCELLED.value)
+        deadline = time.monotonic() + 1
+        while task_id not in FakeClient.cancelled_tasks and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIn(task_id, FakeClient.cancelled_tasks)
+
+    def test_cancel_tasks_status_filter_is_rechecked_atomically(self) -> None:
+        task_id = self.db.create_task(TaskCreate("queued-bulk-race", "~/case", "run"))
+        original_update = self.db.update_task_if_status
+        raced = False
+
+        def race_before_cas(changing_task_id: int, expected_statuses: list[str], **fields: object) -> bool:
+            nonlocal raced
+            if not raced:
+                raced = True
+                self.db.update_task(changing_task_id, status=TaskStatus.RUNNING.value)
+            return original_update(changing_task_id, expected_statuses, **fields)
+
+        self.db.update_task_if_status = race_before_cas  # type: ignore[method-assign]
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        cancelled = scheduler.cancel_tasks(
+            name_contains="queued-bulk-race",
+            statuses={TaskStatus.QUEUED.value},
+        )
+
+        self.assertEqual(cancelled, [])
+        self.assertEqual(self.db.get_task(task_id)["status"], TaskStatus.RUNNING.value)
 
     def test_cancel_tasks_filters_by_name_and_status(self) -> None:
         first = self.db.create_task(TaskCreate("crypto-sweep-a", "~/case", "run"))

@@ -20,7 +20,7 @@ from .conda_sync import CondaEnvSyncManager, conda_bootstrap
 from .config import AppConfig, load_accounts, load_app_config
 from .db import Database
 from .git_auth import find_git_credential, git_task_payload
-from .models import JobCreate, SchedulingProfile, TaskCreate, normalize_scheduling_profile
+from .models import JobCreate, SchedulingProfile, TaskCreate, TaskStatus, normalize_scheduling_profile
 from .inventory import partition_rank
 from .pestat import PestatNode, plan_dynamic_allocations
 from .project_env import ProjectEnvManager, repo_dir_name
@@ -1662,21 +1662,22 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         limit: int = 5000,
         task_ids: str = "",
     ) -> dict:
+        requested_statuses = {part.strip() for part in statuses.split(",") if part.strip()}
+        valid_statuses = {status.value for status in TaskStatus}
+        unknown = sorted(requested_statuses - valid_statuses)
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"unknown task status: {', '.join(unknown)}")
         ids = [int(part) for part in task_ids.split(",") if part.strip().isdigit()]
         if ids:
             cancelled_ids: list[int] = []
             for task_id in ids:
                 try:
-                    scheduler.cancel_task(task_id)
-                    cancelled_ids.append(task_id)
+                    result = scheduler.request_cancel_task(task_id, expected_statuses=requested_statuses)
+                    if result["cancelled"]:
+                        cancelled_ids.append(task_id)
                 except ValueError:
                     continue
             return {"cancelled": cancelled_ids, "count": len(cancelled_ids)}
-        requested_statuses = {part.strip() for part in statuses.split(",") if part.strip()}
-        valid_statuses = {"queued", "attaching", "running", "completed", "failed", "cancelled"}
-        unknown = sorted(requested_statuses - valid_statuses)
-        if unknown:
-            raise HTTPException(status_code=400, detail=f"unknown task status: {', '.join(unknown)}")
         cancelled = scheduler.cancel_tasks(name_contains=name_contains, statuses=requested_statuses, limit=max(1, limit))
         return {"cancelled": cancelled, "count": len(cancelled)}
 
@@ -1895,9 +1896,17 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         )
 
     @app.post("/api/tasks/{task_id}/cancel")
-    def api_cancel_task(task_id: int) -> dict:
+    def api_cancel_task(task_id: int, expected_statuses: str = "") -> dict:
+        requested_statuses = {part.strip() for part in expected_statuses.split(",") if part.strip()}
+        valid_statuses = {status.value for status in TaskStatus}
+        unknown = sorted(requested_statuses - valid_statuses)
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"unknown task status: {', '.join(unknown)}")
         try:
-            return scheduler.request_cancel_task(task_id)
+            return scheduler.request_cancel_task(
+                task_id,
+                expected_statuses=requested_statuses if expected_statuses.strip() else None,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

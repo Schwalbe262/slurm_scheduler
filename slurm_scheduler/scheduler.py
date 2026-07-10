@@ -5586,21 +5586,63 @@ class Scheduler:
         if task.get("allocation_id"):
             self.recalculate_allocation_capacity()
 
-    def request_cancel_task(self, task_id: int) -> dict:
+    def request_cancel_task(self, task_id: int, expected_statuses: set[str] | None = None) -> dict:
+        cancellable = {
+            TaskStatus.QUEUED.value,
+            TaskStatus.ATTACHING.value,
+            TaskStatus.RUNNING.value,
+        }
+        wanted_statuses = set(expected_statuses) if expected_statuses is not None else cancellable
+        for _ in range(4):
+            task = self.db.get_task(task_id)
+            if not task:
+                raise ValueError("task not found")
+            previous_status = str(task["status"])
+            if previous_status not in cancellable or previous_status not in wanted_statuses:
+                return {
+                    "ok": True,
+                    "cancelled": False,
+                    "id": task_id,
+                    "previous_status": previous_status,
+                    "status": previous_status,
+                    "reason": "status_mismatch",
+                }
+            # Compare against the exact row observed above. If queued became
+            # running meanwhile, a queued-only caller must not kill it. A
+            # broader caller retries from a fresh row so remote identifiers
+            # match the state whose cancellation it wins.
+            if not self.db.update_task_if_status(
+                task_id,
+                [previous_status],
+                status=TaskStatus.CANCELLED.value,
+                finished_at="CURRENT_TIMESTAMP",
+            ):
+                continue
+            self.on_task_terminal(task, "cancelled")
+            if task.get("allocation_id"):
+                self.recalculate_allocation_capacity()
+            if previous_status in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
+                thread = threading.Thread(target=self._cancel_task_remote_best_effort, args=(task,), daemon=True)
+                thread.start()
+            return {
+                "ok": True,
+                "cancelled": True,
+                "id": task_id,
+                "previous_status": previous_status,
+                "status": TaskStatus.CANCELLED.value,
+            }
         task = self.db.get_task(task_id)
         if not task:
             raise ValueError("task not found")
-        previous_status = task["status"]
-        if previous_status in {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}:
-            return {"ok": True, "id": task_id, "previous_status": previous_status, "status": previous_status}
-        self.db.update_task(task_id, status=TaskStatus.CANCELLED.value, finished_at="CURRENT_TIMESTAMP")
-        self.on_task_terminal(task, "cancelled")
-        if task.get("allocation_id"):
-            self.recalculate_allocation_capacity()
-        if previous_status in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
-            thread = threading.Thread(target=self._cancel_task_remote_best_effort, args=(task,), daemon=True)
-            thread.start()
-        return {"ok": True, "id": task_id, "previous_status": previous_status, "status": TaskStatus.CANCELLED.value}
+        current_status = str(task["status"])
+        return {
+            "ok": True,
+            "cancelled": False,
+            "id": task_id,
+            "previous_status": current_status,
+            "status": current_status,
+            "reason": "concurrent_transition",
+        }
 
     def _cancel_task_remote_best_effort(self, task: dict) -> None:
         account = self.account_by_name(str(task.get("account_name") or ""))
@@ -5625,6 +5667,7 @@ class Scheduler:
                 continue
             if needle and needle not in str(task.get("name") or "").lower():
                 continue
-            self.request_cancel_task(int(task["id"]))
-            cancelled.append(int(task["id"]))
+            result = self.request_cancel_task(int(task["id"]), expected_statuses=wanted_statuses)
+            if result["cancelled"]:
+                cancelled.append(int(task["id"]))
         return sorted(cancelled)
