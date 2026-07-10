@@ -272,6 +272,7 @@ class Scheduler:
         self._background_attach_semaphore = threading.BoundedSemaphore(max(1, min(4, self.fea_max_attach_per_loop)))
         self._allocation_backoff_until_by_pool: dict[str, float] = {}
         self._allocation_node_backoff_until: dict[tuple[str, str], float] = {}
+        self._allocation_shape_backoff_until: dict[tuple[str, str], float] = {}
         self.cleanup_enabled = cleanup_enabled
         self.cleanup_interval_seconds = cleanup_interval_seconds
         self.cleanup_finished_task_ttl_seconds = cleanup_finished_task_ttl_seconds
@@ -1967,6 +1968,34 @@ class Scheduler:
             return False
         if until <= time.monotonic():
             self._allocation_node_backoff_until.pop(key, None)
+            return False
+        return True
+
+    @classmethod
+    def allocation_shape_backoff_key(cls, resource_pool: str, partition: str) -> tuple[str, str]:
+        normalized_partition = ",".join(sorted(set(cls.partition_spec_names(partition))))
+        return str(resource_pool or "cpu"), normalized_partition
+
+    def backoff_rejected_allocation_shape(self, allocation: dict) -> None:
+        key = self.allocation_shape_backoff_key(
+            str(allocation.get("resource_pool") or "cpu"),
+            str(allocation.get("partition") or ""),
+        )
+        if not key[1]:
+            return
+        backoff_seconds = max(
+            self.poll_interval_seconds * 2,
+            min(max(0, self.allocation_pending_backoff_seconds), 1800),
+        )
+        self._allocation_shape_backoff_until[key] = time.monotonic() + backoff_seconds
+
+    def allocation_shape_in_backoff(self, resource_pool: str, shape: dict) -> bool:
+        key = self.allocation_shape_backoff_key(resource_pool, str(shape.get("partition") or ""))
+        until = self._allocation_shape_backoff_until.get(key)
+        if not until:
+            return False
+        if until <= time.monotonic():
+            self._allocation_shape_backoff_until.pop(key, None)
             return False
         return True
 
@@ -4410,6 +4439,7 @@ class Scheduler:
                 and allocation["state"] == AllocationStatus.PENDING.value
                 and "QOSMaxCpuPerNode" in str(allocation.get("pending_reason") or "")
             ):
+                self.backoff_rejected_allocation_shape(allocation)
                 self.close_allocation(allocation, "CPU demand allocation exceeds QOS CPU-per-node limit")
                 continue
             allocation_desired_cpu_pool_cpus = desired_cpu_pool_cpus
@@ -5165,42 +5195,48 @@ class Scheduler:
                     ),
                     reverse=True,
                 )
-            node, cpus, memory_mb, chosen_gpu_model, gpu_free, _score, _cpu_score, _node_is_gpu_partition = candidates[0]
-            chosen_gpus = min(target_gpu_count, gpu_free) if wants_gpu else 0
-            node_name = node.hostname
-            if not wants_gpu and not self.is_single_job_partition(node.partition) and not _node_is_gpu_partition:
-                node_name = ""
-            if (
-                wants_shared_cpu_pool
-                and _node_is_gpu_partition
-                and self.cpu_pool_partition_spread
-                and target_partition == "auto"
-            ):
-                spread, spread_cpus, spread_memory_mb = self.cpu_pool_spread(
-                    cpus, memory_mb, requested_cpus=int(requested_cpus or 0)
-                )
-                if len(spread) > 1:
-                    # Every listed partition can eventually serve this shape, so
-                    # submit unpinned and let the Slurm queue start it wherever
-                    # room opens first instead of betting on one partition.
-                    return {
-                        "partition": ",".join(spread),
-                        "node_name": "",
-                        "cpus": spread_cpus,
-                        "memory_mb": spread_memory_mb,
-                        "gpus": 0,
-                        "gpu_model": "",
+            for candidate in candidates:
+                node, cpus, memory_mb, chosen_gpu_model, gpu_free, _score, _cpu_score, _node_is_gpu_partition = candidate
+                chosen_gpus = min(target_gpu_count, gpu_free) if wants_gpu else 0
+                node_name = node.hostname
+                if not wants_gpu and not self.is_single_job_partition(node.partition) and not _node_is_gpu_partition:
+                    node_name = ""
+                shape = None
+                if (
+                    wants_shared_cpu_pool
+                    and _node_is_gpu_partition
+                    and self.cpu_pool_partition_spread
+                    and target_partition == "auto"
+                ):
+                    spread, spread_cpus, spread_memory_mb = self.cpu_pool_spread(
+                        cpus, memory_mb, requested_cpus=int(requested_cpus or 0)
+                    )
+                    if len(spread) > 1:
+                        # Every listed partition can eventually serve this shape,
+                        # so submit unpinned and let Slurm start it where room opens.
+                        shape = {
+                            "partition": ",".join(spread),
+                            "node_name": "",
+                            "cpus": spread_cpus,
+                            "memory_mb": spread_memory_mb,
+                            "gpus": 0,
+                            "gpu_model": "",
+                            "exclusive_node": exclusive_node,
+                        }
+                if shape is None:
+                    shape = {
+                        "partition": node.partition,
+                        "node_name": node_name,
+                        "cpus": cpus,
+                        "memory_mb": memory_mb,
+                        "gpus": chosen_gpus,
+                        "gpu_model": chosen_gpu_model if wants_gpu else "",
                         "exclusive_node": exclusive_node,
                     }
-            return {
-                "partition": node.partition,
-                "node_name": node_name,
-                "cpus": cpus,
-                "memory_mb": memory_mb,
-                "gpus": chosen_gpus,
-                "gpu_model": chosen_gpu_model if wants_gpu else "",
-                "exclusive_node": exclusive_node,
-            }
+                if self.allocation_shape_in_backoff(resource_pool, shape):
+                    continue
+                return shape
+            return None
         if target_partition != "auto" and self.is_single_job_partition(target_partition):
             return None
         partition_request = {
@@ -5277,7 +5313,7 @@ class Scheduler:
         if fallback_cpu_limit and not wants_shared_cpu_pool:
             if not fallback_minimum_cpus or fallback_cpu_limit >= fallback_minimum_cpus:
                 fallback_cpus = min(fallback_cpus, fallback_cpu_limit)
-        return {
+        fallback_shape = {
             "partition": partition,
             "node_name": "",
             "cpus": fallback_cpus,
@@ -5286,6 +5322,9 @@ class Scheduler:
             "gpu_model": (target_models[0] if target_models else "") if wants_gpu else "",
             "exclusive_node": exclusive_node,
         }
+        if self.allocation_shape_in_backoff(resource_pool, fallback_shape):
+            return None
+        return fallback_shape
 
     def _memory_mb(self, value: str) -> int:
         raw = (value or "").strip().lower()

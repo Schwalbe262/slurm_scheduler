@@ -2747,6 +2747,89 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(allocation["state"], AllocationStatus.CLOSED.value)
         self.assertIn("qos-blocked", FakeClient.cancelled)
 
+    def test_qos_rejected_partition_spread_is_not_reopened_but_cpu2_remains_available(self) -> None:
+        inventory_text = (
+            "NodeName=gpu-one CPUTot=48 RealMemory=384000 State=IDLE Partitions=gpu1 Gres=gpu:rtx3090:4\n"
+            "NodeName=gpu-four CPUTot=56 RealMemory=512000 State=IDLE Partitions=gpu4 Gres=gpu:a6000:4\n"
+        )
+        pestat_text = (
+            "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+            "gpu-one gpu1 idle 0 48 0.1 384000 380000\n"
+            "gpu-four gpu4 idle 0 56 0.1 512000 500000\n"
+        )
+        self.db.replace_node_inventory(parse_scontrol_nodes(inventory_text))
+        self.db.replace_pestat_nodes(parse_pestat(pestat_text))
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            allocation_cpus=64,
+            cpu_pool_allow_gpu_partitions=True,
+            cpu_pool_partition_spread=True,
+        )
+        rejected_shape = scheduler.choose_allocation_shape(resource_pool="cpu")
+        self.assertIsNotNone(rejected_shape)
+        self.assertGreater(len(scheduler.partition_spec_names(rejected_shape["partition"])), 1)
+        rejected_id = self.db.create_allocation(
+            account_name="a",
+            partition=rejected_shape["partition"],
+            node_name=rejected_shape["node_name"],
+            total_cpus=rejected_shape["cpus"],
+            total_memory_mb=rejected_shape["memory_mb"],
+            resource_pool="cpu",
+        )
+        self.db.update_allocation(
+            rejected_id,
+            state=AllocationStatus.PENDING.value,
+            slurm_job_id="qos-rejected-spread",
+            pending_reason="(QOSMaxCpuPerNode)",
+            drain_reason="queued CPU demand",
+        )
+        self.db.create_task(
+            TaskCreate(
+                "waiting-fea",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+
+        scheduler.maintain_allocation_pool()
+
+        self.assertEqual(self.db.get_allocation(rejected_id)["state"], AllocationStatus.CLOSED.value)
+        live = [
+            allocation
+            for allocation in self.db.list_allocations()
+            if allocation["state"] in {AllocationStatus.PENDING.value, AllocationStatus.WARM.value, AllocationStatus.ACTIVE.value}
+        ]
+        self.assertEqual(live, [])
+        self.assertEqual(FakeClient.allocation_submits, [])
+
+        self.db.replace_node_inventory(
+            parse_scontrol_nodes(
+                inventory_text
+                + "NodeName=cpu2-free CPUTot=256 RealMemory=1031519 State=IDLE Partitions=cpu2 Gres=(null)\n"
+            )
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                pestat_text
+                + "cpu2-free cpu2 idle 0 256 0.1 1031519 1000000\n"
+            )
+        )
+        scheduler.prewarm_for_demand()
+        live = [
+            allocation
+            for allocation in self.db.list_allocations()
+            if allocation["state"] in {AllocationStatus.PENDING.value, AllocationStatus.WARM.value, AllocationStatus.ACTIVE.value}
+        ]
+        self.assertEqual(len(live), 1)
+        self.assertEqual(live[0]["partition"], "cpu2")
+
     def test_warm_demand_allocation_closes_when_no_queued_task_needs_it(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",
