@@ -579,9 +579,35 @@ class Database:
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             return dict(row) if row else None
 
-    def list_tasks(self, limit: int = 200) -> list[dict[str, Any]]:
+    def list_tasks(
+        self,
+        limit: int = 200,
+        *,
+        project: str = "",
+        name_prefix: str = "",
+        statuses: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project:
+            clauses.append("project = ?")
+            params.append(project)
+        if name_prefix:
+            escaped = name_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append("name LIKE ? ESCAPE '\\'")
+            params.append(f"{escaped}%")
+        if statuses is not None:
+            if not statuses:
+                return []
+            placeholders = ",".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.connect() as conn:
-            rows = conn.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute(
+                f"SELECT * FROM tasks{where} ORDER BY id DESC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
             return [dict(row) for row in rows]
 
     def list_tasks_with_active(self, limit: int = 200, active_limit: int = 5000) -> list[dict[str, Any]]:

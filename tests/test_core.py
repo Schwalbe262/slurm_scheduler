@@ -1059,6 +1059,45 @@ class SchedulerTests(unittest.TestCase):
         self.assertIn(running_id, visible_ids)
         self.assertTrue(set(finished_ids[-2:]).issubset(visible_ids))
 
+    def test_list_tasks_applies_project_and_prefix_filters_before_limit(self) -> None:
+        matching_ids = [
+            self.db.create_task(TaskCreate(f"campaign-job-{index}", "~/work", "run", project="motor"))
+            for index in range(3)
+        ]
+        self.db.create_task(TaskCreate("campaign-job-other-project", "~/work", "run", project="other"))
+        for index in range(5):
+            self.db.create_task(TaskCreate(f"newer-noise-{index}", "~/work", "run", project="motor"))
+
+        rows = self.db.list_tasks(limit=2, project="motor", name_prefix="campaign-job-")
+
+        self.assertEqual([int(row["id"]) for row in rows], list(reversed(matching_ids[-2:])))
+        self.assertEqual({row["project"] for row in rows}, {"motor"})
+
+    def test_list_tasks_name_prefix_escapes_sql_wildcards(self) -> None:
+        literal_id = self.db.create_task(TaskCreate("campaign_100%-literal", "~/work", "run"))
+        self.db.create_task(TaskCreate("campaignX100Y-lookalike", "~/work", "run"))
+
+        rows = self.db.list_tasks(limit=10, name_prefix="campaign_100%")
+
+        self.assertEqual([int(row["id"]) for row in rows], [literal_id])
+
+    def test_list_tasks_filters_status_combinations(self) -> None:
+        queued_id = self.db.create_task(TaskCreate("status-queued", "~/work", "run", project="motor"))
+        running_id = self.db.create_task(TaskCreate("status-running", "~/work", "run", project="motor"))
+        completed_id = self.db.create_task(TaskCreate("status-completed", "~/work", "run", project="motor"))
+        failed_id = self.db.create_task(TaskCreate("status-failed", "~/work", "run", project="motor"))
+        self.db.update_task(running_id, status=TaskStatus.RUNNING.value)
+        self.db.update_task(completed_id, status=TaskStatus.COMPLETED.value)
+        self.db.update_task(failed_id, status=TaskStatus.FAILED.value)
+
+        rows = self.db.list_tasks(
+            limit=10,
+            project="motor",
+            statuses=[TaskStatus.QUEUED.value, TaskStatus.COMPLETED.value],
+        )
+
+        self.assertEqual({int(row["id"]) for row in rows}, {queued_id, completed_id})
+
     def test_list_finished_tasks_can_filter_by_name_before_limit(self) -> None:
         for index in range(5):
             task_id = self.db.create_task(TaskCreate(f"other-finished-{index}", "~/work", "run"))
@@ -6621,6 +6660,7 @@ class ProjectApiTests(unittest.TestCase):
         self.app.router.on_shutdown.clear()
         self.create_project = self._route_endpoint("/api/projects", "POST")
         self.get_project = self._route_endpoint("/api/projects/{name}", "GET")
+        self.list_tasks = self._route_endpoint("/api/tasks", "GET")
         self.get_task = self._route_endpoint("/api/tasks/{task_id}", "GET")
 
     def tearDown(self) -> None:
@@ -6676,6 +6716,125 @@ class ProjectApiTests(unittest.TestCase):
         payload = self.get_task(task_id)
         self.assertEqual(payload["project"], "motor")
         self.assertEqual(payload["entrypoint"], "run.py")
+
+    def test_task_list_api_filters_before_limit_and_isolates_project(self) -> None:
+        matching_ids = [
+            self.app.state.db.create_task(
+                TaskCreate(f"api-campaign-{index}", "~/case", "run", project="motor")
+            )
+            for index in range(3)
+        ]
+        self.app.state.db.create_task(TaskCreate("api-campaign-other", "~/case", "run", project="other"))
+        for index in range(4):
+            self.app.state.db.create_task(TaskCreate(f"api-noise-{index}", "~/case", "run", project="motor"))
+
+        payload = self.list_tasks(
+            include_diagnostics=False,
+            limit=2,
+            project="motor",
+            name_prefix="api-campaign-",
+            status=None,
+        )
+
+        self.assertEqual([int(item["id"]) for item in payload], list(reversed(matching_ids[-2:])))
+        self.assertEqual({item["project"] for item in payload}, {"motor"})
+
+    def test_task_list_api_accepts_repeated_and_csv_status_filters(self) -> None:
+        queued_id = self.app.state.db.create_task(TaskCreate("api-status-queued", "~/case", "run"))
+        completed_id = self.app.state.db.create_task(TaskCreate("api-status-completed", "~/case", "run"))
+        failed_id = self.app.state.db.create_task(TaskCreate("api-status-failed", "~/case", "run"))
+        self.app.state.db.update_task(completed_id, status=TaskStatus.COMPLETED.value)
+        self.app.state.db.update_task(failed_id, status=TaskStatus.FAILED.value)
+
+        payload = self.list_tasks(
+            include_diagnostics=False,
+            limit=10,
+            project="",
+            name_prefix="api-status-",
+            status=["QUEUED, completed", "completed"],
+        )
+
+        self.assertEqual({int(item["id"]) for item in payload}, {queued_id, completed_id})
+        self.assertNotIn(failed_id, {int(item["id"]) for item in payload})
+
+        status_parameter = next(
+            parameter
+            for parameter in self.app.openapi()["paths"]["/api/tasks"]["get"]["parameters"]
+            if parameter["name"] == "status"
+        )
+        self.assertTrue(
+            any(item.get("type") == "array" for item in status_parameter["schema"]["anyOf"])
+        )
+
+    def test_task_list_api_rejects_unknown_status(self) -> None:
+        from fastapi import HTTPException
+
+        with self.assertRaises(HTTPException) as raised:
+            self.list_tasks(
+                include_diagnostics=False,
+                limit=10,
+                project="",
+                name_prefix="",
+                status=["running,not-a-status"],
+            )
+
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertIn("not-a-status", raised.exception.detail)
+
+    def test_task_list_api_preserves_unfiltered_explicit_limit_behavior(self) -> None:
+        first_id = self.app.state.db.create_task(TaskCreate("api-old", "~/case", "run"))
+        second_id = self.app.state.db.create_task(TaskCreate("api-new", "~/case", "run"))
+
+        payload = self.list_tasks(
+            include_diagnostics=False,
+            limit=1,
+            project="",
+            name_prefix="",
+            status=None,
+        )
+
+        self.assertEqual([int(item["id"]) for item in payload], [second_id])
+        self.assertNotEqual(first_id, second_id)
+
+    def test_task_list_api_preserves_unfiltered_active_merge_behavior(self) -> None:
+        running_id = self.app.state.db.create_task(TaskCreate("api-old-running", "~/case", "run"))
+        self.app.state.db.update_task(running_id, status=TaskStatus.RUNNING.value)
+        for index in range(205):
+            task_id = self.app.state.db.create_task(TaskCreate(f"api-finished-{index}", "~/case", "run"))
+            self.app.state.db.update_task(task_id, status=TaskStatus.COMPLETED.value)
+
+        payload = self.list_tasks(
+            include_diagnostics=False,
+            limit=0,
+            project="",
+            name_prefix="",
+            status=None,
+        )
+
+        self.assertIn(running_id, {int(item["id"]) for item in payload})
+
+    def test_task_list_api_caps_filtered_limit_and_defaults_to_cap(self) -> None:
+        observed_limits: list[int] = []
+        original = self.app.state.db.list_tasks
+
+        def capture_list_tasks(limit: int, **_filters):
+            observed_limits.append(limit)
+            return []
+
+        self.app.state.db.list_tasks = capture_list_tasks
+        try:
+            for requested in (50_000, 0):
+                self.list_tasks(
+                    include_diagnostics=False,
+                    limit=requested,
+                    project="motor",
+                    name_prefix="",
+                    status=None,
+                )
+        finally:
+            self.app.state.db.list_tasks = original
+
+        self.assertEqual(observed_limits, [10_000, 10_000])
 
 
 class BatchParserTests(unittest.TestCase):

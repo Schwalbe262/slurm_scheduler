@@ -11,7 +11,7 @@ from math import ceil
 import posixpath
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Form, HTTPException, Request, Response
+from fastapi import FastAPI, Form, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
@@ -43,6 +43,29 @@ def normalize_cleanup_globs(value: object) -> str:
     else:
         return ""
     return ",".join(part for part in parts if part and Scheduler._workspace_prune_glob_ok(part))
+
+
+def normalize_task_status_filters(values: list[str] | str | None) -> list[str] | None:
+    """Normalize repeated and comma-separated task status query values."""
+    if values is None:
+        return None
+    raw_values = [values] if isinstance(values, str) else list(values)
+    normalized: list[str] = []
+    for raw in raw_values:
+        for item in str(raw).split(","):
+            value = item.strip().lower()
+            if value and value not in normalized:
+                normalized.append(value)
+    allowed = {status.value for status in TaskStatus}
+    invalid = sorted(value for value in normalized if value not in allowed)
+    if invalid or not normalized:
+        allowed_text = ", ".join(sorted(allowed))
+        invalid_text = ", ".join(invalid) if invalid else "<empty>"
+        raise HTTPException(
+            status_code=422,
+            detail=f"status must contain only {allowed_text}; invalid: {invalid_text}",
+        )
+    return normalized
 
 
 def cleanup_local_temp_artifacts() -> None:
@@ -1575,7 +1598,13 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         return db.list_jobs()
 
     @app.get("/api/tasks")
-    def api_tasks(include_diagnostics: bool = False, limit: int = 0, name_prefix: str = "") -> list[dict]:
+    def api_tasks(
+        include_diagnostics: bool = False,
+        limit: int = 0,
+        project: str = "",
+        name_prefix: str = "",
+        status: list[str] | None = Query(default=None),
+    ) -> list[dict]:
         allocation_rows = None
         allocation_by_id = None
         active_task_allocation_ids = None
@@ -1584,11 +1613,25 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             allocation_rows = db.list_allocations_with_live(limit=500)
             allocation_by_id = {int(allocation["id"]): allocation for allocation in allocation_rows}
             active_task_allocation_ids, active_exclusive_allocation_ids = scheduler.active_task_allocation_sets()
-        # limit/name_prefix: large-campaign harvesting without shipping every row.
-        # An explicit limit means "newest N rows", without the active-task merge.
-        tasks = db.list_tasks(limit=max(1, min(int(limit), 10000))) if limit else db.list_tasks_with_active()
-        if name_prefix:
-            tasks = [task for task in tasks if str(task.get("name") or "").startswith(name_prefix)]
+        statuses = normalize_task_status_filters(status)
+        filtered = bool(project or name_prefix or statuses is not None)
+        if filtered:
+            # A filtered campaign read defaults to the API cap.  The database
+            # applies every WHERE clause before LIMIT, so unrelated global
+            # history cannot hide matching rows.
+            task_limit = max(1, min(int(limit), 10000)) if limit else 10000
+            tasks = db.list_tasks(
+                limit=task_limit,
+                project=project,
+                name_prefix=name_prefix,
+                statuses=statuses,
+            )
+        elif limit:
+            # Preserve the existing explicit-limit behavior for unfiltered reads.
+            tasks = db.list_tasks(limit=max(1, min(int(limit), 10000)))
+        else:
+            # Preserve the existing newest-plus-active behavior with no filters.
+            tasks = db.list_tasks_with_active()
         return [
             task_json(
                 task,
