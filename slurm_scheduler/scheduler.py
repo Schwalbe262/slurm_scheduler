@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -467,19 +468,52 @@ class Scheduler:
                     "recovered", "job stuck in submitting reset to queued", entity_type="job", entity_id=job["id"]
                 )
         for task in self.db.list_tasks_by_statuses([TaskStatus.ATTACHING.value], limit=5000):
-            if not str(task.get("exit_code_path") or ""):
-                LOGGER.warning("recovering task %s stuck in attaching without exit_code_path; requeueing", task["id"])
-                self.db.update_task(
+            attach_token = str(task.get("attach_token") or "")
+            launch_started_at = str(task.get("launch_started_at") or "")
+            if attach_token and not launch_started_at:
+                recovered = self.db.update_task_if_attach_claim(
                     task["id"],
+                    attach_token,
+                    require_launch_not_started=True,
                     status=TaskStatus.QUEUED.value,
                     allocation_id=None,
+                    remote_dir="",
+                    stdout_path="",
+                    stderr_path="",
+                    exit_code_path="",
+                    wrapper_pid="",
+                    attach_token="",
+                    launch_started_at=None,
                     failure_message="",
+                    attached_at=None,
+                    started_at=None,
                 )
+                if not recovered:
+                    continue
+                LOGGER.warning("recovering task %s reserved before remote launch; requeueing", task["id"])
                 self.record_event(
                     "recovered",
-                    "task stuck in attaching requeued",
+                    "task reserved before remote launch requeued",
                     entity_type="task",
                     entity_id=task["id"],
+                )
+                continue
+            if not str(task.get("exit_code_path") or ""):
+                # Once launch_started_at is durable the remote nohup may have
+                # succeeded even though its paths/PID were never acknowledged.
+                # Legacy rows have no attach_token, so they are ambiguous too.
+                # Keeping the claim is the fail-safe: a timeout/manual cancel
+                # can reap it by task marker, while requeue could run it twice.
+                LOGGER.warning(
+                    "preserving task %s attaching claim with unacknowledged remote launch",
+                    task["id"],
+                )
+                self.record_event(
+                    "recovery_held",
+                    "task attach launch may have started; claim preserved to prevent duplicate execution",
+                    entity_type="task",
+                    entity_id=task["id"],
+                    account_name=str(task.get("account_name") or ""),
                 )
 
     def reconcile_slurm_state(self) -> None:
@@ -2194,23 +2228,46 @@ class Scheduler:
         if self.account_storage_blocked(account, for_fea=self.task_is_fea_bursty(task)):
             return False
         task = self.reserve_task_on_allocation(task, allocation, account)
+        if not task:
+            return False
         if background:
             self.start_background_task_attach(task, allocation, account)
             return True
         return self.finish_reserved_task_attach(task, allocation, account)
 
-    def reserve_task_on_allocation(self, task: dict, allocation: dict, account: AccountConfig) -> dict:
+    def reserve_task_on_allocation(self, task: dict, allocation: dict, account: AccountConfig) -> dict | None:
         task = self.apply_dynamic_env_profile(task, account)
-        self.db.update_task(
+        attach_token = uuid.uuid4().hex
+        if not self.db.update_task_if_status(
             task["id"],
+            [TaskStatus.QUEUED.value],
             status=TaskStatus.ATTACHING.value,
             allocation_id=allocation["id"],
             account_name=allocation["account_name"],
+            remote_dir="",
+            stdout_path="",
+            stderr_path="",
+            exit_code_path="",
+            wrapper_pid="",
+            attach_token=attach_token,
+            launch_started_at=None,
+            failure_message="",
             attached_at="CURRENT_TIMESTAMP",
-        )
+            started_at=None,
+            finished_at=None,
+            exit_code=None,
+        ):
+            return None
         self._record_attach_delta(allocation, task)
         self.recalculate_allocation_capacity()
-        return {**task, "status": TaskStatus.ATTACHING.value, "allocation_id": allocation["id"], "account_name": allocation["account_name"]}
+        return {
+            **task,
+            "status": TaskStatus.ATTACHING.value,
+            "allocation_id": allocation["id"],
+            "account_name": allocation["account_name"],
+            "attach_token": attach_token,
+            "launch_started_at": None,
+        }
 
     def start_background_task_attach(self, task: dict, allocation: dict, account: AccountConfig) -> None:
         thread = threading.Thread(
@@ -2227,15 +2284,25 @@ class Scheduler:
 
     def finish_reserved_task_attach(self, task: dict, allocation: dict, account: AccountConfig) -> bool:
         """Complete a reserved attach. All task updates are conditional on the
-        task still being ATTACHING: a concurrent requeue (rebalance, pressure
-        drain) or cancel owns the row once it transitions, and stomping it left
-        tasks running with no allocation."""
+        exact attach token still owning the ATTACHING row. Persisting the launch
+        boundary before the remote side effect lets startup distinguish a safe,
+        unlaunched reservation from an ambiguous launch that must not be rerun."""
+        attach_token = str(task.get("attach_token") or "")
+        if not self.db.update_task_if_attach_claim(
+            task["id"],
+            attach_token,
+            require_launch_not_started=True,
+            launch_started_at="CURRENT_TIMESTAMP",
+        ):
+            LOGGER.info("attach claim for task %s is no longer active; skipping remote launch", task["id"])
+            self.recalculate_allocation_capacity()
+            return False
         try:
             result = self._client(account).attach_task(task, allocation)
         except RemoteExecutionError as exc:
-            if self.db.update_task_if_status(
+            if self.db.update_task_if_attach_claim(
                 task["id"],
-                [TaskStatus.ATTACHING.value],
+                attach_token,
                 status=TaskStatus.FAILED.value,
                 failure_message=str(exc),
                 finished_at="CURRENT_TIMESTAMP",
@@ -2247,9 +2314,9 @@ class Scheduler:
             self.recalculate_allocation_capacity()
             return False
         except Exception as exc:
-            if self.db.update_task_if_status(
+            if self.db.update_task_if_attach_claim(
                 task["id"],
-                [TaskStatus.ATTACHING.value],
+                attach_token,
                 status=TaskStatus.FAILED.value,
                 failure_message=str(exc),
                 finished_at="CURRENT_TIMESTAMP",
@@ -2259,9 +2326,9 @@ class Scheduler:
                 LOGGER.info("attach failure for task %s ignored; task already transitioned", task["id"])
             self.recalculate_allocation_capacity()
             return False
-        if not self.db.update_task_if_status(
+        if not self.db.update_task_if_attach_claim(
             task["id"],
-            [TaskStatus.ATTACHING.value],
+            attach_token,
             status=TaskStatus.RUNNING.value,
             started_at="CURRENT_TIMESTAMP",
             **result,
@@ -3707,6 +3774,8 @@ class Scheduler:
             stderr_path="",
             exit_code_path="",
             wrapper_pid="",
+            attach_token="",
+            launch_started_at=None,
             failure_message="",
             attached_at=None,
             started_at=None,
@@ -3797,6 +3866,8 @@ class Scheduler:
             stderr_path="",
             exit_code_path="",
             wrapper_pid="",
+            attach_token="",
+            launch_started_at=None,
             failure_message="",
             attached_at=None,
             started_at=None,

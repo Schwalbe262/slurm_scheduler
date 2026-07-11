@@ -176,6 +176,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     stderr_path TEXT NOT NULL DEFAULT '',
     exit_code_path TEXT NOT NULL DEFAULT '',
     wrapper_pid TEXT NOT NULL DEFAULT '',
+    attach_token TEXT NOT NULL DEFAULT '',
+    launch_started_at TEXT,
     failure_message TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     attached_at TEXT,
@@ -447,6 +449,8 @@ class Database:
                 "entrypoint": "TEXT NOT NULL DEFAULT ''",
                 "exit_code": "INTEGER",
                 "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+                "attach_token": "TEXT NOT NULL DEFAULT ''",
+                "launch_started_at": "TEXT",
             },
             "allocations": {
                 "total_gpus": "INTEGER NOT NULL DEFAULT 0",
@@ -732,6 +736,38 @@ class Database:
         with self.connect() as conn:
             cursor = conn.execute(
                 f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ? AND status IN ({placeholders})",
+                values,
+            )
+            return cursor.rowcount > 0
+
+    def update_task_if_attach_claim(
+        self,
+        task_id: int,
+        expected_attach_token: str,
+        *,
+        require_launch_not_started: bool = False,
+        **fields: Any,
+    ) -> bool:
+        """Update one exact attach attempt, protecting against requeue/reattach ABA races."""
+        token = str(expected_attach_token or "")
+        if not token or not fields:
+            return False
+        fields["updated_at"] = fields.get("updated_at", "CURRENT_TIMESTAMP")
+        assignments = []
+        values: list[Any] = []
+        for key, value in fields.items():
+            if value == "CURRENT_TIMESTAMP":
+                assignments.append(f"{key} = CURRENT_TIMESTAMP")
+            else:
+                assignments.append(f"{key} = ?")
+                values.append(value)
+        values.extend((task_id, TaskStatus.ATTACHING.value, token))
+        launch_guard = " AND launch_started_at IS NULL" if require_launch_not_started else ""
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"UPDATE tasks SET {', '.join(assignments)} "
+                "WHERE id = ? AND status = ? AND attach_token = ?"
+                f"{launch_guard}",
                 values,
             )
             return cursor.rowcount > 0

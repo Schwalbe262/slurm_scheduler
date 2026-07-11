@@ -6032,6 +6032,8 @@ class SchedulerTests(unittest.TestCase):
         )
 
     def test_attach_completion_does_not_stomp_concurrent_requeue(self) -> None:
+        BlockingAttachClient.attach_started.clear()
+        BlockingAttachClient.release_attach.clear()
         allocation_id = self.db.create_allocation(
             account_name="a",
             partition="cpu1",
@@ -6043,19 +6045,21 @@ class SchedulerTests(unittest.TestCase):
         task_id = self.db.create_task(
             TaskCreate("racy", "~/case", "run", cpus=4, scheduling_profile=SchedulingProfile.FEA_BURSTY.value)
         )
-        self.db.update_task(
-            task_id,
-            status=TaskStatus.ATTACHING.value,
-            account_name="a",
-            allocation_id=allocation_id,
-        )
-        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=BlockingAttachClient)
         allocation = self.db.get_allocation(allocation_id)
-        task = self.db.get_task(task_id)
+        task = scheduler.reserve_task_on_allocation(self.db.get_task(task_id), allocation, self.accounts[0])
+        self.assertIsNotNone(task)
+        result: list[bool] = []
+        thread = threading.Thread(
+            target=lambda: result.append(scheduler.finish_reserved_task_attach(task, allocation, self.accounts[0]))
+        )
+        thread.start()
+        self.assertTrue(BlockingAttachClient.attach_started.wait(timeout=1))
         # A rebalance requeues the task while its attach is still in flight.
         scheduler.requeue_task_for_rebalance(task, "test rebalance")
-        finished = scheduler.finish_reserved_task_attach(task, allocation, self.accounts[0])
-        self.assertFalse(finished)
+        BlockingAttachClient.release_attach.set()
+        thread.join(timeout=2)
+        self.assertEqual(result, [False])
         after = self.db.get_task(task_id)
         self.assertEqual(after["status"], TaskStatus.QUEUED.value)
         self.assertIsNone(after["allocation_id"])
@@ -7247,11 +7251,28 @@ class TransientStateRecoveryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def test_recovers_submitting_job_and_orphaned_attaching_task(self) -> None:
+    def test_recovers_only_definitely_unlaunched_attaching_task(self) -> None:
         job_id = self.db.create_job(JobCreate("https://example/repo.git", "main", "run.py"))
         self.db.update_job(job_id, status=JobStatus.SUBMITTING.value)
-        orphan_id = self.db.create_task(TaskCreate("orphan", "~/work", "run"))
-        self.db.update_task(orphan_id, status=TaskStatus.ATTACHING.value)
+        unlaunched_id = self.db.create_task(TaskCreate("unlaunched", "~/work", "run"))
+        self.db.update_task(
+            unlaunched_id,
+            status=TaskStatus.ATTACHING.value,
+            allocation_id=1,
+            account_name="a",
+            attach_token="unlaunched-token",
+        )
+        launched_id = self.db.create_task(TaskCreate("launch-ambiguous", "~/work", "run"))
+        self.db.update_task(
+            launched_id,
+            status=TaskStatus.ATTACHING.value,
+            allocation_id=2,
+            account_name="a",
+            attach_token="launched-token",
+            launch_started_at="CURRENT_TIMESTAMP",
+        )
+        legacy_id = self.db.create_task(TaskCreate("legacy-ambiguous", "~/work", "run"))
+        self.db.update_task(legacy_id, status=TaskStatus.ATTACHING.value, allocation_id=3, account_name="a")
         tracked_id = self.db.create_task(TaskCreate("tracked", "~/work", "run"))
         self.db.update_task(
             tracked_id,
@@ -7261,8 +7282,111 @@ class TransientStateRecoveryTests(unittest.TestCase):
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
         scheduler.recover_transient_states()
         self.assertEqual(self.db.get_job(job_id)["status"], JobStatus.QUEUED.value)
-        self.assertEqual(self.db.get_task(orphan_id)["status"], TaskStatus.QUEUED.value)
+        unlaunched = self.db.get_task(unlaunched_id)
+        self.assertEqual(unlaunched["status"], TaskStatus.QUEUED.value)
+        self.assertIsNone(unlaunched["allocation_id"])
+        self.assertEqual(unlaunched["attach_token"], "")
+        self.assertEqual(self.db.get_task(launched_id)["status"], TaskStatus.ATTACHING.value)
+        self.assertEqual(self.db.get_task(legacy_id)["status"], TaskStatus.ATTACHING.value)
         self.assertEqual(self.db.get_task(tracked_id)["status"], TaskStatus.ATTACHING.value)
+
+    def test_restart_after_remote_launch_does_not_requeue_or_launch_twice(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=8,
+            total_memory_mb=65536,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.WARM.value, slurm_job_id="alloc-1")
+        task_id = self.db.create_task(
+            TaskCreate("restart-race", "~/work", "run", scheduling_profile=SchedulingProfile.FEA_BURSTY.value)
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        allocation = self.db.get_allocation(allocation_id)
+        reserved = scheduler.reserve_task_on_allocation(self.db.get_task(task_id), allocation, self.accounts[0])
+        self.assertIsNotNone(reserved)
+        self.assertTrue(
+            self.db.update_task_if_attach_claim(
+                task_id,
+                reserved["attach_token"],
+                require_launch_not_started=True,
+                launch_started_at="CURRENT_TIMESTAMP",
+            )
+        )
+        # The remote nohup succeeded, but the process died before result paths
+        # and wrapper_pid were acknowledged back into SQLite.
+        FakeClient.attached_tasks = []
+        FakeClient(self.accounts[0]).attach_task(reserved, allocation)
+
+        restarted = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        restarted.recover_transient_states()
+        restarted.assign_queued_tasks()
+
+        after = self.db.get_task(task_id)
+        self.assertEqual(after["status"], TaskStatus.ATTACHING.value)
+        self.assertEqual(after["allocation_id"], allocation_id)
+        self.assertEqual(FakeClient.attached_tasks, [task_id])
+
+    def test_requeued_unlaunched_reservation_cannot_launch_from_stale_worker(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=8,
+            total_memory_mb=65536,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.WARM.value, slurm_job_id="alloc-1")
+        task_id = self.db.create_task(TaskCreate("reserved-only", "~/work", "run"))
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        allocation = self.db.get_allocation(allocation_id)
+        reserved = scheduler.reserve_task_on_allocation(self.db.get_task(task_id), allocation, self.accounts[0])
+        self.assertIsNotNone(reserved)
+
+        restarted = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        restarted.recover_transient_states()
+        FakeClient.attached_tasks = []
+        self.assertFalse(scheduler.finish_reserved_task_attach(reserved, allocation, self.accounts[0]))
+        self.assertEqual(FakeClient.attached_tasks, [])
+        self.assertEqual(self.db.get_task(task_id)["status"], TaskStatus.QUEUED.value)
+
+    def test_two_stale_schedulers_cannot_claim_the_same_queued_task(self) -> None:
+        allocation_ids = []
+        for index in range(2):
+            allocation_id = self.db.create_allocation(
+                account_name="a",
+                partition="cpu1",
+                node_name=f"n00{index + 1}",
+                total_cpus=8,
+                total_memory_mb=65536,
+            )
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.WARM.value,
+                slurm_job_id=f"alloc-{index + 1}",
+            )
+            allocation_ids.append(allocation_id)
+        task_id = self.db.create_task(TaskCreate("single-claim", "~/work", "run"))
+        stale_task = self.db.get_task(task_id)
+        first = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        second = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+
+        claimed = first.reserve_task_on_allocation(
+            stale_task,
+            self.db.get_allocation(allocation_ids[0]),
+            self.accounts[0],
+        )
+        rejected = second.reserve_task_on_allocation(
+            stale_task,
+            self.db.get_allocation(allocation_ids[1]),
+            self.accounts[0],
+        )
+
+        self.assertIsNotNone(claimed)
+        self.assertIsNone(rejected)
+        after = self.db.get_task(task_id)
+        self.assertEqual(after["allocation_id"], allocation_ids[0])
+        self.assertEqual(after["attach_token"], claimed["attach_token"])
 
 
 if __name__ == "__main__":

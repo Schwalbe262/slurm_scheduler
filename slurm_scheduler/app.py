@@ -681,6 +681,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "failure_message": task_failure_message(task) if derive_failure_message else (task.get("failure_message") or ""),
             "created_at": task.get("created_at"),
             "attached_at": task.get("attached_at"),
+            "launch_started_at": task.get("launch_started_at"),
             "started_at": task.get("started_at"),
             "finished_at": task.get("finished_at"),
             "assigned_allocation": task.get("allocation_id"),
