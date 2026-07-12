@@ -623,6 +623,8 @@ def build_allocation_script(allocation: dict, time_limit: str) -> str:
     gres = gpu_gres_value(str(allocation.get("gpu_model") or ""), int(allocation.get("total_gpus") or 0))
     if gres:
         lines.append(f"#SBATCH --gres={gres}")
+    if int(allocation.get("exclusive_node") or 0):
+        lines.append("#SBATCH --exclusive")
     lines.extend(
         [
             "",

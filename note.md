@@ -403,3 +403,11 @@ Remaining verification:
 - Added `/api/capabilities` so agents can inspect capability placement constraints before submitting tasks.
 - Added a dashboard `Capabilities` section showing capability, eligible accounts, matching env profiles, source, and account-level rule details.
 - Updated README and API docs with the new capability inspection endpoint.
+## 2026-07-12 19:53:04 KST
+
+- Part/goal: make scheduler `exclusive_node` a true physical Slurm-node guarantee without changing shared FEA behavior.
+- Hypothesis: missing allocation `--exclusive`, asymmetric warm-pool reuse, and cpu1 mixed-node selection allowed unintended sharing or pending placement.
+- Actions/options: added conditional allocation directive, exact task/allocation flag matching, and partition-independent idle-node filtering; retained normal `fea_bursty --overlap --cpu-bind=none` and shared mixed-node selection.
+- Metrics/result: focused regressions 6/6 and full `tests.test_core` 331/331 passed; no live task, deployment, commit, or service action performed.
+- Failure reason: system Python lacked dependencies; validation succeeded with the repository `.venv`.
+- Next action: parent review, commit, deploy, and live smoke are still required; token usage tooling was unavailable.

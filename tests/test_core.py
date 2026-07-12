@@ -512,6 +512,7 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("#SBATCH --ntasks=1", script)
         self.assertIn("#SBATCH --cpus-per-task=32", script)
         self.assertIn("#SBATCH --nodelist=n100", script)
+        self.assertNotIn("#SBATCH --exclusive", script)
         self.assertIn("while true; do sleep 60", script)
 
     def test_allocation_script_can_request_gpu_model(self) -> None:
@@ -743,7 +744,7 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn('kill -KILL -- "-$pid"', command)
         self.assertIn('pkill -KILL -P "$pid"', command)
 
-    def test_allocation_script_does_not_request_slurm_exclusive_for_scheduler_exclusive_pool(self) -> None:
+    def test_allocation_script_requests_slurm_exclusive_for_scheduler_exclusive_pool(self) -> None:
         allocation = {
             "total_cpus": 12,
             "total_memory_mb": 98304,
@@ -758,7 +759,7 @@ class SlurmParsingTests(unittest.TestCase):
         }
         script = build_allocation_script(allocation, "48:00:00")
         self.assertIn("#SBATCH --cpus-per-task=12", script)
-        self.assertNotIn("#SBATCH --exclusive", script)
+        self.assertIn("#SBATCH --exclusive", script)
 
     def test_remote_execution_path_promotes_relative_path_under_home(self) -> None:
         self.assertEqual(remote_execution_path("slurm_scheduler/task-1/task.sh"), "$HOME/slurm_scheduler/task-1/task.sh")
@@ -1417,6 +1418,48 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertIsNotNone(scheduler.best_allocation_for_task(self.db.get_task(task_id)))
         self.assertEqual(snapshot_calls, 1)
+
+    def test_task_and_allocation_exclusive_flags_must_match_exactly(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        task = {
+            "cpus": 1,
+            "memory_mb": 1024,
+            "gpus": 0,
+            "partition": "auto",
+            "node_name": "",
+        }
+        allocation = {
+            "id": 1,
+            "account_name": "a",
+            "partition": "cpu1",
+            "node_name": "n001",
+            "total_cpus": 8,
+            "free_cpus": 8,
+            "total_memory_mb": 65536,
+            "free_memory_mb": 65536,
+            "total_gpus": 0,
+            "free_gpus": 0,
+            "resource_pool": "cpu",
+        }
+
+        for include_pending in (False, True):
+            for task_exclusive in (False, True):
+                for allocation_exclusive in (False, True):
+                    candidate_task = {**task, "exclusive_node": task_exclusive}
+                    candidate_allocation = {**allocation, "exclusive_node": allocation_exclusive}
+                    with self.subTest(
+                        include_pending=include_pending,
+                        task_exclusive=task_exclusive,
+                        allocation_exclusive=allocation_exclusive,
+                    ):
+                        self.assertEqual(
+                            scheduler.allocation_matches_task_constraints(
+                                candidate_allocation,
+                                candidate_task,
+                                include_pending=include_pending,
+                            ),
+                            task_exclusive == allocation_exclusive,
+                        )
 
     def test_legacy_projects_table_migrates_max_active_tasks_default_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3054,6 +3097,34 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(len(allocations), 1)
         self.assertEqual(allocations[0]["partition"], "cpu1")
         self.assertEqual(allocations[0]["total_cpus"], 12)
+
+    def test_exclusive_cpu_shape_rejects_busy_cpu1_node(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "cpu1-busy cpu1 mix 4 96 1.0 768000 700000 busy_job\n"
+                "cpu1-idle cpu1 idle 0 48 0.0 768000 700000\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            allocation_partition="cpu1",
+        )
+
+        shape = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            exclusive_node=True,
+            requested_cpus=12,
+            requested_memory_mb=98304,
+            require_fea_eligible_node=True,
+        )
+
+        self.assertIsNotNone(shape)
+        self.assertEqual(shape["node_name"], "cpu1-idle")
 
     def test_pending_demand_allocation_closes_when_no_queued_task_needs_it(self) -> None:
         allocation_id = self.db.create_allocation(

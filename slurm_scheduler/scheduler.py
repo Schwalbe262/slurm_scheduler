@@ -4933,6 +4933,8 @@ class Scheduler:
         active_task_allocation_ids: set[int] | None = None,
         active_exclusive_allocation_ids: set[int] | None = None,
     ) -> bool:
+        if bool(int(allocation.get("exclusive_node") or 0)) != bool(int(task.get("exclusive_node") or 0)):
+            return False
         requested_accounts = self.requested_accounts(self.task_requested_account_name(task))
         if requested_accounts and allocation.get("account_name") not in requested_accounts:
             return False
@@ -6163,6 +6165,8 @@ class Scheduler:
                 continue
             if preferred_full_gpu_partition_set and node.partition not in preferred_full_gpu_partition_set:
                 continue
+            if exclusive_node and (node.state != "idle" or int(node.cpu_used) > 0):
+                continue
             if self.is_single_job_partition(node.partition):
                 if exclusive_node and not wants_gpu and self.partition_has_live_allocation(node.partition, resource_pool="cpu"):
                     continue
@@ -6173,8 +6177,6 @@ class Scheduler:
                     )
                     if node.hostname in occupied:
                         continue
-                if exclusive_node and int(node.cpu_used) > 0:
-                    continue
             inventory = inventory_by_node.get(node.hostname, {})
             node_gpu_count = int(inventory.get("gpu_count") or 0)
             node_gpu_used = int(inventory.get("gpu_used_count") or 0)

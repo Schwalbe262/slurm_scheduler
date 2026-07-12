@@ -302,3 +302,12 @@
 ## 2026-06-16 19:19:17 KST
 
 - Capability labels are scheduling constraints, so they need first-class observability. Showing capability -> account/profile/source mappings directly in the dashboard prevents users from mistaking idle CPU in an ineligible account for usable capacity.
+
+## 2026-07-12 19:53:04 KST
+
+- Source loop: true physical `exclusive_node` scheduler audit.
+- Improvement: enforce exclusivity at the Slurm allocation, warm-pool compatibility, and physical-node candidate layers together.
+- Before: the DB flag did not add `#SBATCH --exclusive`, opposite pool types could match, and cpu1 mixed nodes remained exclusive candidates.
+- After: exclusive allocations request Slurm exclusivity, both flag directions must match, and exclusive shapes accept only idle/unused nodes while shared FEA behavior is unchanged.
+- Evidence: focused 6/6 and full scheduler core 331/331 tests passed.
+- Remaining risk: deployment and a live Slurm allocation smoke are intentionally pending operator review.

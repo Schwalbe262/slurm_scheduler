@@ -116,6 +116,12 @@
 
 \## Risks and gotchas
 
+## 2026-07-12 exclusive allocation fix
+- `exclusive_node` allocation scripts now emit `#SBATCH --exclusive`.
+- Task/allocation exclusivity must match exactly; exclusive shapes reject mixed/busy nodes on every CPU partition.
+- Focused regressions passed 6/6; the full `tests.test_core` suite passed 331/331.
+- Changes are intentionally uncommitted, undeployed, and have not touched live tasks.
+
 
 
 \- <주의점>
