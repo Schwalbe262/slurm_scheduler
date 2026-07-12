@@ -7053,6 +7053,27 @@ class SchedulerTests(unittest.TestCase):
                 "n116 cpu2 mix 250 256 250.0 1024000 900000 others\n"
             )
         )
+        # Fill the allocation-owned 1x baseline first. Allocation-local CPU
+        # utilization is intentionally consulted only for overcommit workers.
+        for index in range(16):
+            task_id = self.db.create_task(
+                TaskCreate(
+                    f"baseline-before-local-util-{index}",
+                    "~/case",
+                    "run",
+                    cpus=4,
+                    memory_mb=4096,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                )
+            )
+            self.db.update_task(
+                task_id,
+                status=TaskStatus.RUNNING.value,
+                allocation_id=allocation_id,
+                account_name="a",
+                attached_at=days_ago(1),
+                started_at=days_ago(1),
+            )
         scheduler = Scheduler(
             self.db,
             self.accounts,
@@ -7070,9 +7091,9 @@ class SchedulerTests(unittest.TestCase):
             "total_cpus": 64.0,
             "at": time.monotonic(),
         }
-        # Budget = 0.85*64 - 10 = 44.4 cores -> 11 four-cpu slots, bounded by
-        # the per-node-per-tick attach cap (8).
-        self.assertEqual(scheduler.fea_dynamic_extra_slots(allocation, task), 8)
+        # Budget = 0.85*64 - 10 = 44.4 cores, but overcommit is hard-bounded
+        # to +2 workers per physical node and tick.
+        self.assertEqual(scheduler.fea_dynamic_extra_slots(allocation, task), 2)
         # Stale sample falls back to the node-wide calculation.
         scheduler._alloc_cpu_util[allocation_id]["at"] = time.monotonic() - 10_000
         self.assertLessEqual(scheduler.fea_dynamic_extra_slots(allocation, task), 1)
