@@ -120,7 +120,8 @@
 - `exclusive_node` allocation scripts now emit `#SBATCH --exclusive`.
 - Task/allocation exclusivity must match exactly; exclusive shapes reject mixed/busy nodes on every CPU partition.
 - Focused regressions passed 6/6; the full `tests.test_core` suite passed 331/331.
-- Changes are intentionally uncommitted, undeployed, and have not touched live tasks.
+- Commit `d0100a0` is live after a native-service restart; running FEA task 28739 stayed attached.
+- Physical-exclusive smoke task 28774 is queued because the latest cluster snapshot has no idle/unused CPU node.
 
 
 
