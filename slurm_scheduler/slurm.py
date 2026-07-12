@@ -709,7 +709,12 @@ def build_srun_attach_command(
     if task_attach_uses_overlap(task):
         srun_parts.append("--overlap")
     else:
-        srun_parts.append("--exclusive")
+        # A pooled allocation hosts many concurrent job steps. ``--exact``
+        # limits each step to its requested CPUs and ``--exclusive`` prevents
+        # another step from receiving that same CPU set. FEA tasks must use
+        # this path: ``--overlap`` pinned every 4-CPU Icepak step to CPUs 0-3,
+        # making all workers on an allocation contend for the same four cores.
+        srun_parts.extend(["--exact", "--exclusive"])
     srun_parts.extend(["bash", shell_expandable_path(script_path)])
     srun_command = " ".join(srun_parts)
     return (
@@ -724,8 +729,7 @@ def task_attach_uses_overlap(task: dict) -> bool:
         and int(task.get("gpus") or 0) == 0
         and int(task.get("cpus") or 0) <= 4
     )
-    fea_bursty_task = normalize_scheduling_profile(str(task.get("scheduling_profile") or "")) == SchedulingProfile.FEA_BURSTY.value
-    return fea_bursty_task or same_node_cpu_client or task_is_vllm_service(task)
+    return same_node_cpu_client or task_is_vllm_service(task)
 
 
 def task_is_vllm_service(task: dict) -> bool:
