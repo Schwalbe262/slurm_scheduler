@@ -410,4 +410,4 @@ Remaining verification:
 - Actions/options: added conditional allocation directive, exact task/allocation flag matching, and partition-independent idle-node filtering; retained normal `fea_bursty --overlap --cpu-bind=none` and shared mixed-node selection.
 - Metrics/result: focused regressions 6/6 and full `tests.test_core` 331/331 passed; commit `d0100a0` is live after restart and running FEA task 28739 remained attached.
 - Failure reason: system Python lacked dependencies; validation succeeded with the repository `.venv`.
-- Next action: smoke task 28774 must reach an actually idle node and prove `OverSubscribe=EXCLUSIVE`; token usage tooling was unavailable.
+- Next action: after IPMSM Stage2 releases its 100-task cap, submit a fresh project-scoped smoke and prove `OverSubscribe=EXCLUSIVE`; 28774/28808 were cancelled before execution.

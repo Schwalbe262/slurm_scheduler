@@ -121,7 +121,8 @@
 - Task/allocation exclusivity must match exactly; exclusive shapes reject mixed/busy nodes on every CPU partition.
 - Focused regressions passed 6/6; the full `tests.test_core` suite passed 331/331.
 - Commit `d0100a0` is live after a native-service restart; running FEA task 28739 stayed attached.
-- Physical-exclusive smoke task 28774 is queued because the latest cluster snapshot has no idle/unused CPU node.
+- Unscoped smoke 28774 was cancelled and project-scoped 28808 correctly waited for an idle node; 28808 was then cancelled before execution to release the 100-task cap to IPMSM Stage2.
+- Physical-exclusive runtime proof remains pending until the Stage2 campaign releases capacity.
 
 
 

@@ -310,4 +310,4 @@
 - Before: the DB flag did not add `#SBATCH --exclusive`, opposite pool types could match, and cpu1 mixed nodes remained exclusive candidates.
 - After: exclusive allocations request Slurm exclusivity, both flag directions must match, and exclusive shapes accept only idle/unused nodes while shared FEA behavior is unchanged.
 - Evidence: focused 6/6 and full scheduler core 331/331 tests passed.
-- Remaining risk: live smoke 28774 is queued until a fully idle CPU node exists, so Slurm runtime evidence remains pending.
+- Remaining risk: 28774/28808 were cancelled before execution so IPMSM Stage2 could own all 100 project slots; Slurm runtime evidence remains pending.
