@@ -9,7 +9,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from slurm_scheduler.aedt_attach_client import AedtProjectLease
+from slurm_scheduler.aedt_attach_client import (
+    AedtProjectLease,
+    acquire_project_lease,
+)
 from slurm_scheduler.aedt_pool import AedtPoolRuntime, AedtPoolService
 from slurm_scheduler.aedt_pool_api import create_aedt_pool_router
 from slurm_scheduler.aedt_session_host import AedtSessionHost
@@ -87,12 +90,20 @@ class AedtPoolTestCase(unittest.TestCase):
         self.service.set_adapter_ready(True)
         self.service.set_enabled(True)
 
-    def request(self, key: str, *, allocation_id: int = 0, node: str = ""):
+    def request(
+        self,
+        key: str,
+        *,
+        allocation_id: int = 0,
+        node: str = "",
+        exclusive_session: bool = False,
+    ):
         return self.service.request_lease(
             request_key=key,
             project_name=f"project-{key}",
             allocation_id=allocation_id,
             node_name=node,
+            exclusive_session=exclusive_session,
         )
 
     def start_one_session(self, allocation_id: int, node: str = "cpu-01"):
@@ -229,6 +240,46 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         )
         self.assertEqual(self.service.get_session(int(session["id"]))["slots_total"], 2)
         self.service.heartbeat_session(int(session["id"]), host_token)
+
+    def test_exclusive_1to1_lease_never_accepts_a_sibling(self) -> None:
+        self.service.set_operator_limit(1)
+        exclusive, _ = self.request(
+            "exclusive",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+            exclusive_session=True,
+        )
+        session, _host_token = self.start_one_session(self.allocation_id)
+        current = self.service.get_lease(int(exclusive["id"]))
+        self.assertEqual(current["session_id"], session["id"])
+        self.assertEqual(current["exclusive_session"], 1)
+
+        sibling, _ = self.request(
+            "sibling-blocked",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        self.assertEqual(
+            self.service.get_lease(int(sibling["id"]))["state"], "queued"
+        )
+        with self.db.connect() as conn:
+            live_on_session = conn.execute(
+                """
+                SELECT COUNT(*) FROM aedt_project_leases
+                WHERE session_id = ?
+                  AND state IN ('leased','active','releasing')
+                """,
+                (int(session["id"]),),
+            ).fetchone()[0]
+        self.assertEqual(live_on_session, 1)
+
+    def test_exclusive_demand_counts_one_session_per_project(self) -> None:
+        self.service.set_operator_limit(2)
+        self.request("exclusive-a", exclusive_session=True)
+        self.request("exclusive-b", exclusive_session=True)
+        plan = self.service.dry_run()
+        self.assertEqual(plan["exclusive_projects"], 2)
+        self.assertEqual(plan["desired_sessions"], 2)
 
     def test_release_is_two_phase_and_slot_is_not_reused_early(self) -> None:
         self.service.set_operator_limit(1)
@@ -446,6 +497,35 @@ class AttachClientTests(unittest.TestCase):
         self.assertEqual(result["state"], "leased")
         self.assertEqual(http.calls, 3)
         lease.stop_heartbeat()
+
+    def test_mft_pilot_can_request_an_exclusive_session(self) -> None:
+        calls = []
+
+        class Http:
+            def request(self, method, path, payload=None, **_kwargs):
+                calls.append((method, path, payload))
+                return {
+                    "lease": {
+                        "id": 7,
+                        "state": "queued",
+                        "endpoint": "",
+                        "exclusive_session": 1,
+                    },
+                    "client_token": "token",
+                }
+
+        with patch(
+            "slurm_scheduler.aedt_attach_client.AedtPoolHttpClient",
+            return_value=Http(),
+        ):
+            lease = acquire_project_lease(
+                "http://scheduler",
+                "mft-pilot",
+                request_key="pilot-1to1",
+                exclusive_session=True,
+            )
+        self.assertTrue(lease.exclusive_session)
+        self.assertTrue(calls[0][2]["exclusive_session"])
 
 
 class PilotPriorityApiTests(unittest.TestCase):

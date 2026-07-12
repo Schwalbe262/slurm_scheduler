@@ -95,6 +95,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
                 task_id=int(payload.get("task_id") or 0),
                 allocation_id=int(payload.get("allocation_id") or 0),
                 node_name=str(payload.get("node_name") or ""),
+                exclusive_session=payload.get("exclusive_session", False),
             )
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc

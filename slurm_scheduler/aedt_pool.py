@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS aedt_project_leases (
     task_id INTEGER NOT NULL DEFAULT 0,
     requested_allocation_id INTEGER NOT NULL DEFAULT 0,
     requested_node_name TEXT NOT NULL DEFAULT '',
+    exclusive_session INTEGER NOT NULL DEFAULT 0,
     session_id INTEGER,
     slot_index INTEGER,
     state TEXT NOT NULL DEFAULT 'queued',
@@ -208,6 +209,17 @@ class AedtPoolService:
             }.items():
                 if name not in session_columns:
                     conn.execute(f"ALTER TABLE aedt_sessions ADD COLUMN {name} {ddl}")
+            lease_columns = {
+                str(row["name"])
+                for row in conn.execute(
+                    "PRAGMA table_info(aedt_project_leases)"
+                ).fetchall()
+            }
+            if "exclusive_session" not in lease_columns:
+                conn.execute(
+                    "ALTER TABLE aedt_project_leases ADD COLUMN "
+                    "exclusive_session INTEGER NOT NULL DEFAULT 0"
+                )
             validation_columns = {
                 str(row["name"])
                 for row in conn.execute("PRAGMA table_info(aedt_pool_validations)").fetchall()
@@ -431,6 +443,7 @@ class AedtPoolService:
         task_id: int = 0,
         allocation_id: int = 0,
         node_name: str = "",
+        exclusive_session: bool = False,
     ) -> tuple[dict[str, Any], str]:
         request_key = request_key.strip()
         project_name = project_name.strip()
@@ -438,6 +451,8 @@ class AedtPoolService:
             raise ValueError("request_key is required")
         if not project_name:
             raise ValueError("project_name is required")
+        if type(exclusive_session) is not bool:
+            raise ValueError("exclusive_session must be a boolean")
         token = secrets.token_urlsafe(32)
         config = self.config()
         expires = _sql_time(self._now() + timedelta(seconds=config.lease_ttl_seconds))
@@ -448,8 +463,8 @@ class AedtPoolService:
                     INSERT INTO aedt_project_leases (
                         request_key, project_name, task_id,
                         requested_allocation_id, requested_node_name,
-                        state, client_token_hash, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+                        exclusive_session, state, client_token_hash, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)
                     """,
                     (
                         request_key,
@@ -457,6 +472,7 @@ class AedtPoolService:
                         max(0, int(task_id)),
                         max(0, int(allocation_id)),
                         node_name.strip(),
+                        int(exclusive_session),
                         _token_hash(token),
                         expires,
                     ),
@@ -1045,9 +1061,23 @@ class AedtPoolService:
         hard_count = sum(state_counts.get(state, 0) for state in SESSION_COUNTED_STATES)
         live_projects = sum(lease_counts.get(state, 0) for state in LEASE_LIVE_STATES)
         desired_projects = min(config.target_projects, live_projects)
+        exclusive_projects = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM aedt_project_leases
+                WHERE exclusive_session = 1
+                  AND state IN ('queued','leased','active','releasing')
+                """
+            ).fetchone()[0]
+        )
+        desired_exclusive = min(exclusive_projects, desired_projects)
+        desired_shared = max(0, desired_projects - desired_exclusive)
         desired_sessions = min(
             config.max_sessions,
-            math.ceil(desired_projects / config.projects_per_session) if desired_projects else 0,
+            desired_exclusive + (
+                math.ceil(desired_shared / config.projects_per_session)
+                if desired_shared else 0
+            ),
         )
         start_needed = max(0, desired_sessions - hard_count)
         cap_excess = max(0, hard_count - config.max_sessions)
@@ -1133,6 +1163,7 @@ class AedtPoolService:
             "state_counts": state_counts,
             "lease_counts": lease_counts,
             "live_projects": live_projects,
+            "exclusive_projects": exclusive_projects,
         }
 
     def dry_run(self) -> dict[str, Any]:
@@ -1248,7 +1279,11 @@ class AedtPoolService:
                         SELECT s.*,
                                (SELECT COUNT(*) FROM aedt_project_leases l
                                 WHERE l.session_id = s.id
-                                  AND l.state IN ('leased','active','releasing')) AS used_slots
+                                  AND l.state IN ('leased','active','releasing')) AS used_slots,
+                               (SELECT COUNT(*) FROM aedt_project_leases l
+                                WHERE l.session_id = s.id
+                                  AND l.state IN ('leased','active','releasing')
+                                  AND l.exclusive_session = 1) AS exclusive_slots
                         FROM aedt_sessions s
                         WHERE s.state IN ('ready','busy')
                           AND (? = 0 OR s.allocation_id = ?)
@@ -1263,7 +1298,15 @@ class AedtPoolService:
                         ),
                     ).fetchall()
                     selected = next(
-                        (row for row in sessions if int(row["used_slots"] or 0) < int(row["slots_total"])),
+                        (
+                            row for row in sessions
+                            if int(row["used_slots"] or 0) < int(row["slots_total"])
+                            and int(row["exclusive_slots"] or 0) == 0
+                            and (
+                                not bool(lease["exclusive_session"])
+                                or int(row["used_slots"] or 0) == 0
+                            )
+                        ),
                         None,
                     )
                     if not selected:
