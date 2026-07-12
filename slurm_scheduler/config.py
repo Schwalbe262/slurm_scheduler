@@ -53,6 +53,12 @@ class AppConfig:
     web_timeout_keep_alive_seconds: int = 5
     web_timeout_graceful_shutdown_seconds: int = 15
     web_limit_concurrency: int = 64
+    web_listener_watchdog_enabled: bool = True
+    web_listener_probe_interval_seconds: int = 5
+    web_listener_startup_grace_seconds: int = 30
+    web_listener_failure_threshold: int = 3
+    web_listener_probe_timeout_seconds: int = 2
+    web_listener_restart_delay_seconds: int = 5
     ssh_command_timeout_seconds: int = 30
     ssh_slow_command_timeout_seconds: int = 300
     scheduler_watchdog_enabled: bool = True
@@ -107,6 +113,16 @@ class AppConfig:
     fea_cpu_footprint_maturity_seconds: int = 120
     fea_shared_memory_estimate_fraction: float = 0.25
     fea_shared_memory_min_estimate_mb: int = 8192
+    # Experimental pooled AEDT backend.  The operator-facing limit lives in
+    # scheduler_settings; these fields configure the separately deployed
+    # node-side session-host adapter.  Disabled is the production default.
+    aedt_pool_session_host_enabled: bool = False
+    aedt_pool_scheduler_url: str = ""
+    aedt_pool_host_remote_cwd: str = ""
+    aedt_pool_host_python: str = "python"
+    aedt_pool_host_env_setup: str = ""
+    aedt_pool_host_bootstrap_token_file: str = ""
+    aedt_pool_host_task_memory_mb: int = 4096
     cleanup_enabled: bool = True
     cleanup_interval_seconds: int = 3600
     cleanup_finished_task_ttl_seconds: int = 259200
@@ -196,6 +212,20 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
         for source, target in mapping.items():
             if source in fea_bursty:
                 data[target] = fea_bursty[source]
+    aedt_pool = data.pop("aedt_pool", None)
+    if isinstance(aedt_pool, dict):
+        mapping = {
+            "session_host_enabled": "aedt_pool_session_host_enabled",
+            "scheduler_url": "aedt_pool_scheduler_url",
+            "host_remote_cwd": "aedt_pool_host_remote_cwd",
+            "host_python": "aedt_pool_host_python",
+            "host_env_setup": "aedt_pool_host_env_setup",
+            "host_bootstrap_token_file": "aedt_pool_host_bootstrap_token_file",
+            "host_task_memory_mb": "aedt_pool_host_task_memory_mb",
+        }
+        for source, target in mapping.items():
+            if source in aedt_pool:
+                data[target] = aedt_pool[source]
     license_monitor = data.pop("license_monitor", None)
     if isinstance(license_monitor, dict):
         for source, target in {

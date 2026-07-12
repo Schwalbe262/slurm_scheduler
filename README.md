@@ -1,5 +1,9 @@
 # Slurm Scheduler
 
+Experimental features: [AEDT session pool architecture](docs/aedt_pool.md) and
+[pilot/rollback runbook](docs/aedt_pool_runbook.md). The pooled backend is disabled until its
+live 1-AEDT:2-project validation gate passes; standalone scheduling remains the default.
+
 Slurm job을 매번 새로 제출하지 않고, 미리 띄워 둔 warm allocation에 작업을 `srun --jobid`로 붙여 실행하는 웹 기반 스케줄러입니다. CPU FEA/RL 배치, 기존 원격 디렉터리 실행, Git 기반 작업, GPU/LLM 작업을 하나의 Web UI와 HTTP API로 다룹니다.
 
 이 README는 사람이 먼저 전체 기능을 이해하도록 정리한 문서입니다. 상세 API, 설정, 장애 대응은 `docs/` 아래 문서에 분리되어 있습니다.

@@ -331,6 +331,29 @@ class Database:
                 (key, value),
             )
 
+    def allocation_has_aedt_pool_claim(self, allocation_id: int) -> bool:
+        """Fail-safe ownership check for the opt-in AEDT session pool.
+
+        The table is installed by the optional pool service, so legacy/test
+        databases without it simply have no external claim.
+        """
+        with self.connect() as conn:
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'aedt_sessions'"
+            ).fetchone()
+            if not table:
+                return False
+            row = conn.execute(
+                """
+                SELECT 1 FROM aedt_sessions
+                WHERE allocation_id = ?
+                  AND state IN ('starting','ready','busy','draining','unhealthy')
+                LIMIT 1
+                """,
+                (int(allocation_id),),
+            ).fetchone()
+            return bool(row)
+
     def record_event(
         self,
         kind: str,
@@ -655,6 +678,28 @@ class Database:
             rows = conn.execute(
                 f"SELECT * FROM tasks WHERE status IN ({placeholders}){name_filter} ORDER BY id DESC LIMIT ? OFFSET ?",
                 (*statuses, *name_params, limit, max(0, int(offset))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_live_task_claims_for_allocation(self, allocation_id: int) -> list[dict[str, Any]]:
+        """Return every task claim that still owns an allocation.
+
+        This query is intentionally scoped by allocation and has no global
+        LIMIT.  Allocation shutdown is a safety boundary: a busy cluster with
+        more than the normal task-list limit must not hide an older live claim
+        and make its parent Slurm allocation look idle.
+        """
+        active_statuses = (TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value)
+        placeholders = ",".join("?" for _ in active_statuses)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM tasks
+                WHERE allocation_id = ?
+                  AND status IN ({placeholders})
+                ORDER BY id ASC
+                """,
+                (int(allocation_id), *active_statuses),
             ).fetchall()
             return [dict(row) for row in rows]
 

@@ -1354,6 +1354,39 @@ class SlurmAccountClient:
         if result.exit_code != 0:
             raise RuntimeError(result.stderr.strip() or "scancel failed")
 
+    def live_allocation_task_steps(self, slurm_job_id: str) -> list[str]:
+        """Return live numeric srun steps below one allocation job.
+
+        ``squeue --steps`` also reports the allocation's ``.batch`` step.
+        Scheduler-owned task launches are the numeric ``<job>.<step>`` rows,
+        so those are the rows that must block parent ``scancel``.  A probe
+        failure raises: allocation shutdown is fail-closed when Slurm cannot
+        confirm that no task step remains.
+        """
+        job_id = str(slurm_job_id or "").strip()
+        if not job_id:
+            return []
+        with self._open_session() as ssh:
+            result = ssh.run(
+                f"squeue --steps -h -j {shlex.quote(job_id)} -o '%i'",
+                timeout=15,
+            )
+        if result.exit_code != 0:
+            raise RuntimeError(
+                result.stderr.strip()
+                or result.stdout.strip()
+                or "failed to inspect allocation task steps"
+            )
+        prefix = f"{job_id}."
+        return sorted(
+            {
+                line.strip()
+                for line in result.stdout.splitlines()
+                if line.strip().startswith(prefix)
+                and line.strip()[len(prefix) :].isdigit()
+            }
+        )
+
     def cancel_task(self, task: dict, allocation_job_id: str = "") -> None:
         wrapper_pid = str(task.get("wrapper_pid") or "").strip()
         task_id = str(task.get("id") or "").strip()

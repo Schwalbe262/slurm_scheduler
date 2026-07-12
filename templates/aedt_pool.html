@@ -1,0 +1,168 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="stack">
+  <div class="title-row">
+    <div>
+      <h1>AEDT Session Pool</h1>
+      <div class="muted">Experimental · standalone backend remains the production default</div>
+    </div>
+    <a class="button secondary" href="/">Dashboard</a>
+  </div>
+
+  <section class="panel">
+    <h2>Operator limit</h2>
+    <p class="muted">
+      This page controls only the hard ceiling for open AEDT processes. Starting, ready,
+      busy, draining, and unhealthy sessions all consume the ceiling. Project capacity is
+      derived from the validated two-projects-per-AEDT policy.
+    </p>
+    <form id="limit-form" class="form-grid">
+      <div>
+        <label for="max-aedt-sessions">Maximum open AEDT sessions</label>
+        <input id="max-aedt-sessions" name="max_aedt_sessions" type="number" min="0" max="550" step="1" required>
+      </div>
+      <div>
+        <label for="target-projects">Derived project concurrency</label>
+        <input id="target-projects" type="number" readonly>
+      </div>
+      <div class="full actions">
+        <button type="submit">Save ceiling</button>
+        <span id="save-result" class="muted" role="status"></span>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <h2>Activation gates</h2>
+    <div id="gates" class="summary-row"></div>
+    <p id="gate-message" class="muted"></p>
+  </section>
+
+  <section class="panel">
+    <h2>Live capacity</h2>
+    <div id="capacity" class="summary-row"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Sessions</h2>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>ID</th><th>State</th><th>Node</th><th>Allocation</th><th>Slots</th><th>Heartbeat</th><th>Failure / quarantine</th></tr></thead>
+        <tbody id="session-rows"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<script>
+  const initialSummary = {{ summary | tojson }};
+
+  function escapeText(value) {
+    return String(value ?? "");
+  }
+
+  function summaryItem(label, value) {
+    const item = document.createElement("div");
+    item.className = "summary-item";
+    const name = document.createElement("span");
+    name.className = "summary-label";
+    name.textContent = label;
+    const val = document.createElement("span");
+    val.className = "summary-value";
+    val.textContent = escapeText(value);
+    item.append(name, val);
+    return item;
+  }
+
+  function render(summary) {
+    const config = summary.config || {};
+    const plan = summary.plan || {};
+    document.getElementById("max-aedt-sessions").value = config.max_aedt_sessions ?? 0;
+    document.getElementById("target-projects").value = config.target_project_concurrency ?? 0;
+
+    const gates = document.getElementById("gates");
+    gates.replaceChildren(
+      summaryItem("Feature flag", config.enabled ? "enabled" : "disabled"),
+      summaryItem("Host adapter", config.adapter_ready ? "ready" : "not ready"),
+      summaryItem("1:2 A/B", config.validation_passed ? "passed" : "not passed"),
+      summaryItem("Operational", config.operational ? "yes" : "no")
+    );
+    document.getElementById("gate-message").textContent = config.operational
+      ? "The opt-in pooled backend may reconcile demand."
+      : "No Slurm node or AEDT process is opened by this pool until every gate passes.";
+
+    const capacity = document.getElementById("capacity");
+    capacity.replaceChildren(
+      summaryItem("Hard-counted AEDT", plan.hard_session_count ?? 0),
+      summaryItem("Desired AEDT", plan.desired_sessions ?? 0),
+      summaryItem("Live projects", plan.live_projects ?? 0),
+      summaryItem("Need start", plan.start_needed ?? 0),
+      summaryItem("Need drain", plan.drain_needed ?? 0),
+      summaryItem("Need nodes", plan.node_requests ?? 0)
+    );
+
+    const body = document.getElementById("session-rows");
+    body.replaceChildren();
+    const sessions = summary.sessions || [];
+    if (!sessions.length) {
+      const row = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.colSpan = 7;
+      cell.className = "muted";
+      cell.textContent = "No AEDT pool sessions.";
+      row.append(cell);
+      body.append(row);
+      return;
+    }
+    for (const session of sessions) {
+      const row = document.createElement("tr");
+      const values = [
+        session.id,
+        session.state,
+        session.node_name || "-",
+        session.allocation_id || "-",
+        session.slots_total,
+        session.last_heartbeat_at || "-",
+        session.quarantine_reason || session.failure_message || "-"
+      ];
+      for (const value of values) {
+        const cell = document.createElement("td");
+        cell.textContent = escapeText(value);
+        row.append(cell);
+      }
+      body.append(row);
+    }
+  }
+
+  async function refresh() {
+    const response = await fetch("/api/aedt-pool");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    render(await response.json());
+  }
+
+  document.getElementById("limit-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const result = document.getElementById("save-result");
+    result.className = "muted";
+    result.textContent = "Saving…";
+    const max = Number(document.getElementById("max-aedt-sessions").value);
+    try {
+      const response = await fetch("/api/aedt-pool/config", {
+        method: "PATCH",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({max_aedt_sessions: max})
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+      result.textContent = `Saved ${payload.max_aedt_sessions} AEDT / ${payload.target_project_concurrency} projects`;
+      await refresh();
+    } catch (error) {
+      result.className = "error";
+      result.textContent = error.message;
+    }
+  });
+
+  render(initialSummary);
+  setInterval(() => refresh().catch(() => {}), 10000);
+</script>
+{% endblock %}
