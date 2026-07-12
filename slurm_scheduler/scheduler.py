@@ -1327,6 +1327,53 @@ class Scheduler:
             }
         return out
 
+    def node_fill_diagnosis(self, node_name: str, task: dict) -> dict:
+        """Everything the node detail page needs to explain why FEA is or is
+        not filling this node further, for a representative task shape."""
+        live_states = {
+            AllocationStatus.PENDING.value,
+            AllocationStatus.WARM.value,
+            AllocationStatus.ACTIVE.value,
+            AllocationStatus.DRAINING.value,
+        }
+        allocations = [
+            allocation
+            for allocation in self.db.list_allocations(limit=500)
+            if str(allocation.get("node_name") or "") == node_name and allocation["state"] in live_states
+        ]
+        utils = self.allocation_utilizations()
+        per_allocation = []
+        for allocation in allocations:
+            trace: dict = {}
+            slots = self.fea_dynamic_extra_slots(allocation, task, trace=trace)
+            cap_remaining = self.fea_node_cpu_cap_remaining(allocation, task)
+            if cap_remaining is not None and cap_remaining < slots:
+                trace["blocked_by"] = trace.get("blocked_by") or "node CPU cap (total requested FEA CPUs)"
+            per_allocation.append(
+                {
+                    "allocation": allocation,
+                    "fit_slots": min(slots, cap_remaining) if cap_remaining is not None else slots,
+                    "raw_slots": slots,
+                    "node_cpu_cap_remaining": cap_remaining,
+                    "utilization": utils.get(int(allocation["id"])),
+                    "trace": trace,
+                }
+            )
+        pressure = self.fea_owned_node_pressures().get(node_name, {})
+        return {
+            "node_name": node_name,
+            "task_shape": {key: task.get(key) for key in ("cpus", "memory_mb", "scheduling_profile")},
+            "allocations": per_allocation,
+            "footprint": self.fea_immature_footprint(node_name),
+            "footprint_maturity_seconds": self.fea_footprint_maturity_seconds,
+            "node_requested_fea_cpus": int(pressure.get("requested_cpus") or 0),
+            "node_cpu_total": self._node_cpu_total(node_name),
+            "node_cpu_cap_factor": self.fea_node_requested_cpu_factor,
+            "alloc_util_target": self.fea_alloc_util_target,
+            "soft_memory_free_percent": self.fea_soft_memory_free_percent,
+            "hard_memory_free_percent": self.fea_hard_memory_free_percent,
+        }
+
     def refresh_allocation_utilization_if_due(self) -> None:
         """Sample each pool job's per-step CPU time via gate-side sstat and
         difference consecutive samples into an allocation-local utilization.
@@ -4063,19 +4110,42 @@ class Scheduler:
             entry["memory_mb"] += float(task.get("memory_mb") or 0)
         return out
 
-    def fea_dynamic_extra_slots(self, allocation: dict, task: dict) -> int:
+    def fea_dynamic_extra_slots(self, allocation: dict, task: dict, trace: dict | None = None) -> int:
+        """FEA attach budget for one allocation. When `trace` is supplied it is
+        filled with every intermediate so the node detail page can explain why
+        the number is what it is — keep the trace writes in lockstep with the
+        actual computation."""
+        record = trace.update if trace is not None else (lambda _values: None)
         if allocation.get("state") == AllocationStatus.PENDING.value:
+            record({"blocked_by": "", "note": "pending allocation: counts as future capacity"})
             return self.fea_max_attach_per_loop
         node_name = str(allocation.get("node_name") or "").strip()
         node_tick_attaches = self._tick_attach_workers_by_node.get(node_name, 0) if node_name else 0
+        record({"tick_attaches": node_tick_attaches, "tick_attach_cap": self.fea_max_attach_per_node_per_loop})
         if node_tick_attaches >= self.fea_max_attach_per_node_per_loop:
+            record({"blocked_by": "per-tick node attach cap already spent this tick"})
             return 0
         node = self.pestat_node_for_allocation(allocation)
         if not node:
             # Stale pestat: conservative single slot when the node was healthy
             # at the last observation, instead of freezing attach entirely.
-            return 1 if self.fea_allocation_accepts_task(allocation) else 0
+            accepted = self.fea_allocation_accepts_task(allocation)
+            record(
+                {
+                    "blocked_by": "" if accepted else "pestat stale and last snapshot unhealthy",
+                    "note": "pestat stale: conservative single slot" if accepted else "",
+                }
+            )
+            return 1 if accepted else 0
         if not self.fea_allocation_accepts_task(allocation):
+            record(
+                {
+                    "blocked_by": "allocation not accepting FEA tasks",
+                    "memory_pressure_state": self.fea_memory_pressure_state(allocation),
+                    "node_load_ok": self.fea_node_load_ok(allocation),
+                    "sustained_overload": self.fea_allocation_sustained_overloaded(allocation),
+                }
+            )
             return 0
         # Discount workers still growing into their declared footprint: FEA
         # consumes CPU/RAM late (mesh refinement), so observed free capacity
@@ -4086,6 +4156,16 @@ class Scheduler:
         soft_floor = int(memory_total * (self.fea_soft_memory_free_percent / 100.0))
         memory_budget = max(0, memory_free - soft_floor)
         memory_slots = memory_budget // max(1, int(task.get("memory_mb") or 1))
+        record(
+            {
+                "footprint_young_cpus": round(float(footprint.get("cpus") or 0.0), 1),
+                "footprint_young_memory_mb": int(footprint.get("memory_mb") or 0),
+                "memory_free_mb": int(node.get("free_memory_mb") or 0),
+                "memory_soft_floor_mb": soft_floor,
+                "memory_budget_mb": memory_budget,
+                "memory_slots": int(memory_slots),
+            }
+        )
 
         util_info = self._alloc_cpu_util.get(int(allocation.get("id") or 0))
         util_fresh = bool(
@@ -4100,13 +4180,29 @@ class Scheduler:
             alloc_cpus = max(1, int(allocation.get("total_cpus") or 1))
             busy_cores = float(util_info["busy_cores"]) + float(footprint.get("cpus") or 0.0)
             load_budget = max(0.0, (alloc_cpus * self.fea_alloc_util_target) - busy_cores)
+            record(
+                {
+                    "cpu_mode": "allocation-local (sstat)",
+                    "measured_busy_cores": round(float(util_info["busy_cores"]), 2),
+                    "cpu_target_cores": round(alloc_cpus * self.fea_alloc_util_target, 1),
+                    "cpu_budget_cores": round(load_budget, 1),
+                }
+            )
         else:
             cpu_total = max(1, int(node.get("cpu_total") or 1))
             cpu_load = max(0.0, float(node.get("cpu_load") or 0.0)) + float(footprint.get("cpus") or 0.0)
             load_budget = max(0.0, (cpu_total * self.fea_load_target) - cpu_load)
+            record(
+                {
+                    "cpu_mode": "node loadavg fallback (no fresh sstat sample)",
+                    "node_load": round(float(node.get("cpu_load") or 0.0), 2),
+                    "cpu_target_cores": round(cpu_total * self.fea_load_target, 1),
+                    "cpu_budget_cores": round(load_budget, 1),
+                }
+            )
         cpu_slots = int(load_budget // max(1, int(task.get("cpus") or 1)))
 
-        return max(
+        slots = max(
             0,
             min(
                 memory_slots,
@@ -4115,6 +4211,13 @@ class Scheduler:
                 self.fea_max_attach_per_node_per_loop - node_tick_attaches,
             ),
         )
+        limiter = "memory budget" if memory_slots <= cpu_slots else "cpu budget"
+        if slots == self.fea_max_attach_per_loop:
+            limiter = "per-loop attach cap"
+        elif slots == self.fea_max_attach_per_node_per_loop - node_tick_attaches and slots < min(memory_slots, cpu_slots):
+            limiter = "per-tick node attach cap"
+        record({"cpu_slots": int(cpu_slots), "slots": int(slots), "limiter": limiter if slots >= 0 else ""})
+        return slots
 
     def fea_effective_worker_limit(
         self,

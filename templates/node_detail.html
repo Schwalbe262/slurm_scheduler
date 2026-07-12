@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="stack">
+<section class="panel">
+  <div class="title-row">
+    <h1>Node {{ node_name }}</h1>
+    <a class="button secondary" href="/">Back to dashboard</a>
+  </div>
+  <div class="summary-row" aria-label="Node facts">
+    <div class="summary-item">
+      <span class="summary-label">Partition</span>
+      <span class="summary-value">{{ (inventory.partition if inventory else pestat.partition if pestat else "?") }}</span>
+    </div>
+    <div class="summary-item">
+      <span class="summary-label">Cores</span>
+      <span class="summary-value">{{ inventory.cpus if inventory else (pestat.cpu_total if pestat else "?") }}</span>
+    </div>
+    <div class="summary-item">
+      <span class="summary-label">Memory</span>
+      <span class="summary-value">{{ ((inventory.memory_mb if inventory else pestat.memory_mb) / 1024) | round | int }} GB</span>
+    </div>
+    {% if pestat %}
+    <div class="summary-item">
+      <span class="summary-label">Load (raw / capped)</span>
+      <span class="summary-value">{{ pestat.cpu_load }} / {{ ((([pestat.cpu_load, pestat.cpu_total] | min) / pestat.cpu_total * 100) if pestat.cpu_total else 0) | round(1) }}%</span>
+    </div>
+    <div class="summary-item">
+      <span class="summary-label">Free memory</span>
+      <span class="summary-value">{{ (pestat.free_memory_mb / 1024) | round | int }} GB ({{ (pestat.free_memory_mb / pestat.memory_mb * 100) | round(1) if pestat.memory_mb else 0 }}%)</span>
+    </div>
+    <div class="summary-item">
+      <span class="summary-label">pestat state / observed</span>
+      <span class="summary-value">{{ pestat.state }} <span class="muted">{{ pestat.observed_at }}</span></span>
+    </div>
+    {% endif %}
+  </div>
+</section>
+
+<section class="panel">
+  <h2>FEA Fill Diagnosis</h2>
+  <p class="muted">
+    Representative task shape: {{ diagnosis.task_shape.cpus }} CPU / {{ diagnosis.task_shape.memory_mb }} MB
+    ({{ "oldest queued FEA task" if shape_from_queue else "default shape; queue is empty" }}).
+    Policy: keep allocation utilization at {{ (diagnosis.alloc_util_target * 100) | round | int }}%,
+    stop attaching below {{ diagnosis.soft_memory_free_percent }}% node free memory
+    (reclaim below {{ diagnosis.hard_memory_free_percent }}%),
+    node-wide FEA CPU cap {{ diagnosis.node_cpu_total }} × {{ diagnosis.node_cpu_cap_factor }} =
+    {{ (diagnosis.node_cpu_total * diagnosis.node_cpu_cap_factor) | round | int }} cores
+    (currently requested: {{ diagnosis.node_requested_fea_cpus }}).
+    Young-worker reservation: {{ (diagnosis.footprint.cpus or 0) | round | int }} CPUs /
+    {{ ((diagnosis.footprint.memory_mb or 0) / 1024) | round | int }} GB held for workers younger than
+    {{ (diagnosis.footprint_maturity_seconds / 60) | round | int }} min.
+  </p>
+  {% for item in diagnosis.allocations %}
+    <h3>
+      Allocation {{ item.allocation.id }}
+      <span class="muted">({{ item.allocation.state }}, {{ item.allocation.total_cpus }} CPUs, slurm {{ item.allocation.slurm_job_id }})</span>
+      — fit now: <strong>{{ item.fit_slots }}</strong> more worker{{ "" if item.fit_slots == 1 else "s" }}
+    </h3>
+    <div class="table-scroll">
+      <table>
+        <tbody>
+          {% if item.utilization %}
+            <tr><th>Measured utilization (ours)</th><td>{{ item.utilization.busy_cores }} / {{ item.allocation.total_cpus }} cores ({{ item.utilization.util_percent }}%)</td></tr>
+          {% endif %}
+          {% if item.trace.blocked_by %}
+            <tr><th>Blocked by</th><td class="error">{{ item.trace.blocked_by }}</td></tr>
+          {% endif %}
+          {% if item.trace.note %}
+            <tr><th>Note</th><td>{{ item.trace.note }}</td></tr>
+          {% endif %}
+          {% if item.trace.memory_pressure_state is defined %}
+            <tr><th>Gates</th><td>memory pressure: {{ item.trace.memory_pressure_state }} · load ok: {{ item.trace.node_load_ok }} · sustained overload: {{ item.trace.sustained_overload }}</td></tr>
+          {% endif %}
+          {% if item.trace.cpu_mode is defined %}
+            <tr>
+              <th>CPU budget ({{ item.trace.cpu_mode }})</th>
+              <td>
+                {% if item.trace.measured_busy_cores is defined %}busy {{ item.trace.measured_busy_cores }}{% else %}node load {{ item.trace.node_load }}{% endif %}
+                + young reservation {{ item.trace.footprint_young_cpus }} vs target {{ item.trace.cpu_target_cores }}
+                → budget {{ item.trace.cpu_budget_cores }} cores → <strong>{{ item.trace.cpu_slots }}</strong> slots
+              </td>
+            </tr>
+            <tr>
+              <th>Memory budget</th>
+              <td>
+                free {{ (item.trace.memory_free_mb / 1024) | round | int }} GB
+                − young reservation {{ (item.trace.footprint_young_memory_mb / 1024) | round | int }} GB
+                − soft floor {{ (item.trace.memory_soft_floor_mb / 1024) | round | int }} GB
+                → budget {{ (item.trace.memory_budget_mb / 1024) | round | int }} GB → <strong>{{ item.trace.memory_slots }}</strong> slots
+              </td>
+            </tr>
+            <tr><th>Per-tick attach cap</th><td>{{ item.trace.tick_attaches }} used of {{ item.trace.tick_attach_cap }} this tick</td></tr>
+            <tr><th>Binding limit</th><td><strong>{{ item.trace.limiter }}</strong></td></tr>
+          {% endif %}
+          {% if item.node_cpu_cap_remaining is not none %}
+            <tr><th>Node FEA CPU cap remaining</th><td>{{ item.node_cpu_cap_remaining }} worker{{ "" if item.node_cpu_cap_remaining == 1 else "s" }} of this shape</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  {% else %}
+    <p class="muted">No live allocations on this node.</p>
+  {% endfor %}
+</section>
+
+<section class="panel">
+  <h2>Tasks on this node ({{ node_tasks | length }})</h2>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Alloc</th><th>Resources</th><th>Elapsed</th></tr></thead>
+      <tbody>
+      {% for task in node_tasks %}
+        <tr>
+          <td>{{ task.id }}</td>
+          <td><a class="cell-truncate" href="/tasks/{{ task.id }}" title="{{ task.name }}">{{ task.name }}</a></td>
+          <td>{{ task.status }}</td>
+          <td>{{ task.allocation_id }}</td>
+          <td class="mono-cell">{{ task.cpus }}c · {{ (task.memory_mb / 1024) | round(0, "ceil") | int }}G</td>
+          <td class="mono-cell">{{ task.elapsed_text or "" }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="6" class="muted">No running tasks on this node.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+</div>
+{% endblock %}

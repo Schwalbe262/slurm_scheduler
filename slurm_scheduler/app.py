@@ -1513,6 +1513,58 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             },
         )
 
+    @app.get("/nodes/{node_name}", response_class=HTMLResponse)
+    def node_detail(node_name: str, request: Request) -> HTMLResponse:
+        inventory = next(
+            (row for row in db.list_node_inventory() if str(row.get("node_name") or "") == node_name),
+            None,
+        )
+        pestat = next(
+            (row for row in db.list_pestat_nodes() if str(row.get("hostname") or "") == node_name),
+            None,
+        )
+        # Representative shape: the oldest queued FEA task, else a sane default.
+        queued_fea = next(
+            (
+                task
+                for task in db.list_tasks_by_statuses(["queued"], limit=200)
+                if normalize_scheduling_profile(str(task.get("scheduling_profile") or ""))
+                == SchedulingProfile.FEA_BURSTY.value
+            ),
+            None,
+        )
+        shape = queued_fea or {
+            "cpus": 4,
+            "memory_mb": 32768,
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+        }
+        task_shape = {
+            "cpus": max(1, int(shape.get("cpus") or 4)),
+            "memory_mb": max(1, int(shape.get("memory_mb") or 32768)),
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+            "max_workers_per_node": 0,
+        }
+        diagnosis = scheduler.node_fill_diagnosis(node_name, task_shape)
+        node_tasks = []
+        allocation_ids = {int(item["allocation"]["id"]) for item in diagnosis["allocations"]}
+        now = datetime.now(timezone.utc)
+        for task in db.list_tasks_by_statuses(["attaching", "running"], limit=5000):
+            if int(task.get("allocation_id") or 0) not in allocation_ids:
+                continue
+            node_tasks.append({**task, **task_view_fields(task, include_diagnostics=False)})
+        return templates.TemplateResponse(
+            "node_detail.html",
+            {
+                "request": request,
+                "node_name": node_name,
+                "inventory": inventory,
+                "pestat": pestat,
+                "diagnosis": diagnosis,
+                "node_tasks": attach_task_elapsed(node_tasks),
+                "shape_from_queue": bool(queued_fea),
+            },
+        )
+
     @app.post("/jobs/{job_id}/cancel")
     def cancel_job(job_id: int) -> Response:
         scheduler.cancel(job_id)

@@ -56,11 +56,11 @@
   </div>
   {% if task.stdout_path %}
     <h3>stdout (tail)</h3>
-    <pre class="mono-cell" id="stdout-tail" style="max-height: 320px; overflow: auto;">loading...</pre>
+    <pre class="log-tail" id="stdout-tail">loading...</pre>
   {% endif %}
   {% if task.stderr_path %}
     <h3>stderr (tail)</h3>
-    <pre class="mono-cell" id="stderr-tail" style="max-height: 320px; overflow: auto;">loading...</pre>
+    <pre class="log-tail" id="stderr-tail">loading...</pre>
   {% endif %}
 </section>
 {% endif %}

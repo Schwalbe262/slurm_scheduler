@@ -724,7 +724,11 @@
             </td>
             <td>{{ allocation.account_name }}</td>
             <td>
-              {{ allocation.node_name or "-" }}
+              {% if allocation.node_name %}
+                <a href="/nodes/{{ allocation.node_name }}">{{ allocation.node_name }}</a>
+              {% else %}
+                -
+              {% endif %}
               {% if allocation.node_name and allocation.partition and "," not in allocation.partition %}
                 <div class="muted">{{ allocation.partition }}</div>
               {% endif %}
