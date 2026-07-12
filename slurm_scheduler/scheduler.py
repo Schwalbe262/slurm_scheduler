@@ -3464,6 +3464,19 @@ class Scheduler:
         active_task_allocation_ids: set[int] | None = None,
         active_exclusive_allocation_ids: set[int] | None = None,
     ) -> dict:
+        # License admission blocks trump fit capacity: a task the admission
+        # gate refuses would otherwise report a misleading "ready" state.
+        if str(task.get("status") or "queued") == TaskStatus.QUEUED.value:
+            _costs, admission_error = self._license_costs_for_task(task)
+            if admission_error:
+                return {
+                    "queue_state": "blocked",
+                    "queue_reason": (
+                        f"license admission: {admission_error} — set the task's project field "
+                        "or add the project to license_monitor.admission.persistent_cost_by_project"
+                    ),
+                    "preferred_node_relaxed": False,
+                }
         capacity = capacity if capacity is not None else self.task_fit_capacity(
             task,
             allocation_rows=allocation_rows,

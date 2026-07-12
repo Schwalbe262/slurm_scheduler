@@ -842,9 +842,13 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             except (TypeError, json.JSONDecodeError):
                 return default
 
+        project_name = str(project.get("name") or "")
+        queued_count = db.count_tasks_by_project(project_name, ["queued"])
+        attaching_count = db.count_tasks_by_project(project_name, ["attaching"])
+        executing_count = db.count_tasks_by_project(project_name, ["running"])
         payload = {
             "id": int(project["id"]),
-            "name": project.get("name") or "",
+            "name": project_name,
             "repos": _loads(project.get("repos"), []),
             "setup": project.get("setup") or "",
             "entrypoints": _loads(project.get("entrypoints"), []),
@@ -853,8 +857,12 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "sim_subdir": project.get("sim_subdir") or "simulation",
             "auto_pull": bool(project.get("auto_pull")),
             "max_active_tasks": max(0, int(project.get("max_active_tasks") or 0)),
-            "running_count": db.count_tasks_by_project(str(project.get("name") or ""), ["attaching", "running"]),
-            "total_count": db.count_tasks_by_project(str(project.get("name") or "")),
+            "queued_count": queued_count,
+            "attaching_count": attaching_count,
+            "executing_count": executing_count,
+            "logical_active_count": queued_count + attaching_count + executing_count,
+            "running_count": attaching_count + executing_count,
+            "total_count": db.count_tasks_by_project(project_name),
             "created_at": project.get("created_at"),
             "updated_at": project.get("updated_at"),
         }
@@ -2232,6 +2240,27 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         if not project:
             raise HTTPException(status_code=404)
         return project_json(project)
+
+    @app.patch("/api/projects/{name}/max-active-tasks")
+    async def api_set_project_max_active_tasks(name: str, request: Request) -> dict:
+        payload = await _json_body(request)
+        if set(payload) != {"max_active_tasks"}:
+            raise HTTPException(
+                status_code=422,
+                detail="request body must contain only max_active_tasks",
+            )
+        max_active_tasks = payload["max_active_tasks"]
+        if type(max_active_tasks) is not int or not 1 <= max_active_tasks <= 300:
+            raise HTTPException(
+                status_code=422,
+                detail="max_active_tasks must be an integer between 1 and 300",
+            )
+        project = db.get_project_by_name(name)
+        if not project:
+            raise HTTPException(status_code=404)
+        project_id = int(project["id"])
+        db.update_project(project_id, max_active_tasks=max_active_tasks)
+        return project_json(db.get_project(project_id))
 
     @app.post("/api/projects")
     async def api_create_project(request: Request) -> JSONResponse:

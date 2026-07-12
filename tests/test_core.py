@@ -8192,6 +8192,9 @@ class ProjectApiTests(unittest.TestCase):
         self.app.router.on_shutdown.clear()
         self.create_project = self._route_endpoint("/api/projects", "POST")
         self.get_project = self._route_endpoint("/api/projects/{name}", "GET")
+        self.patch_project_cap = self._route_endpoint(
+            "/api/projects/{name}/max-active-tasks", "PATCH"
+        )
         self.list_tasks = self._route_endpoint("/api/tasks", "GET")
         self.get_task = self._route_endpoint("/api/tasks/{task_id}", "GET")
 
@@ -8240,6 +8243,125 @@ class ProjectApiTests(unittest.TestCase):
                     )
                 self.assertEqual(raised.exception.status_code, 422)
                 self.assertEqual(raised.exception.detail, "max_active_tasks must be a non-negative integer")
+
+    def test_project_cap_patch_changes_only_cap_and_returns_exact_live_counts(self) -> None:
+        self._post_project(
+            {
+                "name": "motor",
+                "repos": [{"url": "ssh://example.test/motor.git", "ref": "main"}],
+                "setup": "module load ansys",
+                "entrypoints": [{"path": "run.py", "conda_env": "motor"}],
+                "cleanup_globs": "*.tmp",
+                "output_globs": "*.csv",
+                "sim_subdir": "cases",
+                "auto_pull": True,
+                "max_active_tasks": 7,
+            }
+        )
+        queued_id = self.app.state.db.create_task(
+            TaskCreate("motor-queued", "~/case", "run", project="motor")
+        )
+        attaching_id = self.app.state.db.create_task(
+            TaskCreate("motor-attaching", "~/case", "run", project="motor")
+        )
+        running_id = self.app.state.db.create_task(
+            TaskCreate("motor-running", "~/case", "run", project="motor")
+        )
+        completed_id = self.app.state.db.create_task(
+            TaskCreate("motor-completed", "~/case", "run", project="motor")
+        )
+        self.app.state.db.update_task(attaching_id, status=TaskStatus.ATTACHING.value)
+        self.app.state.db.update_task(running_id, status=TaskStatus.RUNNING.value)
+        self.app.state.db.update_task(completed_id, status=TaskStatus.COMPLETED.value)
+        self.app.state.db.create_task(
+            TaskCreate("other-queued", "~/case", "run", project="other")
+        )
+        self.assertGreater(queued_id, 0)
+
+        before = self.app.state.db.get_project_by_name("motor")
+        original_update_project = self.app.state.db.update_project
+        updates = []
+
+        def recording_update(project_id: int, **fields) -> None:
+            updates.append((project_id, dict(fields)))
+            original_update_project(project_id, **fields)
+
+        self.app.state.db.update_project = recording_update
+        try:
+            result = asyncio.run(
+                self.patch_project_cap("motor", self._request({"max_active_tasks": 275}))
+            )
+        finally:
+            self.app.state.db.update_project = original_update_project
+
+        after = self.app.state.db.get_project_by_name("motor")
+        self.assertEqual(updates, [(int(before["id"]), {"max_active_tasks": 275})])
+        for key in (
+            "id",
+            "name",
+            "repos",
+            "setup",
+            "entrypoints",
+            "cleanup_globs",
+            "output_globs",
+            "sim_subdir",
+            "auto_pull",
+            "created_at",
+        ):
+            self.assertEqual(after[key], before[key], key)
+        self.assertEqual(after["max_active_tasks"], 275)
+        self.assertEqual(result["max_active_tasks"], 275)
+        self.assertEqual(result["queued_count"], 1)
+        self.assertEqual(result["attaching_count"], 1)
+        self.assertEqual(result["executing_count"], 1)
+        self.assertEqual(result["logical_active_count"], 3)
+        self.assertEqual(result["running_count"], 2)
+        self.assertEqual(result["total_count"], 4)
+
+    def test_project_cap_patch_rejects_non_cap_bodies_and_out_of_range_values(self) -> None:
+        from fastapi import HTTPException
+
+        self._post_project({"name": "motor", "max_active_tasks": 7})
+        invalid_payloads = (
+            {},
+            {"max_active_tasks": 8, "setup": "must not change"},
+            {"max_active_tasks": 0},
+            {"max_active_tasks": 301},
+            {"max_active_tasks": -1},
+            {"max_active_tasks": True},
+            {"max_active_tasks": 1.5},
+            {"max_active_tasks": "8"},
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(HTTPException) as raised:
+                    asyncio.run(self.patch_project_cap("motor", self._request(payload)))
+                self.assertEqual(raised.exception.status_code, 422)
+                self.assertEqual(
+                    self.app.state.db.get_project_by_name("motor")["max_active_tasks"],
+                    7,
+                )
+
+    def test_project_cap_patch_accepts_inclusive_bounds(self) -> None:
+        self._post_project({"name": "motor", "max_active_tasks": 7})
+        for target in (1, 300):
+            with self.subTest(target=target):
+                result = asyncio.run(
+                    self.patch_project_cap(
+                        "motor", self._request({"max_active_tasks": target})
+                    )
+                )
+                self.assertEqual(result["max_active_tasks"], target)
+
+    def test_project_cap_patch_returns_not_found_without_creating_project(self) -> None:
+        from fastapi import HTTPException
+
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(
+                self.patch_project_cap("missing", self._request({"max_active_tasks": 10}))
+            )
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertIsNone(self.app.state.db.get_project_by_name("missing"))
 
     def test_task_api_exposes_project_and_entrypoint(self) -> None:
         task_id = self.app.state.db.create_task(
