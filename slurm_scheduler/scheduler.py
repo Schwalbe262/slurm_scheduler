@@ -192,9 +192,15 @@ class Scheduler:
         license_monitor_account: str = "",
         license_monitor_lmutil_path: str = "",
         license_monitor_license_server: str = "",
-        license_monitor_interval_seconds: int = 300,
+        license_monitor_interval_seconds: int = 60,
         license_monitor_watch_features: list[str] | None = None,
         license_monitor_display: dict[str, str] | None = None,
+        license_admission_enabled: bool = False,
+        license_admission_snapshot_max_age_seconds: int = 120,
+        license_admission_settlement_seconds: int = 300,
+        license_admission_reserve_by_feature: dict[str, int] | None = None,
+        license_admission_persistent_cost_by_project: dict[str, dict[str, int]] | None = None,
+        license_admission_unknown_fea_project_policy: str = "block",
         cleanup_db_row_ttl_seconds: int = 1209600,
         cleanup_event_ttl_seconds: int = 604800,
         watchdog_enabled: bool = True,
@@ -318,9 +324,53 @@ class Scheduler:
         self.license_monitor_interval_seconds = max(60, int(license_monitor_interval_seconds))
         self.license_monitor_watch_features = list(license_monitor_watch_features or [])
         self.license_monitor_display = dict(license_monitor_display or {})
+        self.license_admission_enabled = bool(license_admission_enabled)
+        self.license_admission_snapshot_max_age_seconds = max(
+            1, int(license_admission_snapshot_max_age_seconds)
+        )
+        self.license_admission_settlement_seconds = max(
+            0, int(license_admission_settlement_seconds)
+        )
+        reserve_source = (
+            {"electronics_desktop": 32}
+            if license_admission_reserve_by_feature is None
+            else license_admission_reserve_by_feature
+        )
+        self.license_admission_reserve_by_feature = {
+            str(feature): max(0, int(reserve))
+            for feature, reserve in reserve_source.items()
+            if str(feature).strip()
+        }
+        cost_source = (
+            {
+                "MFT_1MW_2026v1": {"electronics_desktop": 1},
+                "PYAEDT_MOTOR_IPMSM_V2": {"electronics_desktop": 1},
+            }
+            if license_admission_persistent_cost_by_project is None
+            else license_admission_persistent_cost_by_project
+        )
+        self.license_admission_persistent_cost_by_project = {
+            str(project): {
+                str(feature): max(0, int(cost))
+                for feature, cost in dict(costs or {}).items()
+                if str(feature).strip() and int(cost) > 0
+            }
+            for project, costs in cost_source.items()
+            if str(project).strip()
+        }
+        unknown_policy = str(license_admission_unknown_fea_project_policy or "block").strip().lower()
+        self.license_admission_unknown_fea_project_policy = (
+            unknown_policy if unknown_policy in {"allow", "block"} else "block"
+        )
         self._license_usage: dict = {}
         self._last_license_refresh_at = 0.0
         self._license_refresh_inflight = False
+        self._license_snapshot_completed_monotonic: float | None = None
+        self._license_snapshot_query_started_at: datetime | None = None
+        self._license_last_successful_checked_at = ""
+        self._license_admission_claims: dict[str, dict] = {}
+        self._license_last_blocked_reason = ""
+        self._reconstruct_license_admission_claims()
         self.reconcile_on_start = reconcile_on_start
         self._needs_reconcile = False
         self.backup_enabled = backup_enabled
@@ -506,6 +556,7 @@ class Scheduler:
                     entity_type="task",
                     entity_id=task["id"],
                 )
+                self._license_release_prelaunch_claim(task)
                 continue
             if not str(task.get("exit_code_path") or ""):
                 # Once launch_started_at is durable the remote nohup may have
@@ -524,6 +575,7 @@ class Scheduler:
                     entity_id=task["id"],
                     account_name=str(task.get("account_name") or ""),
                 )
+        self._reconstruct_license_admission_claims()
 
     def reconcile_slurm_state(self) -> None:
         """Cancel scheduler-created 'pool' allocation jobs the DB no longer
@@ -959,8 +1011,291 @@ class Scheduler:
                     continue
                 LOGGER.info("project sim prune removed %d artifacts in %s on %s", len(candidates), name, account.name)
 
+    def _license_costs_for_task(self, task: dict) -> tuple[dict[str, int], str]:
+        """Return persistent feature costs, or a fail-closed profile error.
+
+        Only features held for the whole task belong here.  Stage-specific
+        Maxwell/Icepak solver features are intentionally not treated as
+        persistent leases without a runner stage heartbeat.
+        """
+        if not self.license_admission_enabled:
+            return {}, ""
+        project = str(task.get("project") or "").strip()
+        configured = self.license_admission_persistent_cost_by_project.get(project)
+        if configured:
+            return dict(configured), ""
+        if self.task_is_fea_bursty(task) and self.license_admission_unknown_fea_project_policy == "block":
+            return {}, f"unconfigured license admission profile for FEA project {project or '<empty>'}"
+        return {}, ""
+
+    @staticmethod
+    def _license_claim_key(task: dict) -> str:
+        token = str(task.get("attach_token") or "").strip()
+        if token:
+            return token
+        return "legacy:{id}:{stamp}".format(
+            id=int(task.get("id") or 0),
+            stamp=task.get("attached_at") or task.get("started_at") or task.get("created_at") or "unknown",
+        )
+
+    def _license_claim_from_task(self, task: dict, costs: dict[str, int]) -> dict:
+        status = str(task.get("status") or TaskStatus.ATTACHING.value)
+        return {
+            "task_id": int(task.get("id") or 0),
+            "project": str(task.get("project") or ""),
+            "costs": dict(costs),
+            "state": "running" if status == TaskStatus.RUNNING.value else "attaching",
+            "claimed_at": self._timestamp(
+                task.get("attached_at") or task.get("created_at")
+            ) or self._now(),
+            "launch_started_at": self._timestamp(task.get("launch_started_at")),
+            "running_at": self._timestamp(task.get("started_at")),
+        }
+
+    def _reconstruct_license_admission_claims(self) -> None:
+        """Rebuild reservations that a process restart cannot safely forget."""
+        if not self.license_admission_enabled:
+            return
+        active = self.db.list_tasks_by_statuses(
+            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
+        )
+        with self._task_assignment_lock:
+            for task in active:
+                costs, profile_error = self._license_costs_for_task(task)
+                if profile_error or not costs:
+                    continue
+                key = self._license_claim_key(task)
+                if key not in self._license_admission_claims:
+                    self._license_admission_claims[key] = self._license_claim_from_task(task, costs)
+
+    def _license_record_claim_locked(self, task: dict, attach_token: str) -> None:
+        costs, profile_error = self._license_costs_for_task(task)
+        if profile_error or not costs:
+            return
+        now = self._now()
+        self._license_admission_claims[attach_token] = {
+            "task_id": int(task.get("id") or 0),
+            "project": str(task.get("project") or ""),
+            "costs": dict(costs),
+            "state": "attaching",
+            "claimed_at": now,
+            "launch_started_at": None,
+            "running_at": None,
+        }
+
+    def _license_claims_for_task_locked(self, task: dict) -> list[tuple[str, dict]]:
+        token = str(task.get("attach_token") or "").strip()
+        if token and token in self._license_admission_claims:
+            return [(token, self._license_admission_claims[token])]
+        task_id = int(task.get("id") or 0)
+        return [
+            (key, claim)
+            for key, claim in self._license_admission_claims.items()
+            if int(claim.get("task_id") or 0) == task_id
+        ]
+
+    def _license_mark_launch_started(self, task: dict) -> None:
+        if not self.license_admission_enabled:
+            return
+        with self._task_assignment_lock:
+            for _key, claim in self._license_claims_for_task_locked(task):
+                if claim.get("launch_started_at") is None:
+                    claim["launch_started_at"] = self._now()
+
+    def _license_mark_running(self, task: dict) -> None:
+        if not self.license_admission_enabled:
+            return
+        with self._task_assignment_lock:
+            for _key, claim in self._license_claims_for_task_locked(task):
+                claim["state"] = "running"
+                if claim.get("running_at") is None:
+                    claim["running_at"] = self._now()
+
+    def _license_mark_terminal(self, task: dict) -> None:
+        """Release only a provably unlaunched claim; launched claims settle."""
+        if not self.license_admission_enabled:
+            return
+        with self._task_assignment_lock:
+            for key, claim in list(self._license_claims_for_task_locked(task)):
+                if claim.get("launch_started_at") is None and claim.get("running_at") is None:
+                    self._license_admission_claims.pop(key, None)
+                else:
+                    claim["state"] = "terminal"
+
+    def _license_release_prelaunch_claim(self, task: dict) -> None:
+        if not self.license_admission_enabled:
+            return
+        with self._task_assignment_lock:
+            for key, claim in list(self._license_claims_for_task_locked(task)):
+                if claim.get("launch_started_at") is None and claim.get("running_at") is None:
+                    self._license_admission_claims.pop(key, None)
+
+    def _license_reconcile_claims_locked(self, query_started_at: datetime) -> None:
+        settlement = timedelta(seconds=self.license_admission_settlement_seconds)
+        for key, claim in list(self._license_admission_claims.items()):
+            if claim.get("state") == "attaching":
+                continue
+            anchor = claim.get("running_at") or claim.get("launch_started_at")
+            if anchor is None:
+                continue
+            # A capture that began before the launch (or before its settlement
+            # window elapsed) cannot prove that this checkout was represented.
+            if query_started_at >= anchor + settlement:
+                self._license_admission_claims.pop(key, None)
+
+    def _license_unsettled_costs_locked(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for claim in self._license_admission_claims.values():
+            for feature, cost in dict(claim.get("costs") or {}).items():
+                out[feature] = out.get(feature, 0) + int(cost)
+        return out
+
+    def _license_configured_features(self) -> set[str]:
+        features = set(self.license_admission_reserve_by_feature)
+        for costs in self.license_admission_persistent_cost_by_project.values():
+            features.update(costs)
+        return features
+
+    def _license_admission_diagnostics_locked(
+        self, candidate_costs: dict[str, int] | None = None
+    ) -> dict:
+        candidate_costs = dict(candidate_costs or {})
+        required_features = self._license_configured_features() | set(candidate_costs)
+        unsettled = self._license_unsettled_costs_locked()
+        diagnostics = {
+            "enabled": self.license_admission_enabled,
+            "snapshot_valid": False,
+            "snapshot_age_seconds": None,
+            "snapshot_max_age_seconds": self.license_admission_snapshot_max_age_seconds,
+            "settlement_seconds": self.license_admission_settlement_seconds,
+            "reserve_by_feature": dict(self.license_admission_reserve_by_feature),
+            "persistent_cost_by_project": {
+                project: dict(costs)
+                for project, costs in self.license_admission_persistent_cost_by_project.items()
+            },
+            "unknown_fea_project_policy": self.license_admission_unknown_fea_project_policy,
+            "unsettled_claims": len(self._license_admission_claims),
+            "unsettled_by_feature": unsettled,
+            "features": {},
+            "blocked_reason": "",
+            "last_blocked_reason": self._license_last_blocked_reason,
+            "last_successful_checked_at": self._license_last_successful_checked_at,
+        }
+        if not self.license_admission_enabled:
+            return diagnostics
+        if not self.license_monitor_enabled:
+            diagnostics["blocked_reason"] = "license monitor is disabled"
+            return diagnostics
+        usage = self._license_usage
+        if not usage:
+            diagnostics["blocked_reason"] = "no successful license snapshot"
+            return diagnostics
+        if str(usage.get("error") or ""):
+            diagnostics["blocked_reason"] = f"license monitor error: {usage['error']}"
+            return diagnostics
+        if usage.get("server_up") is not True:
+            diagnostics["blocked_reason"] = "license server is not confirmed up"
+            return diagnostics
+        if self._license_snapshot_completed_monotonic is None:
+            diagnostics["blocked_reason"] = "no successful license snapshot"
+            return diagnostics
+        age = max(0.0, time.monotonic() - self._license_snapshot_completed_monotonic)
+        diagnostics["snapshot_age_seconds"] = round(age, 3)
+        if age > self.license_admission_snapshot_max_age_seconds:
+            diagnostics["blocked_reason"] = (
+                f"license snapshot is stale: {age:.1f}s > "
+                f"{self.license_admission_snapshot_max_age_seconds}s"
+            )
+            return diagnostics
+        raw_features = usage.get("features")
+        if not isinstance(raw_features, list):
+            diagnostics["blocked_reason"] = "license snapshot has no feature list"
+            return diagnostics
+        by_name = {
+            str(item.get("feature") or ""): item
+            for item in raw_features
+            if isinstance(item, dict) and str(item.get("feature") or "")
+        }
+        capacity_reason = ""
+        for feature in sorted(required_features):
+            item = by_name.get(feature)
+            if item is None:
+                diagnostics["blocked_reason"] = f"license feature missing from snapshot: {feature}"
+                return diagnostics
+            try:
+                total = int(item.get("total"))
+                used = int(item.get("used"))
+            except (TypeError, ValueError):
+                diagnostics["blocked_reason"] = f"invalid license counts for {feature}"
+                return diagnostics
+            if total <= 0 or used < 0 or used > total:
+                diagnostics["blocked_reason"] = (
+                    f"invalid license counts for {feature}: used={used}, total={total}"
+                )
+                return diagnostics
+            reserve = int(self.license_admission_reserve_by_feature.get(feature, 0))
+            effective_used = used + int(unsettled.get(feature, 0))
+            capacity = max(0, total - reserve)
+            headroom = capacity - effective_used
+            diagnostics["features"][feature] = {
+                "used": used,
+                "total": total,
+                "reserve": reserve,
+                "unsettled": int(unsettled.get(feature, 0)),
+                "effective_used": effective_used,
+                "admit_capacity": capacity,
+                "admit_headroom": headroom,
+                "candidate_cost": int(candidate_costs.get(feature, 0)),
+            }
+            cost = int(candidate_costs.get(feature, 0))
+            if effective_used + cost > capacity and not capacity_reason:
+                capacity_reason = (
+                    f"license capacity exhausted for {feature}: used={used}, "
+                    f"unsettled={int(unsettled.get(feature, 0))}, candidate={cost}, "
+                    f"reserve={reserve}, total={total}"
+                )
+        diagnostics["snapshot_valid"] = True
+        diagnostics["blocked_reason"] = capacity_reason
+        return diagnostics
+
+    def _license_task_admitted_locked(self, task: dict) -> tuple[bool, str]:
+        if not self.license_admission_enabled:
+            return True, ""
+        costs, profile_error = self._license_costs_for_task(task)
+        if profile_error:
+            self._license_last_blocked_reason = profile_error
+            return False, profile_error
+        if not costs:
+            return True, ""
+        diagnostics = self._license_admission_diagnostics_locked(costs)
+        reason = str(diagnostics.get("blocked_reason") or "")
+        if reason:
+            self._license_last_blocked_reason = reason
+            return False, reason
+        self._license_last_blocked_reason = ""
+        return True, ""
+
+    def _publish_successful_license_snapshot(
+        self, payload: dict, query_started_at: datetime
+    ) -> None:
+        with self._task_assignment_lock:
+            self._license_usage = payload
+            self._license_snapshot_completed_monotonic = time.monotonic()
+            self._license_snapshot_query_started_at = query_started_at
+            self._license_last_successful_checked_at = str(payload.get("checked_at") or "")
+            self._license_reconcile_claims_locked(query_started_at)
+
     def license_usage(self) -> dict:
-        return dict(self._license_usage)
+        with self._task_assignment_lock:
+            payload = dict(self._license_usage)
+            if isinstance(payload.get("features"), list):
+                payload["features"] = [dict(item) for item in payload["features"]]
+            if isinstance(payload.get("in_use"), list):
+                payload["in_use"] = [dict(item) for item in payload["in_use"]]
+            if isinstance(payload.get("display"), list):
+                payload["display"] = [dict(item) for item in payload["display"]]
+            payload["admission"] = self._license_admission_diagnostics_locked()
+            return payload
 
     def refresh_license_usage_if_due(self) -> None:
         if not self.license_monitor_enabled:
@@ -987,6 +1322,7 @@ class Scheduler:
         ).start()
 
     def _refresh_license_usage(self, account: AccountConfig) -> None:
+        query_started_at = self._now()
         try:
             command = (
                 f"{shlex.quote(self.license_monitor_lmutil_path)} lmstat "
@@ -1004,15 +1340,25 @@ class Scheduler:
                     time.sleep(5)
                     result = ssh.run(command)
                     features = parse_lmstat_features(result.stdout)
-            if not features and self._license_usage.get("features"):
-                previous = dict(self._license_usage)
-                previous["error"] = "lmstat returned no feature block; showing the last good snapshot"
-                self._license_usage = previous
-                return
+            if not features:
+                with self._task_assignment_lock:
+                    if self._license_usage.get("features"):
+                        previous = dict(self._license_usage)
+                        previous["error"] = "lmstat returned no feature block; showing the last good snapshot"
+                        self._license_usage = previous
+                        return
             server_up = "license server UP" in result.stdout
             error = ""
-            if not features and not server_up:
+            if result.exit_code != 0:
+                error = (
+                    result.stdout.strip().splitlines()[-1][:200]
+                    if result.stdout.strip()
+                    else f"lmstat exited with status {result.exit_code}"
+                )
+            elif not server_up:
                 error = result.stdout.strip().splitlines()[-1][:200] if result.stdout.strip() else "no lmstat output"
+            elif not features:
+                error = "lmstat returned no feature block"
             by_name = {item["feature"]: item for item in features}
             display = [
                 {
@@ -1023,8 +1369,9 @@ class Scheduler:
                 }
                 for label, feature in self.license_monitor_display.items()
             ]
-            self._license_usage = {
+            payload = {
                 "checked_at": self._now().isoformat(),
+                "query_started_at": query_started_at.isoformat(),
                 "server": self.license_monitor_license_server,
                 "server_up": server_up,
                 "features": features,
@@ -1032,15 +1379,22 @@ class Scheduler:
                 "display": display,
                 "error": error,
             }
+            if result.exit_code == 0 and server_up and features and not error:
+                self._publish_successful_license_snapshot(payload, query_started_at)
+            else:
+                with self._task_assignment_lock:
+                    self._license_usage = payload
         except Exception as exc:
-            self._license_usage = {
-                "checked_at": self._now().isoformat(),
-                "server": self.license_monitor_license_server,
-                "server_up": False,
-                "features": [],
-                "in_use": [],
-                "error": str(exc)[:200],
-            }
+            with self._task_assignment_lock:
+                self._license_usage = {
+                    "checked_at": self._now().isoformat(),
+                    "query_started_at": query_started_at.isoformat(),
+                    "server": self.license_monitor_license_server,
+                    "server_up": False,
+                    "features": [],
+                    "in_use": [],
+                    "error": str(exc)[:200],
+                }
             LOGGER.warning("license monitor refresh failed: %s", exc)
         finally:
             self._license_refresh_inflight = False
@@ -1628,6 +1982,7 @@ class Scheduler:
         if status == JobStatus.RUNNING:
             if task["status"] != TaskStatus.RUNNING.value:
                 self.db.update_task(task["id"], status=TaskStatus.RUNNING.value, started_at="CURRENT_TIMESTAMP")
+                self._license_mark_running(task)
             return
         if status == JobStatus.COMPLETED:
             self.db.update_task(task["id"], status=TaskStatus.COMPLETED.value, exit_code=probe.exit_code, finished_at="CURRENT_TIMESTAMP")
@@ -2335,6 +2690,11 @@ class Scheduler:
                 if self.fit_slots_for_allocation(allocation, task) <= 0:
                     return None
 
+            admitted, admission_reason = self._license_task_admitted_locked(task)
+            if not admitted:
+                LOGGER.debug("holding task %s for license admission: %s", task["id"], admission_reason)
+                return None
+
             task = self.apply_dynamic_env_profile(task, account)
             attach_token = uuid.uuid4().hex
             if not self.db.update_task_if_status(
@@ -2357,6 +2717,7 @@ class Scheduler:
                 exit_code=None,
             ):
                 return None
+            self._license_record_claim_locked(task, attach_token)
             self._record_attach_delta(allocation, task)
             self.recalculate_allocation_capacity()
             return {
@@ -2394,8 +2755,10 @@ class Scheduler:
             launch_started_at="CURRENT_TIMESTAMP",
         ):
             LOGGER.info("attach claim for task %s is no longer active; skipping remote launch", task["id"])
+            self._license_release_prelaunch_claim(task)
             self.recalculate_allocation_capacity()
             return False
+        self._license_mark_launch_started(task)
         try:
             result = self._client(account).attach_task(task, allocation)
         except RemoteExecutionError as exc:
@@ -2443,6 +2806,7 @@ class Scheduler:
                 LOGGER.warning("failed to cancel raced attach for task %s: %s", task["id"], exc)
             self.recalculate_allocation_capacity()
             return False
+        self._license_mark_running(task)
         return True
 
     def best_allocation_for_task(self, task: dict) -> dict | None:
@@ -3821,6 +4185,7 @@ class Scheduler:
         failed, cancelled, timed out, allocation lost) — shell-level cleanup
         inside the task command cannot cover cancel/kill because nothing after
         the killed process runs. Only the scheduler sees all exits."""
+        self._license_mark_terminal(task)
         globs = [
             g.strip()
             for g in str(task.get("cleanup_globs") or "").split(",")
@@ -3875,6 +4240,7 @@ class Scheduler:
             entity_id=task["id"],
             account_name=str(task.get("account_name") or ""),
         )
+        self._license_mark_terminal(task)
         self.db.update_task(
             task["id"],
             status=TaskStatus.QUEUED.value,
@@ -3966,6 +4332,7 @@ class Scheduler:
             entity_id=task["id"],
             account_name=str(task.get("account_name") or ""),
         )
+        self._license_mark_terminal(task)
         self.db.update_task(
             task["id"],
             status=TaskStatus.QUEUED.value,

@@ -141,6 +141,46 @@ class SlurmParsingTests(unittest.TestCase):
         config = load_app_config(example_config_path)
         self.assertEqual(config.fea_footprint_maturity_seconds, 3600)
 
+    def test_load_app_config_parses_license_admission_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "app.yaml"
+            path.write_text(
+                "\n".join(
+                    [
+                        "license_monitor:",
+                        "  interval_seconds: 60",
+                        "  admission:",
+                        "    enabled: true",
+                        "    snapshot_max_age_seconds: 120",
+                        "    settlement_seconds: 300",
+                        "    reserve_by_feature:",
+                        "      electronics_desktop: 32",
+                        "    persistent_cost_by_project:",
+                        "      MFT_1MW_2026v1:",
+                        "        electronics_desktop: 1",
+                        "    unknown_fea_project_policy: block",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config = load_app_config(path)
+        self.assertEqual(config.license_monitor_interval_seconds, 60)
+        self.assertTrue(config.license_admission_enabled)
+        self.assertEqual(config.license_admission_snapshot_max_age_seconds, 120)
+        self.assertEqual(config.license_admission_settlement_seconds, 300)
+        self.assertEqual(config.license_admission_reserve_by_feature, {"electronics_desktop": 32})
+        self.assertEqual(
+            config.license_admission_persistent_cost_by_project,
+            {"MFT_1MW_2026v1": {"electronics_desktop": 1}},
+        )
+        self.assertEqual(config.license_admission_unknown_fea_project_policy, "block")
+
+    def test_example_app_config_uses_sixty_second_license_poll(self) -> None:
+        example_config_path = Path(__file__).resolve().parents[1] / "config" / "app.example.yaml"
+        config = load_app_config(example_config_path)
+        self.assertEqual(config.license_monitor_interval_seconds, 60)
+        self.assertEqual(config.license_admission_reserve_by_feature["electronics_desktop"], 32)
+
     def test_annotate_allocation_node_metrics_adds_pestat_usage(self) -> None:
         allocations = [{"id": 1, "node_name": "n001"}, {"id": 2, "node_name": "n002"}]
         annotated = annotate_allocation_node_metrics(
@@ -7422,6 +7462,475 @@ class LicenseMonitorTests(unittest.TestCase):
             ],
         )
         self.assertEqual(parse_lmstat_features(""), [])
+
+
+class LicenseAdmissionTests(unittest.TestCase):
+    MFT = "MFT_1MW_2026v1"
+    IPMSM = "PYAEDT_MOTOR_IPMSM_V2"
+    FEATURE = "electronics_desktop"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(f"{self.tmp.name}/scheduler.db")
+        self.db.init()
+        self.accounts = [AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)]
+        FakeClient.attached_tasks = []
+        FakeClient.task_states = {}
+        FakeClient.cancelled_tasks = []
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 1.0 262144 250000 idle\n"
+            )
+        )
+        self.allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(
+            self.allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="alloc-license",
+        )
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def make_scheduler(
+        self,
+        *,
+        client_factory=FakeClient,
+        settlement_seconds: int = 300,
+        unknown_policy: str = "block",
+    ) -> Scheduler:
+        return Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=client_factory,
+            license_monitor_enabled=True,
+            license_monitor_lmutil_path="/opt/lmutil",
+            license_monitor_license_server="1055@license",
+            license_monitor_interval_seconds=60,
+            license_admission_enabled=True,
+            license_admission_snapshot_max_age_seconds=120,
+            license_admission_settlement_seconds=settlement_seconds,
+            license_admission_reserve_by_feature={self.FEATURE: 32},
+            license_admission_persistent_cost_by_project={
+                self.MFT: {self.FEATURE: 1},
+                self.IPMSM: {self.FEATURE: 1},
+            },
+            license_admission_unknown_fea_project_policy=unknown_policy,
+        )
+
+    def make_task(
+        self,
+        project: str = MFT,
+        *,
+        name: str = "licensed-fea",
+        fea: bool = True,
+    ) -> int:
+        return self.db.create_task(
+            TaskCreate(
+                name,
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=8192,
+                project=project,
+                scheduling_profile=(
+                    SchedulingProfile.FEA_BURSTY.value if fea else SchedulingProfile.STANDARD.value
+                ),
+            )
+        )
+
+    def set_snapshot(
+        self,
+        scheduler: Scheduler,
+        *,
+        used: int = 100,
+        total: int = 550,
+        age_seconds: float = 0.0,
+        server_up: bool = True,
+        error: str = "",
+        features: list[dict] | None = None,
+    ) -> None:
+        payload_features = (
+            [{"feature": self.FEATURE, "used": used, "total": total}]
+            if features is None
+            else features
+        )
+        with scheduler._task_assignment_lock:
+            scheduler._license_usage = {
+                "checked_at": scheduler._now().isoformat(),
+                "query_started_at": scheduler._now().isoformat(),
+                "server": "1055@license",
+                "server_up": server_up,
+                "features": payload_features,
+                "in_use": [item for item in payload_features if int(item.get("used") or 0) > 0],
+                "error": error,
+            }
+            scheduler._license_snapshot_completed_monotonic = time.monotonic() - age_seconds
+            scheduler._license_snapshot_query_started_at = scheduler._now()
+            scheduler._license_last_successful_checked_at = scheduler._license_usage["checked_at"]
+
+    def publish_snapshot(
+        self,
+        scheduler: Scheduler,
+        query_started_at: datetime,
+        used: int = 100,
+    ) -> None:
+        scheduler._publish_successful_license_snapshot(
+            {
+                "checked_at": scheduler._now().isoformat(),
+                "query_started_at": query_started_at.isoformat(),
+                "server": "1055@license",
+                "server_up": True,
+                "features": [{"feature": self.FEATURE, "used": used, "total": 550}],
+                "in_use": [{"feature": self.FEATURE, "used": used, "total": 550}],
+                "error": "",
+            },
+            query_started_at,
+        )
+
+    def task_admission(self, scheduler: Scheduler, task_id: int) -> tuple[bool, str]:
+        with scheduler._task_assignment_lock:
+            return scheduler._license_task_admitted_locked(self.db.get_task(task_id))
+
+    def test_no_snapshot_fails_closed(self) -> None:
+        scheduler = self.make_scheduler()
+        admitted, reason = self.task_admission(scheduler, self.make_task())
+        self.assertFalse(admitted)
+        self.assertIn("no successful license snapshot", reason)
+
+    def test_server_down_fails_closed(self) -> None:
+        scheduler = self.make_scheduler()
+        self.set_snapshot(scheduler, server_up=False)
+        admitted, reason = self.task_admission(scheduler, self.make_task())
+        self.assertFalse(admitted)
+        self.assertIn("not confirmed up", reason)
+
+    def test_monitor_error_fails_closed_even_with_fresh_counts(self) -> None:
+        scheduler = self.make_scheduler()
+        self.set_snapshot(scheduler, error="last good snapshot only")
+        admitted, reason = self.task_admission(scheduler, self.make_task())
+        self.assertFalse(admitted)
+        self.assertIn("monitor error", reason)
+
+    def test_missing_required_feature_fails_closed(self) -> None:
+        scheduler = self.make_scheduler()
+        self.set_snapshot(
+            scheduler,
+            features=[{"feature": "elec_solve_level1", "used": 1, "total": 550}],
+        )
+        admitted, reason = self.task_admission(scheduler, self.make_task())
+        self.assertFalse(admitted)
+        self.assertIn("feature missing", reason)
+
+    def test_invalid_feature_counts_fail_closed(self) -> None:
+        scheduler = self.make_scheduler()
+        task_id = self.make_task()
+        for used, total in ((0, 0), (-1, 550), (551, 550)):
+            with self.subTest(used=used, total=total):
+                self.set_snapshot(scheduler, used=used, total=total)
+                admitted, reason = self.task_admission(scheduler, task_id)
+                self.assertFalse(admitted)
+                self.assertIn("invalid license counts", reason)
+
+    def test_stale_snapshot_fails_closed(self) -> None:
+        scheduler = self.make_scheduler()
+        self.set_snapshot(scheduler, age_seconds=120.1)
+        admitted, reason = self.task_admission(scheduler, self.make_task())
+        self.assertFalse(admitted)
+        self.assertIn("snapshot is stale", reason)
+
+    def test_exact_capacity_boundary_counts_candidate_and_unsettled_claim(self) -> None:
+        scheduler = self.make_scheduler()
+        self.set_snapshot(scheduler, used=517)
+        first = self.make_task(name="first")
+        second = self.make_task(name="second")
+        self.assertTrue(scheduler.assign_queued_task(self.db.get_task(first)))
+        self.assertFalse(scheduler.assign_queued_task(self.db.get_task(second)))
+        self.assertEqual(self.db.get_task(first)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(self.db.get_task(second)["status"], TaskStatus.QUEUED.value)
+        feature = scheduler.license_usage()["admission"]["features"][self.FEATURE]
+        self.assertEqual(feature["effective_used"], 518)
+        self.assertEqual(feature["admit_headroom"], 0)
+
+    def test_concurrent_last_seat_is_claimed_once_under_assignment_lock(self) -> None:
+        scheduler = self.make_scheduler()
+        self.set_snapshot(scheduler, used=517)
+        task_ids = [self.make_task(name=f"race-{index}") for index in range(2)]
+        original_best = scheduler.best_allocation_for_task
+        selected = threading.Barrier(2)
+
+        def synchronized_best(task: dict) -> dict | None:
+            allocation = original_best(task)
+            selected.wait(timeout=2)
+            return allocation
+
+        scheduler.best_allocation_for_task = synchronized_best  # type: ignore[method-assign]
+        results: list[bool] = []
+        threads = [
+            threading.Thread(
+                target=lambda task_id=task_id: results.append(
+                    scheduler.assign_queued_task(self.db.get_task(task_id))
+                )
+            )
+            for task_id in task_ids
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+        self.assertEqual(sorted(results), [False, True])
+        self.assertEqual(
+            [self.db.get_task(task_id)["status"] for task_id in task_ids].count(TaskStatus.RUNNING.value),
+            1,
+        )
+
+    def test_snapshot_started_before_claim_cannot_absorb_it(self) -> None:
+        scheduler = self.make_scheduler()
+        self.set_snapshot(scheduler, used=100)
+        task_id = self.make_task()
+        self.assertTrue(scheduler.assign_queued_task(self.db.get_task(task_id)))
+        claim = next(iter(scheduler._license_admission_claims.values()))
+        running_at = claim["running_at"]
+        self.publish_snapshot(scheduler, running_at - timedelta(seconds=1), used=101)
+        self.assertEqual(len(scheduler._license_admission_claims), 1)
+        self.publish_snapshot(scheduler, running_at + timedelta(seconds=299), used=101)
+        self.assertEqual(len(scheduler._license_admission_claims), 1)
+        self.publish_snapshot(scheduler, running_at + timedelta(seconds=300), used=101)
+        self.assertEqual(len(scheduler._license_admission_claims), 0)
+
+    def test_attaching_claim_is_never_absorbed_by_snapshot(self) -> None:
+        scheduler = self.make_scheduler()
+        self.set_snapshot(scheduler, used=100)
+        task_id = self.make_task()
+        reserved = scheduler.reserve_task_on_allocation(
+            self.db.get_task(task_id), self.db.get_allocation(self.allocation_id), self.accounts[0]
+        )
+        self.assertIsNotNone(reserved)
+        claimed_at = next(iter(scheduler._license_admission_claims.values()))["claimed_at"]
+        self.publish_snapshot(scheduler, claimed_at + timedelta(hours=1), used=101)
+        self.assertEqual(len(scheduler._license_admission_claims), 1)
+
+    def test_restart_reconstructs_running_and_attaching_claims(self) -> None:
+        old = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        attaching = self.make_task(name="restart-attaching")
+        running = self.make_task(name="restart-running")
+        self.db.update_task(
+            attaching,
+            status=TaskStatus.ATTACHING.value,
+            attach_token="attach-old",
+            attached_at=old,
+            launch_started_at=old,
+        )
+        self.db.update_task(
+            running,
+            status=TaskStatus.RUNNING.value,
+            attach_token="run-old",
+            attached_at=old,
+            launch_started_at=old,
+            started_at=old,
+        )
+        scheduler = self.make_scheduler()
+        self.assertEqual(len(scheduler._license_admission_claims), 2)
+        self.publish_snapshot(scheduler, datetime.now(timezone.utc), used=102)
+        self.assertEqual(len(scheduler._license_admission_claims), 1)
+        remaining = next(iter(scheduler._license_admission_claims.values()))
+        self.assertEqual(remaining["task_id"], attaching)
+        self.assertEqual(remaining["state"], "attaching")
+
+    def test_cancel_before_launch_releases_claim_immediately(self) -> None:
+        scheduler = self.make_scheduler()
+        self.set_snapshot(scheduler, used=100)
+        task_id = self.make_task()
+        reserved = scheduler.reserve_task_on_allocation(
+            self.db.get_task(task_id), self.db.get_allocation(self.allocation_id), self.accounts[0]
+        )
+        self.assertIsNotNone(reserved)
+        self.assertEqual(len(scheduler._license_admission_claims), 1)
+        self.db.update_task(task_id, status=TaskStatus.CANCELLED.value, finished_at="CURRENT_TIMESTAMP")
+        scheduler.on_task_terminal(reserved, "cancelled before launch")
+        self.assertEqual(len(scheduler._license_admission_claims), 0)
+
+    def test_restart_recovery_requeues_and_releases_unlaunched_claim(self) -> None:
+        scheduler = self.make_scheduler()
+        self.set_snapshot(scheduler, used=100)
+        task_id = self.make_task()
+        reserved = scheduler.reserve_task_on_allocation(
+            self.db.get_task(task_id), self.db.get_allocation(self.allocation_id), self.accounts[0]
+        )
+        self.assertIsNotNone(reserved)
+        self.assertEqual(len(scheduler._license_admission_claims), 1)
+        scheduler.recover_transient_states()
+        self.assertEqual(self.db.get_task(task_id)["status"], TaskStatus.QUEUED.value)
+        self.assertEqual(len(scheduler._license_admission_claims), 0)
+
+    def test_ambiguous_attach_failure_is_retained_until_qualifying_snapshot(self) -> None:
+        scheduler = self.make_scheduler(client_factory=AttachFailureClient)
+        self.set_snapshot(scheduler, used=100)
+        task_id = self.make_task()
+        self.assertFalse(scheduler.assign_queued_task(self.db.get_task(task_id)))
+        self.assertEqual(self.db.get_task(task_id)["status"], TaskStatus.FAILED.value)
+        self.assertEqual(len(scheduler._license_admission_claims), 1)
+        claim = next(iter(scheduler._license_admission_claims.values()))
+        self.assertEqual(claim["state"], "terminal")
+        self.publish_snapshot(
+            scheduler,
+            claim["launch_started_at"] + timedelta(seconds=300),
+            used=100,
+        )
+        self.assertEqual(len(scheduler._license_admission_claims), 0)
+
+    def test_unknown_fea_project_is_held_without_blocking_eligible_project(self) -> None:
+        scheduler = self.make_scheduler()
+        self.set_snapshot(scheduler, used=100)
+        unknown = self.make_task("AAA_UNKNOWN", name="unknown")
+        known = self.make_task(self.MFT, name="known")
+        scheduler.assign_ready_fea_tasks()
+        self.assertEqual(self.db.get_task(unknown)["status"], TaskStatus.QUEUED.value)
+        self.assertEqual(self.db.get_task(known)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(scheduler._fea_project_last_claim[0], self.MFT)
+
+    def test_two_seats_follow_persisted_project_fair_order(self) -> None:
+        scheduler = self.make_scheduler()
+        self.set_snapshot(scheduler, used=516)
+        mft_first = self.make_task(self.MFT, name="mft-first")
+        ipmsm = self.make_task(self.IPMSM, name="ipmsm")
+        mft_second = self.make_task(self.MFT, name="mft-second")
+        scheduler.assign_ready_fea_tasks()
+        self.assertEqual(self.db.get_task(mft_first)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(self.db.get_task(ipmsm)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(self.db.get_task(mft_second)["status"], TaskStatus.QUEUED.value)
+        self.assertEqual(scheduler._fea_project_last_claim[0], self.IPMSM)
+
+    def test_unprofiled_standard_task_is_not_held_by_fea_policy(self) -> None:
+        scheduler = self.make_scheduler()
+        task_id = self.make_task("UNLICENSED_STANDARD", fea=False)
+        self.assertTrue(scheduler.assign_queued_task(self.db.get_task(task_id)))
+        self.assertEqual(self.db.get_task(task_id)["status"], TaskStatus.RUNNING.value)
+
+    def test_api_license_payload_adds_admission_diagnostics(self) -> None:
+        scheduler = self.make_scheduler()
+        self.set_snapshot(scheduler, used=436)
+        payload = scheduler.license_usage()
+        self.assertEqual(payload["features"][0]["used"], 436)
+        admission = payload["admission"]
+        self.assertTrue(admission["enabled"])
+        self.assertTrue(admission["snapshot_valid"])
+        self.assertEqual(admission["features"][self.FEATURE]["effective_used"], 436)
+        self.assertEqual(admission["features"][self.FEATURE]["admit_headroom"], 82)
+
+    def test_saturated_capacity_keeps_snapshot_valid_but_blocks_admission(self) -> None:
+        scheduler = self.make_scheduler()
+        self.set_snapshot(scheduler, used=519)
+        admission = scheduler.license_usage()["admission"]
+        self.assertTrue(admission["snapshot_valid"])
+        self.assertIn("capacity exhausted", admission["blocked_reason"])
+        admitted, reason = self.task_admission(scheduler, self.make_task())
+        self.assertFalse(admitted)
+        self.assertIn("capacity exhausted", reason)
+
+    def test_success_empty_fallback_and_recovery_state_transition(self) -> None:
+        from unittest import mock
+
+        scheduler = self.make_scheduler()
+        success_1 = CommandResult(
+            "license server UP\nUsers of electronics_desktop:  (Total of 550 licenses issued;  Total of 436 licenses in use)\n",
+            "",
+            0,
+        )
+        empty = CommandResult("license server UP\n", "", 0)
+        success_2 = CommandResult(
+            "license server UP\nUsers of electronics_desktop:  (Total of 550 licenses issued;  Total of 430 licenses in use)\n",
+            "",
+            0,
+        )
+
+        class SequenceSession:
+            results = [success_1, empty, empty, empty, success_2]
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def run(self, _command):
+                return type(self).results.pop(0)
+
+        with mock.patch("slurm_scheduler.scheduler.SSHSession", SequenceSession), mock.patch(
+            "slurm_scheduler.scheduler.time.sleep", return_value=None
+        ):
+            scheduler._refresh_license_usage(self.accounts[0])
+            self.assertTrue(scheduler.license_usage()["admission"]["snapshot_valid"])
+            scheduler._refresh_license_usage(self.accounts[0])
+            fallback = scheduler.license_usage()
+            self.assertIn("last good snapshot", fallback["error"])
+            self.assertFalse(fallback["admission"]["snapshot_valid"])
+            scheduler._refresh_license_usage(self.accounts[0])
+            recovered = scheduler.license_usage()
+            self.assertEqual(recovered["features"][0]["used"], 430)
+            self.assertTrue(recovered["admission"]["snapshot_valid"])
+
+    def test_refresh_exception_cannot_look_like_fresh_zero_usage(self) -> None:
+        from unittest import mock
+
+        scheduler = self.make_scheduler()
+
+        class BrokenSession:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __enter__(self):
+                raise RuntimeError("lmstat transport failed")
+
+            def __exit__(self, *_args):
+                return None
+
+        with mock.patch("slurm_scheduler.scheduler.SSHSession", BrokenSession):
+            scheduler._refresh_license_usage(self.accounts[0])
+        payload = scheduler.license_usage()
+        self.assertEqual(payload["features"], [])
+        self.assertFalse(payload["admission"]["snapshot_valid"])
+        self.assertIn("monitor error", payload["admission"]["blocked_reason"])
+
+    def test_nonzero_lmstat_exit_with_feature_text_fails_closed(self) -> None:
+        from unittest import mock
+
+        scheduler = self.make_scheduler()
+        partial_failure = CommandResult(
+            "license server UP\nUsers of electronics_desktop:  (Total of 550 licenses issued;  Total of 1 license in use)\n",
+            "",
+            1,
+        )
+
+        class FailedSession:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def run(self, _command):
+                return partial_failure
+
+        with mock.patch("slurm_scheduler.scheduler.SSHSession", FailedSession):
+            scheduler._refresh_license_usage(self.accounts[0])
+        payload = scheduler.license_usage()
+        self.assertFalse(payload["admission"]["snapshot_valid"])
+        self.assertTrue(payload["error"])
 
 
 class ObservabilityTests(unittest.TestCase):

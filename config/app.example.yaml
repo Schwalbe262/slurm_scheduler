@@ -58,6 +58,24 @@ fea_bursty:
   # Three-stage MFT runs can reach their late Thermal memory peak after
   # roughly 48-53 minutes. Keep declared CPU/RAM reserved for the first hour.
   footprint_maturity_seconds: 3600
+license_monitor:
+  enabled: false
+  account: "account_a"
+  lmutil_path: "/path/to/lmutil"
+  license_server: "1055@license-server"
+  interval_seconds: 60
+  admission:
+    enabled: false
+    snapshot_max_age_seconds: 120
+    settlement_seconds: 300
+    reserve_by_feature:
+      electronics_desktop: 32
+    persistent_cost_by_project:
+      MFT_1MW_2026v1:
+        electronics_desktop: 1
+      PYAEDT_MOTOR_IPMSM_V2:
+        electronics_desktop: 1
+    unknown_fea_project_policy: block
 cleanup:
   enabled: true
   interval_seconds: 3600

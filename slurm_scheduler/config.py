@@ -131,9 +131,22 @@ class AppConfig:
     license_monitor_account: str = ""
     license_monitor_lmutil_path: str = ""
     license_monitor_license_server: str = ""
-    license_monitor_interval_seconds: int = 300
+    license_monitor_interval_seconds: int = 60
     license_monitor_watch_features: list[str] = field(default_factory=list)
     license_monitor_display: dict[str, str] = field(default_factory=dict)
+    license_admission_enabled: bool = False
+    license_admission_snapshot_max_age_seconds: int = 120
+    license_admission_settlement_seconds: int = 300
+    license_admission_reserve_by_feature: dict[str, int] = field(
+        default_factory=lambda: {"electronics_desktop": 32}
+    )
+    license_admission_persistent_cost_by_project: dict[str, dict[str, int]] = field(
+        default_factory=lambda: {
+            "MFT_1MW_2026v1": {"electronics_desktop": 1},
+            "PYAEDT_MOTOR_IPMSM_V2": {"electronics_desktop": 1},
+        }
+    )
+    license_admission_unknown_fea_project_policy: str = "block"
     cleanup_db_row_ttl_seconds: int = 1209600
     cleanup_event_ttl_seconds: int = 604800
     git_credentials: list[GitCredentialConfig] = field(default_factory=list)
@@ -203,6 +216,18 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
         }.items():
             if source in license_monitor:
                 data[target] = license_monitor[source]
+        admission = license_monitor.get("admission")
+        if isinstance(admission, dict):
+            for source, target in {
+                "enabled": "license_admission_enabled",
+                "snapshot_max_age_seconds": "license_admission_snapshot_max_age_seconds",
+                "settlement_seconds": "license_admission_settlement_seconds",
+                "reserve_by_feature": "license_admission_reserve_by_feature",
+                "persistent_cost_by_project": "license_admission_persistent_cost_by_project",
+                "unknown_fea_project_policy": "license_admission_unknown_fea_project_policy",
+            }.items():
+                if source in admission:
+                    data[target] = admission[source]
     cleanup = data.pop("cleanup", None)
     if isinstance(cleanup, dict):
         mapping = {

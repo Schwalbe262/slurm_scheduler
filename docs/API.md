@@ -40,15 +40,17 @@ curl -sS "$SCHEDULER_URL/api/events?limit=100"
 
 ### `GET /api/licenses`
 
-Latest FlexLM license snapshot from the license monitor (empty object until the first check completes).
+Latest FlexLM license snapshot from the license monitor. Before the first check, deployments with admission configured return the `admission` diagnostics while snapshot fields are absent.
 
 ```bash
 curl -sS "$SCHEDULER_URL/api/licenses"
 ```
 
 ```json
-{"checked_at": "...", "server": "1055@...", "server_up": true, "in_use": [{"feature": "electronics_desktop", "total": 550, "used": 12}], "features": [...], "error": ""}
+{"checked_at": "...", "server": "1055@...", "server_up": true, "in_use": [{"feature": "electronics_desktop", "total": 550, "used": 12}], "features": [...], "error": "", "admission": {"enabled": true, "snapshot_valid": true, "unsettled_by_feature": {"electronics_desktop": 2}, "features": {"electronics_desktop": {"effective_used": 14, "admit_headroom": 504}}}}
 ```
+
+`admission` is additive diagnostics for the persistent-seat gate. It reports snapshot freshness, reserves, unsettled claims, effective use, remaining admission headroom, and a fail-closed reason without changing the existing license fields.
 
 ### `GET /api/dashboard-summary`
 
