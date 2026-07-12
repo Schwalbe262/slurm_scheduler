@@ -274,6 +274,7 @@ class Scheduler:
         self._fea_overload_scaled_nodes: set[str] = set()
         self.task_refresh_max_per_tick = max(1, int(task_refresh_max_per_tick))
         self._fea_task_refresh_cursor_id = 0
+        self._fea_project_last_success: dict[int, str] = {}
         self._background_attach_semaphore = threading.BoundedSemaphore(max(1, min(4, self.fea_max_attach_per_loop)))
         self._allocation_backoff_until_by_pool: dict[str, float] = {}
         self._allocation_node_backoff_until: dict[tuple[str, str], float] = {}
@@ -2122,7 +2123,10 @@ class Scheduler:
                 attached += 1
 
     @staticmethod
-    def project_fair_queue_order(tasks: list[dict]) -> list[dict]:
+    def project_fair_queue_order(
+        tasks: list[dict],
+        last_success_by_priority: dict[int, str] | None = None,
+    ) -> list[dict]:
         """Round-robin equal-priority work across projects, FIFO within each project."""
         grouped: dict[int, dict[str, deque[dict]]] = {}
         for task in sorted(
@@ -2140,6 +2144,10 @@ class Scheduler:
                 queues,
                 key=lambda project: int(queues[project][0]["id"]),
             )
+            last_success = (last_success_by_priority or {}).get(priority)
+            if last_success in projects:
+                start = projects.index(last_success) + 1
+                projects = projects[start:] + projects[:start]
             while projects:
                 remaining = []
                 for project in projects:
@@ -2157,12 +2165,16 @@ class Scheduler:
                 item
                 for item in self.db.list_tasks(limit=5000)
                 if item["status"] == TaskStatus.QUEUED.value and self.task_is_fea_bursty(item)
-            ]
+            ],
+            self._fea_project_last_success,
         ):
             if attached >= self.fea_max_attach_per_loop:
                 return
             if self.assign_queued_task(task, background=background):
                 attached += 1
+                self._fea_project_last_success[int(task.get("priority") or 0)] = str(
+                    task.get("project") or ""
+                )
 
     def _warn_storage_guard(self, account: AccountConfig, detail: str) -> None:
         now = time.monotonic()

@@ -5185,6 +5185,51 @@ class SchedulerTests(unittest.TestCase):
             [newer_high, older, later_old],
         )
 
+    def test_ready_fea_project_cursor_rotates_across_one_slot_calls(self) -> None:
+        for index in range(3):
+            self.db.create_task(
+                TaskCreate(
+                    f"project-a-{index}",
+                    "~/case-a",
+                    "run",
+                    project="project-a",
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                )
+            )
+        for index in range(2):
+            self.db.create_task(
+                TaskCreate(
+                    f"project-b-{index}",
+                    "~/case-b",
+                    "run",
+                    project="project-b",
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                )
+            )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            fea_max_attach_per_loop=1,
+        )
+        winners = []
+
+        def accept_first(task, background=False):
+            winners.append(task["project"])
+            return True
+
+        scheduler.assign_queued_task = accept_first
+        scheduler.assign_ready_fea_tasks()
+        scheduler.assign_ready_fea_tasks()
+        scheduler.assign_ready_fea_tasks()
+        scheduler.assign_ready_fea_tasks()
+
+        self.assertEqual(
+            winners,
+            ["project-a", "project-b", "project-a", "project-b"],
+        )
+
     def test_fea_bursty_prefers_less_loaded_physical_node(self) -> None:
         busy_id = self.db.create_allocation(
             account_name="a",
