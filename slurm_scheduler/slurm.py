@@ -695,18 +695,32 @@ def build_srun_attach_command(
     stderr_path: str,
     exit_code_path: str,
 ) -> str:
+    fea_bursty_task = (
+        normalize_scheduling_profile(str(task.get("scheduling_profile") or ""))
+        == SchedulingProfile.FEA_BURSTY.value
+    )
+    # Bursty FEA deliberately overcommits by average measured load. Give every
+    # overlapping step the allocation's complete CPU pool so Linux can spread
+    # its serial and parallel phases across all owned cores. The solver still
+    # receives the task's requested core count (currently four) from PyAEDT.
+    step_cpus = (
+        int(allocation.get("total_cpus") or task["cpus"])
+        if fea_bursty_task else int(task["cpus"])
+    )
     srun_parts = [
         "srun",
         f"--jobid={shlex.quote(str(allocation['slurm_job_id']))}",
         "--nodes=1",
         "--ntasks=1",
-        f"--cpus-per-task={int(task['cpus'])}",
+        f"--cpus-per-task={step_cpus}",
         f"--mem={int(task['memory_mb'])}M",
     ]
     gres = gpu_gres_value(str(allocation.get("gpu_model") or task.get("gpu_model") or ""), int(task.get("gpus") or 0))
     if gres:
         srun_parts.append(f"--gres={shlex.quote(gres)}")
-    if task_attach_uses_overlap(task):
+    if fea_bursty_task:
+        srun_parts.extend(["--overlap", "--cpu-bind=none"])
+    elif task_attach_uses_overlap(task):
         srun_parts.append("--overlap")
     else:
         # A pooled allocation hosts many concurrent job steps.  ``--exact``
