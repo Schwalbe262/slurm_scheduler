@@ -52,6 +52,7 @@ fea_bursty:
   hard_memory_free_percent: 40
   load_target: 0.75
   max_attach_per_loop: 24
+  max_attach_per_node_per_loop: 2
   node_name_policy: "preferred"
   # Start at the physical-core baseline, then let measured CPU/RAM headroom
   # ramp FEA workers gradually; never exceed 2x that baseline.
