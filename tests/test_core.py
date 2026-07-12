@@ -635,6 +635,7 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("--ntasks=1", command)
         self.assertIn("--cpus-per-task=4", command)
         self.assertIn("--mem=8192M", command)
+        self.assertIn("--exact", command)
         self.assertIn("--exclusive", command)
 
     def test_srun_attach_command_keeps_gpu_task_exclusive_when_cpu_is_tight(self) -> None:
@@ -702,7 +703,7 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("--overlap", command)
         self.assertNotIn("--exclusive", command)
 
-    def test_srun_attach_command_overlaps_fea_bursty_task(self) -> None:
+    def test_srun_attach_command_gives_fea_bursty_task_exact_exclusive_cpus(self) -> None:
         task = {"cpus": 4, "memory_mb": 8192, "scheduling_profile": SchedulingProfile.FEA_BURSTY.value}
         allocation = {"slurm_job_id": "12345", "free_cpus": 64}
         command = build_srun_attach_command(
@@ -715,8 +716,9 @@ class SlurmParsingTests(unittest.TestCase):
         )
         self.assertIn("--cpus-per-task=4", command)
         self.assertIn("--mem=8192M", command)
-        self.assertIn("--overlap", command)
-        self.assertNotIn("--exclusive", command)
+        self.assertIn("--exact", command)
+        self.assertIn("--exclusive", command)
+        self.assertNotIn("--overlap", command)
 
     def test_background_wrapper_uses_new_session_for_process_group_cancel(self) -> None:
         command = background_wrapper_command("srun --jobid=1 bash /remote/task.sh", "/remote/wrapper.log")
