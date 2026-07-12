@@ -96,27 +96,42 @@
     ];
     const stamp = document.getElementById("log-updated-at");
     let timer = null;
+    const loaded = {};
     async function refreshLogs() {
       let any = false;
+      let failures = 0;
       for (const [elementId, url] of targets) {
         const element = document.getElementById(elementId);
         if (!element) continue;
         any = true;
         try {
           const response = await fetch(url);
-          const text = await response.text();
-          element.textContent = response.ok ? (text || "(empty)") : "(unavailable: " + response.status + ")";
-          element.scrollTop = element.scrollHeight;
+          if (response.ok) {
+            const text = await response.text();
+            element.textContent = text || "(empty)";
+            element.scrollTop = element.scrollHeight;
+            loaded[elementId] = true;
+          } else {
+            // Transient contention (e.g. 429 while the harvester holds the
+            // remote-read slots): keep the last good content and retry.
+            failures += 1;
+            if (!loaded[elementId]) element.textContent = "(loading… busy: HTTP " + response.status + ", retrying)";
+          }
         } catch (err) {
-          element.textContent = "(fetch failed)";
+          failures += 1;
+          if (!loaded[elementId]) element.textContent = "(loading… fetch failed, retrying)";
         }
       }
-      if (any && stamp) stamp.textContent = "updated " + new Date().toLocaleTimeString();
+      if (any && stamp) {
+        stamp.textContent = failures
+          ? "refresh busy (HTTP 429), showing last good — " + new Date().toLocaleTimeString()
+          : "updated " + new Date().toLocaleTimeString();
+      }
       if (isTerminal && timer) clearInterval(timer);
     }
     if (targets.some(([elementId]) => document.getElementById(elementId))) {
       refreshLogs();
-      if (!isTerminal) timer = setInterval(refreshLogs, 7000);
+      if (!isTerminal) timer = setInterval(refreshLogs, 10000);
     }
   })();
 </script>
