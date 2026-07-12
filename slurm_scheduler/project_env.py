@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import posixpath
+import re
 import shlex
 import threading
 from typing import Any
@@ -19,6 +20,7 @@ PROJECTS_ROOT = "slurm_scheduler/projects"
 # Cloning/pulling several repos can take a while; keep a long but bounded deadline
 # (mirrors the conda-sync pack/install timeout).
 DEPLOY_SSH_TIMEOUT = 1800.0
+FULL_COMMIT_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40}\Z")
 
 
 def repo_dir_name(repo: dict[str, Any], index: int) -> str:
@@ -39,8 +41,46 @@ def _home_path(rel: str) -> str:
     return '"$HOME/"' + shlex.quote(rel.strip("/"))
 
 
+def _build_exact_commit_sync_script(rel_dest: str, url: str, ref: str) -> str:
+    """Clone or update a repo and leave it detached at one exact commit."""
+    dest = _home_path(rel_dest)
+    target = ref.lower()
+    # Existing branch deployments are depth-one, single-branch clones. Fetch all
+    # advertised branch history before resolving an older immutable commit.
+    all_branches = shlex.quote("+refs/heads/*:refs/remotes/origin/*")
+    return "\n".join(
+        [
+            "set -euo pipefail",
+            f"dest={dest}",
+            f"target={shlex.quote(target)}",
+            'if [ -d "$dest/.git" ]; then',
+            '  if [ "$(git -C "$dest" rev-parse --is-shallow-repository)" = "true" ]; then',
+            f'    git -C "$dest" fetch -q --unshallow --tags --prune origin {all_branches}',
+            "  else",
+            f'    git -C "$dest" fetch -q --tags --prune origin {all_branches}',
+            "  fi",
+            "else",
+            '  rm -rf -- "$dest"',
+            '  mkdir -p -- "$(dirname "$dest")"',
+            f'  git clone -q --no-checkout {shlex.quote(url)} "$dest"',
+            "fi",
+            'resolved="$(git -C "$dest" rev-parse --verify "${target}^{commit}")"',
+            'test "$resolved" = "$target"',
+            'git -C "$dest" checkout -q --detach "$target"',
+            'git -C "$dest" reset -q --hard "$target"',
+            'actual="$(git -C "$dest" rev-parse --verify "HEAD^{commit}")"',
+            'test "$actual" = "$target"',
+            'if git -C "$dest" symbolic-ref -q HEAD >/dev/null; then',
+            "  exit 1",
+            "fi",
+        ]
+    )
+
+
 def build_repo_sync_script(rel_dest: str, url: str, ref: str) -> str:
-    """Idempotent clone-once / git-pull for a single repo (public https)."""
+    """Build an idempotent branch sync or exact-commit checkout script."""
+    if FULL_COMMIT_SHA_PATTERN.fullmatch(ref):
+        return _build_exact_commit_sync_script(rel_dest, url, ref)
     dest = _home_path(rel_dest)
     branch = f"--branch {shlex.quote(ref)} " if ref else ""
     checkout = f'  git -C "$dest" checkout -q {shlex.quote(ref)}\n' if ref else ""
