@@ -164,6 +164,9 @@ class Scheduler:
         fea_max_attach_per_node_per_loop: int = 8,
         fea_node_requested_cpu_factor: float = 1.0,
         fea_footprint_maturity_seconds: int = 900,
+        fea_alloc_util_enabled: bool = True,
+        fea_alloc_util_target: float = 0.85,
+        fea_alloc_util_sample_interval_seconds: int = 60,
         task_refresh_max_per_tick: int = 32,
         cleanup_enabled: bool = True,
         cleanup_interval_seconds: int = 3600,
@@ -275,6 +278,14 @@ class Scheduler:
         self.fea_node_requested_cpu_factor = max(0.0, float(fea_node_requested_cpu_factor))
         self.fea_footprint_maturity_seconds = max(0, int(fea_footprint_maturity_seconds))
         self._fea_footprint_cache: tuple[int, dict[str, dict[str, float]]] | None = None
+        self.fea_alloc_util_enabled = fea_alloc_util_enabled
+        self.fea_alloc_util_target = min(1.0, max(0.1, float(fea_alloc_util_target)))
+        self.fea_alloc_util_sample_interval_seconds = max(30, int(fea_alloc_util_sample_interval_seconds))
+        # slurm_job_id -> (monotonic_time, {step_id: cumulative cpu seconds})
+        self._alloc_cpu_samples: dict[str, tuple[float, dict[str, float]]] = {}
+        # allocation_id -> {"busy_cores": float, "at": monotonic_time}
+        self._alloc_cpu_util: dict[int, dict[str, float]] = {}
+        self._last_alloc_util_at = 0.0
         self._tick_attach_workers_by_node: dict[str, int] = {}
         self._fea_pressures_cache: tuple[int, dict[str, dict[str, int]]] | None = None
         self._fea_alloc_pressures_cache: tuple[int, dict[int, dict[str, int]]] | None = None
@@ -738,6 +749,7 @@ class Scheduler:
                 run_stage("fail_stale_same_node_tasks", self.fail_stale_same_node_tasks)
                 run_stage("enforce_cpu_partition_limits", self.enforce_cpu_partition_allocation_limits)
                 run_stage("update_fea_overload_before", self.update_fea_overload_state)
+                run_stage("alloc_utilization", self.refresh_allocation_utilization_if_due)
                 run_stage("assign_ready_same_node", self.assign_ready_same_node_tasks)
                 run_stage("assign_ready_gpu", self.assign_ready_gpu_tasks)
                 run_stage("assign_ready_standard", self.assign_ready_standard_tasks)
@@ -1296,6 +1308,103 @@ class Scheduler:
                 payload["display"] = [dict(item) for item in payload["display"]]
             payload["admission"] = self._license_admission_diagnostics_locked()
             return payload
+
+    def allocation_utilizations(self) -> dict[int, dict[str, float]]:
+        """allocation_id -> measured busy cores / utilization inside the
+        allocation's own reserved cores (co-tenant load excluded)."""
+        out: dict[int, dict[str, float]] = {}
+        now = time.monotonic()
+        max_age = 3 * self.fea_alloc_util_sample_interval_seconds
+        for allocation_id, info in self._alloc_cpu_util.items():
+            if now - info["at"] > max_age:
+                continue
+            out[allocation_id] = {
+                "busy_cores": round(info["busy_cores"], 2),
+                "total_cpus": info.get("total_cpus", 0),
+                "util_percent": round(
+                    min(100.0, info["busy_cores"] / max(1.0, info.get("total_cpus") or 1.0) * 100.0), 1
+                ),
+            }
+        return out
+
+    def refresh_allocation_utilization_if_due(self) -> None:
+        """Sample each pool job's per-step CPU time via gate-side sstat and
+        difference consecutive samples into an allocation-local utilization.
+        Node-wide loadavg mixes co-tenant activity; scheduling decisions should
+        track how busy OUR reserved cores are."""
+        if not self.fea_alloc_util_enabled:
+            return
+        now = time.time()
+        if now - self._last_alloc_util_at < self.fea_alloc_util_sample_interval_seconds:
+            return
+        self._last_alloc_util_at = now
+        accounts_by_name = {account.name: account for account in self.accounts}
+        live_states = {
+            AllocationStatus.WARM.value,
+            AllocationStatus.ACTIVE.value,
+            AllocationStatus.DRAINING.value,
+        }
+        by_account: dict[str, list[dict]] = {}
+        live_job_ids: set[str] = set()
+        for allocation in self.db.list_allocations(limit=500):
+            if allocation["state"] not in live_states or not allocation.get("slurm_job_id"):
+                continue
+            if allocation["account_name"] not in accounts_by_name:
+                continue
+            live_job_ids.add(str(allocation["slurm_job_id"]))
+            by_account.setdefault(allocation["account_name"], []).append(allocation)
+        # Forget samples of allocations that went away.
+        for job_id in list(self._alloc_cpu_samples):
+            if job_id not in live_job_ids:
+                self._alloc_cpu_samples.pop(job_id, None)
+        outcomes = self._fan_out_by_account(
+            by_account,
+            lambda account_name, allocations: self._probe_allocation_cpu(
+                accounts_by_name[account_name], allocations
+            ),
+        )
+        for account_name, outcome in outcomes.items():
+            if isinstance(outcome, Exception):
+                LOGGER.warning("allocation utilization probe failed on %s: %s", account_name, outcome)
+                continue
+            self._alloc_cpu_util.update(outcome)
+        live_ids = {int(allocation["id"]) for allocations in by_account.values() for allocation in allocations}
+        for allocation_id in list(self._alloc_cpu_util):
+            if allocation_id not in live_ids:
+                self._alloc_cpu_util.pop(allocation_id, None)
+
+    def _probe_allocation_cpu(
+        self, account: AccountConfig, allocations: list[dict]
+    ) -> dict[int, dict[str, float]]:
+        client = self._client(account)
+        probe = getattr(client, "pool_step_cpu_seconds", None)
+        if not callable(probe):
+            return {}
+        job_ids = [str(allocation["slurm_job_id"]) for allocation in allocations]
+        steps_by_job = probe(job_ids)
+        sampled_at = time.monotonic()
+        out: dict[int, dict[str, float]] = {}
+        for allocation in allocations:
+            job_id = str(allocation["slurm_job_id"])
+            current = steps_by_job.get(job_id, {})
+            previous = self._alloc_cpu_samples.get(job_id)
+            self._alloc_cpu_samples[job_id] = (sampled_at, current)
+            if not previous:
+                continue
+            previous_at, previous_steps = previous
+            elapsed = sampled_at - previous_at
+            if elapsed < 5:
+                continue
+            delta = sum(
+                max(0.0, seconds - previous_steps.get(step_id, 0.0))
+                for step_id, seconds in current.items()
+            )
+            out[int(allocation["id"])] = {
+                "busy_cores": delta / elapsed,
+                "total_cpus": float(allocation.get("total_cpus") or 0),
+                "at": sampled_at,
+            }
+        return out
 
     def refresh_license_usage_if_due(self) -> None:
         if not self.license_monitor_enabled:
@@ -3978,9 +4087,23 @@ class Scheduler:
         memory_budget = max(0, memory_free - soft_floor)
         memory_slots = memory_budget // max(1, int(task.get("memory_mb") or 1))
 
-        cpu_total = max(1, int(node.get("cpu_total") or 1))
-        cpu_load = max(0.0, float(node.get("cpu_load") or 0.0)) + float(footprint.get("cpus") or 0.0)
-        load_budget = max(0.0, (cpu_total * self.fea_load_target) - cpu_load)
+        util_info = self._alloc_cpu_util.get(int(allocation.get("id") or 0))
+        util_fresh = bool(
+            self.fea_alloc_util_enabled
+            and util_info
+            and time.monotonic() - util_info["at"] <= 3 * self.fea_alloc_util_sample_interval_seconds
+        )
+        if util_fresh:
+            # Allocation-local control: how busy are OUR reserved cores (sstat
+            # step CPU deltas), independent of co-tenant load on the node. Keep
+            # utilization at the configured target by budgeting the difference.
+            alloc_cpus = max(1, int(allocation.get("total_cpus") or 1))
+            busy_cores = float(util_info["busy_cores"]) + float(footprint.get("cpus") or 0.0)
+            load_budget = max(0.0, (alloc_cpus * self.fea_alloc_util_target) - busy_cores)
+        else:
+            cpu_total = max(1, int(node.get("cpu_total") or 1))
+            cpu_load = max(0.0, float(node.get("cpu_load") or 0.0)) + float(footprint.get("cpus") or 0.0)
+            load_budget = max(0.0, (cpu_total * self.fea_load_target) - cpu_load)
         cpu_slots = int(load_budget // max(1, int(task.get("cpus") or 1)))
 
         return max(

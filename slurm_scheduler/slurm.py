@@ -205,6 +205,46 @@ def parse_squeue_table(output: str) -> dict[str, tuple[str, str, str, str]]:
     return table
 
 
+def parse_cpu_time_seconds(value: str) -> float:
+    """Parse sstat/sacct CPU time: [D-]HH:MM:SS[.ms] or MM:SS[.ms]."""
+    text = (value or "").strip()
+    if not text:
+        return 0.0
+    days = 0.0
+    if "-" in text:
+        day_part, text = text.split("-", 1)
+        try:
+            days = float(day_part)
+        except ValueError:
+            return 0.0
+    parts = text.split(":")
+    try:
+        numbers = [float(part) for part in parts]
+    except ValueError:
+        return 0.0
+    seconds = 0.0
+    for number in numbers:
+        seconds = seconds * 60 + number
+    return days * 86400 + seconds
+
+
+def parse_sstat_cpu_seconds(output: str) -> dict[str, float]:
+    """Parse `sstat -n -P --format=JobID,AveCPU,NTasks` into step -> CPU seconds."""
+    steps: dict[str, float] = {}
+    for line in (output or "").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) < 2 or not parts[0].strip():
+            continue
+        step_id = parts[0].strip()
+        cpu_seconds = parse_cpu_time_seconds(parts[1])
+        try:
+            ntasks = max(1, int(parts[2])) if len(parts) > 2 and parts[2].strip() else 1
+        except ValueError:
+            ntasks = 1
+        steps[step_id] = cpu_seconds * ntasks
+    return steps
+
+
 def parse_sacct_states(output: str) -> dict[str, str]:
     """Parse `sacct -n -X -o JobID,State` into job_id -> first state word."""
     states: dict[str, str] = {}
@@ -1376,6 +1416,29 @@ class SlurmAccountClient:
                     pass
         if error:
             raise RuntimeError(error)
+
+    def pool_step_cpu_seconds(self, slurm_job_ids: list[str]) -> dict[str, dict[str, float]]:
+        """Cumulative CPU seconds per running step for each pool job, via
+        gate-side sstat (no node access). Two samples differenced over wall
+        time give the allocation's own utilization inside its reserved cores,
+        independent of co-tenant load on the node."""
+        ids = [str(job_id).strip() for job_id in slurm_job_ids if str(job_id or "").strip()]
+        if not ids:
+            return {}
+        out: dict[str, dict[str, float]] = {job_id: {} for job_id in ids}
+        with self._open_session() as ssh:
+            for index in range(0, len(ids), 50):
+                chunk = ids[index : index + 50]
+                result = ssh.run(
+                    "sstat -a -n -P -j "
+                    + ",".join(shlex.quote(job_id) for job_id in chunk)
+                    + " --format=JobID,AveCPU,NTasks 2>/dev/null; true"
+                )
+                for step_id, seconds in parse_sstat_cpu_seconds(result.stdout).items():
+                    job_id = step_id.split(".", 1)[0]
+                    if job_id in out:
+                        out[job_id][step_id] = seconds
+        return out
 
     def remove_tree(self, remote_path: str) -> None:
         with self._open_session() as ssh:

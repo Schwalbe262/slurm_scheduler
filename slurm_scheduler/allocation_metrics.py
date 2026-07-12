@@ -13,6 +13,7 @@ def annotate_allocation_node_metrics(allocations: list[dict], pestat_rows: list[
                     "node_cpu_total": None,
                     "node_cpu_load": None,
                     "node_cpu_load_percent": None,
+                    "node_cpu_busy_percent": None,
                     "node_memory_used_mb": None,
                     "node_memory_free_mb": None,
                     "node_memory_total_mb": None,
@@ -35,6 +36,12 @@ def annotate_allocation_node_metrics(allocations: list[dict], pestat_rows: list[
                 "node_cpu_total": cpu_total,
                 "node_cpu_load": round(cpu_load, 2),
                 "node_cpu_load_percent": round((cpu_load / cpu_total) * 100.0, 1) if cpu_total > 0 else None,
+                # Familiar 0-100% utilization view: loadavg approximates busy
+                # cores while load <= cores; anything above is queueing, which
+                # utilization-wise is still a fully busy node.
+                "node_cpu_busy_percent": round(min(cpu_load, cpu_total) / cpu_total * 100.0, 1)
+                if cpu_total > 0
+                else None,
                 "node_memory_used_mb": memory_used_mb,
                 "node_memory_free_mb": memory_free_mb,
                 "node_memory_total_mb": memory_total_mb,

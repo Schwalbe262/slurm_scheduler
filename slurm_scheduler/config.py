@@ -104,6 +104,9 @@ class AppConfig:
     fea_max_attach_per_node_per_loop: int = 8
     fea_node_requested_cpu_factor: float = 1.0
     fea_footprint_maturity_seconds: int = 900
+    fea_alloc_util_enabled: bool = True
+    fea_alloc_util_target: float = 0.85
+    fea_alloc_util_sample_interval_seconds: int = 60
     cleanup_enabled: bool = True
     cleanup_interval_seconds: int = 3600
     cleanup_finished_task_ttl_seconds: int = 259200
@@ -199,6 +202,9 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
             "max_attach_per_node_per_loop": "fea_max_attach_per_node_per_loop",
             "node_requested_cpu_factor": "fea_node_requested_cpu_factor",
             "footprint_maturity_seconds": "fea_footprint_maturity_seconds",
+            "alloc_util_enabled": "fea_alloc_util_enabled",
+            "alloc_util_target": "fea_alloc_util_target",
+            "alloc_util_sample_interval_seconds": "fea_alloc_util_sample_interval_seconds",
         }
         for source, target in mapping.items():
             if source in fea_bursty:

@@ -256,6 +256,14 @@
       white-space: nowrap;
     }
     .muted { color: var(--muted); }
+    .cell-truncate {
+      display: inline-block;
+      max-width: 300px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      vertical-align: bottom;
+    }
     .error { color: var(--danger); }
     details summary {
       cursor: pointer;

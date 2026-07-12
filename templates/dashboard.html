@@ -711,7 +711,7 @@
     </div>
     <div class="table-scroll">
       <table>
-        <thead><tr><th>ID</th><th>State</th><th>Pool</th><th>Account</th><th>Node</th><th>FEA (alloc)</th><th>FEA CPU / owned</th><th>Node Load</th><th>Node RAM</th><th>CPU Used</th><th>GPU Used</th><th>Mem Used</th><th>Slurm ID</th><th>Time</th><th>Action</th></tr></thead>
+        <thead><tr><th>ID</th><th>State</th><th>Pool</th><th>Account</th><th>Node</th><th>FEA (alloc)</th><th>FEA CPU / owned</th><th>CPU Load</th><th>Node RAM</th><th>GPU</th><th>Slurm ID</th><th>Time</th><th>Action</th></tr></thead>
         <tbody>
         {% for allocation in allocations %}
           <tr class="{{ 'warm-pool-row' if allocation.is_warm_pool else '' }}">
@@ -738,11 +738,13 @@
                 <span class="muted">-</span>
               {% endif %}
             </td>
-            <td class="mono-cell" title="pestat CPUload on physical node {{ allocation.node_name }}">
+            <td class="mono-cell" title="ours = measured busy cores inside this allocation (sstat); node = 0-100% capped loadavg (raw load {{ allocation.node_cpu_load }})">
+              {% if allocation.alloc_util_percent is not none %}
+                <div>ours {{ allocation.alloc_busy_cores }} / {{ allocation.total_cpus }} <span class="muted">({{ allocation.alloc_util_percent }}%)</span></div>
+              {% endif %}
               {% if allocation.node_cpu_total %}
-                {{ allocation.node_cpu_load }} / {{ allocation.node_cpu_total }}
-                {% if allocation.node_cpu_load_percent is not none %}<span class="muted">({{ allocation.node_cpu_load_percent }}%)</span>{% endif %}
-              {% else %}
+                <div class="muted">node {{ allocation.node_cpu_busy_percent }}%</div>
+              {% elif allocation.alloc_util_percent is none %}
                 <span class="muted">-</span>
               {% endif %}
             </td>
@@ -754,9 +756,13 @@
                 <span class="muted">-</span>
               {% endif %}
             </td>
-            <td>{{ allocation.total_cpus - allocation.free_cpus }} / {{ allocation.total_cpus }}</td>
-            <td>{{ (allocation.total_gpus or 0) - (allocation.free_gpus or 0) }} / {{ allocation.total_gpus or 0 }} {{ allocation.gpu_model }}</td>
-            <td>{{ allocation.total_memory_mb - allocation.free_memory_mb }} / {{ allocation.total_memory_mb }} MB</td>
+            <td>
+              {% if allocation.total_gpus %}
+                {{ (allocation.total_gpus or 0) - (allocation.free_gpus or 0) }} / {{ allocation.total_gpus }} {{ allocation.gpu_model }}
+              {% else %}
+                <span class="muted">-</span>
+              {% endif %}
+            </td>
             <td class="mono-cell">{{ allocation.slurm_job_id or "" }}</td>
             <td class="mono-cell pool-time-cell">
               <div><span class="pool-time-label">req</span>{{ allocation.request_elapsed_text or "" }}</div>
@@ -778,7 +784,7 @@
             </td>
           </tr>
         {% else %}
-          <tr><td colspan="15" class="muted">No active allocations.</td></tr>
+          <tr><td colspan="13" class="muted">No active allocations.</td></tr>
         {% endfor %}
         </tbody>
       </table>
@@ -980,7 +986,7 @@
     </div>
     <div class="table-scroll">
       <table id="attached-tasks-table">
-        <thead><tr><th><input type="checkbox" id="select-all-tasks" aria-label="Select all visible tasks"></th><th>ID</th><th>Name</th><th>Status</th><th>Prio</th><th>Allocation</th><th>Capability</th><th>Env</th><th>Scheduling</th><th>CPU</th><th>GPU</th><th>Mem</th><th>Elapsed</th><th>Action</th></tr></thead>
+        <thead><tr><th><input type="checkbox" id="select-all-tasks" aria-label="Select all visible tasks"></th><th>ID</th><th>Name</th><th>Status</th><th>Prio</th><th>Alloc</th><th>Env</th><th>Resources</th><th>Elapsed</th><th>Action</th></tr></thead>
         <tbody id="attached-tasks-body">
         {% for task in tasks %}
           <tr
@@ -996,7 +1002,7 @@
             <td><input type="checkbox" class="task-select" value="{{ task.id }}" aria-label="Select task {{ task.id }}"></td>
             <td>{{ task.id }}</td>
             <td>
-              <a href="/tasks/{{ task.id }}">{{ task.name }}</a>
+              <a class="cell-truncate" href="/tasks/{{ task.id }}" title="{{ task.name }}">{{ task.name }}</a>
               {% if task.log_path %}
                 <button
                   type="button"
@@ -1026,12 +1032,10 @@
               {% endif %}
             </td>
             <td>{{ task.allocation_id or "" }}</td>
-            <td>{{ task.required_capability or "" }}</td>
-            <td>{{ task.env_profile or "" }}</td>
-            <td>{{ task.scheduling_profile or "standard" }}</td>
-            <td>{{ task.cpus }}</td>
-            <td>{{ task.gpus or 0 }} {{ task.gpu_model }}</td>
-            <td>{{ task.memory_mb }} MB</td>
+            <td title="capability: {{ task.required_capability or '-' }}">{{ task.env_profile or task.required_capability or "" }}</td>
+            <td class="mono-cell" title="{{ task.cpus }} CPU / {{ task.memory_mb }} MB{% if task.gpus %} / {{ task.gpus }} GPU {{ task.gpu_model }}{% endif %} / {{ task.scheduling_profile or 'standard' }}">
+              {{ task.cpus }}c · {{ (task.memory_mb / 1024) | round(0, "ceil") | int }}G{% if task.gpus %} · {{ task.gpus }}×{{ task.gpu_model or "gpu" }}{% endif %}{% if (task.scheduling_profile or "standard") == "fea_bursty" %} · FEA{% endif %}
+            </td>
             <td class="mono-cell">{{ task.elapsed_text or "" }}</td>
             <td>
               {% if task.status not in ["completed", "failed", "cancelled"] %}
@@ -1046,9 +1050,9 @@
             </td>
           </tr>
         {% else %}
-          <tr><td colspan="14" class="muted">No active attached tasks.</td></tr>
+          <tr><td colspan="10" class="muted">No active attached tasks.</td></tr>
         {% endfor %}
-          <tr id="attached-task-no-filter-match" hidden><td colspan="14" class="muted">No matching attached tasks.</td></tr>
+          <tr id="attached-task-no-filter-match" hidden><td colspan="10" class="muted">No matching attached tasks.</td></tr>
         </tbody>
       </table>
     </div>

@@ -442,6 +442,9 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         fea_max_attach_per_node_per_loop=config.fea_max_attach_per_node_per_loop,
         fea_node_requested_cpu_factor=config.fea_node_requested_cpu_factor,
         fea_footprint_maturity_seconds=config.fea_footprint_maturity_seconds,
+        fea_alloc_util_enabled=config.fea_alloc_util_enabled,
+        fea_alloc_util_target=config.fea_alloc_util_target,
+        fea_alloc_util_sample_interval_seconds=config.fea_alloc_util_sample_interval_seconds,
         cleanup_enabled=config.cleanup_enabled,
         cleanup_interval_seconds=config.cleanup_interval_seconds,
         cleanup_finished_task_ttl_seconds=config.cleanup_finished_task_ttl_seconds,
@@ -1058,10 +1061,14 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             annotate_allocation_node_metrics(db.list_allocations_with_live(limit=500), db.list_pestat_nodes()),
             alloc_fea_pressures,
         )
+        alloc_utils = scheduler.allocation_utilizations()
         for allocation in allocations:
             allocation["node_fea_worker_count"] = int(
                 (alloc_fea_pressures.get(int(allocation.get("id") or 0)) or {}).get("workers") or 0
             )
+            util_info = alloc_utils.get(int(allocation.get("id") or 0))
+            allocation["alloc_busy_cores"] = util_info["busy_cores"] if util_info else None
+            allocation["alloc_util_percent"] = util_info["util_percent"] if util_info else None
         allocation_by_id = {int(allocation["id"]): allocation for allocation in allocations}
         active_task_allocation_ids, active_exclusive_allocation_ids = scheduler.active_task_allocation_sets()
         terminal_allocation_states = {"closed", "failed"}

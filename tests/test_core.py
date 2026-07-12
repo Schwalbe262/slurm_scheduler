@@ -6378,6 +6378,61 @@ class SchedulerTests(unittest.TestCase):
         }
         self.assertEqual(scheduler.best_allocation_for_task(queued)["id"], spare_id)
 
+    def test_parse_sstat_cpu_seconds_and_time_formats(self) -> None:
+        from slurm_scheduler.slurm import parse_cpu_time_seconds, parse_sstat_cpu_seconds
+
+        self.assertEqual(parse_cpu_time_seconds("00:57:07"), 3427.0)
+        self.assertEqual(parse_cpu_time_seconds("1-01:00:00"), 90000.0)
+        self.assertEqual(parse_cpu_time_seconds("05:30.500"), 330.5)
+        self.assertEqual(parse_cpu_time_seconds(""), 0.0)
+        self.assertEqual(parse_cpu_time_seconds("garbage"), 0.0)
+        output = "731346.batch|00:00:10|1\n731346.114|00:57:07|1\nbadline\n731346.115|01:00:00|2\n"
+        steps = parse_sstat_cpu_seconds(output)
+        self.assertEqual(steps["731346.114"], 3427.0)
+        self.assertEqual(steps["731346.115"], 7200.0)
+        self.assertEqual(steps["731346.batch"], 10.0)
+
+    def test_fea_budget_prefers_allocation_local_utilization(self) -> None:
+        # 256-core node loaded to 250 by co-tenants: the node-wide budget is
+        # nearly zero, but OUR 64-core allocation is only 10 cores busy.
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu2",
+            node_name="n116",
+            total_cpus=64,
+            total_memory_mb=131072,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="alloc-1")
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n116 cpu2 mix 250 256 250.0 1024000 900000 others\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            fea_load_target=1.0,
+            fea_alloc_util_target=0.85,
+        )
+        allocation = self.db.get_allocation(allocation_id)
+        task = {"id": 42, "cpus": 4, "memory_mb": 4096, "scheduling_profile": SchedulingProfile.FEA_BURSTY.value}
+        node_based = scheduler.fea_dynamic_extra_slots(allocation, task)
+        self.assertLessEqual(node_based, 1)
+        scheduler._alloc_cpu_util[allocation_id] = {
+            "busy_cores": 10.0,
+            "total_cpus": 64.0,
+            "at": time.monotonic(),
+        }
+        # Budget = 0.85*64 - 10 = 44.4 cores -> 11 four-cpu slots, bounded by
+        # the per-node-per-tick attach cap (8).
+        self.assertEqual(scheduler.fea_dynamic_extra_slots(allocation, task), 8)
+        # Stale sample falls back to the node-wide calculation.
+        scheduler._alloc_cpu_util[allocation_id]["at"] = time.monotonic() - 10_000
+        self.assertLessEqual(scheduler.fea_dynamic_extra_slots(allocation, task), 1)
+
     def test_fea_node_cpu_cap_limits_total_requested_cpus(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",
