@@ -7,6 +7,7 @@ import threading
 import tempfile
 import time
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -8197,6 +8198,7 @@ class ProjectApiTests(unittest.TestCase):
         )
         self.list_tasks = self._route_endpoint("/api/tasks", "GET")
         self.get_task = self._route_endpoint("/api/tasks/{task_id}", "GET")
+        self.task_capacity = self._route_endpoint("/api/task-capacity", "GET")
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -8370,6 +8372,41 @@ class ProjectApiTests(unittest.TestCase):
         payload = self.get_task(task_id)
         self.assertEqual(payload["project"], "motor")
         self.assertEqual(payload["entrypoint"], "run.py")
+
+    def test_task_capacity_passes_project_to_fit_and_license_diagnostics(self) -> None:
+        capacity = {
+            "fit_slots": 1,
+            "ready_fit_slots": 1,
+            "pending_fit_slots": 0,
+            "inflight_fit_slots": 1,
+        }
+        diagnostics = {
+            "queue_state": "ready",
+            "queue_reason": "",
+            "preferred_node_relaxed": False,
+        }
+        with mock.patch.object(
+            self.app.state.scheduler,
+            "active_task_allocation_sets",
+            return_value=(set(), set()),
+        ), mock.patch.object(
+            self.app.state.scheduler,
+            "task_fit_capacity",
+            return_value=dict(capacity),
+        ) as fit, mock.patch.object(
+            self.app.state.scheduler,
+            "task_queue_diagnostics",
+            return_value=dict(diagnostics),
+        ) as queue:
+            payload = self.task_capacity(project="MFT_1MW_2026v1")
+
+        fit_task = fit.call_args.args[0]
+        queue_task = queue.call_args.args[0]
+        self.assertEqual(fit_task["project"], "MFT_1MW_2026v1")
+        self.assertEqual(queue_task["project"], "MFT_1MW_2026v1")
+        self.assertEqual(payload["queue_state"], "ready")
+        openapi_parameters = self.app.openapi()["paths"]["/api/task-capacity"]["get"]["parameters"]
+        self.assertIn("project", {item["name"] for item in openapi_parameters})
 
     def test_task_list_api_filters_before_limit_and_isolates_project(self) -> None:
         matching_ids = [
