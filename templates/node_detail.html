@@ -3,112 +3,134 @@
 <div class="stack">
 <section class="panel">
   <div class="title-row">
-    <h1>Node {{ node_name }}</h1>
-    <a class="button secondary" href="/">Back to dashboard</a>
+    <h1>노드 {{ node_name }}</h1>
+    <a class="button secondary" href="/">대시보드로</a>
   </div>
-  <div class="summary-row" aria-label="Node facts">
+  <div class="summary-row" aria-label="노드 기본 정보">
     <div class="summary-item">
-      <span class="summary-label">Partition</span>
+      <span class="summary-label">파티션</span>
       <span class="summary-value">{{ (inventory.partition if inventory else pestat.partition if pestat else "?") }}</span>
     </div>
     <div class="summary-item">
-      <span class="summary-label">Cores</span>
+      <span class="summary-label">코어</span>
       <span class="summary-value">{{ inventory.cpus if inventory else (pestat.cpu_total if pestat else "?") }}</span>
     </div>
     <div class="summary-item">
-      <span class="summary-label">Memory</span>
+      <span class="summary-label">메모리</span>
       <span class="summary-value">{{ ((inventory.memory_mb if inventory else pestat.memory_mb) / 1024) | round | int }} GB</span>
     </div>
     {% if pestat %}
     <div class="summary-item">
-      <span class="summary-label">Load (raw / capped)</span>
+      <span class="summary-label">Load (원시 / 0~100% 환산)</span>
       <span class="summary-value">{{ pestat.cpu_load }} / {{ ((([pestat.cpu_load, pestat.cpu_total] | min) / pestat.cpu_total * 100) if pestat.cpu_total else 0) | round(1) }}%</span>
     </div>
     <div class="summary-item">
-      <span class="summary-label">Free memory</span>
+      <span class="summary-label">여유 메모리</span>
       <span class="summary-value">{{ (pestat.free_memory_mb / 1024) | round | int }} GB ({{ (pestat.free_memory_mb / pestat.memory_mb * 100) | round(1) if pestat.memory_mb else 0 }}%)</span>
     </div>
     <div class="summary-item">
-      <span class="summary-label">pestat state / observed</span>
-      <span class="summary-value">{{ pestat.state }} <span class="muted">{{ pestat.observed_at }}</span></span>
+      <span class="summary-label">상태 / 관측 시각</span>
+      <span class="summary-value">{{ pestat.state }} <span class="muted">{{ pestat.observed_at }} UTC</span></span>
     </div>
     {% endif %}
   </div>
 </section>
 
 <section class="panel">
-  <h2>FEA Fill Diagnosis</h2>
+  <h2>FEA 채움 진단 — 왜 더 붙거나 안 붙는가</h2>
   <p class="muted">
-    Representative task shape: {{ diagnosis.task_shape.cpus }} CPU / {{ diagnosis.task_shape.memory_mb }} MB
-    ({{ "oldest queued FEA task" if shape_from_queue else "default shape; queue is empty" }}).
-    Policy: keep allocation utilization at {{ (diagnosis.alloc_util_target * 100) | round | int }}%,
-    stop attaching below {{ diagnosis.soft_memory_free_percent }}% node free memory
-    (reclaim below {{ diagnosis.hard_memory_free_percent }}%),
-    node-wide FEA CPU cap {{ diagnosis.node_cpu_total }} × {{ diagnosis.node_cpu_cap_factor }} =
-    {{ (diagnosis.node_cpu_total * diagnosis.node_cpu_cap_factor) | round | int }} cores
-    (currently requested: {{ diagnosis.node_requested_fea_cpus }}).
-    Young-worker reservation: {{ (diagnosis.footprint.cpus or 0) | round | int }} CPUs /
-    {{ ((diagnosis.footprint.memory_mb or 0) / 1024) | round | int }} GB held for workers younger than
-    {{ (diagnosis.footprint_maturity_seconds / 60) | round | int }} min.
+    기준 태스크: CPU {{ diagnosis.task_shape.cpus }}개 / 메모리 {{ (diagnosis.task_shape.memory_mb / 1024) | round | int }} GB 선언
+    ({{ "대기 큐의 실제 태스크 기준" if shape_from_queue else "큐가 비어 있어 기본값 사용" }}).<br>
+    적용 중인 정책: 할당 내 실측 사용률 {{ (diagnosis.alloc_util_target * 100) | round | int }}% 유지 ·
+    노드 여유 메모리 {{ diagnosis.soft_memory_free_percent | round | int }}% 미만이면 신규 투입 중단
+    ({{ diagnosis.hard_memory_free_percent | round | int }}% 미만이면 워커 회수) ·
+    노드당 FEA CPU 상한 {{ (diagnosis.node_cpu_total * diagnosis.node_cpu_cap_factor) | round | int }}코어
+    (현재 신고분 {{ diagnosis.node_requested_fea_cpus }}코어).<br>
+    갓 시작한 워커 예약분: 시작 {{ (diagnosis.footprint_maturity_seconds / 60) | round | int }}분 미만 워커 몫으로
+    메모리 {{ ((diagnosis.footprint.memory_mb or 0) / 1024) | round | int }} GB를 미리 잡아둠
+    (FEA는 메시가 커진 뒤에야 메모리를 쓰기 때문).
   </p>
   {% for item in diagnosis.allocations %}
     <h3>
-      Allocation {{ item.allocation.id }}
-      <span class="muted">({{ item.allocation.state }}, {{ item.allocation.total_cpus }} CPUs, slurm {{ item.allocation.slurm_job_id }})</span>
-      — fit now: <strong>{{ item.fit_slots }}</strong> more worker{{ "" if item.fit_slots == 1 else "s" }}
+      할당 {{ item.allocation.id }}
+      <span class="muted">({{ item.allocation.state }} · {{ item.allocation.total_cpus }}코어 · slurm {{ item.allocation.slurm_job_id }})</span>
+      — 지금 <strong>{{ item.fit_slots }}개</strong> 더 투입 가능
     </h3>
     <div class="table-scroll">
       <table>
         <tbody>
           {% if item.utilization %}
-            <tr><th>Measured utilization (ours)</th><td>{{ item.utilization.busy_cores }} / {{ item.allocation.total_cpus }} cores ({{ item.utilization.util_percent }}%)</td></tr>
+            <tr><th>실측 사용률 (우리 몫)</th><td>{{ item.allocation.total_cpus }}코어 중 {{ item.utilization.busy_cores }}코어 사용 중 ({{ item.utilization.util_percent }}%)</td></tr>
           {% endif %}
           {% if item.trace.blocked_by %}
-            <tr><th>Blocked by</th><td class="error">{{ item.trace.blocked_by }}</td></tr>
+            <tr><th>막힌 이유</th><td class="error">{{ item.trace.blocked_by }}</td></tr>
           {% endif %}
           {% if item.trace.note %}
-            <tr><th>Note</th><td>{{ item.trace.note }}</td></tr>
+            <tr><th>참고</th><td>{{ item.trace.note }}</td></tr>
           {% endif %}
           {% if item.trace.memory_pressure_state is defined %}
-            <tr><th>Gates</th><td>memory pressure: {{ item.trace.memory_pressure_state }} · load ok: {{ item.trace.node_load_ok }} · sustained overload: {{ item.trace.sustained_overload }}</td></tr>
+            <tr><th>게이트 상태</th><td>메모리 압박: {{ item.trace.memory_pressure_state }} · 부하 정상: {{ item.trace.node_load_ok }} · 지속 과부하: {{ item.trace.sustained_overload }}</td></tr>
           {% endif %}
-          {% if item.trace.cpu_mode is defined %}
+          {% if item.trace.memory_slots is defined %}
             <tr>
-              <th>CPU budget ({{ item.trace.cpu_mode }})</th>
+              <th>메모리 여력</th>
               <td>
-                {% if item.trace.measured_busy_cores is defined %}busy {{ item.trace.measured_busy_cores }}{% else %}node load {{ item.trace.node_load }}{% endif %}
-                + young reservation {{ item.trace.footprint_young_cpus }} vs target {{ item.trace.cpu_target_cores }}
-                → budget {{ item.trace.cpu_budget_cores }} cores → <strong>{{ item.trace.cpu_slots }}</strong> slots
+                노드 여유 {{ (item.trace.memory_free_mb / 1024) | round | int }} GB
+                − 신입 워커 예약 {{ (item.trace.footprint_young_memory_mb / 1024) | round | int }} GB
+                − 최소 확보선 {{ (item.trace.memory_soft_floor_mb / 1024) | round | int }} GB
+                = <strong>{{ (item.trace.memory_budget_mb / 1024) | round | int }} GB</strong>
+                → 워커당 {{ (item.trace.memory_estimate_per_worker_mb / 1024) | round | int }} GB 잡으면 <strong>{{ item.trace.memory_slots }}자리</strong>
               </td>
             </tr>
+          {% endif %}
+          {% if item.trace.cpu_mode == "allocation-owned 1x baseline" %}
             <tr>
-              <th>Memory budget</th>
+              <th>CPU 여력 (기본 채움 단계)</th>
+              <td>이 할당이 확보한 코어({{ item.allocation.total_cpus }}개)의 1배수까지는 신고 CPU 기준으로 바로 채움 — 남은 자리 <strong>{{ item.trace.baseline_slots_remaining }}개</strong></td>
+            </tr>
+          {% elif item.trace.cpu_mode == "allocation-local (sstat)" %}
+            <tr>
+              <th>CPU 여력 (실측 기반)</th>
               <td>
-                free {{ (item.trace.memory_free_mb / 1024) | round | int }} GB
-                − young reservation {{ (item.trace.footprint_young_memory_mb / 1024) | round | int }} GB
-                − soft floor {{ (item.trace.memory_soft_floor_mb / 1024) | round | int }} GB
-                → budget {{ (item.trace.memory_budget_mb / 1024) | round | int }} GB → <strong>{{ item.trace.memory_slots }}</strong> slots
+                실측 사용 {{ item.trace.measured_busy_cores }}코어 vs 목표 {{ item.trace.cpu_target_cores }}코어
+                → 여유 <strong>{{ item.trace.cpu_budget_cores }}코어</strong> → <strong>{{ item.trace.cpu_slots }}자리</strong>
+                <div class="muted">기본 채움(1배수)이 끝난 할당이라, 추가 투입은 sstat 실측 사용률이 목표({{ (diagnosis.alloc_util_target * 100) | round | int }}%) 아래일 때만, 틱당 최대 2개씩.</div>
               </td>
             </tr>
-            <tr><th>Per-tick attach cap</th><td>{{ item.trace.tick_attaches }} used of {{ item.trace.tick_attach_cap }} this tick</td></tr>
-            <tr><th>Binding limit</th><td><strong>{{ item.trace.limiter }}</strong></td></tr>
+          {% elif item.trace.cpu_mode is defined %}
+            <tr>
+              <th>CPU 여력 (노드 load 기준 — 실측 샘플 없음)</th>
+              <td>노드 load {{ item.trace.node_load }} vs 목표 {{ item.trace.cpu_target_cores }}코어 → 여유 {{ item.trace.cpu_budget_cores }}코어 → {{ item.trace.cpu_slots }}자리</td>
+            </tr>
+          {% endif %}
+          {% if item.trace.tick_attaches is defined %}
+            <tr><th>이번 틱 투입 수</th><td>{{ item.trace.tick_attaches }}개 (기본 채움 한도 {{ item.trace.baseline_tick_attach_cap }}, 초과 투입 한도 {{ item.trace.overcommit_tick_attach_cap }})</td></tr>
+          {% endif %}
+          {% if item.trace.limiter is defined and item.trace.limiter %}
+            <tr><th><strong>지금 발목을 잡는 것</strong></th><td><strong>
+              {% if item.trace.limiter == "memory budget" %}메모리 여력
+              {% elif item.trace.limiter == "cpu budget" %}CPU 여력 (실측 사용률이 목표에 도달)
+              {% elif item.trace.limiter == "1x CPU baseline" %}기본 채움(1배수) 잔여분
+              {% elif "per-tick" in item.trace.limiter or "per-loop" in item.trace.limiter %}틱당 투입 속도 제한 (다음 틱에 이어서 투입)
+              {% else %}{{ item.trace.limiter }}{% endif %}
+            </strong></td></tr>
           {% endif %}
           {% if item.node_cpu_cap_remaining is not none %}
-            <tr><th>Node FEA CPU cap remaining</th><td>{{ item.node_cpu_cap_remaining }} worker{{ "" if item.node_cpu_cap_remaining == 1 else "s" }} of this shape</td></tr>
+            <tr><th>노드 FEA CPU 상한 잔여</th><td>이 크기 워커 기준 {{ item.node_cpu_cap_remaining }}개 분량</td></tr>
           {% endif %}
         </tbody>
       </table>
     </div>
   {% else %}
-    <p class="muted">No live allocations on this node.</p>
+    <p class="muted">이 노드에 살아있는 할당이 없습니다.</p>
   {% endfor %}
 </section>
 
 <section class="panel">
-  <h2>Tasks on this node ({{ node_tasks | length }})</h2>
+  <h2>이 노드에서 실행 중인 태스크 ({{ node_tasks | length }})</h2>
   <div class="table-scroll">
     <table>
-      <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Alloc</th><th>Resources</th><th>Elapsed</th></tr></thead>
+      <thead><tr><th>ID</th><th>이름</th><th>상태</th><th>할당</th><th>자원</th><th>경과</th></tr></thead>
       <tbody>
       {% for task in node_tasks %}
         <tr>
@@ -120,7 +142,7 @@
           <td class="mono-cell">{{ task.elapsed_text or "" }}</td>
         </tr>
       {% else %}
-        <tr><td colspan="6" class="muted">No running tasks on this node.</td></tr>
+        <tr><td colspan="6" class="muted">이 노드에 실행 중인 태스크가 없습니다.</td></tr>
       {% endfor %}
       </tbody>
     </table>

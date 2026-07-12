@@ -2340,7 +2340,7 @@ class Scheduler:
                 self.close_allocation(allocation, "drained")
             elif age >= self.allocation_force_cancel_after_seconds:
                 self.fail_running_tasks(allocation["id"], "allocation force-cancelled near walltime")
-                self.close_allocation(allocation, "force timeout")
+                self.close_allocation(allocation, "force timeout", force=True)
 
     def expire_pending_allocation_if_stale(self, allocation: dict) -> None:
         if self.allocation_pending_timeout_seconds <= 0:
@@ -2452,44 +2452,100 @@ class Scheduler:
             if task.get("allocation_id"):
                 self.recalculate_allocation_capacity()
 
-    def close_allocation(self, allocation: dict, reason: str) -> None:
-        if allocation["state"] in {AllocationStatus.CLOSED.value, AllocationStatus.FAILED.value, AllocationStatus.CLOSING.value}:
-            return
-        previous_state = allocation["state"]
-        account = next((item for item in self.accounts if item.name == allocation["account_name"]), None)
-        self.db.update_allocation(allocation["id"], state=AllocationStatus.CLOSING.value, drain_reason=reason)
-        if account and allocation.get("slurm_job_id"):
-            try:
-                self._client(account).cancel(allocation["slurm_job_id"])
-            except Exception as exc:
-                self.db.update_allocation(
-                    allocation["id"],
-                    state=previous_state,
-                    failure_message=str(exc),
+    def close_allocation(self, allocation: dict, reason: str, *, force: bool = False) -> bool:
+        allocation_id = int(allocation["id"])
+        # Placement and shutdown share one lock. Without it, the same-node web
+        # fast path could reserve a task after the final claim check but before
+        # scancel. Keep the lock through cancellation so a closing allocation
+        # can never acquire a new owner.
+        with self._task_assignment_lock:
+            current = self.db.get_allocation(allocation_id)
+            if not current or current["state"] in {
+                AllocationStatus.CLOSED.value,
+                AllocationStatus.FAILED.value,
+                AllocationStatus.CLOSING.value,
+            }:
+                return False
+            live_claims = self.db.list_live_task_claims_for_allocation(allocation_id)
+            if live_claims and not force:
+                # WARM with a live claim is stale state. Reconcile it
+                # conservatively. ATTACHING also includes recovery-held
+                # launches whose remote outcome must not be rerun or killed.
+                if current["state"] == AllocationStatus.WARM.value:
+                    self.db.update_allocation(
+                        allocation_id,
+                        state=AllocationStatus.ACTIVE.value,
+                        last_active_at="CURRENT_TIMESTAMP",
+                    )
+                LOGGER.warning(
+                    "refusing to close allocation %s (%s); live task claims: %s",
+                    allocation_id,
+                    reason,
+                    ", ".join(str(task["id"]) for task in live_claims),
                 )
-                return
-        self.db.update_allocation(
-            allocation["id"],
-            state=AllocationStatus.CLOSED.value,
-            failure_message="",
-            closed_at="CURRENT_TIMESTAMP",
-        )
-        self.record_event(
-            "allocation_closed",
-            reason,
-            entity_type="allocation",
-            entity_id=allocation["id"],
-            account_name=str(allocation.get("account_name") or ""),
-        )
+                return False
+            account = next((item for item in self.accounts if item.name == current["account_name"]), None)
+            client = self._client(account) if account and current.get("slurm_job_id") else None
+            if client is not None and not force:
+                try:
+                    live_steps = client.live_allocation_task_steps(current["slurm_job_id"])
+                except Exception as exc:
+                    LOGGER.warning(
+                        "refusing to close allocation %s (%s); live-step probe failed: %s",
+                        allocation_id,
+                        reason,
+                        exc,
+                    )
+                    self.db.update_allocation(
+                        allocation_id,
+                        failure_message=f"allocation close safety probe failed: {exc}",
+                    )
+                    return False
+                if live_steps:
+                    if current["state"] == AllocationStatus.WARM.value:
+                        self.db.update_allocation(
+                            allocation_id,
+                            state=AllocationStatus.ACTIVE.value,
+                            last_active_at="CURRENT_TIMESTAMP",
+                        )
+                    LOGGER.warning(
+                        "refusing to close allocation %s (%s); live Slurm task steps: %s",
+                        allocation_id,
+                        reason,
+                        ", ".join(live_steps),
+                    )
+                    return False
+            previous_state = current["state"]
+            self.db.update_allocation(allocation_id, state=AllocationStatus.CLOSING.value, drain_reason=reason)
+            if client is not None:
+                try:
+                    client.cancel(current["slurm_job_id"])
+                except Exception as exc:
+                    self.db.update_allocation(
+                        allocation_id,
+                        state=previous_state,
+                        failure_message=str(exc),
+                    )
+                    return False
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.CLOSED.value,
+                failure_message="",
+                closed_at="CURRENT_TIMESTAMP",
+            )
+            self.record_event(
+                "allocation_closed",
+                reason,
+                entity_type="allocation",
+                entity_id=allocation_id,
+                account_name=str(current.get("account_name") or ""),
+            )
+            return True
 
     def active_task_ids_for_allocation(self, allocation_id: int) -> list[int]:
         return [
             int(task["id"])
-            for task in self.db.list_tasks_by_statuses(
-                [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
-            )
-            if int(task.get("allocation_id") or 0) == allocation_id
-            and task["status"] in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}
+            for task in self.db.list_live_task_claims_for_allocation(allocation_id)
         ]
 
     def request_close_allocation(self, allocation_id: int, force: bool = False, allow_protected: bool = False) -> dict:
@@ -2518,7 +2574,7 @@ class Scheduler:
             )
         if active_task_ids:
             self.fail_running_tasks(allocation_id, "allocation manually closed")
-        self.close_allocation(allocation, "manual close")
+        self.close_allocation(allocation, "manual close", force=force)
         updated = self.db.get_allocation(allocation_id) or allocation
         return {
             "ok": updated["state"] == AllocationStatus.CLOSED.value,

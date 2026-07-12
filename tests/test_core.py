@@ -352,6 +352,47 @@ class SlurmParsingTests(unittest.TestCase):
         )
         self.assertIn("'/remote/path with spaces/out.log'", remote_text_command("/remote/path with spaces/out.log", max_bytes=10))
 
+    def test_live_allocation_task_steps_keeps_only_numeric_children(self) -> None:
+        class StepSession:
+            command = ""
+
+            def ensure_connected(self) -> None:
+                pass
+
+            def run(self, command: str, timeout: float | None = None) -> CommandResult:
+                self.command = command
+                return CommandResult(
+                    "732195.18\n732195.batch\n732195.extern\n732195.24\nother.1\n",
+                    "",
+                    0,
+                )
+
+        account = AccountConfig("a", "host", 22, "a", "key", "/work")
+        client = SlurmAccountClient(account)
+        session = StepSession()
+        client.bind_shared_session(session)  # type: ignore[arg-type]
+
+        self.assertEqual(
+            client.live_allocation_task_steps("732195"),
+            ["732195.18", "732195.24"],
+        )
+        self.assertIn("squeue --steps -h -j 732195", session.command)
+
+    def test_live_allocation_task_steps_probe_failure_raises(self) -> None:
+        class FailingStepSession:
+            def ensure_connected(self) -> None:
+                pass
+
+            def run(self, command: str, timeout: float | None = None) -> CommandResult:
+                return CommandResult("", "slurm controller unavailable", 1)
+
+        account = AccountConfig("a", "host", 22, "a", "key", "/work")
+        client = SlurmAccountClient(account)
+        client.bind_shared_session(FailingStepSession())  # type: ignore[arg-type]
+
+        with self.assertRaisesRegex(RuntimeError, "slurm controller unavailable"):
+            client.live_allocation_task_steps("732195")
+
     def test_remote_file_expands_project_home_root_and_preserves_absolute_path(self) -> None:
         self.assertIn("$HOME/slurm_scheduler/projects/result.json", remote_text_command("$HOME/slurm_scheduler/projects/result.json"))
         self.assertIn("$HOME/'project files/result.json'", remote_text_command("~/project files/result.json"))
@@ -842,6 +883,7 @@ class FakeClient:
     attached_tasks: list[int] = []
     cancelled: list[str] = []
     cancelled_tasks: list[int] = []
+    live_steps: dict[str, list[str]] = {}
     removed: list[str] = []
 
     def __init__(self, account: AccountConfig):
@@ -908,6 +950,9 @@ class FakeClient:
 
     def cancel(self, slurm_job_id: str) -> None:
         self.cancelled.append(slurm_job_id)
+
+    def live_allocation_task_steps(self, slurm_job_id: str) -> list[str]:
+        return list(self.live_steps.get(slurm_job_id, []))
 
     def cancel_task(self, task: dict, allocation_job_id: str = "") -> None:
         self.cancelled_tasks.append(int(task["id"]))
@@ -987,6 +1032,11 @@ class FailingCancelClient(FakeClient):
         raise RuntimeError("scancel failed")
 
 
+class FailingLiveStepProbeClient(FakeClient):
+    def live_allocation_task_steps(self, slurm_job_id: str) -> list[str]:
+        raise RuntimeError("squeue steps unavailable")
+
+
 class PartialSnapshotFailureClient(FakeClient):
     def snapshot(self, storage_used_gb: float | None = None) -> AccountSnapshot:
         if self.account.name == "b":
@@ -1011,6 +1061,7 @@ class SchedulerTests(unittest.TestCase):
         FakeClient.attached_tasks = []
         FakeClient.cancelled = []
         FakeClient.cancelled_tasks = []
+        FakeClient.live_steps = {}
         FakeClient.removed = []
         FakeClient.snapshots = {
             "a": AccountSnapshot("a", running=3, pending=0, max_running=4, max_pending=10, max_total=10),
@@ -1822,6 +1873,7 @@ class SchedulerTests(unittest.TestCase):
             account_name="a",
             allocation_id=allocation_id,
         )
+        FakeClient.live_steps["alloc-1"] = ["alloc-1.7"]
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
         response = scheduler.request_close_allocation(allocation_id, force=True)
         self.assertEqual(response["ok"], True)
@@ -3406,6 +3458,119 @@ class SchedulerTests(unittest.TestCase):
         allocation = self.db.get_allocation(allocation_id)
         self.assertEqual(allocation["state"], AllocationStatus.CLOSED.value)
         self.assertIn("warm-demand", FakeClient.cancelled)
+
+    def test_warm_demand_allocation_keeps_live_db_claims_then_closes_after_release(self) -> None:
+        claims: list[tuple[int, int]] = []
+        for index, status in enumerate((TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value), start=1):
+            allocation_id = self.db.create_allocation(
+                account_name="a",
+                partition="cpu1",
+                node_name=f"n00{index}",
+                total_cpus=48,
+                total_memory_mb=262144,
+                resource_pool="cpu",
+            )
+            slurm_job_id = f"live-demand-{index}"
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.WARM.value,
+                slurm_job_id=slurm_job_id,
+                drain_reason="queued CPU demand",
+                started_at="CURRENT_TIMESTAMP",
+            )
+            task_id = self.db.create_task(TaskCreate(f"live-{status}", "~/case", "run"))
+            self.db.update_task(
+                task_id,
+                status=status,
+                allocation_id=allocation_id,
+                account_name="a",
+                attach_token=f"claim-{index}",
+                launch_started_at="CURRENT_TIMESTAMP",
+                attached_at="CURRENT_TIMESTAMP",
+                started_at="CURRENT_TIMESTAMP" if status == TaskStatus.RUNNING.value else None,
+            )
+            claims.append((allocation_id, task_id))
+
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, min_warm_allocations=0)
+        scheduler.scale_in_idle_allocations()
+
+        for allocation_id, _task_id in claims:
+            self.assertEqual(self.db.get_allocation(allocation_id)["state"], AllocationStatus.ACTIVE.value)
+        self.assertEqual(FakeClient.cancelled, [])
+
+        for _allocation_id, task_id in claims:
+            self.db.update_task(
+                task_id,
+                status=TaskStatus.COMPLETED.value,
+                finished_at="CURRENT_TIMESTAMP",
+            )
+        scheduler.recalculate_allocation_capacity()
+        scheduler.scale_in_idle_allocations()
+
+        for allocation_id, _task_id in claims:
+            self.assertEqual(self.db.get_allocation(allocation_id)["state"], AllocationStatus.CLOSED.value)
+        self.assertEqual(FakeClient.cancelled, ["live-demand-1", "live-demand-2"])
+
+    def test_warm_demand_allocation_keeps_untracked_live_slurm_step(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=48,
+            total_memory_mb=262144,
+            resource_pool="cpu",
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="remote-live-demand",
+            drain_reason="queued CPU demand",
+            started_at="CURRENT_TIMESTAMP",
+        )
+        FakeClient.live_steps["remote-live-demand"] = ["remote-live-demand.17"]
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, min_warm_allocations=0)
+
+        scheduler.scale_in_idle_allocations()
+
+        self.assertEqual(self.db.get_allocation(allocation_id)["state"], AllocationStatus.ACTIVE.value)
+        self.assertEqual(FakeClient.cancelled, [])
+
+        FakeClient.live_steps.clear()
+        scheduler.recalculate_allocation_capacity()
+        scheduler.scale_in_idle_allocations()
+        self.assertEqual(self.db.get_allocation(allocation_id)["state"], AllocationStatus.CLOSED.value)
+        self.assertEqual(FakeClient.cancelled, ["remote-live-demand"])
+
+    def test_warm_demand_allocation_close_probe_failure_is_fail_closed(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=48,
+            total_memory_mb=262144,
+            resource_pool="cpu",
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="probe-failure-demand",
+            drain_reason="queued CPU demand",
+            started_at="CURRENT_TIMESTAMP",
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FailingLiveStepProbeClient,
+            min_warm_allocations=0,
+        )
+
+        scheduler.scale_in_idle_allocations()
+
+        allocation = self.db.get_allocation(allocation_id)
+        self.assertEqual(allocation["state"], AllocationStatus.WARM.value)
+        self.assertIn("close safety probe failed", allocation["failure_message"])
+        self.assertEqual(FakeClient.cancelled, [])
 
     def test_just_warm_demand_allocation_gets_one_attach_poll_before_scale_in(self) -> None:
         allocation_id = self.db.create_allocation(
