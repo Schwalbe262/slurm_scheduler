@@ -753,8 +753,14 @@ def build_srun_attach_command(
         "--nodes=1",
         "--ntasks=1",
         f"--cpus-per-task={step_cpus}",
-        f"--mem={int(task['memory_mb'])}M",
     ]
+    if not fea_bursty_task:
+        # Standard tasks retain their per-step Slurm memory reservation and
+        # cgroup ceiling.  Bursty FEA steps intentionally share the parent
+        # allocation's memory pool: task.memory_mb is peak/safety metadata for
+        # admission and pressure control, not an exclusive reservation for
+        # every overlapping step.
+        srun_parts.append(f"--mem={int(task['memory_mb'])}M")
     gres = gpu_gres_value(str(allocation.get("gpu_model") or task.get("gpu_model") or ""), int(task.get("gpus") or 0))
     if gres:
         srun_parts.append(f"--gres={shlex.quote(gres)}")

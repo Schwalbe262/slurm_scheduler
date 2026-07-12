@@ -244,13 +244,15 @@ Form fields:
 - `account_name`: optional exact account constraint. Use one account such as `account_a`, or ordered candidates such as `account_a,account_b`.
 - `cpus`: CPU cores requested from an allocation.
 - `memory_mb`: memory requested from an allocation. This is a scheduling/reservation and possible Slurm enforcement limit; it does not physically allocate RAM before the process uses it.
-- `scheduling_profile`: `standard` keeps the existing hard CPU/memory slot accounting. `fea_bursty` keeps `--cpus-per-task` and `--mem` on the Slurm step, uses `--overlap`, skips hard CPU/memory slot subtraction, and gates new attaches from live `pestat` load/free-memory data.
+- `scheduling_profile`: `standard` keeps the existing hard CPU/memory slot accounting and per-step `--mem` ceiling. `fea_bursty` gives each overlapping step the allocation CPU pool, omits a per-step `--mem` reservation so workers share the parent allocation memory pool, and treats `memory_mb` as peak/safety metadata. New FEA attaches require fresh `pestat` CPU/Freemem data, preserve configured soft/hard memory floors, and reserve a conservative young-worker growth estimate. The allocation-owned 1x CPU baseline fast-fills up to `max_attach_per_node_per_loop`; only overcommit workers ramp by at most two per physical node per scheduler tick, with a hard 2x allocation CPU cap.
 - `gpus`: GPU count, normally `0` or `1`.
 - `gpu_model`: optional normalized model such as `a6000ada` or `a6000`. Ordered candidates such as `a6000ada,a6000` are accepted.
 - `partition`: `auto` or a specific Slurm partition.
 - `node_name`: optional specific node constraint.
 - `same_node_as_task_id` or `same_node_as`: optional task id to co-locate this task on the same actual node as a currently `attaching` or `running` task. Use this for localhost-bound service tasks such as vLLM. If the reference task is not running or has no resolved node yet, the new task stays queued. Same-node CPU clients and vLLM service tasks are launched with Slurm step overlap so service and client steps can coexist.
 - `exclusive_node`: use only when a task cannot share a node.
+
+All CPU and GPU allocations are profile-isolated: an allocation claimed by an `attaching` or `running` `fea_bursty` task cannot accept a `standard` task, and vice versa. This prevents shared-memory FEA steps from mixing with per-step `--mem` reservations. Explicit `same_node_as_task_id` placement remains available only when the reference allocation already has the same scheduling profile. CPU-only `fea_bursty` tasks cannot claim real GPU pools; a CPU allocation pinned to a GPU partition remains eligible when it owns no GPUs, and a FEA task explicitly requesting GPUs remains eligible for a matching GPU pool.
 
 ## Submit Git-Based Commands
 

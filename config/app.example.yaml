@@ -52,11 +52,17 @@ fea_bursty:
   hard_memory_free_percent: 40
   load_target: 0.75
   max_attach_per_loop: 24
-  max_attach_per_node_per_loop: 2
+  max_attach_per_node_per_loop: 12
   node_name_policy: "preferred"
-  # Start at the physical-core baseline, then let measured CPU/RAM headroom
-  # ramp FEA workers gradually; never exceed 2x that baseline.
+  # Fast-fill the allocation-owned physical-core baseline (bounded by
+  # max_attach_per_node_per_loop), then add overcommit workers at +2/tick;
+  # never exceed 2x that baseline.
   node_requested_cpu_factor: 2.0
+  # memory_mb remains the per-task peak/safety value. Shared FEA admission
+  # reserves this conservative growth estimate while live pestat Freemem is
+  # the authoritative node-level guard.
+  shared_memory_estimate_fraction: 0.25
+  shared_memory_min_estimate_mb: 8192
   overload_scale_out_load_factor: 2.0
   overload_scale_out_seconds: 300
   # Three-stage MFT runs can reach their late Thermal memory peak after
