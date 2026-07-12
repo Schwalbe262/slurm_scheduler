@@ -50,6 +50,7 @@ class AedtProjectLease:
     project_name: str
     state: str = "queued"
     endpoint: str = ""
+    exclusive_session: bool = False
     _heartbeat_stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _heartbeat_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     heartbeat_error: str = field(default="", init=False)
@@ -209,8 +210,11 @@ def acquire_project_lease(
     task_id: int = 0,
     allocation_id: int = 0,
     node_name: str = "",
+    exclusive_session: bool = False,
 ) -> AedtProjectLease:
     """Create a lease request; call `wait_until_leased` before opening a project."""
+    if type(exclusive_session) is not bool:
+        raise ValueError("exclusive_session must be a boolean")
     http = AedtPoolHttpClient(scheduler_url)
     key = request_key.strip() or (
         f"{project_name}:{task_id or os.getpid()}:{uuid.uuid4().hex}"
@@ -224,6 +228,7 @@ def acquire_project_lease(
             "task_id": max(0, int(task_id)),
             "allocation_id": max(0, int(allocation_id)),
             "node_name": node_name,
+            "exclusive_session": exclusive_session,
         },
     )
     lease = payload["lease"]
@@ -234,4 +239,5 @@ def acquire_project_lease(
         project_name=project_name,
         state=str(lease.get("state") or "queued"),
         endpoint=str(lease.get("endpoint") or ""),
+        exclusive_session=bool(lease.get("exclusive_session")),
     )

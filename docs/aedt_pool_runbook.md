@@ -6,16 +6,19 @@
 
 ## Source and deployment safety
 
-- After the 2026-07-13 RaiDrive incident, build, test, commit, and push this
-  experiment only from a local NTFS clean clone.
-- Do not use the mapped `Y:` worktree as a Git source, test source, or
-  deployment source.
+- Build, test, commit, and push this experiment from a dedicated clean clone,
+  never from the dirty live scheduler tree.
 - Deploy only by checking out an identified GitHub branch and commit SHA onto
   local or cluster-local storage, then verify the checked-out SHA before any
   service action.
 - The live scheduler has not been deployed or restarted for this experiment.
   Keep `enabled=false` and `adapter_ready=false` until the complete live A/B
   validation contract passes.
+
+The first integration step is the exclusive 1:1 procedure in
+[`mft_aedt_attach_1to1.md`](mft_aedt_attach_1to1.md).  It must use
+`priority=10000`, `project=MFT_1MW_2026v1`, and exact full Git SHAs.  It leaves
+the production pool disabled and does not satisfy the later 1:2 A/B gate.
 
 ## 1. Preflight
 

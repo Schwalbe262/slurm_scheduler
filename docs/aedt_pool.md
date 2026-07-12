@@ -6,11 +6,14 @@
 > AEDT process until the host adapter is configured and the mandatory live A/B
 > validation passes.
 
-> **Source-of-truth note:** after the 2026-07-13 RaiDrive incident, this
-> experiment must be built, tested, committed, and pushed only from a local
-> NTFS clone.  Do not use the mapped `Y:` worktree as a Git, test, or deployment
-> source.  Any later deployment must be checked out from an identified GitHub
-> branch and commit SHA onto local or cluster-local storage.
+> **Source-of-truth note:** build and test this experiment in a dedicated clean
+> clone, never in the dirty live scheduler tree.  Deployment must use an
+> identified GitHub branch and exact commit SHA on cluster-local storage.
+
+> **Current integration gate:** the MFT adapter is restricted to an exclusive
+> one-Desktop/one-project pilot.  See
+> [MFT AEDT attach 1:1 pilot](mft_aedt_attach_1to1.md).  A 1:1 pass does not
+> authorize 1:2 or the 250/500 target.
 
 ## 목적과 범위
 
