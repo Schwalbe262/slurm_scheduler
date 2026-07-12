@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import logging
 import os
 import posixpath
@@ -11,6 +12,7 @@ import threading
 import time
 import traceback
 import uuid
+from bisect import bisect_right
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -35,6 +37,7 @@ from .slurm import (
 
 LOGGER = logging.getLogger(__name__)
 ClientFactory = Callable[[AccountConfig], SlurmAccountClient]
+FEA_PROJECT_CURSOR_SETTING = "fea_project_last_claim_by_priority"
 
 
 LMSTAT_FEATURE_RE = re.compile(
@@ -274,7 +277,7 @@ class Scheduler:
         self._fea_overload_scaled_nodes: set[str] = set()
         self.task_refresh_max_per_tick = max(1, int(task_refresh_max_per_tick))
         self._fea_task_refresh_cursor_id = 0
-        self._fea_project_last_success: dict[int, str] = {}
+        self._fea_project_last_claim = self.load_fea_project_claim_cursor()
         self._background_attach_semaphore = threading.BoundedSemaphore(max(1, min(4, self.fea_max_attach_per_loop)))
         self._allocation_backoff_until_by_pool: dict[str, float] = {}
         self._allocation_node_backoff_until: dict[tuple[str, str], float] = {}
@@ -2125,7 +2128,7 @@ class Scheduler:
     @staticmethod
     def project_fair_queue_order(
         tasks: list[dict],
-        last_success_by_priority: dict[int, str] | None = None,
+        last_claim_by_priority: dict[int, str] | None = None,
     ) -> list[dict]:
         """Round-robin equal-priority work across projects, FIFO within each project."""
         grouped: dict[int, dict[str, deque[dict]]] = {}
@@ -2140,13 +2143,11 @@ class Scheduler:
         ordered = []
         for priority in sorted(grouped, reverse=True):
             queues = grouped[priority]
-            projects = sorted(
-                queues,
-                key=lambda project: int(queues[project][0]["id"]),
-            )
-            last_success = (last_success_by_priority or {}).get(priority)
-            if last_success in projects:
-                start = projects.index(last_success) + 1
+            projects = sorted(queues)
+            if last_claim_by_priority is not None \
+                    and priority in last_claim_by_priority:
+                last_claim = last_claim_by_priority[priority]
+                start = bisect_right(projects, last_claim)
                 projects = projects[start:] + projects[:start]
             while projects:
                 remaining = []
@@ -2158,6 +2159,36 @@ class Scheduler:
                 projects = remaining
         return ordered
 
+    def load_fea_project_claim_cursor(self) -> dict[int, str]:
+        raw = self.db.get_setting(FEA_PROJECT_CURSOR_SETTING)
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise ValueError("cursor payload is not an object")
+            return {
+                int(priority): str(project)
+                for priority, project in payload.items()
+            }
+        except (TypeError, ValueError, json.JSONDecodeError):
+            LOGGER.warning("ignoring invalid persisted FEA project cursor")
+            return {}
+
+    def persist_fea_project_claim(self, task: dict) -> None:
+        priority = int(task.get("priority") or 0)
+        project = str(task.get("project") or "")
+        self._fea_project_last_claim[priority] = project
+        self.db.set_setting(
+            FEA_PROJECT_CURSOR_SETTING,
+            json.dumps(
+                {str(key): value for key, value in self._fea_project_last_claim.items()},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
     def assign_ready_fea_tasks(self, background: bool = False) -> None:
         attached = 0
         for task in self.project_fair_queue_order(
@@ -2166,15 +2197,16 @@ class Scheduler:
                 for item in self.db.list_tasks(limit=5000)
                 if item["status"] == TaskStatus.QUEUED.value and self.task_is_fea_bursty(item)
             ],
-            self._fea_project_last_success,
+            self._fea_project_last_claim,
         ):
             if attached >= self.fea_max_attach_per_loop:
                 return
             if self.assign_queued_task(task, background=background):
                 attached += 1
-                self._fea_project_last_success[int(task.get("priority") or 0)] = str(
-                    task.get("project") or ""
-                )
+                # This is an accepted DB attach claim, not proof that the remote
+                # worker later started. Rotating on claims also prevents a
+                # repeatedly failing project from monopolizing scarce slots.
+                self.persist_fea_project_claim(task)
 
     def _warn_storage_guard(self, account: AccountConfig, detail: str) -> None:
         now = time.monotonic()

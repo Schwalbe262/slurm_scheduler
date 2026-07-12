@@ -5185,7 +5185,7 @@ class SchedulerTests(unittest.TestCase):
             [newer_high, older, later_old],
         )
 
-    def test_ready_fea_project_cursor_rotates_across_one_slot_calls(self) -> None:
+    def test_ready_fea_project_cursor_persists_across_one_slot_restarts(self) -> None:
         for index in range(3):
             self.db.create_task(
                 TaskCreate(
@@ -5206,29 +5206,79 @@ class SchedulerTests(unittest.TestCase):
                     scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 )
             )
-        scheduler = Scheduler(
-            self.db,
-            self.accounts,
-            30,
-            client_factory=FakeClient,
-            fea_max_attach_per_loop=1,
-        )
         winners = []
 
         def accept_first(task, background=False):
             winners.append(task["project"])
             return True
 
-        scheduler.assign_queued_task = accept_first
-        scheduler.assign_ready_fea_tasks()
-        scheduler.assign_ready_fea_tasks()
-        scheduler.assign_ready_fea_tasks()
-        scheduler.assign_ready_fea_tasks()
+        for _ in range(4):
+            scheduler = Scheduler(
+                self.db,
+                self.accounts,
+                30,
+                client_factory=FakeClient,
+                fea_max_attach_per_loop=1,
+            )
+            scheduler.assign_queued_task = accept_first
+            scheduler.assign_ready_fea_tasks(background=True)
 
         self.assertEqual(
             winners,
             ["project-a", "project-b", "project-a", "project-b"],
         )
+        self.assertEqual(
+            json.loads(self.db.get_setting("fea_project_last_claim_by_priority")),
+            {"0": "project-b"},
+        )
+
+    def test_ready_fea_stable_ring_continues_after_project_drains(self) -> None:
+        projects = ["project-a", "project-a", "project-b", "project-c"]
+        for index, project in enumerate(projects):
+            self.db.create_task(
+                TaskCreate(
+                    f"task-{index}",
+                    "~/case",
+                    "run",
+                    project=project,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                )
+            )
+        winners = []
+
+        def accept_and_drain(task, background=False):
+            winners.append(task["project"])
+            self.db.update_task(task["id"], status=TaskStatus.CANCELLED.value)
+            return True
+
+        for _ in range(4):
+            scheduler = Scheduler(
+                self.db,
+                self.accounts,
+                30,
+                client_factory=FakeClient,
+                fea_max_attach_per_loop=1,
+            )
+            scheduler.assign_queued_task = accept_and_drain
+            scheduler.assign_ready_fea_tasks(background=True)
+
+        self.assertEqual(
+            winners,
+            ["project-a", "project-b", "project-c", "project-a"],
+        )
+
+    def test_ready_fea_projectless_cursor_survives_restart(self) -> None:
+        self.db.set_setting(
+            "fea_project_last_claim_by_priority",
+            json.dumps({"0": ""}),
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+        )
+        self.assertEqual(scheduler._fea_project_last_claim, {0: ""})
 
     def test_fea_bursty_prefers_less_loaded_physical_node(self) -> None:
         busy_id = self.db.create_allocation(
