@@ -63,6 +63,10 @@ fea_bursty:
   # the authoritative node-level guard.
   shared_memory_estimate_fraction: 0.25
   shared_memory_min_estimate_mb: 8192
+  # Keep RAM growth reserved through late FEA stages, but reserve declared
+  # CPUs only until fresh load/utilization samples can observe new workers.
+  footprint_maturity_seconds: 3600
+  cpu_footprint_maturity_seconds: 120
   overload_scale_out_load_factor: 2.0
   overload_scale_out_seconds: 300
 cleanup:

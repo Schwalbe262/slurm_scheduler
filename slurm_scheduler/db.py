@@ -171,6 +171,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     status TEXT NOT NULL,
     allocation_id INTEGER,
     account_name TEXT,
+    requested_account_name TEXT,
     remote_dir TEXT NOT NULL DEFAULT '',
     stdout_path TEXT NOT NULL DEFAULT '',
     stderr_path TEXT NOT NULL DEFAULT '',
@@ -432,6 +433,7 @@ class Database:
                 "required_capability": "TEXT NOT NULL DEFAULT ''",
                 "env_profile": "TEXT NOT NULL DEFAULT ''",
                 "account_name": "TEXT NOT NULL DEFAULT ''",
+                "requested_account_name": "TEXT",
                 "scheduling_profile": f"TEXT NOT NULL DEFAULT '{SchedulingProfile.STANDARD.value}'",
                 "gpus": "INTEGER NOT NULL DEFAULT 0",
                 "gpu_model": "TEXT NOT NULL DEFAULT ''",
@@ -527,10 +529,11 @@ class Database:
             cursor = conn.execute(
                 """
                 INSERT INTO tasks (
-                    name, remote_cwd, command, env_setup, required_capability, env_profile, account_name, cpus, memory_mb,
+                    name, remote_cwd, command, env_setup, required_capability, env_profile,
+                    account_name, requested_account_name, cpus, memory_mb,
                     scheduling_profile, gpus, gpu_model, partition, node_name, exclusive_node, priority, timeout_seconds, dedupe_key,
                     max_workers_per_node, same_node_as_task_id, payload_json, cleanup_globs, project, entrypoint, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.name,
@@ -539,6 +542,7 @@ class Database:
                     task.env_setup,
                     task.required_capability,
                     task.env_profile,
+                    task.account_name,
                     task.account_name,
                     task.cpus,
                     task.memory_mb,

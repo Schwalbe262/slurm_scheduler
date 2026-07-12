@@ -134,6 +134,7 @@ fea_bursty:
   max_attach_per_node_per_loop: 8
   node_requested_cpu_factor: 1.0
   footprint_maturity_seconds: 900
+  cpu_footprint_maturity_seconds: 120
 ```
 
 Meanings:
@@ -143,7 +144,8 @@ Meanings:
 - `pressure_max_attempts`: how many memory-pressure kills a task survives before it is marked failed for good.
 - `max_attach_per_node_per_loop`: per-node cap on new FEA attaches in one tick. Together with the attach ledger (budgets are discounted by attaches issued since the last `pestat` snapshot), this prevents dogpiling one node on stale data.
 - `node_requested_cpu_factor`: hard node-wide cap — total FEA-requested CPUs on a physical node may not exceed `cpu_total * factor` (default 1.0 = the node's core count). Load-based ramping alone lets idle-heavy simulations stack far past the core count; this bounds the worst case. Enforcement is retroactive too: nodes already over the cap are drained newest-worker-first (`max_attach_per_node_per_loop` workers per tick), with the drained tasks requeued without an attempt-count penalty. Set `0` to disable.
-- `footprint_maturity_seconds`: FEA workers consume their CPU/RAM late (mesh refinement grows over minutes), so workers younger than this window have their full declared `cpus`/`memory_mb` reserved out of the attach budgets instead of trusting the instantaneous `pestat` readings. The packed-srun in-job manager applies the same reservation to workers younger than `ramp_interval_seconds`. Set `0` to disable.
+- `footprint_maturity_seconds`: keeps each young FEA worker's conservative shared-memory growth estimate reserved through late mesh/thermal stages. Live `pestat` free memory and the soft/hard floors remain authoritative.
+- `cpu_footprint_maturity_seconds`: short grace window for CPU declarations while fresh load/utilization samples catch up. It is intentionally separate from the longer RAM window so observed CPU is not double-counted for an hour. Set `0` to disable the CPU grace.
 - `load_target`: attach only while `pestat` CPU load is at or below `cpu_total * load_target`. For `fea_bursty`, the scheduler may exceed a task's `max_workers_per_node` baseline when both load budget and free-memory budget are still healthy.
 - `max_attach_per_loop`: maximum new `fea_bursty` tasks the scheduler starts in one tick.
 - `node_name_policy`: `preferred` treats `node_name` on CPU `fea_bursty` tasks as a preferred node with healthy-node fallback; `strict` preserves exact-node matching.

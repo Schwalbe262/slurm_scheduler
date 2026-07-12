@@ -126,6 +126,7 @@ class SlurmParsingTests(unittest.TestCase):
                         "fea_bursty:",
                         "  overload_scale_out_load_factor: 2.25",
                         "  overload_scale_out_seconds: 420",
+                        "  cpu_footprint_maturity_seconds: 150",
                         "  shared_memory_estimate_fraction: 0.3",
                         "  shared_memory_min_estimate_mb: 12288",
                     ]
@@ -135,6 +136,7 @@ class SlurmParsingTests(unittest.TestCase):
             config = load_app_config(path)
         self.assertEqual(config.fea_overload_scale_out_load_factor, 2.25)
         self.assertEqual(config.fea_overload_scale_out_seconds, 420)
+        self.assertEqual(config.fea_cpu_footprint_maturity_seconds, 150)
         self.assertEqual(config.fea_shared_memory_estimate_fraction, 0.3)
         self.assertEqual(config.fea_shared_memory_min_estimate_mb, 12288)
 
@@ -6231,6 +6233,8 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(requeued["status"], TaskStatus.QUEUED.value)
         self.assertEqual(requeued["attempt_count"], 1)
         self.assertIsNone(requeued["allocation_id"])
+        self.assertEqual(requeued["requested_account_name"], "")
+        self.assertEqual(requeued["account_name"], "")
         self.assertEqual(requeued["failure_message"], "")
         self.assertEqual(self.db.get_task(old_fea)["status"], TaskStatus.RUNNING.value)
         self.assertEqual(self.db.get_task(standard)["status"], TaskStatus.RUNNING.value)
@@ -6288,6 +6292,78 @@ class SchedulerTests(unittest.TestCase):
         task = {"cpus": 4, "memory_mb": 65536}
         self.assertEqual(scheduler.fea_shared_memory_estimate_mb(task), 16384)
         self.assertEqual(task["memory_mb"], 65536)
+
+    def test_fea_requeue_preserves_explicit_requested_account(self) -> None:
+        task_id = self.db.create_task(
+            TaskCreate(
+                "pinned-fea",
+                "~/case",
+                "run",
+                account_name="a",
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        self.db.update_task(task_id, status=TaskStatus.RUNNING.value, account_name="a")
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        scheduler.requeue_pressure_killed_task(self.db.get_task(task_id))
+        requeued = self.db.get_task(task_id)
+        self.assertEqual(requeued["requested_account_name"], "a")
+        self.assertEqual(requeued["account_name"], "a")
+
+    def test_legacy_null_requested_account_keeps_existing_constraint(self) -> None:
+        task_id = self.db.create_task(
+            TaskCreate(
+                "legacy-pinned",
+                "~/case",
+                "run",
+                account_name="a",
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        self.db.update_task(task_id, requested_account_name=None)
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        task = self.db.get_task(task_id)
+        self.assertEqual(scheduler.task_requested_account_name(task), "a")
+
+    def test_fea_cpu_footprint_matures_before_memory_footprint(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        task_id = self.db.create_task(
+            TaskCreate(
+                "fea-five-minutes-old",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=65536,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        self.db.update_task(
+            task_id,
+            status=TaskStatus.RUNNING.value,
+            allocation_id=allocation_id,
+            account_name="a",
+            attached_at="CURRENT_TIMESTAMP",
+        )
+        with self.db.connect() as conn:
+            conn.execute("UPDATE tasks SET attached_at = datetime('now', '-5 minutes') WHERE id = ?", (task_id,))
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            fea_footprint_maturity_seconds=3600,
+            fea_cpu_footprint_maturity_seconds=120,
+            fea_shared_memory_estimate_fraction=0.25,
+        )
+        footprint = scheduler.fea_immature_footprint("n001")
+        self.assertEqual(footprint["cpus"], 0.0)
+        self.assertEqual(footprint["memory_mb"], 16384.0)
 
     def test_fea_dynamic_extra_slots_reserves_estimated_footprint_of_young_workers(self) -> None:
         self.db.replace_pestat_nodes(
@@ -6400,6 +6476,8 @@ class SchedulerTests(unittest.TestCase):
             fea_max_attach_per_loop=24,
             fea_max_attach_per_node_per_loop=8,
             fea_node_requested_cpu_factor=2.0,
+            fea_footprint_maturity_seconds=3600,
+            fea_cpu_footprint_maturity_seconds=120,
         )
         task = {
             "id": 10,
@@ -6428,13 +6506,23 @@ class SchedulerTests(unittest.TestCase):
                 status=TaskStatus.RUNNING.value,
                 allocation_id=allocation_id,
                 account_name="a",
-                attached_at=days_ago(1),
-                started_at=days_ago(1),
+                attached_at="CURRENT_TIMESTAMP",
+                started_at="CURRENT_TIMESTAMP",
+            )
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET attached_at = datetime('now', '-5 minutes'), "
+                "started_at = datetime('now', '-5 minutes') WHERE allocation_id = ?",
+                (allocation_id,),
             )
         scheduler._fea_alloc_pressures_cache = None
         scheduler._fea_pressures_cache = None
         scheduler._fea_footprint_cache = None
-        # Once 1x is full, only two overcommit workers may be added this tick.
+        # Five-minute-old workers remain inside the one-hour RAM growth window,
+        # but their two-minute CPU observation grace has matured. They can ramp
+        # by two without double-counting declared CPU for the RAM window.
+        self.assertEqual(scheduler.fea_immature_footprint("n001")["cpus"], 0.0)
+        self.assertGreater(scheduler.fea_immature_footprint("n001")["memory_mb"], 0.0)
         self.assertEqual(scheduler.fit_slots_for_allocation(self.db.get_allocation(allocation_id), task), 2)
 
         # Exactly at the soft floor there is no shared-memory growth budget;
@@ -6483,6 +6571,7 @@ class SchedulerTests(unittest.TestCase):
             fea_max_attach_per_node_per_loop=8,
             fea_node_requested_cpu_factor=2.0,
             fea_footprint_maturity_seconds=0,
+            fea_cpu_footprint_maturity_seconds=0,
         )
 
         def status_count(status: str) -> int:
