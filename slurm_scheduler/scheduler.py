@@ -4620,6 +4620,7 @@ class Scheduler:
             if (
                 allocation_desired_cpu_pool_cpus
                 and (allocation.get("resource_pool") or "cpu") == "cpu"
+                and allocation["state"] == AllocationStatus.PENDING.value
                 and not int(allocation.get("exclusive_node") or 0)
                 and not self.pinned_gpu_cpu_demand_allocation_covers_queue(allocation, reserved_allocation_ids)
                 and int(allocation.get("total_cpus") or 0) < allocation_desired_cpu_pool_cpus
