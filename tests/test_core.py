@@ -5098,6 +5098,93 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.db.get_task(queued_id)["status"], TaskStatus.RUNNING.value)
         self.assertEqual(self.db.get_task(queued_id)["allocation_id"], allocation_id)
 
+    def test_ready_fea_round_robins_equal_priority_projects(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=200000,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="alloc-project-fair",
+        )
+        project_a = [
+            self.db.create_task(
+                TaskCreate(
+                    f"project-a-{index}",
+                    "~/case-a",
+                    "run",
+                    project="project-a",
+                    cpus=4,
+                    memory_mb=8192,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                )
+            )
+            for index in range(6)
+        ]
+        project_b = [
+            self.db.create_task(
+                TaskCreate(
+                    f"project-b-{index}",
+                    "~/case-b",
+                    "run",
+                    project="project-b",
+                    cpus=4,
+                    memory_mb=8192,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                )
+            )
+            for index in range(2)
+        ]
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 0 64 1.0 200000 200000 some_job\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            fea_max_attach_per_loop=4,
+        )
+        scheduler.assign_ready_fea_tasks()
+
+        self.assertEqual(
+            [self.db.get_task(task_id)["status"] for task_id in project_a],
+            [TaskStatus.RUNNING.value, TaskStatus.RUNNING.value]
+            + [TaskStatus.QUEUED.value] * 4,
+        )
+        self.assertEqual(
+            [self.db.get_task(task_id)["status"] for task_id in project_b],
+            [TaskStatus.RUNNING.value, TaskStatus.RUNNING.value],
+        )
+
+    def test_ready_fea_project_fairness_preserves_explicit_priority(self) -> None:
+        older = {
+            "id": 1,
+            "project": "older-project",
+            "priority": 0,
+        }
+        newer_high = {
+            "id": 2,
+            "project": "newer-project",
+            "priority": 10,
+        }
+        later_old = {
+            "id": 3,
+            "project": "older-project",
+            "priority": 0,
+        }
+        self.assertEqual(
+            Scheduler.project_fair_queue_order([older, newer_high, later_old]),
+            [newer_high, older, later_old],
+        )
+
     def test_fea_bursty_prefers_less_loaded_physical_node(self) -> None:
         busy_id = self.db.create_allocation(
             account_name="a",

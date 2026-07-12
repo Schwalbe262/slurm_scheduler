@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -2120,15 +2121,43 @@ class Scheduler:
             if self.assign_queued_task(task):
                 attached += 1
 
+    @staticmethod
+    def project_fair_queue_order(tasks: list[dict]) -> list[dict]:
+        """Round-robin equal-priority work across projects, FIFO within each project."""
+        grouped: dict[int, dict[str, deque[dict]]] = {}
+        for task in sorted(
+            tasks,
+            key=lambda item: (-int(item.get("priority") or 0), int(item["id"])),
+        ):
+            priority = int(task.get("priority") or 0)
+            project = str(task.get("project") or "")
+            grouped.setdefault(priority, {}).setdefault(project, deque()).append(task)
+
+        ordered = []
+        for priority in sorted(grouped, reverse=True):
+            queues = grouped[priority]
+            projects = sorted(
+                queues,
+                key=lambda project: int(queues[project][0]["id"]),
+            )
+            while projects:
+                remaining = []
+                for project in projects:
+                    queue = queues[project]
+                    ordered.append(queue.popleft())
+                    if queue:
+                        remaining.append(project)
+                projects = remaining
+        return ordered
+
     def assign_ready_fea_tasks(self, background: bool = False) -> None:
         attached = 0
-        for task in sorted(
+        for task in self.project_fair_queue_order(
             [
                 item
                 for item in self.db.list_tasks(limit=5000)
                 if item["status"] == TaskStatus.QUEUED.value and self.task_is_fea_bursty(item)
-            ],
-            key=lambda item: (-int(item.get("priority") or 0), int(item["id"])),
+            ]
         ):
             if attached >= self.fea_max_attach_per_loop:
                 return
