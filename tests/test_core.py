@@ -126,6 +126,8 @@ class SlurmParsingTests(unittest.TestCase):
                         "fea_bursty:",
                         "  overload_scale_out_load_factor: 2.25",
                         "  overload_scale_out_seconds: 420",
+                        "  shared_memory_estimate_fraction: 0.3",
+                        "  shared_memory_min_estimate_mb: 12288",
                     ]
                 ),
                 encoding="utf-8",
@@ -133,6 +135,8 @@ class SlurmParsingTests(unittest.TestCase):
             config = load_app_config(path)
         self.assertEqual(config.fea_overload_scale_out_load_factor, 2.25)
         self.assertEqual(config.fea_overload_scale_out_seconds, 420)
+        self.assertEqual(config.fea_shared_memory_estimate_fraction, 0.3)
+        self.assertEqual(config.fea_shared_memory_min_estimate_mb, 12288)
 
     def test_annotate_allocation_node_metrics_adds_pestat_usage(self) -> None:
         allocations = [{"id": 1, "node_name": "n001"}, {"id": 2, "node_name": "n002"}]
@@ -668,11 +672,14 @@ class SlurmParsingTests(unittest.TestCase):
             "/remote/exit_code",
         )
         self.assertIn("--cpus-per-task=64", command)
-        self.assertIn("--mem=8192M", command)
+        self.assertNotIn("--mem=", command)
         self.assertIn("--overlap", command)
         self.assertIn("--cpu-bind=none", command)
         self.assertNotIn("--exact", command)
         self.assertNotIn("--exclusive", command)
+        # Peak memory remains task metadata; only the nested FEA step stops
+        # treating it as an exclusive per-step reservation.
+        self.assertEqual(task["memory_mb"], 8192)
 
     def test_background_wrapper_uses_new_session_for_process_group_cancel(self) -> None:
         command = background_wrapper_command("srun --jobid=1 bash /remote/task.sh", "/remote/wrapper.log")
@@ -3031,7 +3038,7 @@ class SchedulerTests(unittest.TestCase):
         allocation_id = self.db.create_allocation(
             account_name="a",
             partition="cpu2",
-            node_name="",
+            node_name="n111",
             total_cpus=16,
             total_memory_mb=32768,
             resource_pool="cpu",
@@ -4885,6 +4892,482 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(capacity["fit_slots"], 2)
         self.assertEqual(capacity["memory_pressure_state"], "ok")
 
+    def test_allocation_rejects_fea_standard_profile_mixing_for_running_and_attaching_tasks(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="alloc-1")
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 1.0 262144 240000 busy\n"
+            )
+        )
+        fea_id = self.db.create_task(
+            TaskCreate(
+                "active-fea",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=65536,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        self.db.update_task(
+            fea_id,
+            status=TaskStatus.ATTACHING.value,
+            allocation_id=allocation_id,
+            account_name="a",
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        allocation = self.db.get_allocation(allocation_id)
+        standard = {"cpus": 4, "memory_mb": 8192, "gpus": 0, "partition": "auto", "node_name": ""}
+        fea = {**standard, "scheduling_profile": SchedulingProfile.FEA_BURSTY.value}
+        self.assertFalse(scheduler.allocation_can_run_task(allocation, standard, include_pending=False))
+        self.assertTrue(scheduler.allocation_can_run_task(allocation, fea, include_pending=False))
+
+        self.db.update_task(fea_id, status=TaskStatus.COMPLETED.value, finished_at="CURRENT_TIMESTAMP")
+        standard_id = self.db.create_task(TaskCreate("active-standard", "~/case", "run", cpus=4, memory_mb=8192))
+        self.db.update_task(
+            standard_id,
+            status=TaskStatus.RUNNING.value,
+            allocation_id=allocation_id,
+            account_name="a",
+        )
+        scheduler._active_profile_sets_cache = None
+        self.assertFalse(scheduler.allocation_can_run_task(allocation, fea, include_pending=False))
+        self.assertTrue(scheduler.allocation_can_run_task(allocation, standard, include_pending=False))
+
+    def test_active_profile_scan_keeps_old_active_task_beyond_recent_5000_history(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="alloc-old")
+        old_standard_id = self.db.create_task(TaskCreate("old-active-standard", "~/case", "run"))
+        self.db.update_task(
+            old_standard_id,
+            status=TaskStatus.RUNNING.value,
+            allocation_id=allocation_id,
+            account_name="a",
+        )
+        fea_allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n002",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(
+            fea_allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="alloc-old-fea",
+        )
+        old_fea_id = self.db.create_task(
+            TaskCreate(
+                "old-active-fea",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=65536,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        self.db.update_task(
+            old_fea_id,
+            status=TaskStatus.RUNNING.value,
+            allocation_id=fea_allocation_id,
+            account_name="a",
+        )
+        with self.db.connect() as conn:
+            conn.executemany(
+                "INSERT INTO tasks (name, remote_cwd, command, status) VALUES (?, ?, ?, ?)",
+                [
+                    (f"newer-terminal-{index}", "~/case", "true", TaskStatus.COMPLETED.value)
+                    for index in range(5001)
+                ],
+            )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        fea_ids, standard_ids = scheduler.active_profile_allocation_sets(refresh=True)
+        self.assertIn(fea_allocation_id, fea_ids)
+        self.assertIn(allocation_id, standard_ids)
+        self.assertEqual(
+            scheduler.fea_allocation_pressures()[fea_allocation_id],
+            {"workers": 1, "requested_cpus": 4, "owned_cpus": 64},
+        )
+        fea = {
+            "cpus": 4,
+            "memory_mb": 65536,
+            "gpus": 0,
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+        }
+        self.assertTrue(scheduler.allocation_profile_conflicts(self.db.get_allocation(allocation_id), fea))
+
+    def test_same_node_allows_same_profile_but_rejects_cross_profile_sidecars(self) -> None:
+        cpu_allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(cpu_allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="cpu-1")
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 1.0 262144 240000 busy\n"
+            )
+        )
+        fea_id = self.db.create_task(
+            TaskCreate(
+                "fea-service",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=65536,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        self.db.update_task(
+            fea_id,
+            status=TaskStatus.RUNNING.value,
+            allocation_id=cpu_allocation_id,
+            account_name="a",
+        )
+        same_node_id = self.db.create_task(
+            TaskCreate(
+                "explicit-sidecar",
+                "~/case",
+                "run",
+                cpus=1,
+                memory_mb=1024,
+                same_node_as_task_id=fea_id,
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        self.assertFalse(
+            scheduler.allocation_can_run_task(
+                self.db.get_allocation(cpu_allocation_id),
+                self.db.get_task(same_node_id),
+                include_pending=False,
+            )
+        )
+        same_profile_fea_id = self.db.create_task(
+            TaskCreate(
+                "fea-sidecar",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=65536,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                same_node_as_task_id=fea_id,
+            )
+        )
+        self.assertTrue(
+            scheduler.allocation_can_run_task(
+                self.db.get_allocation(cpu_allocation_id),
+                self.db.get_task(same_profile_fea_id),
+                include_pending=False,
+            )
+        )
+
+        standard_allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n003",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(
+            standard_allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="cpu-standard",
+        )
+        standard_service_id = self.db.create_task(TaskCreate("standard-service", "~/case", "run"))
+        self.db.update_task(
+            standard_service_id,
+            status=TaskStatus.RUNNING.value,
+            allocation_id=standard_allocation_id,
+            account_name="a",
+        )
+        fea_sidecar_id = self.db.create_task(
+            TaskCreate(
+                "fea-sidecar",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=65536,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                same_node_as_task_id=standard_service_id,
+            )
+        )
+        scheduler._active_profile_sets_cache = None
+        self.assertFalse(
+            scheduler.allocation_can_run_task(
+                self.db.get_allocation(standard_allocation_id),
+                self.db.get_task(fea_sidecar_id),
+                include_pending=False,
+            )
+        )
+        standard_sidecar_id = self.db.create_task(
+            TaskCreate(
+                "standard-sidecar",
+                "~/case",
+                "run",
+                cpus=1,
+                memory_mb=1024,
+                same_node_as_task_id=standard_service_id,
+            )
+        )
+        self.assertTrue(
+            scheduler.allocation_can_run_task(
+                self.db.get_allocation(standard_allocation_id),
+                self.db.get_task(standard_sidecar_id),
+                include_pending=False,
+            )
+        )
+
+    def test_profile_isolation_applies_to_gpu_allocations(self) -> None:
+
+        gpu_allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="gpu5",
+            node_name="n002",
+            total_cpus=16,
+            total_memory_mb=131072,
+            total_gpus=1,
+            gpu_model="a6000",
+            resource_pool="gpu:a6000",
+        )
+        self.db.update_allocation(
+            gpu_allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="gpu-1",
+            free_cpus=16,
+            free_memory_mb=131072,
+            free_gpus=1,
+        )
+        gpu_fea_id = self.db.create_task(
+            TaskCreate(
+                "gpu-pool-fea",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                gpus=1,
+                gpu_model="a6000",
+            )
+        )
+        self.db.update_task(
+            gpu_fea_id,
+            status=TaskStatus.RUNNING.value,
+            allocation_id=gpu_allocation_id,
+            account_name="a",
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        standard = {"cpus": 4, "memory_mb": 8192, "gpus": 0, "partition": "auto", "node_name": ""}
+        self.assertFalse(
+            scheduler.allocation_can_run_task(
+                self.db.get_allocation(gpu_allocation_id),
+                standard,
+                include_pending=False,
+            )
+        )
+
+    def test_cpu_only_fea_cannot_claim_gpu_pool_but_gpu_fea_can(self) -> None:
+        gpu_allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="gpu5",
+            node_name="n090",
+            total_cpus=16,
+            total_memory_mb=131072,
+            total_gpus=1,
+            gpu_model="a6000",
+            resource_pool="gpu:a6000",
+        )
+        cpu_on_gpu_partition_id = self.db.create_allocation(
+            account_name="a",
+            partition="gpu4",
+            node_name="n091",
+            total_cpus=48,
+            total_memory_mb=262144,
+            total_gpus=0,
+            resource_pool="cpu",
+        )
+        for allocation_id, job_id in (
+            (gpu_allocation_id, "gpu-pool"),
+            (cpu_on_gpu_partition_id, "cpu-pool"),
+        ):
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.WARM.value,
+                slurm_job_id=job_id,
+                free_gpus=1 if allocation_id == gpu_allocation_id else 0,
+            )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n090 gpu5 mix 8 16 1.0 131072 120000 idle\n"
+                "n091 gpu4 mix 8 48 1.0 262144 240000 idle\n"
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        cpu_fea = {
+            "cpus": 4,
+            "memory_mb": 65536,
+            "gpus": 0,
+            "gpu_model": "",
+            "partition": "auto",
+            "node_name": "",
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+        }
+        gpu_fea = {**cpu_fea, "gpus": 1, "gpu_model": "a6000"}
+        gpu_allocation = self.db.get_allocation(gpu_allocation_id)
+        cpu_allocation = self.db.get_allocation(cpu_on_gpu_partition_id)
+        self.assertFalse(scheduler.allocation_can_run_task(gpu_allocation, cpu_fea, include_pending=False))
+        self.assertEqual(
+            scheduler.task_fit_capacity(cpu_fea, allocation_rows=[dict(gpu_allocation)])["fit_slots"],
+            0,
+        )
+        self.assertTrue(scheduler.allocation_can_run_task(cpu_allocation, cpu_fea, include_pending=False))
+        self.assertTrue(scheduler.allocation_can_run_task(gpu_allocation, gpu_fea, include_pending=False))
+
+    def test_inflight_allocation_reservations_do_not_mix_fea_and_standard_profiles(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.PENDING.value, slurm_job_id="pending-1")
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        fea = {
+            "id": 1,
+            "cpus": 4,
+            "memory_mb": 65536,
+            "gpus": 0,
+            "partition": "auto",
+            "node_name": "",
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+        }
+        standard = {
+            "id": 2,
+            "cpus": 4,
+            "memory_mb": 8192,
+            "gpus": 0,
+            "partition": "auto",
+            "node_name": "",
+            "scheduling_profile": SchedulingProfile.STANDARD.value,
+        }
+        allocations = [dict(self.db.get_allocation(allocation_id))]
+        reserved = scheduler.reserve_inflight_capacity_for_task(allocations, fea)
+        self.assertIsNotNone(reserved)
+        self.assertEqual(reserved.get("_reserved_scheduling_profile"), "fea")
+        self.assertIsNone(scheduler.reserve_inflight_capacity_for_task(allocations, standard))
+
+        allocations = [dict(self.db.get_allocation(allocation_id))]
+        reserved = scheduler.reserve_inflight_capacity_for_task(allocations, standard)
+        self.assertIsNotNone(reserved)
+        self.assertEqual(reserved.get("_reserved_scheduling_profile"), "standard")
+        self.assertIsNone(scheduler.reserve_inflight_capacity_for_task(allocations, fea))
+
+    def test_reservation_recheck_prevents_concurrent_profile_claim_race(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.WARM.value, slurm_job_id="alloc-1")
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 1.0 262144 240000 busy\n"
+            )
+        )
+        fea_id = self.db.create_task(
+            TaskCreate(
+                "queued-fea",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=65536,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        standard_id = self.db.create_task(TaskCreate("queued-standard", "~/case", "run", cpus=4, memory_mb=8192))
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        fea_task = self.db.get_task(fea_id)
+        standard_task = self.db.get_task(standard_id)
+        fea_allocation = scheduler.best_allocation_for_task(fea_task)
+        standard_allocation = scheduler.best_allocation_for_task(standard_task)
+        self.assertIsNotNone(fea_allocation)
+        self.assertIsNotNone(standard_allocation)
+
+        account = self.accounts[0]
+        self.assertIsNotNone(scheduler.reserve_task_on_allocation(fea_task, fea_allocation, account))
+        self.assertIsNone(scheduler.reserve_task_on_allocation(standard_task, standard_allocation, account))
+        self.assertEqual(self.db.get_task(standard_id)["status"], TaskStatus.QUEUED.value)
+
+    def test_assignment_uses_separate_allocations_for_fea_and_standard(self) -> None:
+        fea_allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(fea_allocation_id, state=AllocationStatus.WARM.value, slurm_job_id="alloc-fea")
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 1.0 262144 240000 idle\n"
+            )
+        )
+        fea_id = self.db.create_task(
+            TaskCreate(
+                "queued-fea",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=65536,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        standard_id = self.db.create_task(TaskCreate("queued-standard", "~/case", "run", cpus=4, memory_mb=8192))
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        scheduler.assign_ready_fea_tasks()
+        scheduler.assign_ready_standard_tasks()
+        self.assertEqual(self.db.get_task(fea_id)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(self.db.get_task(standard_id)["status"], TaskStatus.QUEUED.value)
+
+        standard_allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n002",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(
+            standard_allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="alloc-standard",
+        )
+        scheduler.assign_ready_standard_tasks()
+        standard = self.db.get_task(standard_id)
+        self.assertEqual(standard["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(standard["allocation_id"], standard_allocation_id)
+
     def test_fea_bursty_max_workers_is_enforced_per_physical_node_for_reservations(self) -> None:
         allocation_ids = []
         for index, node_name in enumerate(["n001", "n001", "n002"]):
@@ -5138,7 +5621,7 @@ class SchedulerTests(unittest.TestCase):
         self.db.replace_pestat_nodes(
             parse_pestat(
                 "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
-                "n001 cpu1 mix 0 8 1.0 100000 65000 some_job\n"
+                "n001 cpu1 mix 0 8 1.0 100000 90000 some_job\n"
             )
         )
         task_id = self.db.create_task(
@@ -5237,7 +5720,7 @@ class SchedulerTests(unittest.TestCase):
         self.db.replace_pestat_nodes(
             parse_pestat(
                 "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
-                "n001 cpu1 mix 0 8 1.0 100000 65000 some_job\n"
+                "n001 cpu1 mix 0 8 1.0 100000 90000 some_job\n"
             )
         )
         task_id = self.db.create_task(
@@ -5793,7 +6276,20 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(failed["attempt_count"], 3)
         self.assertIn("after 3 attempts", failed["failure_message"])
 
-    def test_fea_dynamic_extra_slots_reserves_declared_footprint_of_young_workers(self) -> None:
+    def test_fea_shared_memory_estimate_uses_peak_fraction_not_full_64gb(self) -> None:
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            fea_shared_memory_estimate_fraction=0.25,
+            fea_shared_memory_min_estimate_mb=8192,
+        )
+        task = {"cpus": 4, "memory_mb": 65536}
+        self.assertEqual(scheduler.fea_shared_memory_estimate_mb(task), 16384)
+        self.assertEqual(task["memory_mb"], 65536)
+
+    def test_fea_dynamic_extra_slots_reserves_estimated_footprint_of_young_workers(self) -> None:
         self.db.replace_pestat_nodes(
             parse_pestat(
                 "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
@@ -5814,7 +6310,7 @@ class SchedulerTests(unittest.TestCase):
         baseline = scheduler.fea_dynamic_extra_slots(allocation, task)
         self.assertGreater(baseline, 0)
         # Freshly attached FEA workers have not grown into their footprint yet;
-        # their declared cpus/memory must be reserved out of the budgets.
+        # their conservative shared-pool estimate is reserved from the budget.
         for index in range(3):
             task_id = self.db.create_task(
                 TaskCreate(
@@ -5861,7 +6357,155 @@ class SchedulerTests(unittest.TestCase):
         scheduler._record_attach_delta(allocation, task)
         self.assertEqual(scheduler.fea_dynamic_extra_slots(allocation, task), 0)
 
-    def test_fea_stale_pestat_allows_single_slot_when_last_row_was_healthy(self) -> None:
+    def test_fea_dynamic_extra_slots_never_ramps_more_than_two_per_node(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 0.0 1000000 1000000 some_job\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            fea_max_attach_per_loop=24,
+            fea_max_attach_per_node_per_loop=8,
+            fea_node_requested_cpu_factor=2.0,
+        )
+        allocation = {"id": 1, "state": AllocationStatus.WARM.value, "node_name": "n001"}
+        task = {"id": 10, "cpus": 1, "memory_mb": 1024}
+        self.assertEqual(scheduler.fea_dynamic_extra_slots(allocation, task), 2)
+
+    def test_fea_fills_owned_cpu_baseline_then_ramps_overcommit_two_at_a_time(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=1000000,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.WARM.value, slurm_job_id="alloc-1")
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 0.0 1000000 1000000 some_job\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            fea_max_attach_per_loop=24,
+            fea_max_attach_per_node_per_loop=8,
+            fea_node_requested_cpu_factor=2.0,
+        )
+        task = {
+            "id": 10,
+            "cpus": 4,
+            "memory_mb": 65536,
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+            "max_workers_per_node": 8,
+        }
+        # 64 owned CPUs / 4 CPUs per worker gives a 16-worker baseline. The
+        # configured fast-fill cap admits eight of those this tick.
+        self.assertEqual(scheduler.fit_slots_for_allocation(self.db.get_allocation(allocation_id), task), 8)
+
+        for index in range(16):
+            task_id = self.db.create_task(
+                TaskCreate(
+                    f"baseline-fea-{index}",
+                    "~/case",
+                    "run",
+                    cpus=4,
+                    memory_mb=65536,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                )
+            )
+            self.db.update_task(
+                task_id,
+                status=TaskStatus.RUNNING.value,
+                allocation_id=allocation_id,
+                account_name="a",
+                attached_at=days_ago(1),
+                started_at=days_ago(1),
+            )
+        scheduler._fea_alloc_pressures_cache = None
+        scheduler._fea_pressures_cache = None
+        scheduler._fea_footprint_cache = None
+        # Once 1x is full, only two overcommit workers may be added this tick.
+        self.assertEqual(scheduler.fit_slots_for_allocation(self.db.get_allocation(allocation_id), task), 2)
+
+        # Exactly at the soft floor there is no shared-memory growth budget;
+        # the CPU baseline/soft worker target must not manufacture capacity.
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 0.0 1000000 600000 some_job\n"
+            )
+        )
+        scheduler._pestat_nodes_cache = None
+        self.assertEqual(scheduler.fit_slots_for_allocation(self.db.get_allocation(allocation_id), task), 0)
+
+    def test_assign_ready_fea_stops_at_baseline_cap_then_two_overcommit_per_tick(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=48,
+            total_memory_mb=1000000,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.WARM.value, slurm_job_id="alloc-1")
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 48 0.0 1000000 1000000 some_job\n"
+            )
+        )
+        for index in range(16):
+            self.db.create_task(
+                TaskCreate(
+                    f"queued-fea-{index}",
+                    "~/case",
+                    "run",
+                    cpus=4,
+                    memory_mb=65536,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                )
+            )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            fea_max_attach_per_loop=24,
+            fea_max_attach_per_node_per_loop=8,
+            fea_node_requested_cpu_factor=2.0,
+            fea_footprint_maturity_seconds=0,
+        )
+
+        def status_count(status: str) -> int:
+            return sum(1 for task in self.db.list_tasks(limit=100) if task["status"] == status)
+
+        scheduler.assign_ready_fea_tasks()
+        self.assertEqual(status_count(TaskStatus.RUNNING.value), 8)
+        self.assertEqual(scheduler._tick_attach_workers_by_node.get("n001"), 8)
+
+        # Next tick finishes the remaining four workers in the 48/4 baseline.
+        scheduler._tick_seq += 1
+        scheduler._tick_attach_workers_by_node.clear()
+        scheduler.assign_ready_fea_tasks()
+        self.assertEqual(status_count(TaskStatus.RUNNING.value), 12)
+
+        # Once 1x is full, only two overcommit workers are admitted per tick.
+        scheduler._tick_seq += 1
+        scheduler._tick_attach_workers_by_node.clear()
+        scheduler.assign_ready_fea_tasks()
+        self.assertEqual(status_count(TaskStatus.RUNNING.value), 14)
+        self.assertEqual(status_count(TaskStatus.QUEUED.value), 2)
+
+    def test_fea_stale_pestat_fails_closed_even_when_last_row_was_healthy(self) -> None:
         self.db.replace_pestat_nodes(
             parse_pestat(
                 "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
@@ -5874,7 +6518,7 @@ class SchedulerTests(unittest.TestCase):
         allocation = {"id": 1, "state": AllocationStatus.WARM.value, "node_name": "n001"}
         task = {"id": 10, "cpus": 4, "memory_mb": 8192}
         self.assertIsNone(scheduler.pestat_node_for_allocation(allocation))
-        self.assertEqual(scheduler.fea_dynamic_extra_slots(allocation, task), 1)
+        self.assertEqual(scheduler.fea_dynamic_extra_slots(allocation, task), 0)
 
     def test_fea_fit_respects_node_cap_without_max_workers_per_node(self) -> None:
         allocation_id = self.db.create_allocation(
@@ -6035,13 +6679,92 @@ class SchedulerTests(unittest.TestCase):
             doubled.fea_effective_worker_limit(allocation, task, current_workers=10, base_limit=32),
             24,
         )
-        uncapped = Scheduler(
+        zero_requested = Scheduler(
             self.db, self.accounts, 30, client_factory=FakeClient, fea_node_requested_cpu_factor=0
         )
-        self.assertIsNone(uncapped.fea_node_cpu_cap_remaining(allocation, task))
-        self.assertGreaterEqual(
-            uncapped.fea_effective_worker_limit(allocation, task, current_workers=10, base_limit=32), 32
+        # Zero can no longer disable the safety invariant; it clamps to the
+        # 1x physical baseline.
+        self.assertEqual(zero_requested.fea_node_requested_cpu_factor, 1.0)
+        self.assertEqual(zero_requested.fea_node_cpu_cap_remaining(allocation, task), 2)
+        self.assertEqual(
+            zero_requested.fea_effective_worker_limit(allocation, task, current_workers=10, base_limit=32), 12
         )
+        above_max = Scheduler(
+            self.db, self.accounts, 30, client_factory=FakeClient, fea_node_requested_cpu_factor=3.5
+        )
+        self.assertEqual(above_max.fea_node_requested_cpu_factor, 2.0)
+        self.assertEqual(above_max.fea_node_cpu_cap_remaining(allocation, task), 14)
+        self.assertEqual(
+            above_max.fea_effective_worker_limit(allocation, task, current_workers=10, base_limit=32), 24
+        )
+
+    def test_gpu_fea_is_included_in_allocation_two_x_cpu_cap_and_rebalance(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="gpu5",
+            node_name="n090",
+            total_cpus=4,
+            total_memory_mb=262144,
+            total_gpus=16,
+            gpu_model="a6000",
+            resource_pool="gpu:a6000",
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="gpu-fea",
+            free_gpus=6,
+        )
+        task_ids = []
+        for index in range(10):
+            task_id = self.db.create_task(
+                TaskCreate(
+                    f"gpu-fea-{index}",
+                    "~/case",
+                    "run",
+                    cpus=1,
+                    memory_mb=8192,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                    gpus=1,
+                    gpu_model="a6000",
+                )
+            )
+            self.db.update_task(
+                task_id,
+                status=TaskStatus.RUNNING.value,
+                allocation_id=allocation_id,
+                account_name="a",
+                attached_at=f"2026-01-01 00:{index:02d}:00",
+            )
+            task_ids.append(task_id)
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            fea_node_requested_cpu_factor=2.0,
+        )
+        allocation = self.db.get_allocation(allocation_id)
+        queued_shape = {
+            "cpus": 1,
+            "memory_mb": 8192,
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+            "gpus": 1,
+            "gpu_model": "a6000",
+        }
+        pressure = scheduler.fea_allocation_pressures()[allocation_id]
+        self.assertEqual(pressure, {"workers": 10, "requested_cpus": 10, "owned_cpus": 4})
+        self.assertEqual(scheduler.fea_node_cpu_cap_remaining(allocation, queued_shape), 0)
+        self.assertEqual(
+            scheduler.fea_owned_node_pressures()["n090"],
+            {"workers": 10, "requested_cpus": 10, "owned_cpus": 4},
+        )
+
+        scheduler.enforce_fea_node_cpu_cap()
+        for task_id in task_ids[-2:]:
+            self.assertEqual(self.db.get_task(task_id)["status"], TaskStatus.QUEUED.value)
+        for task_id in task_ids[:-2]:
+            self.assertEqual(self.db.get_task(task_id)["status"], TaskStatus.RUNNING.value)
 
     def test_attach_completion_does_not_stomp_concurrent_requeue(self) -> None:
         BlockingAttachClient.attach_started.clear()

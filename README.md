@@ -48,11 +48,13 @@ FEA 작업은 CPU와 메모리를 항상 고정량으로 점유하지 않는 경
 동작 방식:
 
 - `cpus`는 peak CPU 요청으로 유지하지만 scheduler slot 계산에서는 hard reservation으로 쓰지 않습니다.
-- `memory_mb`는 task별 Slurm step memory limit이자 예상 peak 상한입니다.
+- `memory_mb`는 FEA task의 예상 peak/safety 메타데이터로 보존하며, 각 step의 독점 메모리 예약으로 쓰지 않습니다.
 - 신규 FEA attach는 `pestat`의 node free memory와 CPU load를 보고 결정합니다.
 - free memory가 soft threshold 미만이면 새 FEA attach를 막습니다.
 - free memory가 hard threshold 미만이면 해당 allocation에서 가장 늦게 붙은 running FEA task를 실패 처리하고 cancel합니다.
-- FEA task와 same-node CPU client, vLLM service task의 `srun`은 `--overlap --cpus-per-task=<cpus> --mem=<memory_mb>M` 형태로 실행됩니다.
+- allocation이 소유한 1x CPU baseline은 설정된 node당 attach cap까지 먼저 채우고, 그 이후 overcommit worker만 node당 tick마다 최대 2개씩 추가하며 2x를 넘지 않습니다.
+- CPU·GPU allocation은 `fea_bursty`와 `standard` 중 먼저 활성화된 profile 전용으로 사용하며, `same_node_as`도 같은 profile 사이에서만 공동배치됩니다. CPU-only FEA는 실제 GPU pool을 점유하지 않지만 GPU가 없는 CPU allocation이 GPU partition에 배치된 경우는 사용할 수 있습니다.
+- FEA task는 `--overlap --cpu-bind=none`으로 allocation의 CPU·메모리 풀을 공유합니다. `standard`, same-node client, vLLM 경로의 per-step `--mem` 동작은 그대로 유지됩니다.
 
 기본 정책:
 
@@ -62,6 +64,9 @@ fea_bursty:
   hard_memory_free_percent: 40
   load_target: 0.75
   max_attach_per_loop: 8
+  max_attach_per_node_per_loop: 12
+  shared_memory_estimate_fraction: 0.25
+  shared_memory_min_estimate_mb: 8192
   node_name_policy: preferred
   overload_scale_out_load_factor: 2.0
   overload_scale_out_seconds: 300

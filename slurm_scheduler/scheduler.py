@@ -157,9 +157,11 @@ class Scheduler:
         fea_overload_scale_out_load_factor: float = 2.0,
         fea_overload_scale_out_seconds: int = 300,
         fea_pressure_max_attempts: int = 3,
-        fea_max_attach_per_node_per_loop: int = 8,
+        fea_max_attach_per_node_per_loop: int = 12,
         fea_node_requested_cpu_factor: float = 1.0,
         fea_footprint_maturity_seconds: int = 900,
+        fea_shared_memory_estimate_fraction: float = 0.25,
+        fea_shared_memory_min_estimate_mb: int = 8192,
         task_refresh_max_per_tick: int = 32,
         cleanup_enabled: bool = True,
         cleanup_interval_seconds: int = 3600,
@@ -262,8 +264,14 @@ class Scheduler:
         self.fea_overload_scale_out_seconds = max(0, int(fea_overload_scale_out_seconds))
         self.fea_pressure_max_attempts = max(1, int(fea_pressure_max_attempts))
         self.fea_max_attach_per_node_per_loop = max(1, int(fea_max_attach_per_node_per_loop))
-        self.fea_node_requested_cpu_factor = max(0.0, float(fea_node_requested_cpu_factor))
+        # FEA may ramp from the physical-core baseline, but never beyond 2x
+        # the CPUs owned by the allocation.
+        self.fea_node_requested_cpu_factor = min(2.0, max(1.0, float(fea_node_requested_cpu_factor)))
         self.fea_footprint_maturity_seconds = max(0, int(fea_footprint_maturity_seconds))
+        self.fea_shared_memory_estimate_fraction = min(
+            1.0, max(0.0, float(fea_shared_memory_estimate_fraction))
+        )
+        self.fea_shared_memory_min_estimate_mb = max(1, int(fea_shared_memory_min_estimate_mb))
         self._fea_footprint_cache: tuple[int, dict[str, dict[str, float]]] | None = None
         self._tick_attach_workers_by_node: dict[str, int] = {}
         self._fea_pressures_cache: tuple[int, dict[str, dict[str, int]]] | None = None
@@ -333,6 +341,8 @@ class Scheduler:
         self._tick_local = threading.local()
         self._tick_caches: set[_TickClientCache] = set()
         self._tick_caches_lock = threading.Lock()
+        self._task_reservation_lock = threading.RLock()
+        self._active_profile_sets_cache: tuple[set[int], set[int]] | None = None
         self.ssh_parallelism = max(1, int(ssh_parallelism))
         self._ssh_executor = ThreadPoolExecutor(
             max_workers=self.ssh_parallelism, thread_name_prefix="ssh-fanout"
@@ -660,6 +670,7 @@ class Scheduler:
         self._tick_seq += 1
         self._tick_started_at = time.monotonic()
         self._tick_attach_workers_by_node.clear()
+        self._active_profile_sets_cache = None
         stage_seconds: dict[str, float] = {}
 
         def run_stage(name: str, operation: Callable[[], Any]) -> Any:
@@ -1577,7 +1588,9 @@ class Scheduler:
         accounts_by_name = {account.name: account for account in self.accounts}
         candidates = [
             task
-            for task in self.db.list_tasks(limit=5000)
+            for task in self.db.list_tasks_by_statuses(
+                [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
+            )
             if task["status"] in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}
         ]
         by_account: dict[str, list[dict]] = {}
@@ -1732,7 +1745,9 @@ class Scheduler:
         self.close_allocation(allocation, f"exclusive task {task['id']} finished")
 
     def recalculate_allocation_capacity(self) -> None:
-        tasks = self.db.list_tasks(limit=5000)
+        tasks = self.db.list_tasks_by_statuses(
+            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
+        )
         running_by_allocation: dict[int, dict[str, int]] = {}
         for task in tasks:
             if task["status"] not in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
@@ -1860,13 +1875,17 @@ class Scheduler:
     def _running_task_count(self, allocation_id: int) -> int:
         return sum(
             1
-            for task in self.db.list_tasks(limit=5000)
+            for task in self.db.list_tasks_by_statuses(
+                [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
+            )
             if task.get("allocation_id") == allocation_id
             and task["status"] in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}
         )
 
     def fail_running_tasks(self, allocation_id: int, message: str) -> None:
-        for task in self.db.list_tasks(limit=5000):
+        for task in self.db.list_tasks_by_statuses(
+            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
+        ):
             if task.get("allocation_id") != allocation_id:
                 continue
             if task["status"] in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
@@ -1880,7 +1899,10 @@ class Scheduler:
 
     def fail_stale_same_node_tasks(self) -> None:
         terminal = {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}
-        for task in self.db.list_tasks(limit=5000):
+        for task in self.db.list_tasks_by_statuses(
+            [TaskStatus.QUEUED.value, TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value],
+            limit=5000,
+        ):
             if task["status"] not in {
                 TaskStatus.QUEUED.value,
                 TaskStatus.ATTACHING.value,
@@ -1941,7 +1963,9 @@ class Scheduler:
     def active_task_ids_for_allocation(self, allocation_id: int) -> list[int]:
         return [
             int(task["id"])
-            for task in self.db.list_tasks(limit=5000)
+            for task in self.db.list_tasks_by_statuses(
+                [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
+            )
             if int(task.get("allocation_id") or 0) == allocation_id
             and task["status"] in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}
         ]
@@ -2236,38 +2260,43 @@ class Scheduler:
         return self.finish_reserved_task_attach(task, allocation, account)
 
     def reserve_task_on_allocation(self, task: dict, allocation: dict, account: AccountConfig) -> dict | None:
-        task = self.apply_dynamic_env_profile(task, account)
-        attach_token = uuid.uuid4().hex
-        if not self.db.update_task_if_status(
-            task["id"],
-            [TaskStatus.QUEUED.value],
-            status=TaskStatus.ATTACHING.value,
-            allocation_id=allocation["id"],
-            account_name=allocation["account_name"],
-            remote_dir="",
-            stdout_path="",
-            stderr_path="",
-            exit_code_path="",
-            wrapper_pid="",
-            attach_token=attach_token,
-            launch_started_at=None,
-            failure_message="",
-            attached_at="CURRENT_TIMESTAMP",
-            started_at=None,
-            finished_at=None,
-            exit_code=None,
-        ):
-            return None
-        self._record_attach_delta(allocation, task)
-        self.recalculate_allocation_capacity()
-        return {
-            **task,
-            "status": TaskStatus.ATTACHING.value,
-            "allocation_id": allocation["id"],
-            "account_name": allocation["account_name"],
-            "attach_token": attach_token,
-            "launch_started_at": None,
-        }
+        with self._task_reservation_lock:
+            # Another fast-path caller may have claimed this previously empty
+            # CPU allocation after placement but before this transition.
+            if self.allocation_profile_conflicts(allocation, task, refresh=True):
+                return None
+            task = self.apply_dynamic_env_profile(task, account)
+            attach_token = uuid.uuid4().hex
+            if not self.db.update_task_if_status(
+                task["id"],
+                [TaskStatus.QUEUED.value],
+                status=TaskStatus.ATTACHING.value,
+                allocation_id=allocation["id"],
+                account_name=allocation["account_name"],
+                remote_dir="",
+                stdout_path="",
+                stderr_path="",
+                exit_code_path="",
+                wrapper_pid="",
+                attach_token=attach_token,
+                launch_started_at=None,
+                failure_message="",
+                attached_at="CURRENT_TIMESTAMP",
+                started_at=None,
+                finished_at=None,
+                exit_code=None,
+            ):
+                return None
+            self._record_attach_delta(allocation, task)
+            self.recalculate_allocation_capacity()
+            return {
+                **task,
+                "status": TaskStatus.ATTACHING.value,
+                "allocation_id": allocation["id"],
+                "account_name": allocation["account_name"],
+                "attach_token": attach_token,
+                "launch_started_at": None,
+            }
 
     def start_background_task_attach(self, task: dict, allocation: dict, account: AccountConfig) -> None:
         thread = threading.Thread(
@@ -2385,6 +2414,10 @@ class Scheduler:
                 cap_remaining = self.fea_node_cpu_cap_remaining(allocation, task)
                 if cap_remaining is not None and cap_remaining <= 0:
                     continue
+                fit_slots = self.fit_slots_for_allocation(allocation, task)
+                if fit_slots <= 0:
+                    continue
+                allocation["_task_fit_slots"] = fit_slots
             if self.task_requires_gpu(task):
                 gpu_candidates.append(allocation)
             elif int(allocation.get("total_gpus") or 0) > 0:
@@ -2400,7 +2433,7 @@ class Scheduler:
                 candidates,
                 key=lambda item: (
                     -self.allocation_worker_count_for_task(item, task),
-                    self.fit_slots_for_allocation(item, task),
+                    int(item.get("_task_fit_slots") or 0),
                     self.fea_memory_free_percent(item) or 0.0,
                     int(item.get("free_memory_mb") or 0),
                 ),
@@ -2418,7 +2451,9 @@ class Scheduler:
     def allocation_worker_count(self, allocation_id: int) -> int:
         return sum(
             1
-            for task in self.db.list_tasks(limit=5000)
+            for task in self.db.list_tasks_by_statuses(
+                [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
+            )
             if int(task.get("allocation_id") or 0) == allocation_id
             and task["status"] in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}
         )
@@ -2437,7 +2472,9 @@ class Scheduler:
             and str(allocation.get("node_name") or "")
         }
         counts: dict[str, int] = {}
-        for task in self.db.list_tasks(limit=5000):
+        for task in self.db.list_tasks_by_statuses(
+            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
+        ):
             if task["status"] not in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
                 continue
             node_name = allocation_node_by_id.get(int(task.get("allocation_id") or 0))
@@ -2460,7 +2497,9 @@ class Scheduler:
             and str(allocation.get("node_name") or "")
         }
         counts: dict[str, int] = {}
-        for task in self.db.list_tasks(limit=5000):
+        for task in self.db.list_tasks_by_statuses(
+            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
+        ):
             if task["status"] not in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
                 continue
             if not self.task_is_fea_bursty(task):
@@ -2680,14 +2719,21 @@ class Scheduler:
 
     def allocation_rejection_reasons(self, allocation: dict, task: dict) -> list[str]:
         reasons: list[str] = []
+        if (
+            self.task_is_fea_bursty(task)
+            and not self.task_requires_gpu(task)
+            and self.allocation_has_gpu_pool(allocation)
+        ):
+            return ["CPU-only FEA cannot claim a GPU allocation pool"]
+        if self.allocation_profile_conflicts(allocation, task):
+            wanted = self.task_allocation_profile(task)
+            occupied = "standard" if wanted == "fea" else "fea"
+            return [f"CPU allocation is occupied by active {occupied} tasks"]
         if self.task_is_fea_bursty(task):
             if allocation.get("state") != AllocationStatus.PENDING.value:
                 node = self.pestat_node_for_allocation(allocation)
                 if node is None:
-                    if self.fea_stale_node_recently_ok(allocation):
-                        reasons.append("pestat stale; conservative single slot only")
-                    else:
-                        reasons.append("pestat stale or missing and last snapshot was not healthy")
+                    reasons.append("pestat stale or missing; shared-memory FEA admission is fail-closed")
                 else:
                     pressure = self.fea_memory_pressure_state(allocation)
                     if pressure != "ok":
@@ -3070,6 +3116,12 @@ class Scheduler:
                 node_reserved_slots = self.reserved_fea_slots_for_node(reservation_allocations, node_name)
                 dynamic_limit = self.fea_effective_worker_limit(allocation, task, node_workers, max_workers)
                 slots = min(slots, max(0, dynamic_limit - node_workers - node_reserved_slots))
+                # max_workers_per_node is a soft baseline for bursty FEA, not
+                # permission to bypass measured shared-memory capacity. The
+                # dynamic result fills the allocation-owned 1x CPU baseline
+                # first, then limits only the overcommit region to +2/tick.
+                measured_ramp_slots = self.fea_dynamic_extra_slots(allocation, task)
+                slots = min(slots, measured_ramp_slots)
                 reserved_slots = 0
             elif max_workers > 0:
                 slots = min(slots, max(0, max_workers - self.allocation_worker_count(int(allocation["id"]))))
@@ -3186,6 +3238,7 @@ class Scheduler:
         return row
 
     def _record_attach_delta(self, allocation: dict, task: dict) -> None:
+        self._active_profile_sets_cache = None
         node_name = str(allocation.get("node_name") or "").strip()
         if not node_name:
             return
@@ -3239,9 +3292,10 @@ class Scheduler:
 
     def fea_allocation_accepts_task(self, allocation: dict) -> bool:
         if self.pestat_node_for_allocation(allocation) is None:
-            return self.fea_stale_node_recently_ok(allocation) and not self.fea_allocation_sustained_overloaded(
-                allocation
-            )
+            # Shared-memory FEA has no per-step cgroup ceiling. Never admit a
+            # new worker from stale/missing node metrics, even if the previous
+            # sample was healthy.
+            return False
         return (
             self.fea_memory_pressure_state(allocation) == "ok"
             and self.fea_node_load_ok(allocation)
@@ -3271,14 +3325,17 @@ class Scheduler:
                 continue
             allocation_id = int(allocation["id"])
             allocation_node_by_id[allocation_id] = node_name
-            if (allocation.get("resource_pool") or "cpu") == "cpu":
+            owned_cpus = int(allocation.get("total_cpus") or 0)
+            if owned_cpus > 0:
                 owned_cpus_by_node[node_name] = owned_cpus_by_node.get(node_name, 0) + int(
-                    allocation.get("total_cpus") or 0
+                    owned_cpus
                 )
 
         requested_cpus_by_node: dict[str, int] = {}
         workers_by_node: dict[str, int] = {}
-        for task in self.db.list_tasks(limit=5000):
+        for task in self.db.list_tasks_by_statuses(
+            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
+        ):
             if task["status"] not in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
                 continue
             if not self.task_is_fea_bursty(task):
@@ -3309,8 +3366,8 @@ class Scheduler:
         return pressures
 
     def _compute_fea_allocation_pressures(self) -> dict[int, dict[str, int]]:
-        # FEA cap is per Slurm allocation (job): each cpu allocation reserves its
-        # own cores and tasks attach to one allocation via srun --jobid. Keying
+        # FEA cap is per Slurm allocation (job): every CPU or GPU allocation
+        # reserves its own CPUs and tasks attach via srun --jobid. Keying
         # per node would inflate the cap when several cpu2 allocations share a
         # node (n allocations -> owned = n*64), letting FEA overshoot a single
         # allocation's reservation.
@@ -3322,12 +3379,15 @@ class Scheduler:
                 AllocationStatus.DRAINING.value,
             }:
                 continue
-            if (allocation.get("resource_pool") or "cpu") != "cpu":
+            owned = int(allocation.get("total_cpus") or 0)
+            if owned <= 0:
                 continue
-            owned_by_alloc[int(allocation["id"])] = int(allocation.get("total_cpus") or 0)
+            owned_by_alloc[int(allocation["id"])] = owned
         requested_by_alloc: dict[int, int] = {}
         workers_by_alloc: dict[int, int] = {}
-        for task in self.db.list_tasks(limit=5000):
+        for task in self.db.list_tasks_by_statuses(
+            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
+        ):
             if task["status"] not in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
                 continue
             if not self.task_is_fea_bursty(task):
@@ -3432,11 +3492,25 @@ class Scheduler:
         self._fea_overload_scaled_nodes.add(node_name)
         return True
 
+    def fea_shared_memory_estimate_mb(self, task: dict) -> int:
+        """Conservative growth estimate for one worker in the shared pool.
+
+        ``task.memory_mb`` remains its peak/safety metadata. Reserving that
+        whole peak for every overlapping young FEA worker defeated bursty
+        scheduling, so admission combines live pestat Freemem with a bounded
+        fraction of the peak. The node soft/hard floors remain authoritative.
+        """
+        peak_mb = max(1, int(task.get("memory_mb") or 1))
+        fractional_mb = int((peak_mb * self.fea_shared_memory_estimate_fraction) + 0.999999)
+        return min(peak_mb, max(self.fea_shared_memory_min_estimate_mb, fractional_mb))
+
     def fea_immature_footprint(self, node_name: str) -> dict[str, float]:
-        """Declared cpus/memory of FEA workers younger than the maturity window
-        on this node. FEA consumes its resources late (meshing refines over
-        time), so observed pestat free capacity overstates what is really
-        available while young workers are still growing into their footprint."""
+        """Estimated not-yet-mature footprint of young FEA workers.
+
+        CPU declarations remain fully discounted. Memory uses the shared-pool
+        growth estimate instead of reserving each task's full peak; current
+        consumption is already present in pestat Freemem.
+        """
         empty = {"cpus": 0.0, "memory_mb": 0.0}
         if self.fea_footprint_maturity_seconds <= 0 or not node_name:
             return empty
@@ -3461,7 +3535,9 @@ class Scheduler:
         }
         now = self._now()
         out: dict[str, dict[str, float]] = {}
-        for task in self.db.list_tasks(limit=5000):
+        for task in self.db.list_tasks_by_statuses(
+            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
+        ):
             if task["status"] not in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
                 continue
             if not self.task_is_fea_bursty(task):
@@ -3477,7 +3553,7 @@ class Scheduler:
                 continue
             entry = out.setdefault(node_name, {"cpus": 0.0, "memory_mb": 0.0})
             entry["cpus"] += float(task.get("cpus") or 0)
-            entry["memory_mb"] += float(task.get("memory_mb") or 0)
+            entry["memory_mb"] += float(self.fea_shared_memory_estimate_mb(task))
         return out
 
     def fea_dynamic_extra_slots(self, allocation: dict, task: dict) -> int:
@@ -3485,39 +3561,72 @@ class Scheduler:
             return self.fea_max_attach_per_loop
         node_name = str(allocation.get("node_name") or "").strip()
         node_tick_attaches = self._tick_attach_workers_by_node.get(node_name, 0) if node_name else 0
-        if node_tick_attaches >= self.fea_max_attach_per_node_per_loop:
-            return 0
         node = self.pestat_node_for_allocation(allocation)
         if not node:
-            # Stale pestat: conservative single slot when the node was healthy
-            # at the last observation, instead of freezing attach entirely.
-            return 1 if self.fea_allocation_accepts_task(allocation) else 0
+            # No fresh MemAvailable/Freemem observation means no safe shared-
+            # pool admission decision.
+            return 0
         if not self.fea_allocation_accepts_task(allocation):
             return 0
-        # Discount workers still growing into their declared footprint: FEA
-        # consumes CPU/RAM late (mesh refinement), so observed free capacity
-        # overstates what is really available.
+        # Pestat Freemem is the observed shared-pool authority. Discount a
+        # conservative growth estimate for workers still maturing because FEA
+        # consumes CPU/RAM late during mesh refinement.
         footprint = self.fea_immature_footprint(node_name)
         memory_total = max(1, int(node.get("memory_mb") or 1))
         memory_free = max(0, int(node.get("free_memory_mb") or 0) - int(footprint.get("memory_mb") or 0))
         soft_floor = int(memory_total * (self.fea_soft_memory_free_percent / 100.0))
         memory_budget = max(0, memory_free - soft_floor)
-        memory_slots = memory_budget // max(1, int(task.get("memory_mb") or 1))
+        memory_slots = memory_budget // self.fea_shared_memory_estimate_mb(task)
+
+        # The first stage fills CPUs actually owned by this Slurm allocation
+        # up to 1x requested CPU. It is not overcommit, so the +2 ramp applies
+        # only after this per-allocation baseline is full. Fresh memory data
+        # and the soft floor still gate every baseline attach.
+        baseline_slots = self.fea_allocation_baseline_slots_remaining(allocation, task)
+        if baseline_slots > 0:
+            baseline_slots_left = self.fea_max_attach_per_node_per_loop - node_tick_attaches
+            return max(
+                0,
+                min(
+                    memory_slots,
+                    baseline_slots,
+                    self.fea_max_attach_per_loop,
+                    baseline_slots_left,
+                ),
+            )
 
         cpu_total = max(1, int(node.get("cpu_total") or 1))
         cpu_load = max(0.0, float(node.get("cpu_load") or 0.0)) + float(footprint.get("cpus") or 0.0)
         load_budget = max(0.0, (cpu_total * self.fea_load_target) - cpu_load)
         cpu_slots = int(load_budget // max(1, int(task.get("cpus") or 1)))
 
+        # Even when both CPU and memory are idle, observe the next samples
+        # before adding more than two workers to one physical node per tick.
+        ramp_slots_left = 2 - node_tick_attaches
         return max(
             0,
             min(
                 memory_slots,
                 cpu_slots,
                 self.fea_max_attach_per_loop,
-                self.fea_max_attach_per_node_per_loop - node_tick_attaches,
+                ramp_slots_left,
             ),
         )
+
+    def fea_allocation_baseline_slots_remaining(self, allocation: dict, task: dict) -> int:
+        """Workers still fitting inside this allocation's owned 1x CPU pool."""
+        if allocation.get("state") == AllocationStatus.PENDING.value:
+            owned = int(allocation.get("total_cpus") or 0)
+            requested = 0
+        else:
+            alloc_id = int(allocation.get("id") or 0)
+            # FEA intentionally ignores hard free_cpus bookkeeping; the 1x
+            # baseline is the CPU pool owned by the parent allocation.
+            owned = int(allocation.get("total_cpus") or 0)
+            pressure = self.fea_allocation_pressures().get(alloc_id, {}) if alloc_id > 0 else {}
+            requested = int(pressure.get("requested_cpus") or 0)
+        budget = max(0, owned - requested)
+        return budget // max(1, int(task.get("cpus") or 1))
 
     def fea_effective_worker_limit(
         self,
@@ -3634,8 +3743,6 @@ class Scheduler:
         accumulated more FEA-requested CPUs than their reserved cores * factor
         are drained newest-worker-first, a few per tick, by requeueing the
         workers so the work reruns elsewhere."""
-        if self.fea_node_requested_cpu_factor <= 0:
-            return
         pressures = self.fea_allocation_pressures()
         if not pressures:
             return
@@ -3650,7 +3757,7 @@ class Scheduler:
             if allocation["state"] in live_states
         }
         tasks_by_alloc: dict[int, list[dict]] = {}
-        for task in self.db.list_tasks(limit=5000):
+        for task in self.db.list_tasks_by_statuses([TaskStatus.RUNNING.value], limit=5000):
             # RUNNING only: draining a task whose attach is still in flight
             # races the background attach thread.
             if task["status"] != TaskStatus.RUNNING.value:
@@ -3763,6 +3870,7 @@ class Scheduler:
         self._fea_pressures_cache = None
         self._fea_alloc_pressures_cache = None
         self._fea_footprint_cache = None
+        self._active_profile_sets_cache = None
         self.record_event(
             "task_requeued",
             f"task {task.get('name') or task['id']} requeued: {reason}",
@@ -3792,8 +3900,6 @@ class Scheduler:
         (total_cpus) * fea_node_requested_cpu_factor. Per-allocation, not
         per-node, so several cpu2 allocations sharing a node each stay bounded to
         their own reservation. None = no cap applicable."""
-        if self.fea_node_requested_cpu_factor <= 0:
-            return None
         if allocation.get("state") == AllocationStatus.PENDING.value:
             return None
         alloc_id = int(allocation.get("id") or 0)
@@ -3881,7 +3987,7 @@ class Scheduler:
     def newest_running_fea_task(self, allocation_id: int) -> dict | None:
         candidates = [
             task
-            for task in self.db.list_tasks(limit=5000)
+            for task in self.db.list_tasks_by_statuses([TaskStatus.RUNNING.value], limit=5000)
             if int(task.get("allocation_id") or 0) == allocation_id
             # RUNNING only: killing a task whose attach is still in flight
             # races the background attach thread.
@@ -3968,7 +4074,9 @@ class Scheduler:
         return max(0, free_cpus - reserve)
 
     def allocation_has_active_exclusive_task(self, allocation_id: int) -> bool:
-        for task in self.db.list_tasks(limit=5000):
+        for task in self.db.list_tasks_by_statuses(
+            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
+        ):
             if int(task.get("allocation_id") or 0) != allocation_id:
                 continue
             if task.get("status") not in {
@@ -3983,7 +4091,9 @@ class Scheduler:
     def active_task_allocation_sets(self) -> tuple[set[int], set[int]]:
         active_allocation_ids: set[int] = set()
         active_exclusive_allocation_ids: set[int] = set()
-        for task in self.db.list_tasks(limit=5000):
+        for task in self.db.list_tasks_by_statuses(
+            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
+        ):
             if task.get("status") not in {
                 TaskStatus.ATTACHING.value,
                 TaskStatus.RUNNING.value,
@@ -3997,8 +4107,72 @@ class Scheduler:
                 active_exclusive_allocation_ids.add(allocation_id)
         return active_allocation_ids, active_exclusive_allocation_ids
 
+    def active_profile_allocation_sets(self, *, refresh: bool = False) -> tuple[set[int], set[int]]:
+        """Allocations claimed by ordinary FEA or standard tasks.
+
+        ATTACHING rows are reservations and count immediately. Same-node
+        placement remains available only within the same scheduling profile;
+        every task therefore contributes its actual FEA/standard profile.
+        """
+        if not refresh and self._active_profile_sets_cache is not None:
+            return self._active_profile_sets_cache
+        fea_allocation_ids: set[int] = set()
+        standard_allocation_ids: set[int] = set()
+        for active_task in self.db.list_tasks_by_statuses(
+            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value],
+            limit=5000,
+        ):
+            allocation_id = int(active_task.get("allocation_id") or 0)
+            profile = self.task_allocation_profile(active_task)
+            if allocation_id <= 0 or not profile:
+                continue
+            if profile == "fea":
+                fea_allocation_ids.add(allocation_id)
+            else:
+                standard_allocation_ids.add(allocation_id)
+        result = (fea_allocation_ids, standard_allocation_ids)
+        self._active_profile_sets_cache = result
+        return result
+
+    def task_allocation_profile(self, task: dict) -> str:
+        return "fea" if self.task_is_fea_bursty(task) else "standard"
+
+    @staticmethod
+    def allocation_has_gpu_pool(allocation: dict) -> bool:
+        return (
+            int(allocation.get("total_gpus") or 0) > 0
+            or str(allocation.get("resource_pool") or "").startswith("gpu:")
+        )
+
+    def allocation_profile_conflicts(
+        self,
+        allocation: dict,
+        task: dict,
+        *,
+        refresh: bool = False,
+    ) -> bool:
+        """Prevent shared-memory FEA and per-step-memory standard mixing.
+
+        Isolation applies to CPU and GPU allocations because FEA omits
+        per-step --mem in both. Same-node placement can overlap only tasks
+        belonging to the allocation's existing profile.
+        """
+        profile = self.task_allocation_profile(task)
+        if not profile:
+            return False
+        reserved_profile = str(allocation.get("_reserved_scheduling_profile") or "")
+        if reserved_profile and reserved_profile != profile:
+            return True
+        fea_allocation_ids, standard_allocation_ids = self.active_profile_allocation_sets(refresh=refresh)
+        allocation_id = int(allocation.get("id") or 0)
+        if profile == "fea":
+            return allocation_id in standard_allocation_ids
+        return allocation_id in fea_allocation_ids
+
     def allocation_has_active_task(self, allocation_id: int) -> bool:
-        for task in self.db.list_tasks(limit=5000):
+        for task in self.db.list_tasks_by_statuses(
+            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
+        ):
             if int(task.get("allocation_id") or 0) != allocation_id:
                 continue
             if task.get("status") in {
@@ -4032,6 +4206,14 @@ class Scheduler:
             str(task.get("required_capability") or ""),
             str(task.get("env_profile") or ""),
         ):
+            return False
+        if (
+            self.task_is_fea_bursty(task)
+            and not self.task_requires_gpu(task)
+            and self.allocation_has_gpu_pool(allocation)
+        ):
+            return False
+        if self.allocation_profile_conflicts(allocation, task):
             return False
         if self.task_is_fea_bursty(task) and account and self.account_storage_blocked(account, for_fea=True):
             return False
@@ -4381,6 +4563,9 @@ class Scheduler:
                 int(item.get("free_memory_mb") or 0),
             ),
         )
+        allocation_profile = self.task_allocation_profile(effective_task)
+        if allocation_profile:
+            allocation["_reserved_scheduling_profile"] = allocation_profile
         if self.task_is_fea_bursty(effective_task):
             allocation["_reserved_fea_slots"] = int(allocation.get("_reserved_fea_slots") or 0) + 1
             if self.task_requires_gpu(effective_task):

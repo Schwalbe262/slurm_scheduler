@@ -101,9 +101,11 @@ class AppConfig:
     fea_overload_scale_out_load_factor: float = 2.0
     fea_overload_scale_out_seconds: int = 300
     fea_pressure_max_attempts: int = 3
-    fea_max_attach_per_node_per_loop: int = 8
+    fea_max_attach_per_node_per_loop: int = 12
     fea_node_requested_cpu_factor: float = 1.0
     fea_footprint_maturity_seconds: int = 900
+    fea_shared_memory_estimate_fraction: float = 0.25
+    fea_shared_memory_min_estimate_mb: int = 8192
     cleanup_enabled: bool = True
     cleanup_interval_seconds: int = 3600
     cleanup_finished_task_ttl_seconds: int = 259200
@@ -186,6 +188,8 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
             "max_attach_per_node_per_loop": "fea_max_attach_per_node_per_loop",
             "node_requested_cpu_factor": "fea_node_requested_cpu_factor",
             "footprint_maturity_seconds": "fea_footprint_maturity_seconds",
+            "shared_memory_estimate_fraction": "fea_shared_memory_estimate_fraction",
+            "shared_memory_min_estimate_mb": "fea_shared_memory_min_estimate_mb",
         }
         for source, target in mapping.items():
             if source in fea_bursty:
