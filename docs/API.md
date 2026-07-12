@@ -201,9 +201,16 @@ Estimates how many currently owned allocation slots can run a task shape.
 curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=16&memory_mb=32768&gpus=0&required_capability=conda:flight-searcher"
 curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=4&memory_mb=32768&gpus=1&gpu_model=a6000"
 curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=4&memory_mb=32768&scheduling_profile=fea_bursty"
+curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=4&memory_mb=32768&scheduling_profile=fea_bursty&project=MFT_1MW_2026v1"
 ```
 
 The response includes total ready `fit_slots`, `ready_fit_slots`, `pending_fit_slots`, `inflight_fit_slots`, `queue_state`, `queue_reason`, `preferred_node_relaxed`, `memory_pressure_state`, and per-allocation free CPU, memory, GPU, and fit slots. For `scheduling_profile=fea_bursty`, `memory_pressure_state` is `ok`, `soft_blocked`, or `hard_pressure`.
+
+Pass `project` for project-owned FEA work. License admission uses the exact
+project identity and deliberately treats an empty or unconfigured FEA project
+according to `license_monitor.admission.unknown_fea_project_policy` (normally
+fail-closed). The capacity endpoint is read-only; this parameter selects the
+admission profile but does not create or update a project.
 
 Use:
 

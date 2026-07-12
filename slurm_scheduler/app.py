@@ -1838,6 +1838,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         gpu_model: str = "",
         required_capability: str = "",
         env_profile: str = "",
+        project: str = "",
         account_name: str = "",
         partition: str = "auto",
         node_name: str = "",
@@ -1851,6 +1852,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "gpu_model": gpu_model,
             "required_capability": required_capability,
             "env_profile": env_profile,
+            # Project is part of the FEA license-admission identity.  Without
+            # it, a capacity probe for a configured project is indistinguish-
+            # able from unknown/projectless work and correctly fails closed.
+            "project": project.strip(),
             "account_name": account_name,
             "partition": partition,
             "node_name": node_name,
