@@ -5810,7 +5810,7 @@ class SchedulerTests(unittest.TestCase):
         ]
         self.assertEqual(len(live_allocations), 2)
 
-    def test_pending_fea_fit_slots_respect_allocation_cpu_cap(self) -> None:
+    def test_pending_fea_starts_at_physical_core_baseline_before_overcommit(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",
             partition="cpu2",
@@ -5832,7 +5832,7 @@ class SchedulerTests(unittest.TestCase):
             client_factory=FakeClient,
             min_warm_allocations=0,
             fea_max_attach_per_loop=24,
-            fea_node_requested_cpu_factor=1.0,
+            fea_node_requested_cpu_factor=2.0,
         )
         task = {
             "id": 999,
@@ -6420,6 +6420,15 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(scheduler.fea_node_cpu_cap_remaining(allocation, task), 2)
         limit = scheduler.fea_effective_worker_limit(allocation, task, current_workers=10, base_limit=32)
         self.assertEqual(limit, 12)
+        doubled = Scheduler(
+            self.db, self.accounts, 30, client_factory=FakeClient, fea_node_requested_cpu_factor=2.0
+        )
+        # The load-driven ceiling is twice the 48 / 4 = 12-worker baseline.
+        self.assertEqual(doubled.fea_node_cpu_cap_remaining(allocation, task), 14)
+        self.assertEqual(
+            doubled.fea_effective_worker_limit(allocation, task, current_workers=10, base_limit=32),
+            24,
+        )
         uncapped = Scheduler(
             self.db, self.accounts, 30, client_factory=FakeClient, fea_node_requested_cpu_factor=0
         )

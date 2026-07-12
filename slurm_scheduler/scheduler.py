@@ -3524,7 +3524,12 @@ class Scheduler:
                 and (allocation.get("resource_pool") or "cpu") == "cpu"
                 and self.fea_node_requested_cpu_factor > 0
             ):
-                cpu_cap = int(int(allocation.get("total_cpus") or 0) * self.fea_node_requested_cpu_factor)
+                # A new FEA pool starts at one worker-core budget per owned
+                # core.  The configured factor is the later load-driven
+                # ceiling, not an instruction to fill the overcommit margin
+                # before we have observed CPU/RAM headroom.
+                startup_factor = min(1.0, self.fea_node_requested_cpu_factor)
+                cpu_cap = int(int(allocation.get("total_cpus") or 0) * startup_factor)
                 slots = min(slots, cpu_cap // max(1, int(task.get("cpus") or 1)))
             reserved_slots = int(allocation.get("_reserved_fea_slots") or 0)
             max_workers = int(task.get("max_workers_per_node") or 0)
