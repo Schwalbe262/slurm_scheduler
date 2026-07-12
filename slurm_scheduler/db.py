@@ -331,6 +331,29 @@ class Database:
                 (key, value),
             )
 
+    def allocation_has_aedt_pool_claim(self, allocation_id: int) -> bool:
+        """Fail-safe ownership check for the opt-in AEDT session pool.
+
+        The table is installed by the optional pool service, so legacy/test
+        databases without it simply have no external claim.
+        """
+        with self.connect() as conn:
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'aedt_sessions'"
+            ).fetchone()
+            if not table:
+                return False
+            row = conn.execute(
+                """
+                SELECT 1 FROM aedt_sessions
+                WHERE allocation_id = ?
+                  AND state IN ('starting','ready','busy','draining','unhealthy')
+                LIMIT 1
+                """,
+                (int(allocation_id),),
+            ).fetchone()
+            return bool(row)
+
     def record_event(
         self,
         kind: str,

@@ -11,6 +11,12 @@ web_remote_read_cache_seconds: 3
 web_timeout_keep_alive_seconds: 5
 web_timeout_graceful_shutdown_seconds: 15
 web_limit_concurrency: 64
+web_listener_watchdog_enabled: true
+web_listener_probe_interval_seconds: 5
+web_listener_startup_grace_seconds: 30
+web_listener_failure_threshold: 3
+web_listener_probe_timeout_seconds: 2
+web_listener_restart_delay_seconds: 5
 cluster_refresh_interval_seconds: 120
 min_warm_allocations: 1
 allocation_partition: "auto"
@@ -89,6 +95,15 @@ license_monitor:
       PYAEDT_MOTOR_IPMSM_V2:
         electronics_desktop: 1
     unknown_fea_project_policy: block
+# Experimental and disabled until the live 1-AEDT:2-project A/B gate passes.
+aedt_pool:
+  session_host_enabled: false
+  scheduler_url: ""
+  host_remote_cwd: ""
+  host_python: "python"
+  host_env_setup: ""
+  host_bootstrap_token_file: ""
+  host_task_memory_mb: 4096
 cleanup:
   enabled: true
   interval_seconds: 3600

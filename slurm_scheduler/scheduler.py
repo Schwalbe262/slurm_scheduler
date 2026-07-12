@@ -2452,7 +2452,14 @@ class Scheduler:
             if task.get("allocation_id"):
                 self.recalculate_allocation_capacity()
 
-    def close_allocation(self, allocation: dict, reason: str, *, force: bool = False) -> bool:
+    def close_allocation(
+        self,
+        allocation: dict,
+        reason: str,
+        *,
+        force: bool = False,
+        allow_aedt_pool_owner: bool = False,
+    ) -> bool:
         allocation_id = int(allocation["id"])
         # Placement and shutdown share one lock. Without it, the same-node web
         # fast path could reserve a task after the final claim check but before
@@ -2466,11 +2473,30 @@ class Scheduler:
                 AllocationStatus.CLOSING.value,
             }:
                 return False
+            if (
+                not force
+                and not allow_aedt_pool_owner
+                and str(current.get("drain_reason") or "").startswith("AEDT pool")
+            ):
+                LOGGER.warning(
+                    "refusing generic close of dedicated AEDT pool allocation %s (%s)",
+                    allocation_id,
+                    reason,
+                )
+                return False
+            if not force and self.db.allocation_has_aedt_pool_claim(allocation_id):
+                LOGGER.warning(
+                    "refusing to close allocation %s (%s); counted AEDT session claim exists",
+                    allocation_id,
+                    reason,
+                )
+                return False
             live_claims = self.db.list_live_task_claims_for_allocation(allocation_id)
             if live_claims and not force:
-                # WARM with a live claim is stale state. Reconcile it
-                # conservatively. ATTACHING also includes recovery-held
-                # launches whose remote outcome must not be rerun or killed.
+                # A WARM row with a live claim is stale.  Reconcile it
+                # conservatively and leave the Slurm parent untouched.  An
+                # ATTACHING row also covers a recovery-held launch whose
+                # remote outcome is ambiguous.
                 if current["state"] == AllocationStatus.WARM.value:
                     self.db.update_allocation(
                         allocation_id,
@@ -2541,6 +2567,23 @@ class Scheduler:
                 account_name=str(current.get("account_name") or ""),
             )
             return True
+
+    def close_empty_aedt_pool_allocation(self, allocation_id: int) -> bool:
+        """Pool-runtime-only lifecycle path for a dedicated empty allocation."""
+        allocation = self.db.get_allocation(int(allocation_id))
+        if not allocation:
+            return False
+        if not str(allocation.get("drain_reason") or "").startswith("AEDT pool"):
+            return False
+        if self.db.allocation_has_aedt_pool_claim(int(allocation_id)):
+            return False
+        if self.db.list_live_task_claims_for_allocation(int(allocation_id)):
+            return False
+        return self.close_allocation(
+            allocation,
+            "AEDT pool empty",
+            allow_aedt_pool_owner=True,
+        )
 
     def active_task_ids_for_allocation(self, allocation_id: int) -> list[int]:
         return [

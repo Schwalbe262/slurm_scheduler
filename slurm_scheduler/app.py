@@ -16,6 +16,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from .allocation_metrics import annotate_allocation_fea_pressure, annotate_allocation_node_metrics
+from .aedt_pool import AedtPoolRuntime, AedtPoolService
+from .aedt_pool_api import create_aedt_pool_router
 from .conda_sync import CondaEnvSyncManager, conda_bootstrap
 from .config import AppConfig, load_accounts, load_app_config
 from .db import Database
@@ -495,6 +497,33 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     app.state.config = config
     app.state.db = db
     app.state.scheduler = scheduler
+    aedt_pool_bootstrap_token = os.environ.get("SLURM_AEDT_POOL_BOOTSTRAP_TOKEN", "").strip()
+    aedt_pool = AedtPoolService(db, bootstrap_token=aedt_pool_bootstrap_token)
+    aedt_pool.init()
+    aedt_adapter_configured = bool(
+        config.aedt_pool_session_host_enabled
+        and aedt_pool_bootstrap_token
+        and config.aedt_pool_scheduler_url.strip()
+        and config.aedt_pool_host_remote_cwd.strip()
+        and config.aedt_pool_host_bootstrap_token_file.strip()
+    )
+    # Recompute on every start so a stale DB flag cannot outlive a removed
+    # token file/launch configuration.
+    aedt_pool.set_adapter_ready(aedt_adapter_configured)
+    aedt_pool_runtime = AedtPoolRuntime(
+        aedt_pool,
+        scheduler,
+        interval_seconds=config.poll_interval_seconds,
+        scheduler_url=config.aedt_pool_scheduler_url,
+        host_remote_cwd=config.aedt_pool_host_remote_cwd,
+        host_python=config.aedt_pool_host_python,
+        host_env_setup=config.aedt_pool_host_env_setup,
+        host_bootstrap_token_file=config.aedt_pool_host_bootstrap_token_file,
+        host_task_memory_mb=config.aedt_pool_host_task_memory_mb,
+    )
+    app.state.aedt_pool = aedt_pool
+    app.state.aedt_pool_runtime = aedt_pool_runtime
+    app.include_router(create_aedt_pool_router(aedt_pool))
     env_sync_manager = CondaEnvSyncManager(db, accounts)
     app.state.env_sync_manager = env_sync_manager
     project_env_manager = ProjectEnvManager(
@@ -1057,9 +1086,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     def _startup() -> None:
         cleanup_local_temp_artifacts()
         scheduler.start()
+        aedt_pool_runtime.start()
 
     @app.on_event("shutdown")
     def _shutdown() -> None:
+        aedt_pool_runtime.stop()
         scheduler.stop()
 
     @app.get("/", response_class=HTMLResponse)
@@ -2275,6 +2306,31 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return JSONResponse(project_json(db.get_project(project_id)), status_code=201)
+
+    @app.patch("/api/projects/{name}/max-active-tasks")
+    async def api_set_project_max_active_tasks(name: str, request: Request) -> dict:
+        """Atomically mutate only a project's active-task cap.
+
+        This deliberately does not reuse the project upsert endpoint: a cap
+        control must never replace repos, setup, entrypoints, or deployment
+        configuration when the caller sends a one-field payload.
+        """
+        project = db.get_project_by_name(name)
+        if not project:
+            raise HTTPException(status_code=404, detail=f"project not found: {name}")
+        payload = await _json_body(request)
+        raw_value = payload.get("max_active_tasks")
+        if type(raw_value) is not int or not 1 <= raw_value <= 300:
+            raise HTTPException(
+                status_code=422,
+                detail="max_active_tasks must be an integer between 1 and 300",
+            )
+        target = raw_value
+        db.update_project(int(project["id"]), max_active_tasks=target)
+        updated = db.get_project(int(project["id"]))
+        if not updated:
+            raise HTTPException(status_code=404, detail=f"project not found: {name}")
+        return project_json(updated)
 
     @app.delete("/api/projects/{name}")
     def api_delete_project(name: str) -> dict:
