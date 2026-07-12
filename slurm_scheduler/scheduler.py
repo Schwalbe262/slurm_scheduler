@@ -278,6 +278,10 @@ class Scheduler:
         self.task_refresh_max_per_tick = max(1, int(task_refresh_max_per_tick))
         self._fea_task_refresh_cursor_id = 0
         self._fea_project_last_claim = self.load_fea_project_claim_cursor()
+        # Candidate selection and the queued -> attaching claim can also be
+        # entered from a web request.  Serialize the final admission check so
+        # two callers cannot both consume the same last FEA node-fit slot.
+        self._task_assignment_lock = threading.RLock()
         self._background_attach_semaphore = threading.BoundedSemaphore(max(1, min(4, self.fea_max_attach_per_loop)))
         self._allocation_backoff_until_by_pool: dict[str, float] = {}
         self._allocation_node_backoff_until: dict[tuple[str, str], float] = {}
@@ -2309,38 +2313,60 @@ class Scheduler:
         return self.finish_reserved_task_attach(task, allocation, account)
 
     def reserve_task_on_allocation(self, task: dict, allocation: dict, account: AccountConfig) -> dict | None:
-        task = self.apply_dynamic_env_profile(task, account)
-        attach_token = uuid.uuid4().hex
-        if not self.db.update_task_if_status(
-            task["id"],
-            [TaskStatus.QUEUED.value],
-            status=TaskStatus.ATTACHING.value,
-            allocation_id=allocation["id"],
-            account_name=allocation["account_name"],
-            remote_dir="",
-            stdout_path="",
-            stderr_path="",
-            exit_code_path="",
-            wrapper_pid="",
-            attach_token=attach_token,
-            launch_started_at=None,
-            failure_message="",
-            attached_at="CURRENT_TIMESTAMP",
-            started_at=None,
-            finished_at=None,
-            exit_code=None,
-        ):
-            return None
-        self._record_attach_delta(allocation, task)
-        self.recalculate_allocation_capacity()
-        return {
-            **task,
-            "status": TaskStatus.ATTACHING.value,
-            "allocation_id": allocation["id"],
-            "account_name": allocation["account_name"],
-            "attach_token": attach_token,
-            "launch_started_at": None,
-        }
+        with self._task_assignment_lock:
+            # The allocation returned by best_allocation_for_task is only a
+            # snapshot.  Reload both rows under the assignment lock and, for
+            # bursty FEA, recompute dynamic node fit immediately before the
+            # optimistic DB claim.  _record_attach_delta invalidates the
+            # footprint/pressure caches before the next waiter enters.
+            current_task = self.db.get_task(int(task["id"]))
+            current_allocation = self.db.get_allocation(int(allocation["id"]))
+            if not current_task or current_task.get("status") != TaskStatus.QUEUED.value:
+                return None
+            if not current_allocation:
+                return None
+            task = current_task
+            allocation = current_allocation
+            if self.task_is_fea_bursty(task):
+                if allocation.get("state") not in {AllocationStatus.WARM.value, AllocationStatus.ACTIVE.value}:
+                    return None
+                if not allocation.get("slurm_job_id") or not self.allocation_accepts_new_tasks(allocation):
+                    return None
+                if self.fit_slots_for_allocation(allocation, task) <= 0:
+                    return None
+
+            task = self.apply_dynamic_env_profile(task, account)
+            attach_token = uuid.uuid4().hex
+            if not self.db.update_task_if_status(
+                task["id"],
+                [TaskStatus.QUEUED.value],
+                status=TaskStatus.ATTACHING.value,
+                allocation_id=allocation["id"],
+                account_name=allocation["account_name"],
+                remote_dir="",
+                stdout_path="",
+                stderr_path="",
+                exit_code_path="",
+                wrapper_pid="",
+                attach_token=attach_token,
+                launch_started_at=None,
+                failure_message="",
+                attached_at="CURRENT_TIMESTAMP",
+                started_at=None,
+                finished_at=None,
+                exit_code=None,
+            ):
+                return None
+            self._record_attach_delta(allocation, task)
+            self.recalculate_allocation_capacity()
+            return {
+                **task,
+                "status": TaskStatus.ATTACHING.value,
+                "allocation_id": allocation["id"],
+                "account_name": allocation["account_name"],
+                "attach_token": attach_token,
+                "launch_started_at": None,
+            }
 
     def start_background_task_attach(self, task: dict, allocation: dict, account: AccountConfig) -> None:
         thread = threading.Thread(
@@ -2469,6 +2495,17 @@ class Scheduler:
             return None
         if self.task_is_fea_bursty(task):
             self.annotate_fea_node_worker_counts(candidates)
+            # A healthy instantaneous pestat row is necessary but not
+            # sufficient: fit_slots also discounts young workers' declared
+            # footprint and the per-tick attach ledger.  A zero-fit candidate
+            # must never remain eligible merely because it sorts last/best.
+            candidates = [
+                item
+                for item in candidates
+                if self.fit_slots_for_allocation(item, task) > 0
+            ]
+            if not candidates:
+                return None
             return max(
                 candidates,
                 key=lambda item: (

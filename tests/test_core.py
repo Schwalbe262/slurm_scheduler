@@ -6080,6 +6080,131 @@ class SchedulerTests(unittest.TestCase):
         scheduler._record_attach_delta(allocation, task)
         self.assertEqual(scheduler.fea_dynamic_extra_slots(allocation, task), 0)
 
+    def test_fea_best_allocation_excludes_two_same_node_zero_memory_fit_pools(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu2 mix 128 256 8.0 1000000 900000 busy\n"
+            )
+        )
+        allocation_ids = []
+        for index in range(2):
+            allocation_id = self.db.create_allocation(
+                account_name="a",
+                partition="cpu2",
+                node_name="n001",
+                total_cpus=64,
+                total_memory_mb=652310,
+            )
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.ACTIVE.value,
+                slurm_job_id=f"alloc-{index}",
+            )
+            allocation_ids.append(allocation_id)
+
+        # Four young 64 GiB workers leave the instantaneous node above the
+        # 60% soft floor, but their declared footprint consumes the remaining
+        # admission headroom across both pools on the same physical node.
+        for index in range(4):
+            task_id = self.db.create_task(
+                TaskCreate(
+                    f"fea-young-shared-node-{index}",
+                    "~/case",
+                    "run",
+                    cpus=4,
+                    memory_mb=65536,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                )
+            )
+            self.db.update_task(
+                task_id,
+                status=TaskStatus.RUNNING.value,
+                account_name="a",
+                allocation_id=allocation_ids[index % 2],
+                wrapper_pid=str(8000 + index),
+                attached_at="CURRENT_TIMESTAMP",
+            )
+
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        queued = {
+            "id": 999,
+            "cpus": 4,
+            "memory_mb": 65536,
+            "gpus": 0,
+            "partition": "auto",
+            "node_name": "",
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+            "max_workers_per_node": 0,
+        }
+        allocations = [self.db.get_allocation(allocation_id) for allocation_id in allocation_ids]
+        self.assertTrue(all(scheduler.fea_memory_pressure_state(item) == "ok" for item in allocations))
+        self.assertTrue(all(scheduler.fit_slots_for_allocation(item, queued) == 0 for item in allocations))
+        self.assertIsNone(scheduler.best_allocation_for_task(queued))
+
+    def test_fea_claim_revalidates_last_dynamic_fit_slot_under_lock(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 4.0 100000 90000 idle\n"
+            )
+        )
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="alloc-1",
+        )
+        task_ids = [
+            self.db.create_task(
+                TaskCreate(
+                    f"fea-last-slot-{index}",
+                    "~/case",
+                    "run",
+                    cpus=4,
+                    memory_mb=30000,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                )
+            )
+            for index in range(2)
+        ]
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        original_best = scheduler.best_allocation_for_task
+        both_selected = threading.Barrier(2)
+
+        def synchronized_best(task: dict) -> dict | None:
+            selected = original_best(task)
+            both_selected.wait(timeout=2)
+            return selected
+
+        scheduler.best_allocation_for_task = synchronized_best  # type: ignore[method-assign]
+        results: list[bool] = []
+        threads = [
+            threading.Thread(
+                target=lambda task_id=task_id: results.append(
+                    scheduler.assign_queued_task(self.db.get_task(task_id))
+                )
+            )
+            for task_id in task_ids
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(sorted(results), [False, True])
+        statuses = [self.db.get_task(task_id)["status"] for task_id in task_ids]
+        self.assertEqual(statuses.count(TaskStatus.RUNNING.value), 1)
+        self.assertEqual(statuses.count(TaskStatus.QUEUED.value), 1)
+        self.assertEqual(len(FakeClient.attached_tasks), 1)
+
     def test_fea_stale_pestat_allows_single_slot_when_last_row_was_healthy(self) -> None:
         self.db.replace_pestat_nodes(
             parse_pestat(
@@ -6266,6 +6391,12 @@ class SchedulerTests(unittest.TestCase):
         self.db.update_allocation(allocation_id, state=AllocationStatus.ACTIVE.value, slurm_job_id="alloc-1")
         task_id = self.db.create_task(
             TaskCreate("racy", "~/case", "run", cpus=4, scheduling_profile=SchedulingProfile.FEA_BURSTY.value)
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 48 4.0 380000 350000 idle\n"
+            )
         )
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=BlockingAttachClient)
         allocation = self.db.get_allocation(allocation_id)
@@ -7523,6 +7654,12 @@ class TransientStateRecoveryTests(unittest.TestCase):
         self.db.update_allocation(allocation_id, state=AllocationStatus.WARM.value, slurm_job_id="alloc-1")
         task_id = self.db.create_task(
             TaskCreate("restart-race", "~/work", "run", scheduling_profile=SchedulingProfile.FEA_BURSTY.value)
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 0 8 1.0 65536 60000 idle\n"
+            )
         )
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
         allocation = self.db.get_allocation(allocation_id)
