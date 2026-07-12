@@ -5357,7 +5357,7 @@ class SchedulerTests(unittest.TestCase):
         self.db.replace_pestat_nodes(
             parse_pestat(
                 "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
-                "n001 cpu1 mix 0 8 1.0 100000 65000 some_job\n"
+                "n001 cpu1 mix 0 8 1.0 100000 95000 some_job\n"
             )
         )
         task_id = self.db.create_task(
@@ -5456,7 +5456,7 @@ class SchedulerTests(unittest.TestCase):
         self.db.replace_pestat_nodes(
             parse_pestat(
                 "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
-                "n001 cpu1 mix 0 8 1.0 100000 65000 some_job\n"
+                "n001 cpu1 mix 0 8 1.0 100000 95000 some_job\n"
             )
         )
         task_id = self.db.create_task(
@@ -5533,7 +5533,7 @@ class SchedulerTests(unittest.TestCase):
             parse_pestat(
                 "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
                 "n114 cpu1 mix 8 64 12.0 100000 55000 some_job\n"
-                "n115 cpu1 mix 8 64 12.0 100000 80000 some_job\n"
+                "n115 cpu1 mix 8 64 12.0 100000 95000 some_job\n"
             )
         )
         task_id = self.db.create_task(
@@ -5665,8 +5665,8 @@ class SchedulerTests(unittest.TestCase):
         self.db.replace_pestat_nodes(
             parse_pestat(
                 "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
-                "n114 cpu1 mix 8 64 12.0 100000 80000 some_job\n"
-                "n115 cpu1 mix 8 64 12.0 100000 80000 some_job\n"
+                "n114 cpu1 mix 8 64 12.0 100000 95000 some_job\n"
+                "n115 cpu1 mix 8 64 12.0 100000 95000 some_job\n"
             )
         )
         task_id = self.db.create_task(
@@ -6594,7 +6594,7 @@ class SchedulerTests(unittest.TestCase):
             parse_pestat(
                 "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
                 "n001 cpu1 mix 8 64 12.0 200000 180000 some_job\n"
-                "n002 cpu1 mix 8 64 12.0 100000 90000 some_job\n"
+                "n002 cpu1 mix 8 64 12.0 100000 95000 some_job\n"
             )
         )
         task_id = self.create_queued_fea_task("quota-fallback")
