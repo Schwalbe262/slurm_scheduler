@@ -55,6 +55,9 @@ fea_bursty:
   node_name_policy: "preferred"
   overload_scale_out_load_factor: 2.0
   overload_scale_out_seconds: 300
+  # Three-stage MFT runs can reach their late Thermal memory peak after
+  # roughly 48-53 minutes. Keep declared CPU/RAM reserved for the first hour.
+  footprint_maturity_seconds: 3600
 cleanup:
   enabled: true
   interval_seconds: 3600

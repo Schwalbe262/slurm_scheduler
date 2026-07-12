@@ -126,6 +126,7 @@ class SlurmParsingTests(unittest.TestCase):
                         "fea_bursty:",
                         "  overload_scale_out_load_factor: 2.25",
                         "  overload_scale_out_seconds: 420",
+                        "  footprint_maturity_seconds: 3600",
                     ]
                 ),
                 encoding="utf-8",
@@ -133,6 +134,12 @@ class SlurmParsingTests(unittest.TestCase):
             config = load_app_config(path)
         self.assertEqual(config.fea_overload_scale_out_load_factor, 2.25)
         self.assertEqual(config.fea_overload_scale_out_seconds, 420)
+        self.assertEqual(config.fea_footprint_maturity_seconds, 3600)
+
+    def test_example_app_config_reserves_fea_footprint_through_thermal_entry(self) -> None:
+        example_config_path = Path(__file__).resolve().parents[1] / "config" / "app.example.yaml"
+        config = load_app_config(example_config_path)
+        self.assertEqual(config.fea_footprint_maturity_seconds, 3600)
 
     def test_annotate_allocation_node_metrics_adds_pestat_usage(self) -> None:
         allocations = [{"id": 1, "node_name": "n001"}, {"id": 2, "node_name": "n002"}]
