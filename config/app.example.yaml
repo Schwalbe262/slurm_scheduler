@@ -66,8 +66,11 @@ fea_bursty:
   overload_scale_out_load_factor: 2.0
   overload_scale_out_seconds: 300
   # Three-stage MFT runs can reach their late Thermal memory peak after
-  # roughly 48-53 minutes. Keep declared CPU/RAM reserved for the first hour.
+  # roughly 48-53 minutes. Keep shared RAM growth reserved for the first hour.
   footprint_maturity_seconds: 3600
+  # CPU declarations need only bridge the delay until load/sstat observes a
+  # newly attached worker; do not double-count CPU for the full RAM window.
+  cpu_footprint_maturity_seconds: 120
 license_monitor:
   enabled: false
   account: "account_a"

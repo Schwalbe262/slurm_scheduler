@@ -442,6 +442,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         fea_max_attach_per_node_per_loop=config.fea_max_attach_per_node_per_loop,
         fea_node_requested_cpu_factor=config.fea_node_requested_cpu_factor,
         fea_footprint_maturity_seconds=config.fea_footprint_maturity_seconds,
+        fea_cpu_footprint_maturity_seconds=config.fea_cpu_footprint_maturity_seconds,
         fea_alloc_util_enabled=config.fea_alloc_util_enabled,
         fea_alloc_util_target=config.fea_alloc_util_target,
         fea_alloc_util_sample_interval_seconds=config.fea_alloc_util_sample_interval_seconds,
@@ -698,6 +699,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "assigned_allocation": task.get("allocation_id"),
             "allocation_id": task.get("allocation_id"),
             "account_name": task.get("account_name") or "",
+            "requested_account_name": task.get("requested_account_name") or "",
             "slurm_job_id": allocation.get("slurm_job_id") if allocation else "",
             "remote_cwd": task.get("remote_cwd") or "",
             "remote_dir": task.get("remote_dir") or "",
@@ -774,7 +776,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "env_setup": task.get("env_setup") or "",
             "required_capability": task.get("required_capability") or "",
             "env_profile": task.get("env_profile") or "",
-            "account_name": task.get("account_name") or "",
+            "account_name": (
+                task.get("requested_account_name")
+                if "requested_account_name" in task and task.get("requested_account_name") is not None
+                else task.get("account_name")
+            ) or "",
             "cpus": int(task.get("cpus") or 1),
             "memory_mb": int(task.get("memory_mb") or 4096),
             "scheduling_profile": normalize_scheduling_profile(task.get("scheduling_profile") or ""),

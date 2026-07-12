@@ -164,6 +164,7 @@ class Scheduler:
         fea_max_attach_per_node_per_loop: int = 12,
         fea_node_requested_cpu_factor: float = 1.0,
         fea_footprint_maturity_seconds: int = 900,
+        fea_cpu_footprint_maturity_seconds: int = 120,
         fea_alloc_util_enabled: bool = True,
         fea_alloc_util_target: float = 0.85,
         fea_alloc_util_sample_interval_seconds: int = 60,
@@ -281,6 +282,7 @@ class Scheduler:
         # the CPUs owned by the allocation.
         self.fea_node_requested_cpu_factor = min(2.0, max(1.0, float(fea_node_requested_cpu_factor)))
         self.fea_footprint_maturity_seconds = max(0, int(fea_footprint_maturity_seconds))
+        self.fea_cpu_footprint_maturity_seconds = max(0, int(fea_cpu_footprint_maturity_seconds))
         self.fea_shared_memory_estimate_fraction = min(
             1.0, max(0.0, float(fea_shared_memory_estimate_fraction))
         )
@@ -556,6 +558,7 @@ class Scheduler:
                     require_launch_not_started=True,
                     status=TaskStatus.QUEUED.value,
                     allocation_id=None,
+                    account_name=self.task_requested_account_name(task),
                     remote_dir="",
                     stdout_path="",
                     stderr_path="",
@@ -3290,7 +3293,7 @@ class Scheduler:
             active_exclusive_allocation_ids=active_exclusive_ids,
         )
         snapshots_by_name = {snapshot.account_name: snapshot for snapshot in self.snapshots()}
-        requested = self.requested_accounts(str(task.get("account_name") or ""))
+        requested = self.requested_accounts(self.task_requested_account_name(task))
         accounts = []
         for account in self.accounts:
             reasons: list[str] = []
@@ -3612,7 +3615,7 @@ class Scheduler:
                 open_by_account[allocation["account_name"]] = open_by_account.get(allocation["account_name"], 0) + 1
             if allocation["state"] == AllocationStatus.PENDING.value:
                 pending_by_account[allocation["account_name"]] = pending_by_account.get(allocation["account_name"], 0) + 1
-        requested_accounts = self.requested_accounts(str(task.get("account_name") or ""))
+        requested_accounts = self.requested_accounts(self.task_requested_account_name(task))
         eligible = [
             account
             for account in self.accounts
@@ -4109,7 +4112,7 @@ class Scheduler:
             preferred_accounts=self.warm_pool_preferred_accounts,
             required_capability=str(task.get("required_capability") or ""),
             env_profile=str(task.get("env_profile") or ""),
-            account_name=str(task.get("account_name") or ""),
+            account_name=self.task_requested_account_name(task),
             require_fea_eligible_node=True,
         )
         if not allocation:
@@ -4132,12 +4135,15 @@ class Scheduler:
     def fea_immature_footprint(self, node_name: str) -> dict[str, float]:
         """Estimated not-yet-mature footprint of young FEA workers.
 
-        CPU declarations remain fully discounted. Memory uses the shared-pool
-        growth estimate instead of reserving each task's full peak; current
-        consumption is already present in pestat Freemem.
+        Memory stays reserved through the late-stage growth window. Declared
+        CPU is reserved only for a short observation window; after that fresh
+        load samples already include the worker.
         """
         empty = {"cpus": 0.0, "memory_mb": 0.0}
-        if self.fea_footprint_maturity_seconds <= 0 or not node_name:
+        if (
+            self.fea_footprint_maturity_seconds <= 0
+            and self.fea_cpu_footprint_maturity_seconds <= 0
+        ) or not node_name:
             return empty
         cached = self._fea_footprint_cache
         if cached is not None and cached[0] == self._tick_seq:
@@ -4174,11 +4180,20 @@ class Scheduler:
                 task.get("attached_at") or task.get("started_at") or task.get("created_at")
             )
             # Unknown start time counts as young: overcounting is the safe side.
-            if started is not None and (now - started).total_seconds() >= self.fea_footprint_maturity_seconds:
+            age_seconds = None if started is None else max(0.0, (now - started).total_seconds())
+            cpu_young = self.fea_cpu_footprint_maturity_seconds > 0 and (
+                age_seconds is None or age_seconds < self.fea_cpu_footprint_maturity_seconds
+            )
+            memory_young = self.fea_footprint_maturity_seconds > 0 and (
+                age_seconds is None or age_seconds < self.fea_footprint_maturity_seconds
+            )
+            if not cpu_young and not memory_young:
                 continue
             entry = out.setdefault(node_name, {"cpus": 0.0, "memory_mb": 0.0})
-            entry["cpus"] += float(task.get("cpus") or 0)
-            entry["memory_mb"] += float(self.fea_shared_memory_estimate_mb(task))
+            if cpu_young:
+                entry["cpus"] += float(task.get("cpus") or 0)
+            if memory_young:
+                entry["memory_mb"] += float(self.fea_shared_memory_estimate_mb(task))
         return out
 
     def fea_dynamic_extra_slots(self, allocation: dict, task: dict, trace: dict | None = None) -> int:
@@ -4277,7 +4292,10 @@ class Scheduler:
             # step CPU deltas), independent of co-tenant load on the node. Keep
             # utilization at the configured target by budgeting the difference.
             alloc_cpus = max(1, int(allocation.get("total_cpus") or 1))
-            busy_cores = float(util_info["busy_cores"]) + float(footprint.get("cpus") or 0.0)
+            # The fresh sstat delta already measures these workers. Adding the
+            # young declared CPUs again double-counted them and blocked all
+            # overcommit for the one-hour RAM maturity window.
+            busy_cores = float(util_info["busy_cores"])
             load_budget = max(0.0, (alloc_cpus * self.fea_alloc_util_target) - busy_cores)
             record(
                 {
@@ -4592,6 +4610,7 @@ class Scheduler:
             task["id"],
             status=TaskStatus.QUEUED.value,
             allocation_id=None,
+            account_name=self.task_requested_account_name(task),
             remote_dir="",
             stdout_path="",
             stderr_path="",
@@ -4683,6 +4702,7 @@ class Scheduler:
             status=TaskStatus.QUEUED.value,
             attempt_count=attempts,
             allocation_id=None,
+            account_name=self.task_requested_account_name(task),
             remote_dir="",
             stdout_path="",
             stderr_path="",
@@ -4717,6 +4737,18 @@ class Scheduler:
 
     def requested_accounts(self, account_name: str) -> list[str]:
         return [part.strip() for part in re.split(r"[\s,;/|]+", account_name or "") if part.strip()]
+
+    @staticmethod
+    def task_requested_account_name(task: dict) -> str:
+        """Return the requested placement constraint, not the last assignment.
+
+        NULL means a legacy row whose original intent is unknown, so preserve
+        its existing account_name. New rows store an explicit empty string for
+        unpinned work and a non-empty value for deliberate account pins.
+        """
+        if "requested_account_name" in task and task.get("requested_account_name") is not None:
+            return str(task.get("requested_account_name") or "")
+        return str(task.get("account_name") or "")
 
     def same_node_as_task_id(self, task: dict) -> int:
         return max(0, int(task.get("same_node_as_task_id") or task.get("same_node_as") or 0))
@@ -4901,7 +4933,7 @@ class Scheduler:
         active_task_allocation_ids: set[int] | None = None,
         active_exclusive_allocation_ids: set[int] | None = None,
     ) -> bool:
-        requested_accounts = self.requested_accounts(str(task.get("account_name") or ""))
+        requested_accounts = self.requested_accounts(self.task_requested_account_name(task))
         if requested_accounts and allocation.get("account_name") not in requested_accounts:
             return False
         reference_id = self.same_node_as_task_id(task)
@@ -5357,7 +5389,7 @@ class Scheduler:
                 exclusive_node=bool(task.get("exclusive_node")),
                 required_capability=str(task.get("required_capability") or ""),
                 env_profile=str(task.get("env_profile") or ""),
-                account_name=str(task.get("account_name") or ""),
+                account_name=self.task_requested_account_name(task),
                 requested_cpus=int(task.get("cpus") or 0),
                 requested_memory_mb=int(task.get("memory_mb") or 0),
                 require_fea_eligible_node=self.task_is_fea_bursty(task),
@@ -5371,7 +5403,7 @@ class Scheduler:
             exclusive_node=exclusive_node,
             required_capability=str(task.get("required_capability") or ""),
             env_profile=str(task.get("env_profile") or ""),
-            account_name=str(task.get("account_name") or ""),
+            account_name=self.task_requested_account_name(task),
             requested_cpus=int(task.get("cpus") or 0) if exclusive_node or not self.task_is_fea_bursty(task) else 0,
             requested_memory_mb=int(task.get("memory_mb") or 0) if exclusive_node else 0,
             require_fea_eligible_node=self.task_is_fea_bursty(task),
