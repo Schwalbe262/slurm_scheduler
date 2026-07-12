@@ -53,6 +53,9 @@ fea_bursty:
   load_target: 0.75
   max_attach_per_loop: 24
   node_name_policy: "preferred"
+  # Start at the physical-core baseline, then let measured CPU/RAM headroom
+  # ramp FEA workers gradually; never exceed 2x that baseline.
+  node_requested_cpu_factor: 2.0
   overload_scale_out_load_factor: 2.0
   overload_scale_out_seconds: 300
 cleanup:
