@@ -8223,6 +8223,16 @@ class ProjectApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201)
         return json.loads(response.body)
 
+    def test_project_cap_route_is_registered_exactly_once(self) -> None:
+        routes = [
+            route
+            for route in self.app.routes
+            if getattr(route, "path", "")
+            == "/api/projects/{name}/max-active-tasks"
+            and "PATCH" in getattr(route, "methods", set())
+        ]
+        self.assertEqual(len(routes), 1)
+
     def test_project_api_round_trips_and_updates_max_active_tasks(self) -> None:
         created = self._post_project({"name": "motor", "max_active_tasks": 7})
         self.assertEqual(created["max_active_tasks"], 7)

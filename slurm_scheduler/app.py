@@ -2307,31 +2307,6 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return JSONResponse(project_json(db.get_project(project_id)), status_code=201)
 
-    @app.patch("/api/projects/{name}/max-active-tasks")
-    async def api_set_project_max_active_tasks(name: str, request: Request) -> dict:
-        """Atomically mutate only a project's active-task cap.
-
-        This deliberately does not reuse the project upsert endpoint: a cap
-        control must never replace repos, setup, entrypoints, or deployment
-        configuration when the caller sends a one-field payload.
-        """
-        project = db.get_project_by_name(name)
-        if not project:
-            raise HTTPException(status_code=404, detail=f"project not found: {name}")
-        payload = await _json_body(request)
-        raw_value = payload.get("max_active_tasks")
-        if type(raw_value) is not int or not 1 <= raw_value <= 300:
-            raise HTTPException(
-                status_code=422,
-                detail="max_active_tasks must be an integer between 1 and 300",
-            )
-        target = raw_value
-        db.update_project(int(project["id"]), max_active_tasks=target)
-        updated = db.get_project(int(project["id"]))
-        if not updated:
-            raise HTTPException(status_code=404, detail=f"project not found: {name}")
-        return project_json(updated)
-
     @app.delete("/api/projects/{name}")
     def api_delete_project(name: str) -> dict:
         project = db.get_project_by_name(name)
