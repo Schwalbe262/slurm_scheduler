@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from .models import AllocationStatus, JobCreate, JobStatus, SchedulingProfile, TaskCreate, TaskStatus
+from .models import AedtBackend, AllocationStatus, JobCreate, JobStatus, SchedulingProfile, TaskCreate, TaskStatus, normalize_aedt_backend
 
 
 def json_dumps(value: Any) -> str:
@@ -152,6 +152,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     cpus INTEGER NOT NULL DEFAULT 1,
     memory_mb INTEGER NOT NULL DEFAULT 4096,
     scheduling_profile TEXT NOT NULL DEFAULT 'standard',
+    aedt_backend TEXT NOT NULL DEFAULT 'standalone',
     gpus INTEGER NOT NULL DEFAULT 0,
     gpu_model TEXT NOT NULL DEFAULT '',
     partition TEXT NOT NULL DEFAULT 'auto',
@@ -253,6 +254,7 @@ CREATE TABLE IF NOT EXISTS projects (
     sim_subdir TEXT NOT NULL DEFAULT 'simulation',
     auto_pull INTEGER NOT NULL DEFAULT 0,
     max_active_tasks INTEGER NOT NULL DEFAULT 0,
+    aedt_backend TEXT NOT NULL DEFAULT 'standalone',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -458,6 +460,7 @@ class Database:
                 "account_name": "TEXT NOT NULL DEFAULT ''",
                 "requested_account_name": "TEXT",
                 "scheduling_profile": f"TEXT NOT NULL DEFAULT '{SchedulingProfile.STANDARD.value}'",
+                "aedt_backend": f"TEXT NOT NULL DEFAULT '{AedtBackend.STANDALONE.value}'",
                 "gpus": "INTEGER NOT NULL DEFAULT 0",
                 "gpu_model": "TEXT NOT NULL DEFAULT ''",
                 "partition": "TEXT NOT NULL DEFAULT 'auto'",
@@ -491,6 +494,7 @@ class Database:
             "projects": {
                 "output_globs": "TEXT NOT NULL DEFAULT ''",
                 "max_active_tasks": "INTEGER NOT NULL DEFAULT 0",
+                "aedt_backend": f"TEXT NOT NULL DEFAULT '{AedtBackend.STANDALONE.value}'",
             },
         }
         for table, columns in table_columns.items():
@@ -554,9 +558,9 @@ class Database:
                 INSERT INTO tasks (
                     name, remote_cwd, command, env_setup, required_capability, env_profile,
                     account_name, requested_account_name, cpus, memory_mb,
-                    scheduling_profile, gpus, gpu_model, partition, node_name, exclusive_node, priority, timeout_seconds, dedupe_key,
+                    scheduling_profile, aedt_backend, gpus, gpu_model, partition, node_name, exclusive_node, priority, timeout_seconds, dedupe_key,
                     max_workers_per_node, same_node_as_task_id, payload_json, cleanup_globs, project, entrypoint, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.name,
@@ -570,6 +574,7 @@ class Database:
                     task.cpus,
                     task.memory_mb,
                     task.scheduling_profile,
+                    normalize_aedt_backend(task.aedt_backend),
                     task.gpus,
                     task.gpu_model,
                     task.partition,
@@ -1079,14 +1084,15 @@ class Database:
         sim_subdir: str = "simulation",
         auto_pull: bool = False,
         max_active_tasks: int = 0,
+        aedt_backend: str = AedtBackend.STANDALONE.value,
     ) -> int:
         with self.connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO projects (
                     name, repos, setup, entrypoints, cleanup_globs, output_globs, sim_subdir, auto_pull,
-                    max_active_tasks
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    max_active_tasks, aedt_backend
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name,
@@ -1098,6 +1104,7 @@ class Database:
                     sim_subdir,
                     1 if auto_pull else 0,
                     max(0, int(max_active_tasks)),
+                    normalize_aedt_backend(aedt_backend),
                 ),
             )
             return int(cursor.lastrowid)

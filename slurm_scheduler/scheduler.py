@@ -22,7 +22,7 @@ from typing import Any, Callable
 from .config import AccountConfig
 from .db import Database
 from .inventory import CPU_PROFILES_BY_PARTITION, GPU_PRIORITY, gpu_model_candidates, normalize_gpu_model, parse_scontrol_nodes, parse_sinfo_nodes, partition_rank
-from .models import AccountSnapshot, AllocationStatus, JobStatus, SchedulingProfile, TaskStatus, normalize_scheduling_profile
+from .models import AedtBackend, AccountSnapshot, AllocationStatus, JobStatus, SchedulingProfile, TaskStatus, normalize_aedt_backend, normalize_scheduling_profile
 from .pestat import PestatNode, parse_pestat
 from .slurm import (
     JobStateInfo,
@@ -217,6 +217,7 @@ class Scheduler:
         self.accounts = accounts
         self.poll_interval_seconds = poll_interval_seconds
         self.client_factory = client_factory
+        self._aedt_backend_admission_checker: Callable[[dict], tuple[bool, str]] | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._snapshot_cache: tuple[float, list[AccountSnapshot]] | None = None
@@ -1048,7 +1049,14 @@ class Scheduler:
         project = str(task.get("project") or "").strip()
         configured = self.license_admission_persistent_cost_by_project.get(project)
         if configured:
-            return dict(configured), ""
+            costs = dict(configured)
+            if self.task_aedt_backend(task) == AedtBackend.POOLED.value:
+                costs = {
+                    feature: count
+                    for feature, count in costs.items()
+                    if feature.casefold() != "electronics_desktop"
+                }
+            return costs, ""
         if self.task_is_fea_bursty(task) and self.license_admission_unknown_fea_project_policy == "block":
             return {}, f"unconfigured license admission profile for FEA project {project or '<empty>'}"
         return {}, ""
@@ -2927,6 +2935,8 @@ class Scheduler:
     def assign_queued_task(self, task: dict, background: bool = False) -> bool:
         if task.get("status") != TaskStatus.QUEUED.value:
             return False
+        if self.aedt_backend_block_reason(task):
+            return False
         # Normal assignment is serialized by the scheduler loop. The existing
         # same-node web fast path can also call this method; strict enforcement
         # across concurrent callers requires one transactional check/transition.
@@ -2963,6 +2973,8 @@ class Scheduler:
                 return None
             task = current_task
             allocation = current_allocation
+            if self.aedt_backend_block_reason(task):
+                return None
             if self.allocation_profile_conflicts(allocation, task, refresh=True):
                 return None
             if self.task_is_fea_bursty(task):
@@ -3435,7 +3447,7 @@ class Scheduler:
         return {
             "task": {key: task.get(key) for key in (
                 "cpus", "memory_mb", "gpus", "gpu_model", "partition", "node_name",
-                "scheduling_profile", "required_capability", "env_profile", "account_name",
+                "scheduling_profile", "aedt_backend", "required_capability", "env_profile", "account_name",
             )},
             "queue_state": diagnostics.get("queue_state"),
             "queue_reason": diagnostics.get("queue_reason"),
@@ -3510,6 +3522,13 @@ class Scheduler:
         # License admission blocks trump fit capacity: a task the admission
         # gate refuses would otherwise report a misleading "ready" state.
         if str(task.get("status") or "queued") == TaskStatus.QUEUED.value:
+            backend_reason = self.aedt_backend_block_reason(task)
+            if backend_reason:
+                return {
+                    "queue_state": "blocked",
+                    "queue_reason": f"AEDT backend: {backend_reason}",
+                    "preferred_node_relaxed": False,
+                }
             _costs, admission_error = self._license_costs_for_task(task)
             if admission_error:
                 return {
@@ -3912,6 +3931,30 @@ class Scheduler:
     def task_scheduling_profile(self, task: dict) -> str:
         return normalize_scheduling_profile(str(task.get("scheduling_profile") or ""))
 
+    def set_aedt_backend_admission_checker(
+        self, checker: Callable[[dict], tuple[bool, str]] | None
+    ) -> None:
+        self._aedt_backend_admission_checker = checker
+
+    def task_aedt_backend(self, task: dict) -> str:
+        return normalize_aedt_backend(str(task.get("aedt_backend") or ""))
+
+    def aedt_backend_block_reason(self, task: dict) -> str:
+        if self.task_aedt_backend(task) == AedtBackend.STANDALONE.value:
+            return ""
+        checker = self._aedt_backend_admission_checker
+        if checker is None:
+            return "AEDT pooled backend admission is not configured"
+        try:
+            allowed, reason = checker(task)
+        except Exception as exc:
+            LOGGER.exception("AEDT pooled backend admission check failed")
+            return f"AEDT pooled backend admission check failed: {exc}"
+        return "" if allowed else (str(reason).strip() or "AEDT pooled backend is unavailable")
+
+    def task_aedt_backend_admitted(self, task: dict) -> bool:
+        return not self.aedt_backend_block_reason(task)
+
     def task_is_fea_bursty(self, task: dict) -> bool:
         return self.task_scheduling_profile(task) == SchedulingProfile.FEA_BURSTY.value
 
@@ -4192,6 +4235,7 @@ class Scheduler:
                 and not int(task.get("exclusive_node") or 0)
                 and not self.task_requires_gpu(task)
                 and not self.same_node_as_task_id(task)
+                and self.task_aedt_backend_admitted(task)
             ],
             key=lambda item: (-int(item.get("priority") or 0), int(item["id"])),
         )
@@ -5287,7 +5331,9 @@ class Scheduler:
             [
                 task
                 for task in self.db.list_tasks(limit=5000)
-                if task["status"] == TaskStatus.QUEUED.value and not int(task.get("exclusive_node") or 0)
+                if task["status"] == TaskStatus.QUEUED.value
+                and not int(task.get("exclusive_node") or 0)
+                and self.task_aedt_backend_admitted(task)
             ],
             key=lambda item: (-int(item.get("priority") or 0), int(item["id"])),
         )
@@ -5374,7 +5420,12 @@ class Scheduler:
 
     def next_queued_task_without_inflight_capacity(self) -> dict | None:
         queued_tasks = sorted(
-            [task for task in self.db.list_tasks(limit=5000) if task["status"] == TaskStatus.QUEUED.value],
+            [
+                task
+                for task in self.db.list_tasks(limit=5000)
+                if task["status"] == TaskStatus.QUEUED.value
+                and self.task_aedt_backend_admitted(task)
+            ],
             key=lambda item: int(item["id"]),
         )
         remaining_allocations = [
@@ -5439,7 +5490,9 @@ class Scheduler:
             [
                 task
                 for task in self.db.list_tasks(limit=5000)
-                if task["status"] == TaskStatus.QUEUED.value and int(task.get("exclusive_node") or 0)
+                if task["status"] == TaskStatus.QUEUED.value
+                and int(task.get("exclusive_node") or 0)
+                and self.task_aedt_backend_admitted(task)
             ],
             key=lambda item: int(item["id"]),
         )

@@ -38,6 +38,20 @@ class SchedulingProfile(StrEnum):
     FEA_BURSTY = "fea_bursty"
 
 
+class AedtBackend(StrEnum):
+    STANDALONE = "standalone"
+    POOLED = "pooled"
+
+
+def normalize_aedt_backend(value: str | None) -> str:
+    raw = (value or "").strip().lower()
+    if raw in {"", AedtBackend.STANDALONE.value}:
+        return AedtBackend.STANDALONE.value
+    if raw == AedtBackend.POOLED.value:
+        return AedtBackend.POOLED.value
+    raise ValueError("aedt_backend must be standalone or pooled")
+
+
 def normalize_scheduling_profile(value: str | None) -> str:
     raw = (value or "").strip().lower()
     if raw == SchedulingProfile.FEA_BURSTY.value:
@@ -89,6 +103,7 @@ class TaskCreate:
     cpus: int = 1
     memory_mb: int = 4096
     scheduling_profile: str = SchedulingProfile.STANDARD.value
+    aedt_backend: str = AedtBackend.STANDALONE.value
     gpus: int = 0
     gpu_model: str = ""
     partition: str = "auto"

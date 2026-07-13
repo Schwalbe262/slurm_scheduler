@@ -22,7 +22,7 @@ from .conda_sync import CondaEnvSyncManager, conda_bootstrap
 from .config import AppConfig, load_accounts, load_app_config
 from .db import Database
 from .git_auth import find_git_credential, git_task_payload
-from .models import JobCreate, SchedulingProfile, TaskCreate, TaskStatus, normalize_scheduling_profile
+from .models import AedtBackend, JobCreate, SchedulingProfile, TaskCreate, TaskStatus, normalize_aedt_backend, normalize_scheduling_profile
 from .inventory import partition_rank
 from .pestat import PestatNode, plan_dynamic_allocations
 from .project_env import ProjectEnvManager, repo_dir_name
@@ -32,6 +32,13 @@ from .task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, build_git_task_command
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+
+def parse_aedt_backend(value: object) -> str:
+    try:
+        return normalize_aedt_backend(str(value or ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def normalize_cleanup_globs(value: object) -> str:
@@ -500,6 +507,13 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     aedt_pool_bootstrap_token = os.environ.get("SLURM_AEDT_POOL_BOOTSTRAP_TOKEN", "").strip()
     aedt_pool = AedtPoolService(db, bootstrap_token=aedt_pool_bootstrap_token)
     aedt_pool.init()
+    scheduler.set_aedt_backend_admission_checker(
+        lambda _task: (
+            (True, "")
+            if aedt_pool.config().operational
+            else (False, "AEDT pooled backend is not operational")
+        )
+    )
     aedt_adapter_configured = bool(
         config.aedt_pool_session_host_enabled
         and aedt_pool_bootstrap_token
@@ -740,6 +754,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "project": task.get("project") or "",
             "entrypoint": task.get("entrypoint") or "",
             "scheduling_profile": normalize_scheduling_profile(task.get("scheduling_profile") or ""),
+            "aedt_backend": normalize_aedt_backend(task.get("aedt_backend") or ""),
             "priority": int(task.get("priority") or 0),
             "timeout_seconds": int(task.get("timeout_seconds") or 0),
             "dedupe_key": task.get("dedupe_key") or "",
@@ -813,6 +828,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "cpus": int(task.get("cpus") or 1),
             "memory_mb": int(task.get("memory_mb") or 4096),
             "scheduling_profile": normalize_scheduling_profile(task.get("scheduling_profile") or ""),
+            "aedt_backend": normalize_aedt_backend(task.get("aedt_backend") or ""),
             "gpus": int(task.get("gpus") or 0),
             "gpu_model": task.get("gpu_model") or "",
             "partition": task.get("partition") or "auto",
@@ -886,6 +902,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "sim_subdir": project.get("sim_subdir") or "simulation",
             "auto_pull": bool(project.get("auto_pull")),
             "max_active_tasks": max(0, int(project.get("max_active_tasks") or 0)),
+            "aedt_backend": normalize_aedt_backend(project.get("aedt_backend") or ""),
             "queued_count": queued_count,
             "attaching_count": attaching_count,
             "executing_count": executing_count,
@@ -947,6 +964,9 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         sim_subdir = str(payload.get("sim_subdir") or "simulation").strip() or "simulation"
         auto_pull = bool(payload.get("auto_pull") or False)
         existing = db.get_project_by_name(name)
+        aedt_backend = normalize_aedt_backend(
+            payload.get("aedt_backend", existing.get("aedt_backend") if existing else "")
+        )
         raw_max_active_tasks = payload.get(
             "max_active_tasks",
             existing.get("max_active_tasks") if existing else 0,
@@ -972,6 +992,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 sim_subdir=sim_subdir,
                 auto_pull=1 if auto_pull else 0,
                 max_active_tasks=max_active_tasks,
+                aedt_backend=aedt_backend,
             )
             return int(existing["id"])
         return db.create_project(
@@ -984,6 +1005,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             sim_subdir=sim_subdir,
             auto_pull=auto_pull,
             max_active_tasks=max_active_tasks,
+            aedt_backend=aedt_backend,
         )
 
     def apply_project_to_payload(payload: dict) -> dict:
@@ -1026,6 +1048,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         existing_setup = str(payload.get("env_setup") or "").strip()
         merged_setup = generated_setup if not existing_setup else f"{generated_setup}\n{existing_setup}"
         updated = {**payload, "env_setup": merged_setup}
+        if not str(payload.get("aedt_backend") or "").strip():
+            updated["aedt_backend"] = normalize_aedt_backend(project.get("aedt_backend") or "")
         if not str(payload.get("remote_cwd") or "").strip():
             updated["remote_cwd"] = remote_cwd
         if not str(payload.get("command") or "").strip() and entrypoint:
@@ -1058,6 +1082,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             cpus=max(1, int(payload.get("cpus") or 1)),
             memory_mb=max(1, int(payload.get("memory_mb") or 4096)),
             scheduling_profile=normalize_scheduling_profile(str(payload.get("scheduling_profile") or "")),
+            aedt_backend=parse_aedt_backend(payload.get("aedt_backend")),
             gpus=max(0, int(payload.get("gpus") or 0)),
             gpu_model=str(payload.get("gpu_model") or ""),
             partition=str(payload.get("partition") or "auto"),
@@ -1453,6 +1478,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         cpus: int = Form(1),
         memory_mb: int = Form(4096),
         scheduling_profile: str = Form(SchedulingProfile.STANDARD.value),
+        aedt_backend: str = Form(AedtBackend.STANDALONE.value),
         gpus: int = Form(0),
         gpu_model: str = Form(""),
         partition: str = Form("auto"),
@@ -1474,6 +1500,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 cpus=max(1, cpus),
                 memory_mb=max(1, memory_mb),
                 scheduling_profile=normalize_scheduling_profile(scheduling_profile),
+                aedt_backend=parse_aedt_backend(aedt_backend),
                 gpus=max(0, gpus),
                 gpu_model=gpu_model,
                 partition=partition,
@@ -1503,6 +1530,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         cpus: int = Form(1),
         memory: str = Form("4G"),
         scheduling_profile: str = Form(SchedulingProfile.STANDARD.value),
+        aedt_backend: str = Form(AedtBackend.STANDALONE.value),
         gpus: int = Form(0),
         gpu_model: str = Form(""),
         node_name: str = Form(""),
@@ -1524,6 +1552,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 cpus=max(1, cpus),
                 memory_mb=max(1, parse_memory_mb(memory)),
                 scheduling_profile=normalize_scheduling_profile(scheduling_profile),
+                aedt_backend=parse_aedt_backend(aedt_backend),
                 gpus=max(0, gpus),
                 gpu_model=gpu_model,
                 partition=partition,
@@ -1809,6 +1838,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "cpus": max(1, int(payload.get("cpus") or 1)),
             "memory_mb": max(1, int(payload.get("memory_mb") or parse_memory_mb(str(payload.get("memory") or "4G")))),
             "scheduling_profile": normalize_scheduling_profile(str(payload.get("scheduling_profile") or "")),
+            "aedt_backend": parse_aedt_backend(payload.get("aedt_backend")),
             "gpus": max(0, int(payload.get("gpus") or 0)),
             "gpu_model": str(payload.get("gpu_model") or ""),
             "partition": str(payload.get("partition") or "auto"),
@@ -1894,6 +1924,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         cpus: int = 1,
         memory_mb: int = 4096,
         scheduling_profile: str = SchedulingProfile.STANDARD.value,
+        aedt_backend: str = AedtBackend.STANDALONE.value,
         gpus: int = 0,
         gpu_model: str = "",
         required_capability: str = "",
@@ -1908,6 +1939,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "cpus": max(1, cpus),
             "memory_mb": max(1, memory_mb),
             "scheduling_profile": normalize_scheduling_profile(scheduling_profile),
+            "aedt_backend": parse_aedt_backend(aedt_backend),
             "gpus": max(0, gpus),
             "gpu_model": gpu_model,
             "required_capability": required_capability,
@@ -1965,6 +1997,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         cpus: int = Form(1),
         memory_mb: int = Form(4096),
         scheduling_profile: str = Form(SchedulingProfile.STANDARD.value),
+        aedt_backend: str = Form(AedtBackend.STANDALONE.value),
         gpus: int = Form(0),
         gpu_model: str = Form(""),
         required_capability: str = Form(""),
@@ -1978,6 +2011,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "cpus": max(1, cpus),
             "memory_mb": max(1, memory_mb),
             "scheduling_profile": normalize_scheduling_profile(scheduling_profile),
+            "aedt_backend": parse_aedt_backend(aedt_backend),
             "gpus": max(0, gpus),
             "gpu_model": gpu_model,
             "required_capability": required_capability,
@@ -2351,6 +2385,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         output_globs: str = Form(""),
         sim_subdir: str = Form("simulation"),
         auto_pull: str = Form(""),
+        aedt_backend: str = Form(AedtBackend.STANDALONE.value),
     ) -> Response:
         try:
             upsert_project_from_payload(
@@ -2363,6 +2398,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                     "output_globs": output_globs,
                     "sim_subdir": sim_subdir,
                     "auto_pull": bool(auto_pull),
+                    "aedt_backend": aedt_backend,
                 }
             )
         except ValueError as exc:

@@ -15,7 +15,7 @@ import paramiko
 from .config import AccountConfig, GitCredentialConfig
 from .git_auth import git_credential_id_from_payload
 from .inventory import normalize_gpu_model
-from .models import AccountSnapshot, JobStatus, SchedulingProfile, normalize_scheduling_profile
+from .models import AccountSnapshot, JobStatus, SchedulingProfile, normalize_aedt_backend, normalize_scheduling_profile
 from .task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, TASK_ID_PLACEHOLDER
 
 
@@ -707,6 +707,7 @@ def build_task_script(task: dict) -> str:
         # grandchildren that leave the wrapper's process group) so cancel and
         # the orphan-process sweep can attribute and kill them on the node.
         lines.append(f"export SLURM_SCHED_TASK_ID={shlex.quote(str(task['id']))}")
+    lines.append(f"export MFT_AEDT_BACKEND={shlex.quote(normalize_aedt_backend(task.get('aedt_backend')))}")
     if task.get("payload_json") and task.get("payload_path"):
         lines.extend(
             [
