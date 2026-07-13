@@ -762,6 +762,10 @@ class Scheduler:
                     run_stage("reconcile_slurm_state", self.reconcile_slurm_state)
                 run_stage("fail_stale_same_node_tasks", self.fail_stale_same_node_tasks)
                 run_stage("enforce_cpu_partition_limits", self.enforce_cpu_partition_allocation_limits)
+                # Admission must be able to recover even when a later account
+                # lifecycle/storage stage fails.  This method only launches a
+                # background refresh and does not block the tick.
+                run_stage("license_refresh", self.refresh_license_usage_if_due)
                 run_stage("update_fea_overload_before", self.update_fea_overload_state)
                 run_stage("alloc_utilization", self.refresh_allocation_utilization_if_due)
                 run_stage("assign_ready_same_node", self.assign_ready_same_node_tasks)
@@ -782,7 +786,6 @@ class Scheduler:
                 run_stage("cleanup", self.cleanup_remote_artifacts_if_due)
                 run_stage("orphan_process_sweep", self.sweep_orphan_processes_if_due)
                 run_stage("backup", self.backup_database_if_due)
-                run_stage("license_refresh", self.refresh_license_usage_if_due)
         finally:
             started = self._tick_started_at
             if started is not None:
@@ -2877,7 +2880,16 @@ class Scheduler:
         if self.storage_guard_min_free_gb <= 0:
             return False
         if for_fea:
-            probe = self.cached_storage_quota(account, self._client(account), time.time())
+            try:
+                probe = self.cached_storage_quota(
+                    account, self._client(account), time.time()
+                )
+            except AccountUnavailableThisTick as exc:
+                self._warn_storage_guard(
+                    account,
+                    f"FEA work held: account unavailable this tick ({exc})",
+                )
+                return True
             if probe.error:
                 detail = f"FEA work held: storage quota probe failed ({probe.error[:200]})"
                 self._warn_storage_guard(account, detail)

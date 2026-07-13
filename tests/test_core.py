@@ -7660,6 +7660,19 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(scheduler.account_storage_blocked(account, for_fea=True))
         self.assertFalse(scheduler.account_storage_blocked(account, for_fea=False))
 
+    def test_fea_storage_guard_holds_unavailable_account_without_aborting_tick(self) -> None:
+        account = AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)
+        scheduler = Scheduler(
+            self.db,
+            [account],
+            30,
+            client_factory=FakeClient,
+            storage_guard_min_free_gb=5.0,
+        )
+        with scheduler._tick_client_cache() as cache:
+            cache.mark_failed(account.name)
+            self.assertTrue(scheduler.account_storage_blocked(account, for_fea=True))
+
     def test_gpfs_quota_probe_failure_holds_fea_but_non_gpfs_does_not(self) -> None:
         account = AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)
         scheduler = Scheduler(
@@ -9362,6 +9375,11 @@ class ObservabilityTests(unittest.TestCase):
         self.assertTrue(health["last_tick_completed_at"])
         self.assertIn("assign_ready_fea", health["last_tick_stage_seconds"])
         self.assertIn("maintain_allocation_pool", health["last_tick_stage_seconds"])
+        stage_order = list(health["last_tick_stage_seconds"])
+        self.assertLess(
+            stage_order.index("license_refresh"),
+            stage_order.index("assign_ready_same_node"),
+        )
         self.assertEqual(health["consecutive_tick_failures"], 0)
 
 
