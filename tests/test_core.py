@@ -84,6 +84,20 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertEqual(config.cleanup_finished_task_ttl_seconds, 259200)
         self.assertEqual(config.cleanup_finished_job_ttl_seconds, 259200)
 
+    def test_load_app_config_defaults_sqlite_journal_mode_to_wal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "app.yaml"
+            path.write_text("", encoding="utf-8")
+            config = load_app_config(path)
+        self.assertEqual(config.sqlite_journal_mode, "wal")
+
+    def test_load_app_config_parses_sqlite_journal_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "app.yaml"
+            path.write_text("sqlite_journal_mode: delete\n", encoding="utf-8")
+            config = load_app_config(path)
+        self.assertEqual(config.sqlite_journal_mode, "delete")
+
     def test_load_app_config_parses_gpu_prewarm_cpu_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "app.yaml"
@@ -9529,6 +9543,28 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0]["kind"], "task_failed")
         self.assertEqual(events[1]["entity_id"], "7")
+
+    def test_database_applies_normalized_journal_mode(self) -> None:
+        db = Database(f"{self.tmp.name}/delete.db", journal_mode=" DELETE ")
+        db.init()
+        self.assertEqual(db.journal_mode, "delete")
+        with db.connect() as conn:
+            journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        self.assertEqual(journal_mode, "delete")
+
+    def test_database_rejects_unsupported_journal_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported SQLite journal mode"):
+            Database(f"{self.tmp.name}/invalid.db", journal_mode="not-a-mode")
+
+    def test_delete_mode_prune_skips_wal_checkpoint_connection(self) -> None:
+        db = Database(f"{self.tmp.name}/delete-prune.db", journal_mode="delete")
+        db.init()
+        with mock.patch.object(db, "connect", wraps=db.connect) as connect:
+            db.prune_old_rows("2100-01-01 00:00:00", "2100-01-01 00:00:00")
+        self.assertEqual(connect.call_count, 1)
+        with db.connect() as conn:
+            journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        self.assertEqual(journal_mode, "delete")
 
     def test_prune_old_rows_deletes_only_cleaned_terminal_rows(self) -> None:
         old_clean = self.db.create_task(TaskCreate("old-clean", "~/w", "run"))

@@ -22,6 +22,7 @@ Important fields:
 
 ```yaml
 database_path: "data/slurm_scheduler.db"
+sqlite_journal_mode: "wal"
 accounts_path: "config/accounts.yaml"
 poll_interval_seconds: 30
 bind_host: "127.0.0.1"
@@ -85,6 +86,9 @@ git_credentials:
 
 Field meanings:
 
+- `sqlite_journal_mode`: SQLite journal mode applied to every connection. The default is `wal` for
+  local-disk deployments. Use `delete` when `database_path` is on a network filesystem; WAL is not
+  supported there.
 - `cluster_refresh_interval_seconds`: how often the background loop refreshes Slurm node inventory and `pestat` data.
 - `web_remote_file_default_max_bytes`: default maximum bytes returned by web log/remote-file endpoints when the request does not specify `max_bytes`.
 - `web_remote_file_hard_max_bytes`: absolute response cap for web log/remote-file endpoints. Set to `0` to disable the hard cap.
@@ -177,7 +181,7 @@ Meanings:
 - `finished_job_ttl_seconds`: how long completed, failed, or cancelled direct-job directories are kept. Default is 3 days.
 - `closed_allocation_ttl_seconds`: how long closed allocation directories are kept. Default is 1 day.
 - `orphan_sweep_*`: a daily sweep lists `task-*`/`job-*`/`allocation-*` (and `env-sync/job-*`) directories in each account workspace and removes the ones no database row references and whose mtime is older than `orphan_min_age_seconds` (default 7 days). This catches directories left behind by DB resets, deleted rows, or wedged tasks that the TTL cleanups above cannot see.
-- `db_row_ttl_seconds`: terminal task/job/allocation rows whose remote directories were already cleaned are deleted from the database after this long (default 14 days), followed by a WAL checkpoint. Older run history disappears from the finished lists after this window.
+- `db_row_ttl_seconds`: terminal task/job/allocation rows whose remote directories were already cleaned are deleted from the database after this long (default 14 days), followed by a checkpoint when WAL mode is enabled. Older run history disappears from the finished lists after this window.
 - `finished_task_log_max_bytes`: when nonzero, stdout/stderr of terminal tasks older than `finished_task_log_trim_after_seconds` (default 1 day) are truncated to this many tail bytes, so per-task multi-MB harvest logs do not accumulate for the full TTL window.
 - `workspace_prune_globs`: name patterns of disposable artifacts that user jobs leave anywhere in the workspace — e.g. `["*.aedtresults"]` for ANSYS AEDT solution directories, which otherwise grow tens of GB per campaign. Only these explicit basename globs are deleted (never bare `*`, never paths), every `workspace_prune_interval_seconds` (default 6h), and only when nothing inside was modified within `workspace_prune_min_age_seconds` (default 24h) — so running simulations are never touched. Empty by default.
 - `event_ttl_seconds`: retention for `scheduler_events` rows.

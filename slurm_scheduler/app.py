@@ -394,7 +394,7 @@ def last_json_object(text: str) -> object | None:
 def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     config = load_app_config(config_path)
     accounts = load_accounts(config.accounts_path)
-    db = Database(config.database_path)
+    db = Database(config.database_path, journal_mode=config.sqlite_journal_mode)
     db.init()
     client_factory = lambda account: SlurmAccountClient(
         account,

@@ -29,7 +29,7 @@ def main() -> None:
         raise SystemExit(result.stderr or result.stdout)
 
     nodes = parse_pestat(result.stdout)
-    db = Database(app_config.database_path)
+    db = Database(app_config.database_path, journal_mode=app_config.sqlite_journal_mode)
     db.init()
     db.replace_pestat_nodes(nodes)
     print(f"stored_pestat_nodes={len(nodes)}")

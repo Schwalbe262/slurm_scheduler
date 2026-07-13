@@ -51,6 +51,12 @@
 - The scheduler watchdog no longer re-enters SQLite while escalating a stall,
   so its terminal path reaches `os._exit` even when the database is wedged.
 
+## 2026-07-13 (Codex) - Configurable SQLite journal mode
+- Added `sqlite_journal_mode` with a backward-compatible `wal` default and
+  documented `delete` for databases stored on network filesystems.
+- Database cleanup checkpoints only in WAL mode, so non-WAL deployments do not
+  reconnect solely to issue a WAL-specific pragma.
+
 ## 2026-07-13 (Codex) - Node-local AEDT host-owned placement
 - Added durable `requested_allocation_id` task placement so a node-local AEDT
   canary host can reserve an exact live allocation without depending on a

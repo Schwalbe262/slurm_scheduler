@@ -32,7 +32,7 @@ def main() -> None:
             if result.exit_code != 0:
                 raise SystemExit(result.stderr or result.stdout)
             nodes = parse_sinfo_nodes(result.stdout)
-    db = Database(app_config.database_path)
+    db = Database(app_config.database_path, journal_mode=app_config.sqlite_journal_mode)
     db.init()
     db.replace_node_inventory(nodes)
     print(f"stored_nodes={len(nodes)}")

@@ -41,6 +41,7 @@ class AccountConfig:
 @dataclass(frozen=True)
 class AppConfig:
     database_path: str = "data/slurm_scheduler.db"
+    sqlite_journal_mode: str = "wal"
     accounts_path: str = "config/accounts.yaml"
     poll_interval_seconds: int = 30
     bind_host: str = "127.0.0.1"

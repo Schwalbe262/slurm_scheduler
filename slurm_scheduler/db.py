@@ -298,19 +298,28 @@ CREATE INDEX IF NOT EXISTS idx_scheduler_events_created_at ON scheduler_events(c
 """
 
 
+SQLITE_JOURNAL_MODES = frozenset({"delete", "truncate", "persist", "memory", "wal", "off"})
+
+
 class Database:
-    def __init__(self, path: str):
+    def __init__(self, path: str, journal_mode: str = "wal"):
         self.path = path
+        self.journal_mode = str(journal_mode).strip().lower()
+        if self.journal_mode not in SQLITE_JOURNAL_MODES:
+            supported = ", ".join(sorted(SQLITE_JOURNAL_MODES))
+            raise ValueError(
+                f"unsupported SQLite journal mode {journal_mode!r}; expected one of: {supported}"
+            )
         Path(path).parent.mkdir(parents=True, exist_ok=True)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.path, timeout=30)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout = 30000")
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = NORMAL")
         try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute(f"PRAGMA journal_mode = {self.journal_mode}")
+            conn.execute("PRAGMA synchronous = NORMAL")
             yield conn
             conn.commit()
         finally:
@@ -409,7 +418,7 @@ class Database:
         event_cutoff: str,
     ) -> dict[str, int]:
         """Delete terminal rows whose remote artifacts were already cleaned
-        (remote dir columns emptied) and old events, then truncate the WAL."""
+        (remote dir columns emptied) and old events, then truncate WAL when enabled."""
         deleted: dict[str, int] = {}
         with self.connect() as conn:
             deleted["tasks"] = conn.execute(
@@ -431,8 +440,9 @@ class Database:
                 "DELETE FROM scheduler_events WHERE created_at < ?",
                 (event_cutoff,),
             ).rowcount
-        with self.connect() as conn:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        if self.journal_mode == "wal":
+            with self.connect() as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         return deleted
 
     def _ensure_columns(self, conn: sqlite3.Connection) -> None:

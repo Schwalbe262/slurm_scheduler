@@ -1,4 +1,6 @@
 database_path: "data/slurm_scheduler.db"
+# WARNING: use delete when database_path is on a network filesystem — WAL is unsupported there.
+sqlite_journal_mode: "wal"
 accounts_path: "config/accounts.yaml"
 poll_interval_seconds: 30
 bind_host: "127.0.0.1"
