@@ -711,7 +711,10 @@ def build_task_script(task: dict) -> str:
     if task.get("payload_json") and task.get("payload_path"):
         lines.extend(
             [
-                "python - <<'PY'",
+                # The payload is materialized before the task's conda profile is
+                # activated.  Compute-node base images consistently provide
+                # ``python3`` but some intentionally have no ``python`` alias.
+                "python3 - <<'PY'",
                 "from pathlib import Path",
                 f"path = Path({str(task['payload_path'])!r})",
                 "path.parent.mkdir(parents=True, exist_ok=True)",

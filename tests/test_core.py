@@ -673,6 +673,8 @@ class SlurmParsingTests(unittest.TestCase):
             "payload_path": "/remote/task-1/payload.json",
         }
         script = build_task_script(task)
+        self.assertIn("python3 - <<'PY'", script)
+        self.assertNotIn("\npython - <<'PY'", script)
         self.assertIn("SLURM_SCHEDULER_PAYLOAD_PATH=/remote/task-1/payload.json", script)
         self.assertIn("path.write_text", script)
         self.assertLess(script.index("path.write_text"), script.index("cd $HOME/case"))
