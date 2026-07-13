@@ -270,6 +270,21 @@ class AedtPoolGateTests(AedtPoolTestCase):
         ):
             self.assertIn(required, template)
 
+    def test_main_dashboard_links_hard_counted_aedt_and_project_limits(self) -> None:
+        template = (
+            Path(__file__).resolve().parents[1] / "templates" / "dashboard.html"
+        ).read_text(encoding="utf-8")
+        for required in (
+            'href="/aedt-pool"',
+            'id="aedt-dashboard-sessions"',
+            "aedt_pool_summary.plan.hard_session_count",
+            "aedt_pool_summary.config.max_aedt_sessions",
+            'id="aedt-dashboard-projects"',
+            "aedt_pool_summary.plan.live_projects",
+            "aedt_pool_summary.config.target_project_concurrency",
+        ):
+            self.assertIn(required, template)
+
 
 class AedtLeaseLifecycleTests(AedtPoolTestCase):
     def setUp(self) -> None:

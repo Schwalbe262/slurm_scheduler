@@ -1174,6 +1174,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             name_contains=attached_task_name_filter,
         )
         task_summary = task_activity_summary(active_running_rows + summary_queued_rows)
+        aedt_dashboard_summary = aedt_pool.summary()
         active_task_rows = {
             int(task["id"]): task
             for task in (active_running_rows + visible_queued_rows)
@@ -1244,6 +1245,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 "finished_job_count": len(finished_jobs),
                 "tasks": active_tasks,
                 "task_summary": task_summary,
+                "aedt_pool_summary": aedt_dashboard_summary,
                 "finished_tasks": finished_tasks,
                 "finished_task_count": finished_task_count,
                 "finished_page": finished_page,
