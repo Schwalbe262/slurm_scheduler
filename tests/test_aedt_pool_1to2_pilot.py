@@ -158,7 +158,7 @@ def test_terminal_validator_rejects_prior_pid_grpc_false_positive():
         "aedt_exclusive_session": 0,
         "matrix_solve_attempts": 1,
         "matrix_solution_queries": 0,
-        "Llt_phys": None,
+        "Llt": None,
         "project_name": "simulation_B",
         "sibling_pid_survived": True,
         "grpc_survived": True,
@@ -167,7 +167,7 @@ def test_terminal_validator_rejects_prior_pid_grpc_false_positive():
     assert failures
     assert any(item.startswith("result_valid_em") for item in failures)
     assert "matrix_solution_queries<1" in failures
-    assert "Llt_phys_missing" in failures
+    assert "Llt_missing" in failures
 
 
 def test_terminal_validator_accepts_complete_matrix_result():
@@ -177,6 +177,6 @@ def test_terminal_validator_accepts_complete_matrix_result():
         "aedt_exclusive_session": 0,
         "matrix_solve_attempts": 1,
         "matrix_solution_queries": 1,
-        "Llt_phys": 27.5,
+        "Llt": 27.5,
         "project_name": "simulation_B",
     }) == []

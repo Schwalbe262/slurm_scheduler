@@ -331,10 +331,10 @@ def _valid_matrix_result(result: dict[str, Any]) -> list[str]:
     if int(result.get("matrix_solution_queries") or 0) < 1:
         failures.append("matrix_solution_queries<1")
     try:
-        if not float(result["Llt_phys"]) > 0:
-            failures.append("Llt_phys_not_positive")
+        if not float(result["Llt"]) > 0:
+            failures.append("Llt_not_positive")
     except (KeyError, TypeError, ValueError):
-        failures.append("Llt_phys_missing")
+        failures.append("Llt_missing")
     if not str(result.get("project_name") or "").strip():
         failures.append("project_name_missing")
     return failures

@@ -21,7 +21,7 @@ orchestrator starts two MFT project clients.
 - two non-exclusive leases in distinct slots;
 - two distinct MFT projects and terminal `RESULT_JSON` records;
 - both records have `result_valid_em=1`, one Matrix solve/query, and positive
-  `Llt_phys`;
+  positive `Llt`;
 - peak two owned `elec_solve_maxwell` checkout rows;
 - independent project-close ACKs, Desktop close ACK, process exit, license
   return, and workspace cleanup.
