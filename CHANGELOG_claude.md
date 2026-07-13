@@ -1,4 +1,11 @@
 
+## 2026-07-13 (Codex) - Configurable project concurrency ceiling
+- Added `project_max_active_tasks_ceiling` with a backward-compatible default
+  of 300 and made project create/upsert plus project-cap PATCH validation/errors
+  use that configured value.
+- Documented that a higher administrative ceiling does not bypass license
+  admission or the scheduler's FEA CPU/RAM pressure guards.
+
 ## 2026-07-07 (MFT 캠페인)
 - GET /api/tasks 에 limit(기본 200, 최대 10000) / name_prefix 쿼리 파라미터 추가
   - 이유: 400+ 태스크 캠페인 집계·결과 회수 시 200개 페이지 제한으로 누락 발생

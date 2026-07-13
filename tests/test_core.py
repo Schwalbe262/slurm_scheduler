@@ -98,6 +98,16 @@ class SlurmParsingTests(unittest.TestCase):
             config = load_app_config(path)
         self.assertEqual(config.sqlite_journal_mode, "delete")
 
+    def test_load_app_config_defaults_and_parses_project_max_active_tasks_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "app.yaml"
+            path.write_text("", encoding="utf-8")
+            default_config = load_app_config(path)
+            path.write_text("project_max_active_tasks_ceiling: 600\n", encoding="utf-8")
+            overridden_config = load_app_config(path)
+        self.assertEqual(default_config.project_max_active_tasks_ceiling, 300)
+        self.assertEqual(overridden_config.project_max_active_tasks_ceiling, 600)
+
     def test_load_app_config_parses_gpu_prewarm_cpu_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "app.yaml"
@@ -8373,6 +8383,7 @@ class ProjectApiTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self.config_path = config_path
         previous_config = os.environ.get("SLURM_SCHEDULER_CONFIG")
         os.environ["SLURM_SCHEDULER_CONFIG"] = str(config_path)
         try:
@@ -8398,10 +8409,11 @@ class ProjectApiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def _route_endpoint(self, path: str, method: str):
+    def _route_endpoint(self, path: str, method: str, *, app=None):
+        target_app = app or self.app
         return next(
             route.endpoint
-            for route in self.app.routes
+            for route in target_app.routes
             if getattr(route, "path", "") == path and method in getattr(route, "methods", set())
         )
 
@@ -8513,14 +8525,17 @@ class ProjectApiTests(unittest.TestCase):
     def test_project_api_rejects_invalid_max_active_tasks(self) -> None:
         from fastapi import HTTPException
 
-        for invalid in (-1, 1.5, True, ""):
+        for invalid in (-1, 350, 1.5, True, ""):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(HTTPException) as raised:
                     self._post_project(
                         {"name": f"invalid-{type(invalid).__name__}", "max_active_tasks": invalid}
                     )
                 self.assertEqual(raised.exception.status_code, 422)
-                self.assertEqual(raised.exception.detail, "max_active_tasks must be a non-negative integer")
+                self.assertEqual(
+                    raised.exception.detail,
+                    "max_active_tasks must be an integer between 0 and 300",
+                )
 
     def test_project_cap_patch_changes_only_cap_and_returns_exact_live_counts(self) -> None:
         self._post_project(
@@ -8630,6 +8645,78 @@ class ProjectApiTests(unittest.TestCase):
                     )
                 )
                 self.assertEqual(result["max_active_tasks"], target)
+
+    def test_project_cap_patch_uses_configurable_ceiling(self) -> None:
+        from fastapi import HTTPException
+        from slurm_scheduler.app import create_app
+
+        self._post_project({"name": "motor", "max_active_tasks": 7})
+        with self.assertRaises(HTTPException) as default_rejection:
+            asyncio.run(
+                self.patch_project_cap(
+                    "motor", self._request({"max_active_tasks": 350})
+                )
+            )
+        self.assertEqual(default_rejection.exception.status_code, 422)
+        self.assertEqual(
+            default_rejection.exception.detail,
+            "max_active_tasks must be an integer between 1 and 300",
+        )
+
+        self.config_path.write_text(
+            self.config_path.read_text(encoding="utf-8")
+            + "\nproject_max_active_tasks_ceiling: 600\n",
+            encoding="utf-8",
+        )
+        configured_app = create_app(str(self.config_path))
+        configured_app.router.on_startup.clear()
+        configured_app.router.on_shutdown.clear()
+        configured_create = self._route_endpoint(
+            "/api/projects",
+            "POST",
+            app=configured_app,
+        )
+        configured_patch = self._route_endpoint(
+            "/api/projects/{name}/max-active-tasks",
+            "PATCH",
+            app=configured_app,
+        )
+
+        created = asyncio.run(
+            configured_create(
+                self._request({"name": "wide-project", "max_active_tasks": 500})
+            )
+        )
+        self.assertEqual(json.loads(created.body)["max_active_tasks"], 500)
+        with self.assertRaises(HTTPException) as create_rejection:
+            asyncio.run(
+                configured_create(
+                    self._request({"name": "too-wide", "max_active_tasks": 700})
+                )
+            )
+        self.assertEqual(
+            create_rejection.exception.detail,
+            "max_active_tasks must be an integer between 0 and 600",
+        )
+
+        accepted = asyncio.run(
+            configured_patch("motor", self._request({"max_active_tasks": 500}))
+        )
+        self.assertEqual(accepted["max_active_tasks"], 500)
+
+        with self.assertRaises(HTTPException) as configured_rejection:
+            asyncio.run(
+                configured_patch("motor", self._request({"max_active_tasks": 700}))
+            )
+        self.assertEqual(configured_rejection.exception.status_code, 422)
+        self.assertEqual(
+            configured_rejection.exception.detail,
+            "max_active_tasks must be an integer between 1 and 600",
+        )
+        self.assertEqual(
+            configured_app.state.db.get_project_by_name("motor")["max_active_tasks"],
+            500,
+        )
 
     def test_project_cap_patch_returns_not_found_without_creating_project(self) -> None:
         from fastapi import HTTPException

@@ -44,6 +44,7 @@ class AppConfig:
     sqlite_journal_mode: str = "wal"
     accounts_path: str = "config/accounts.yaml"
     poll_interval_seconds: int = 30
+    project_max_active_tasks_ceiling: int = 300
     bind_host: str = "127.0.0.1"
     bind_port: int = 8000
     web_remote_file_default_max_bytes: int = 262144

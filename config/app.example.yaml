@@ -3,6 +3,10 @@ database_path: "data/slurm_scheduler.db"
 sqlite_journal_mode: "wal"
 accounts_path: "config/accounts.yaml"
 poll_interval_seconds: 30
+# Administrative ceiling for each project's max_active_tasks setting. Raising
+# this does not bypass enabled license-admission feature headroom (including
+# electronics_desktop); FEA attaches also remain subject to CPU/RAM pressure checks.
+project_max_active_tasks_ceiling: 300
 bind_host: "127.0.0.1"
 bind_port: 8000
 web_remote_file_default_max_bytes: 262144

@@ -42,7 +42,7 @@ tasks or allocations, and verify:
 - an empty project remains blocked;
 - `project=MFT_1MW_2026v1` no longer reports `<empty>` and uses the configured
   admission profile;
-- project cap remains 300 and existing task/allocation identities are unchanged.
+- project cap retains its configured value and existing task/allocation identities are unchanged.
 
 Rollback restores the recorded pre-deploy source commit/tree and restarts only
 the web child. It must not cancel Slurm jobs, tasks, or allocations.

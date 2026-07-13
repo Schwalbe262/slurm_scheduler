@@ -986,16 +986,20 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "max_active_tasks",
             existing.get("max_active_tasks") if existing else 0,
         )
+        max_active_tasks_error = (
+            "max_active_tasks must be an integer between 0 and "
+            f"{config.project_max_active_tasks_ceiling}"
+        )
         if isinstance(raw_max_active_tasks, bool):
-            raise ValueError("max_active_tasks must be a non-negative integer")
+            raise ValueError(max_active_tasks_error)
         if isinstance(raw_max_active_tasks, int):
             max_active_tasks = raw_max_active_tasks
         elif isinstance(raw_max_active_tasks, str) and raw_max_active_tasks.strip().isdigit():
             max_active_tasks = int(raw_max_active_tasks.strip())
         else:
-            raise ValueError("max_active_tasks must be a non-negative integer")
-        if max_active_tasks < 0:
-            raise ValueError("max_active_tasks must be a non-negative integer")
+            raise ValueError(max_active_tasks_error)
+        if not 0 <= max_active_tasks <= config.project_max_active_tasks_ceiling:
+            raise ValueError(max_active_tasks_error)
         if existing:
             db.update_project(
                 int(existing["id"]),
@@ -2378,10 +2382,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 detail="request body must contain only max_active_tasks",
             )
         max_active_tasks = payload["max_active_tasks"]
-        if type(max_active_tasks) is not int or not 1 <= max_active_tasks <= 300:
+        ceiling = config.project_max_active_tasks_ceiling
+        if type(max_active_tasks) is not int or not 1 <= max_active_tasks <= ceiling:
             raise HTTPException(
                 status_code=422,
-                detail="max_active_tasks must be an integer between 1 and 300",
+                detail=f"max_active_tasks must be an integer between 1 and {ceiling}",
             )
         project = db.get_project_by_name(name)
         if not project:
