@@ -692,7 +692,12 @@ class Scheduler:
         if frame is None:
             return
         stack = "".join(traceback.format_stack(frame))
-        LOGGER.critical("scheduler thread stack:\n%s", stack)
+        LOGGER.critical(
+            "scheduler thread stack database_path=%s sqlite_journal_mode=%s:\n%s",
+            self.db.path,
+            self.db.journal_mode,
+            stack,
+        )
 
     def _tick_sessions_force_close(self) -> None:
         with self._tick_caches_lock:

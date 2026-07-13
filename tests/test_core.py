@@ -9002,6 +9002,17 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(self.exits, [])
         self.assertEqual(self.force_closes, [True, True])
 
+    def test_watchdog_stack_dump_logs_database_context(self) -> None:
+        scheduler = self.make_scheduler()
+        scheduler.db = Database(f"{self.tmp.name}/network.db", journal_mode="delete")
+        scheduler._thread = threading.current_thread()
+        with self.assertLogs("slurm_scheduler.scheduler", level="CRITICAL") as captured:
+            scheduler._dump_scheduler_stack()
+        message = "\n".join(captured.output)
+        self.assertIn(f"database_path={scheduler.db.path}", message)
+        self.assertIn("sqlite_journal_mode=delete", message)
+        self.assertIn("scheduler thread stack", message)
+
 
 class LicenseMonitorTests(unittest.TestCase):
     def test_parse_lmstat_features(self) -> None:

@@ -57,6 +57,10 @@
 - Database cleanup checkpoints only in WAL mode, so non-WAL deployments do not
   reconnect solely to issue a WAL-specific pragma.
 
+## 2026-07-13 (Codex) - Watchdog SQLite context
+- Scheduler watchdog stack dumps now include the active database path and
+  normalized SQLite journal mode on their first line.
+
 ## 2026-07-13 (Codex) - Node-local AEDT host-owned placement
 - Added durable `requested_allocation_id` task placement so a node-local AEDT
   canary host can reserve an exact live allocation without depending on a
