@@ -108,6 +108,11 @@
       <div>
         <label for="edit_setup">셋업 (module load / 라이선스 등)</label>
         <textarea id="edit_setup" name="setup" rows="3">{{ project.setup }}</textarea>
+        <label for="edit_aedt_backend">AEDT backend</label>
+        <select id="edit_aedt_backend" name="aedt_backend">
+          <option value="standalone" {% if project.aedt_backend == "standalone" %}selected{% endif %}>standalone</option>
+          <option value="pooled" {% if project.aedt_backend == "pooled" %}selected{% endif %}>pooled attach</option>
+        </select>
         <label for="edit_cleanup">청소 globs (sim 폴더 주기 삭제, basename)</label>
         <input id="edit_cleanup" name="cleanup_globs" value="{{ project.cleanup_globs }}" placeholder="*.aedtresults, simulation">
         <label for="edit_output">output globs (결과 수집 대상, basename)</label>
