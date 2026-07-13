@@ -48,5 +48,13 @@
 - The host remains an active allocation owner until explicit cancel/drain or
   its own process exit; clients continue to co-locate through the host task ID.
 
+## 2026-07-13 (Codex) - AEDT pool warm spare
+- Added durable `min_idle_aedt_sessions` scaling (default `0`) so operators can
+  keep ready, unleased AEDT sessions available without exceeding the existing
+  session ceiling.
+- Warm-spare starts are checked against fresh license-admission headroom before
+  session rows or nodes are created; current idle count and any skip reason are
+  exposed by the pool API and UI.
+
 ## 2026-07-12 (Claude)
 - docs/bug_idle_active_allocation_leak.md: 태스크 0개 active 할당(6757, 63h)이 유휴 회수에서 누락되는 버그 리포트

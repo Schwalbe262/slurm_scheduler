@@ -131,6 +131,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
     def test_requested_250_500_is_staged_but_disabled(self) -> None:
         config = self.service.config()
         self.assertEqual(config.max_sessions, 250)
+        self.assertEqual(config.min_idle_sessions, 0)
         self.assertEqual(config.target_projects, 500)
         self.assertFalse(config.enabled)
         self.assertFalse(config.operational)
@@ -146,13 +147,18 @@ class AedtPoolGateTests(AedtPoolTestCase):
     def test_operator_can_set_all_three_durable_limits_while_disabled(self) -> None:
         config = self.service.set_operator_limits(
             max_sessions=250,
+            min_idle_sessions=1,
             target_projects=400,
             projects_per_session=2,
         )
         self.assertEqual(config.max_sessions, 250)
+        self.assertEqual(config.min_idle_sessions, 1)
         self.assertEqual(config.target_projects, 400)
         self.assertEqual(config.projects_per_session, 2)
         self.assertFalse(config.enabled)
+        gated_plan = self.service.summary()["plan"]
+        self.assertEqual(gated_plan["warm_spare_starts_authorized"], 0)
+        self.assertIn("not operational", gated_plan["warm_spare_status_reason"])
         reloaded = AedtPoolService(self.db, bootstrap_token="secret")
         self.assertEqual(reloaded.config().target_projects, 400)
 
@@ -230,10 +236,12 @@ class AedtPoolGateTests(AedtPoolTestCase):
 
         response = asyncio.run(endpoint(Request({
             "max_aedt_sessions": 250,
+            "min_idle_aedt_sessions": 1,
             "target_project_concurrency": 400,
             "projects_per_aedt": 2,
         })))
         self.assertEqual(response["target_project_concurrency"], 400)
+        self.assertEqual(response["min_idle_aedt_sessions"], 1)
         self.assertEqual(response["projects_per_aedt"], 2)
         from fastapi import HTTPException
 
@@ -261,11 +269,14 @@ class AedtPoolGateTests(AedtPoolTestCase):
         ).read_text(encoding="utf-8")
         for required in (
             'id="max-aedt-sessions"',
+            'id="min-idle-aedt-sessions"',
             'id="target-projects"',
             'id="projects-per-aedt"',
             'id="lease-rows"',
             'id="enable-pool"',
             "latest_validation",
+            "idle_session_count",
+            "warm_spare_status_reason",
             'fetch("/api/aedt-pool/enable"',
         ):
             self.assertIn(required, template)
@@ -305,6 +316,90 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         )
         self.assertEqual(self.service.get_session(int(session["id"]))["slots_total"], 2)
         self.service.heartbeat_session(int(session["id"]), host_token)
+
+    def test_min_idle_session_starts_and_refills_when_last_idle_is_leased(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=2,
+            min_idle_sessions=1,
+            target_projects=4,
+        )
+        self.service.reconcile(execute=True)
+        session, _host_token = self.start_one_session(self.allocation_id)
+        before = self.service.summary()
+        self.assertEqual(before["config"]["min_idle_aedt_sessions"], 1)
+        self.assertEqual(before["plan"]["idle_session_count"], 1)
+
+        lease, _token = self.request(
+            "take-last-idle",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+
+        self.assertEqual(self.service.get_lease(int(lease["id"]))["session_id"], session["id"])
+        self.assertEqual(len(self.service.starting_sessions()), 1)
+        after = self.service.summary()["plan"]
+        self.assertEqual(after["hard_session_count"], 2)
+        self.assertEqual(after["idle_session_count"], 0)
+        self.assertIn("startup", after["warm_spare_status_reason"])
+
+    def test_min_idle_session_never_exceeds_session_ceiling(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=1,
+            min_idle_sessions=1,
+            target_projects=2,
+        )
+        self.service.reconcile(execute=True)
+        self.start_one_session(self.allocation_id)
+
+        self.request("ceiling", allocation_id=self.allocation_id, node="cpu-01")
+
+        plan = self.service.summary()["plan"]
+        self.assertEqual(plan["hard_session_count"], 1)
+        self.assertEqual(self.service.starting_sessions(), [])
+        self.assertEqual(plan["idle_session_count"], 0)
+        self.assertIn("ceiling", plan["warm_spare_status_reason"])
+
+    def test_min_idle_session_skips_start_without_license_headroom(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=2,
+            min_idle_sessions=1,
+            target_projects=4,
+        )
+        self.service.set_warm_spare_admission_checker(
+            lambda requested: (0, "license capacity exhausted for electronics_desktop")
+        )
+
+        plan = self.service.reconcile(execute=True)
+
+        self.assertEqual(self.service.starting_sessions(), [])
+        self.assertEqual(plan["hard_session_count"], 0)
+        self.assertEqual(plan["node_requests"], 0)
+        self.assertEqual(plan["warm_spare_starts_authorized"], 0)
+        self.assertIn("license capacity exhausted", plan["warm_spare_status_reason"])
+
+    def test_min_idle_session_replaces_unhealthy_owner_below_ceiling(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=2,
+            min_idle_sessions=1,
+            target_projects=4,
+        )
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO aedt_sessions (
+                    session_key, allocation_id, account_name, node_name,
+                    slots_total, state, failure_message
+                ) VALUES ('unhealthy-owner', ?, 'a', 'cpu-01', 2, 'unhealthy', 'lost heartbeat')
+                """,
+                (self.allocation_id,),
+            )
+
+        self.service.reconcile(execute=True)
+
+        plan = self.service.summary()["plan"]
+        self.assertEqual(plan["unavailable_session_count"], 1)
+        self.assertEqual(plan["hard_session_count"], 2)
+        self.assertEqual(len(self.service.starting_sessions()), 1)
 
     def test_exclusive_1to1_lease_never_accepts_a_sibling(self) -> None:
         self.service.set_operator_limit(1)

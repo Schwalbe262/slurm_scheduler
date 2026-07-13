@@ -1315,6 +1315,69 @@ class Scheduler:
         self._license_last_blocked_reason = ""
         return True, ""
 
+    def aedt_pool_warm_spare_admission(self, requested_sessions: int) -> tuple[int, str]:
+        """Return how many new AEDT processes current license headroom permits."""
+        requested = max(0, int(requested_sessions))
+        if requested <= 0:
+            return requested, ""
+        if not self.license_admission_enabled:
+            reason = "license admission is disabled"
+            self._license_last_blocked_reason = reason
+            return 0, reason
+        host_task = {
+            "project": "_aedt_pool_hosts",
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+            "aedt_backend": AedtBackend.STANDALONE.value,
+        }
+        with self._task_assignment_lock:
+            costs, profile_error = self._license_costs_for_task(host_task)
+            if profile_error:
+                self._license_last_blocked_reason = profile_error
+                return 0, profile_error
+            desktop_cost = sum(
+                int(cost)
+                for feature, cost in costs.items()
+                if str(feature).casefold() == "electronics_desktop"
+            )
+            if desktop_cost <= 0:
+                reason = (
+                    "license admission profile for _aedt_pool_hosts must declare "
+                    "electronics_desktop headroom"
+                )
+                self._license_last_blocked_reason = reason
+                return 0, reason
+            diagnostics = self._license_admission_diagnostics_locked()
+            reason = str(diagnostics.get("blocked_reason") or "")
+            if reason:
+                self._license_last_blocked_reason = reason
+                return 0, reason
+            allowed = requested
+            for feature, cost in costs.items():
+                per_session = int(cost)
+                if per_session <= 0:
+                    continue
+                feature_status = dict(diagnostics.get("features") or {}).get(feature) or {}
+                allowed = min(
+                    allowed,
+                    max(0, int(feature_status.get("admit_headroom") or 0)) // per_session,
+                )
+            if allowed < requested:
+                requested_costs = {
+                    feature: int(cost) * requested
+                    for feature, cost in costs.items()
+                }
+                requested_diagnostics = self._license_admission_diagnostics_locked(
+                    requested_costs
+                )
+                reason = str(requested_diagnostics.get("blocked_reason") or "") or (
+                    f"license admission headroom permits {allowed} of "
+                    f"{requested} warm-spare AEDT sessions"
+                )
+                self._license_last_blocked_reason = reason
+                return allowed, reason
+            self._license_last_blocked_reason = ""
+            return allowed, ""
+
     def _publish_successful_license_snapshot(
         self, payload: dict, query_started_at: datetime
     ) -> None:

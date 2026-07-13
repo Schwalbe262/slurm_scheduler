@@ -510,6 +510,9 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     aedt_pool_bootstrap_token = os.environ.get("SLURM_AEDT_POOL_BOOTSTRAP_TOKEN", "").strip()
     aedt_pool = AedtPoolService(db, bootstrap_token=aedt_pool_bootstrap_token)
     aedt_pool.init()
+    aedt_pool.set_warm_spare_admission_checker(
+        scheduler.aedt_pool_warm_spare_admission
+    )
     scheduler.set_aedt_backend_admission_checker(
         lambda task: (
             (True, "")

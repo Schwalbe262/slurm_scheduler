@@ -186,6 +186,13 @@ Operator:
 - `POST /api/aedt-pool/enable`
 - `POST /api/aedt-pool/validations`
 
+`min_idle_aedt_sessions` defaults to `0`. Setting it to `1` through the
+configuration PATCH keeps one whole `ready` (unleased) Desktop available and
+starts its replacement as soon as the last idle session takes a lease. The
+warm-spare request remains inside `max_aedt_sessions` and is skipped with a
+visible pool status reason unless `license_monitor.admission.enabled` is true
+and the `_aedt_pool_hosts` profile has fresh `electronics_desktop` headroom.
+
 Project lease:
 
 - `POST /api/aedt-pool/leases`

@@ -9069,6 +9069,7 @@ class LicenseAdmissionTests(unittest.TestCase):
             license_admission_settlement_seconds=settlement_seconds,
             license_admission_reserve_by_feature={self.FEATURE: 32},
             license_admission_persistent_cost_by_project={
+                "_aedt_pool_hosts": {self.FEATURE: 1},
                 self.MFT: {self.FEATURE: 1},
                 self.IPMSM: {self.FEATURE: 1},
             },
@@ -9208,6 +9209,33 @@ class LicenseAdmissionTests(unittest.TestCase):
         feature = scheduler.license_usage()["admission"]["features"][self.FEATURE]
         self.assertEqual(feature["effective_used"], 518)
         self.assertEqual(feature["admit_headroom"], 0)
+
+    def test_aedt_warm_spare_admission_is_bounded_by_license_headroom(self) -> None:
+        scheduler = self.make_scheduler()
+        self.set_snapshot(scheduler, used=516)
+
+        allowed, reason = scheduler.aedt_pool_warm_spare_admission(3)
+
+        self.assertEqual(allowed, 2)
+        self.assertIn("license capacity exhausted", reason)
+        self.set_snapshot(scheduler, used=518)
+        allowed, reason = scheduler.aedt_pool_warm_spare_admission(1)
+        self.assertEqual(allowed, 0)
+        self.assertIn("license capacity exhausted", reason)
+
+    def test_aedt_warm_spare_admission_fails_closed_when_admission_is_disabled(self) -> None:
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            license_admission_enabled=False,
+        )
+
+        allowed, reason = scheduler.aedt_pool_warm_spare_admission(1)
+
+        self.assertEqual(allowed, 0)
+        self.assertIn("admission is disabled", reason)
 
     def test_concurrent_last_seat_is_claimed_once_under_assignment_lock(self) -> None:
         scheduler = self.make_scheduler()

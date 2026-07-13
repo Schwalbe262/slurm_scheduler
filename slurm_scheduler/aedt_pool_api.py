@@ -38,6 +38,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         payload = await request.json()
         allowed = {
             "max_aedt_sessions",
+            "min_idle_aedt_sessions",
             "target_project_concurrency",
             "projects_per_aedt",
         }
@@ -45,13 +46,15 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    "only max_aedt_sessions, target_project_concurrency, "
-                    "and projects_per_aedt are operator-configurable"
+                    "only max_aedt_sessions, min_idle_aedt_sessions, "
+                    "target_project_concurrency, and projects_per_aedt "
+                    "are operator-configurable"
                 ),
             )
         try:
             config = service.set_operator_limits(
                 max_sessions=payload.get("max_aedt_sessions"),
+                min_idle_sessions=payload.get("min_idle_aedt_sessions"),
                 target_projects=payload.get("target_project_concurrency"),
                 projects_per_session=payload.get("projects_per_aedt"),
             )
@@ -60,6 +63,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {
             "max_aedt_sessions": config.max_sessions,
+            "min_idle_aedt_sessions": config.min_idle_sessions,
             "target_project_concurrency": config.target_projects,
             "projects_per_aedt": config.projects_per_session,
             "enabled": config.enabled,

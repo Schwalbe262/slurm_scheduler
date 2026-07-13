@@ -22,6 +22,10 @@
         <input id="max-aedt-sessions" name="max_aedt_sessions" type="number" min="0" max="550" step="1" required>
       </div>
       <div>
+        <label for="min-idle-aedt-sessions">Minimum idle AEDT sessions</label>
+        <input id="min-idle-aedt-sessions" name="min_idle_aedt_sessions" type="number" min="0" max="550" step="1" required>
+      </div>
+      <div>
         <label for="target-projects">Maximum concurrent projects</label>
         <input id="target-projects" name="target_project_concurrency" type="number" min="0" max="1100" step="1" required>
       </div>
@@ -50,6 +54,7 @@
   <section class="panel">
     <h2>Live capacity</h2>
     <div id="capacity" class="summary-row"></div>
+    <p id="warm-spare-status" class="muted"></p>
   </section>
 
   <section class="panel">
@@ -97,6 +102,7 @@
     const config = summary.config || {};
     const plan = summary.plan || {};
     document.getElementById("max-aedt-sessions").value = config.max_aedt_sessions ?? 0;
+    document.getElementById("min-idle-aedt-sessions").value = config.min_idle_aedt_sessions ?? 0;
     document.getElementById("target-projects").value = config.target_project_concurrency ?? 0;
     document.getElementById("projects-per-aedt").value = config.projects_per_aedt ?? 1;
 
@@ -118,6 +124,8 @@
     capacity.replaceChildren(
       summaryItem("Hard-counted AEDT", plan.hard_session_count ?? 0),
       summaryItem("Desired AEDT", plan.desired_sessions ?? 0),
+      summaryItem("Idle AEDT", plan.idle_session_count ?? 0),
+      summaryItem("Minimum idle", config.min_idle_aedt_sessions ?? 0),
       summaryItem("Live projects", plan.live_projects ?? 0),
       summaryItem("Queued leases", plan.lease_counts?.queued ?? 0),
       summaryItem("Active leases", (plan.lease_counts?.leased ?? 0) + (plan.lease_counts?.active ?? 0)),
@@ -125,6 +133,8 @@
       summaryItem("Need drain", plan.drain_needed ?? 0),
       summaryItem("Need nodes", plan.node_requests ?? 0)
     );
+    document.getElementById("warm-spare-status").textContent =
+      plan.warm_spare_status_reason || "Warm-spare target satisfied.";
 
     const body = document.getElementById("session-rows");
     body.replaceChildren();
@@ -203,6 +213,7 @@
     result.className = "muted";
     result.textContent = "Saving…";
     const max = Number(document.getElementById("max-aedt-sessions").value);
+    const minIdle = Number(document.getElementById("min-idle-aedt-sessions").value);
     const target = Number(document.getElementById("target-projects").value);
     const projectsPerAedt = Number(document.getElementById("projects-per-aedt").value);
     try {
@@ -211,6 +222,7 @@
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({
           max_aedt_sessions: max,
+          min_idle_aedt_sessions: minIdle,
           target_project_concurrency: target,
           projects_per_aedt: projectsPerAedt
         })

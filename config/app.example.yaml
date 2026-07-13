@@ -90,6 +90,9 @@ license_monitor:
     reserve_by_feature:
       electronics_desktop: 32
     persistent_cost_by_project:
+      # Required for license-gated AEDT pool demand and warm-spare hosts.
+      _aedt_pool_hosts:
+        electronics_desktop: 1
       MFT_1MW_2026v1:
         electronics_desktop: 1
       PYAEDT_MOTOR_IPMSM_V2:

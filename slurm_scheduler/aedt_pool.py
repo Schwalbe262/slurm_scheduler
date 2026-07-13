@@ -118,6 +118,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "aedt_pool_enabled": "0",
     "aedt_pool_adapter_ready": "0",
     "aedt_pool_max_sessions": "250",
+    "aedt_pool_min_idle_sessions": "0",
     "aedt_pool_target_projects": "500",
     "aedt_pool_projects_per_session": "2",
     "aedt_pool_project_cpus": "4",
@@ -155,6 +156,7 @@ class AedtPoolConfig:
     adapter_ready: bool
     validation_passed: bool
     max_sessions: int
+    min_idle_sessions: int
     target_projects: int
     projects_per_session: int
     project_cpus: int
@@ -194,6 +196,7 @@ class AedtPoolService:
         self.bootstrap_token = bootstrap_token
         self._now = now
         self._lock = threading.RLock()
+        self._warm_spare_admission_checker: Callable[[int], tuple[int, str]] | None = None
 
     def init(self) -> None:
         with self.db.connect() as conn:
@@ -242,6 +245,13 @@ class AedtPoolService:
         value = self.db.get_setting(key)
         return DEFAULT_SETTINGS[key] if value is None else value
 
+    def set_warm_spare_admission_checker(
+        self,
+        checker: Callable[[int], tuple[int, str]] | None,
+    ) -> None:
+        """Install the scheduler's fail-closed license headroom check."""
+        self._warm_spare_admission_checker = checker
+
     def latest_validation(self) -> dict[str, Any] | None:
         with self.db.connect() as conn:
             row = conn.execute(
@@ -263,6 +273,7 @@ class AedtPoolService:
             adapter_ready=_bool_setting(self._setting("aedt_pool_adapter_ready")),
             validation_passed=bool(validation and validation.get("status") == "passed"),
             max_sessions=max(0, int(self._setting("aedt_pool_max_sessions"))),
+            min_idle_sessions=max(0, int(self._setting("aedt_pool_min_idle_sessions"))),
             target_projects=max(0, int(self._setting("aedt_pool_target_projects"))),
             projects_per_session=max(1, int(self._setting("aedt_pool_projects_per_session"))),
             project_cpus=max(1, int(self._setting("aedt_pool_project_cpus"))),
@@ -289,17 +300,27 @@ class AedtPoolService:
         self,
         *,
         max_sessions: int | None = None,
+        min_idle_sessions: int | None = None,
         target_projects: int | None = None,
         projects_per_session: int | None = None,
     ) -> AedtPoolConfig:
         current = self.config()
         requested_max = current.max_sessions if max_sessions is None else max_sessions
+        requested_min_idle = (
+            current.min_idle_sessions
+            if min_idle_sessions is None
+            else min_idle_sessions
+        )
         requested_slots = (
             current.projects_per_session
             if projects_per_session is None else projects_per_session
         )
         if type(requested_max) is not int or not 0 <= requested_max <= 550:
             raise ValueError("max_aedt_sessions must be an integer between 0 and 550")
+        if type(requested_min_idle) is not int or not 0 <= requested_min_idle <= 550:
+            raise ValueError("min_idle_aedt_sessions must be an integer between 0 and 550")
+        if requested_min_idle > requested_max:
+            raise ValueError("min_idle_aedt_sessions cannot exceed max_aedt_sessions")
         if type(requested_slots) is not int or not 1 <= requested_slots <= 2:
             raise ValueError("projects_per_aedt must be an integer between 1 and 2")
         if target_projects is None:
@@ -332,6 +353,7 @@ class AedtPoolService:
             with self.db.connect() as conn:
                 for key, value in (
                     ("aedt_pool_max_sessions", requested_max),
+                    ("aedt_pool_min_idle_sessions", requested_min_idle),
                     ("aedt_pool_target_projects", requested_target),
                     ("aedt_pool_projects_per_session", requested_slots),
                 ):
@@ -1111,6 +1133,12 @@ class AedtPoolService:
             ).fetchall()
         }
         hard_count = sum(state_counts.get(state, 0) for state in SESSION_COUNTED_STATES)
+        idle_count = state_counts.get("ready", 0)
+        busy_count = state_counts.get("busy", 0)
+        unavailable_count = (
+            state_counts.get("draining", 0)
+            + state_counts.get("unhealthy", 0)
+        )
         live_projects = sum(lease_counts.get(state, 0) for state in LEASE_LIVE_STATES)
         desired_projects = min(config.target_projects, live_projects)
         exclusive_projects = int(
@@ -1124,14 +1152,72 @@ class AedtPoolService:
         )
         desired_exclusive = min(exclusive_projects, desired_projects)
         desired_shared = max(0, desired_projects - desired_exclusive)
-        desired_sessions = min(
+        demand_sessions = min(
             config.max_sessions,
             desired_exclusive + (
                 math.ceil(desired_shared / config.projects_per_session)
                 if desired_shared else 0
             ),
         )
+        # A busy session cannot be consolidated immediately even when its
+        # sibling slot is empty.  Preserve every such owner, then add whole
+        # ready sessions as the warm-spare target.
+        demand_sessions = min(config.max_sessions, max(demand_sessions, busy_count))
+        desired_sessions = min(
+            config.max_sessions,
+            demand_sessions + config.min_idle_sessions + unavailable_count,
+        )
         start_needed = max(0, desired_sessions - hard_count)
+        demand_start_needed = max(0, demand_sessions - hard_count)
+        warm_spare_start_needed = max(0, start_needed - demand_start_needed)
+        unclaimed_starting_sessions = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM aedt_sessions s
+                WHERE s.state = 'starting'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM tasks t
+                      WHERE t.dedupe_key = 'aedt-session-host:' || s.id
+                        AND t.status IN ('attaching','running')
+                  )
+                """
+            ).fetchone()[0]
+        )
+        warm_spare_starts_authorized = warm_spare_start_needed
+        warm_spare_status_reason = ""
+        if warm_spare_start_needed and not config.operational:
+            warm_spare_starts_authorized = 0
+            warm_spare_status_reason = "AEDT pool is not operational; warm-spare start is gated"
+        elif warm_spare_start_needed and self._warm_spare_admission_checker:
+            try:
+                allowed_total, warm_spare_status_reason = self._warm_spare_admission_checker(
+                    unclaimed_starting_sessions
+                    + demand_start_needed
+                    + warm_spare_start_needed
+                )
+            except Exception as exc:
+                LOGGER.exception("AEDT warm-spare license admission failed")
+                allowed_total = 0
+                warm_spare_status_reason = f"license admission check failed: {exc}"
+            warm_spare_starts_authorized = max(
+                0,
+                min(
+                    warm_spare_start_needed,
+                    int(allowed_total)
+                    - unclaimed_starting_sessions
+                    - demand_start_needed,
+                ),
+            )
+            if (
+                warm_spare_starts_authorized < warm_spare_start_needed
+                and not warm_spare_status_reason
+            ):
+                warm_spare_status_reason = (
+                    "license admission headroom is insufficient for "
+                    f"{warm_spare_start_needed} warm-spare session(s)"
+                )
+        start_needed = demand_start_needed + warm_spare_starts_authorized
+        warm_spare_deficit = max(0, config.min_idle_sessions - idle_count)
         cap_excess = max(0, hard_count - config.max_sessions)
         demand_excess = max(0, hard_count - desired_sessions)
         idle_cutoff = _sql_time(self._now() - timedelta(seconds=config.idle_ttl_seconds))
@@ -1201,10 +1287,34 @@ class AedtPoolService:
             if unplaced_after_pending
             else 0
         )
+        if warm_spare_deficit and not warm_spare_status_reason:
+            if demand_sessions + config.min_idle_sessions > config.max_sessions:
+                warm_spare_status_reason = (
+                    "session ceiling leaves insufficient capacity for the idle-session target"
+                )
+            elif state_counts.get("starting", 0):
+                warm_spare_status_reason = "warm-spare session startup is in progress"
+            elif warm_spare_starts_authorized and len(placements) > demand_start_needed:
+                warm_spare_status_reason = "warm-spare session start is planned on a live allocation"
+            elif warm_spare_starts_authorized and (node_requests or pending_capacity):
+                warm_spare_status_reason = "waiting for AEDT pool allocation capacity"
+            elif hard_count >= desired_sessions:
+                warm_spare_status_reason = (
+                    "counted non-idle sessions currently consume the warm-spare capacity"
+                )
         return {
             "hard_session_count": hard_count,
             "desired_sessions": desired_sessions,
+            "demand_sessions": demand_sessions,
             "start_needed": start_needed,
+            "idle_session_count": idle_count,
+            "unavailable_session_count": unavailable_count,
+            "min_idle_aedt_sessions": config.min_idle_sessions,
+            "warm_spare_deficit": warm_spare_deficit,
+            "warm_spare_start_needed": warm_spare_start_needed,
+            "warm_spare_starts_authorized": warm_spare_starts_authorized,
+            "unclaimed_starting_sessions": unclaimed_starting_sessions,
+            "warm_spare_status_reason": warm_spare_status_reason,
             "drain_needed": max(cap_excess, min(demand_excess, idle_drainable)),
             "idle_drainable_sessions": idle_drainable,
             "placements": placements,
@@ -1465,6 +1575,7 @@ class AedtPoolService:
                 "validation_passed": config.validation_passed,
                 "operational": config.operational,
                 "max_aedt_sessions": config.max_sessions,
+                "min_idle_aedt_sessions": config.min_idle_sessions,
                 "target_project_concurrency": config.target_projects,
                 "projects_per_aedt": config.projects_per_session,
                 "hard_counted_states": list(SESSION_COUNTED_STATES),
@@ -1483,6 +1594,25 @@ class AedtPoolService:
                     "SELECT * FROM aedt_sessions WHERE state = 'starting' ORDER BY id ASC"
                 ).fetchall()
             ]
+
+    def fail_unclaimed_session_start(self, session_id: int, reason: str) -> bool:
+        """Release a planned row when no node-side host ever acquired it."""
+        now = _sql_time(self._now())
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE aedt_sessions
+                SET state = 'failed', failure_message = ?, closed_at = ?, updated_at = ?
+                WHERE id = ? AND state = 'starting' AND host_id = ''
+                """,
+                (
+                    reason.strip() or "AEDT session host reservation failed",
+                    now,
+                    now,
+                    int(session_id),
+                ),
+            )
+            return cursor.rowcount == 1
 
     def allocation_has_counted_session(self, allocation_id: int) -> bool:
         with self.db.connect() as conn:
@@ -1647,11 +1777,22 @@ class AedtPoolRuntime:
                 else None
             )
             if not reserved or not account:
+                license_reason = ""
+                if bool(getattr(self.scheduler, "license_admission_enabled", False)):
+                    _allowed, license_reason = self.scheduler.aedt_pool_warm_spare_admission(1)
+                failure_reason = (
+                    license_reason
+                    or "could not reserve exact dedicated AEDT allocation"
+                )
                 self.service.db.update_task(
                     task_id,
                     status=TaskStatus.FAILED.value,
-                    failure_message="could not reserve exact dedicated AEDT allocation",
+                    failure_message=failure_reason,
                     finished_at="CURRENT_TIMESTAMP",
+                )
+                self.service.fail_unclaimed_session_start(
+                    int(session["id"]),
+                    failure_reason,
                 )
                 continue
             self.scheduler.start_background_task_attach(reserved, allocation, account)
