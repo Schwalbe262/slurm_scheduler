@@ -761,6 +761,10 @@ class Scheduler:
                     self._needs_reconcile = False
                     run_stage("reconcile_slurm_state", self.reconcile_slurm_state)
                 run_stage("fail_stale_same_node_tasks", self.fail_stale_same_node_tasks)
+                run_stage(
+                    "fail_stale_requested_allocation_tasks",
+                    self.fail_stale_requested_allocation_tasks,
+                )
                 run_stage("enforce_cpu_partition_limits", self.enforce_cpu_partition_allocation_limits)
                 # Admission must be able to recover even when a later account
                 # lifecycle/storage stage fails.  This method only launches a
@@ -2463,6 +2467,33 @@ class Scheduler:
             if task.get("allocation_id"):
                 self.recalculate_allocation_capacity()
 
+    def fail_stale_requested_allocation_tasks(self) -> None:
+        """Terminalize queued exact pins whose requested parent cannot recover."""
+        terminal_states = {
+            AllocationStatus.DRAINING.value,
+            AllocationStatus.CLOSING.value,
+            AllocationStatus.CLOSED.value,
+            AllocationStatus.FAILED.value,
+        }
+        for task in self.db.list_tasks_by_statuses(
+            [TaskStatus.QUEUED.value],
+            limit=5000,
+        ):
+            requested_id = self.task_requested_allocation_id(task)
+            if requested_id <= 0:
+                continue
+            allocation = self.db.get_allocation(requested_id)
+            if allocation and allocation.get("state") not in terminal_states:
+                continue
+            state = allocation.get("state") if allocation else "not found"
+            self.db.update_task(
+                task["id"],
+                status=TaskStatus.FAILED.value,
+                failure_message=f"requested allocation {requested_id} is {state}",
+                finished_at="CURRENT_TIMESTAMP",
+            )
+            self.on_task_terminal(task, "failed")
+
     def close_allocation(
         self,
         allocation: dict,
@@ -2989,11 +3020,32 @@ class Scheduler:
                 return None
             if self.allocation_profile_conflicts(allocation, task, refresh=True):
                 return None
+            if allocation.get("state") not in {
+                AllocationStatus.WARM.value,
+                AllocationStatus.ACTIVE.value,
+            }:
+                return None
+            if not allocation.get("slurm_job_id") or not self.allocation_accepts_new_tasks(allocation):
+                return None
+            active_task_allocation_ids, active_exclusive_allocation_ids = (
+                self.active_task_allocation_sets()
+            )
+            validation_task = task
+            if (
+                self.task_can_relax_preferred_node(task)
+                and str(allocation.get("node_name") or "")
+                != str(task.get("node_name") or "")
+            ):
+                validation_task = self.relaxed_preferred_node_task(task)
+            if not self.allocation_can_run_task(
+                allocation,
+                validation_task,
+                include_pending=False,
+                active_task_allocation_ids=active_task_allocation_ids,
+                active_exclusive_allocation_ids=active_exclusive_allocation_ids,
+            ):
+                return None
             if self.task_is_fea_bursty(task):
-                if allocation.get("state") not in {AllocationStatus.WARM.value, AllocationStatus.ACTIVE.value}:
-                    return None
-                if not allocation.get("slurm_job_id") or not self.allocation_accepts_new_tasks(allocation):
-                    return None
                 if self.fit_slots_for_allocation(allocation, task) <= 0:
                     return None
 
@@ -3460,6 +3512,7 @@ class Scheduler:
             "task": {key: task.get(key) for key in (
                 "cpus", "memory_mb", "gpus", "gpu_model", "partition", "node_name",
                 "scheduling_profile", "aedt_backend", "required_capability", "env_profile", "account_name",
+                "requested_allocation_id",
             )},
             "queue_state": diagnostics.get("queue_state"),
             "queue_reason": diagnostics.get("queue_reason"),
@@ -3470,6 +3523,9 @@ class Scheduler:
 
     def allocation_rejection_reasons(self, allocation: dict, task: dict) -> list[str]:
         reasons: list[str] = []
+        requested_allocation_id = self.task_requested_allocation_id(task)
+        if requested_allocation_id and int(allocation.get("id") or 0) != requested_allocation_id:
+            return [f"task requests allocation {requested_allocation_id}"]
         if (
             self.task_is_fea_bursty(task)
             and not self.task_requires_gpu(task)
@@ -3565,6 +3621,12 @@ class Scheduler:
         queue_state = "ready" if ready_slots > 0 else "pending" if pending_slots > 0 else "opening"
         same_node_reference_id = self.same_node_as_task_id(task)
         same_node_target = self.same_node_target_for_task(task) if same_node_reference_id else None
+        requested_allocation_id = self.task_requested_allocation_id(task)
+        requested_allocation = (
+            self.db.get_allocation(requested_allocation_id)
+            if requested_allocation_id
+            else None
+        )
 
         if self.task_can_relax_preferred_node(task):
             if active_task_allocation_ids is None or active_exclusive_allocation_ids is None:
@@ -3598,6 +3660,21 @@ class Scheduler:
         if project_cap_reason:
             queue_state = "blocked"
             reason = project_cap_reason
+
+        if not reason and requested_allocation_id:
+            if not requested_allocation:
+                queue_state = "blocked"
+                reason = f"requested allocation {requested_allocation_id} not found"
+            elif requested_allocation.get("state") not in {
+                AllocationStatus.PENDING.value,
+                AllocationStatus.WARM.value,
+                AllocationStatus.ACTIVE.value,
+            }:
+                queue_state = "blocked"
+                reason = (
+                    f"requested allocation {requested_allocation_id} is "
+                    f"{requested_allocation.get('state') or 'unavailable'}"
+                )
 
         if not reason:
             if same_node_reference_id and not same_node_target:
@@ -3787,7 +3864,7 @@ class Scheduler:
         return f"account job limit reached: {','.join(blocked)}"
 
     def allocation_shape_block_reason_for_task(self, task: dict) -> str:
-        if self.same_node_as_task_id(task):
+        if self.same_node_as_task_id(task) or self.task_requested_allocation_id(task):
             return ""
         if self.task_requires_gpu(task):
             return ""
@@ -3976,6 +4053,7 @@ class Scheduler:
             and self.task_is_fea_bursty(task)
             and bool(str(task.get("node_name") or "").strip())
             and not int(task.get("same_node_as_task_id") or 0)
+            and not self.task_requested_allocation_id(task)
             and not self.task_requires_gpu(task)
             and not int(task.get("exclusive_node") or 0)
         )
@@ -4918,6 +4996,11 @@ class Scheduler:
             return str(task.get("requested_account_name") or "")
         return str(task.get("account_name") or "")
 
+    @staticmethod
+    def task_requested_allocation_id(task: dict) -> int:
+        """Return an exact allocation placement request, distinct from assignment."""
+        return max(0, int(task.get("requested_allocation_id") or 0))
+
     def same_node_as_task_id(self, task: dict) -> int:
         return max(0, int(task.get("same_node_as_task_id") or task.get("same_node_as") or 0))
 
@@ -5102,6 +5185,9 @@ class Scheduler:
         active_exclusive_allocation_ids: set[int] | None = None,
     ) -> bool:
         if bool(int(allocation.get("exclusive_node") or 0)) != bool(int(task.get("exclusive_node") or 0)):
+            return False
+        requested_allocation_id = self.task_requested_allocation_id(task)
+        if requested_allocation_id and int(allocation.get("id") or 0) != requested_allocation_id:
             return False
         requested_accounts = self.requested_accounts(self.task_requested_account_name(task))
         if requested_accounts and allocation.get("account_name") not in requested_accounts:
@@ -5553,7 +5639,7 @@ class Scheduler:
         return self.open_allocation_for_task_record(task) is not None
 
     def open_allocation_for_task_record(self, task: dict) -> dict | None:
-        if self.same_node_as_task_id(task):
+        if self.same_node_as_task_id(task) or self.task_requested_allocation_id(task):
             return None
         if self.task_requires_gpu(task):
             model = self.choose_gpu_model_for_task(task) or self.choose_gpu_model_for_prewarm()

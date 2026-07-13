@@ -41,5 +41,12 @@
   restarts a wedged Uvicorn child without cancelling Slurm allocations. See
   `docs/incident_web_listener_winerror64.md`.
 
+## 2026-07-13 (Codex) - Node-local AEDT host-owned placement
+- Added durable `requested_allocation_id` task placement so a node-local AEDT
+  canary host can reserve an exact live allocation without depending on a
+  short-lived `same_node_as_task_id` sibling.
+- The host remains an active allocation owner until explicit cancel/drain or
+  its own process exit; clients continue to co-locate through the host task ID.
+
 ## 2026-07-12 (Claude)
 - docs/bug_idle_active_allocation_leak.md: 태스크 0개 active 할당(6757, 63h)이 유휴 회수에서 누락되는 버그 리포트

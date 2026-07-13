@@ -118,6 +118,7 @@ class TaskCreate:
     cleanup_globs: str = ""
     project: str = ""
     entrypoint: str = ""
+    requested_allocation_id: int = 0
 
 
 @dataclass(frozen=True)

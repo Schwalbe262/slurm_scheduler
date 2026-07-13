@@ -19,6 +19,28 @@ and carries matching bundle identity and expected-project count fields in
 `payload_json`. This temporary exception is hard-capped at the currently
 validated N=2.
 
+Submit the host itself with `requested_allocation_id` set to the database ID
+of an existing live allocation and leave `same_node_as_task_id` unset (or
+zero). This is an exact allocation pin: it neither falls back to another
+allocation on the same node nor opens a replacement allocation. The host's
+own task claim keeps that allocation active, so completion of an unrelated
+sibling does not terminate it. For example, the host task portion of a
+`POST /api/tasks` request is:
+
+```json
+{
+  "entrypoint": "aedt_node_canary_host",
+  "requested_allocation_id": 1234,
+  "same_node_as_task_id": 0,
+  "timeout_seconds": 0
+}
+```
+
+After the host reaches `running`, submit each client with
+`same_node_as_task_id` (or its `same_node_as` alias) set to the host task ID.
+Do not combine `requested_allocation_id` and `same_node_as_task_id` on the
+same task; the API rejects that ambiguous request.
+
 The host exits only after all N project-local close ACKs and Desktop process
 shutdown. Its final `NODE_CANARY_EVIDENCE` record is passing only when both
 leases were released without a fault. The discovery file is removed on exit.

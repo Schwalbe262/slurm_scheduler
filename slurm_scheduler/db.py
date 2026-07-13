@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     dedupe_key TEXT NOT NULL DEFAULT '',
     max_workers_per_node INTEGER NOT NULL DEFAULT 0,
     same_node_as_task_id INTEGER NOT NULL DEFAULT 0,
+    requested_allocation_id INTEGER NOT NULL DEFAULT 0,
     payload_json TEXT NOT NULL DEFAULT '',
     cleanup_globs TEXT NOT NULL DEFAULT '',
     project TEXT NOT NULL DEFAULT '',
@@ -471,6 +472,7 @@ class Database:
                 "dedupe_key": "TEXT NOT NULL DEFAULT ''",
                 "max_workers_per_node": "INTEGER NOT NULL DEFAULT 0",
                 "same_node_as_task_id": "INTEGER NOT NULL DEFAULT 0",
+                "requested_allocation_id": "INTEGER NOT NULL DEFAULT 0",
                 "payload_json": "TEXT NOT NULL DEFAULT ''",
                 "cleanup_globs": "TEXT NOT NULL DEFAULT ''",
                 "project": "TEXT NOT NULL DEFAULT ''",
@@ -559,8 +561,9 @@ class Database:
                     name, remote_cwd, command, env_setup, required_capability, env_profile,
                     account_name, requested_account_name, cpus, memory_mb,
                     scheduling_profile, aedt_backend, gpus, gpu_model, partition, node_name, exclusive_node, priority, timeout_seconds, dedupe_key,
-                    max_workers_per_node, same_node_as_task_id, payload_json, cleanup_globs, project, entrypoint, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    max_workers_per_node, same_node_as_task_id, requested_allocation_id,
+                    payload_json, cleanup_globs, project, entrypoint, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.name,
@@ -585,6 +588,7 @@ class Database:
                     task.dedupe_key,
                     task.max_workers_per_node,
                     max(0, int(task.same_node_as_task_id or 0)),
+                    max(0, int(task.requested_allocation_id or 0)),
                     task.payload_json,
                     task.cleanup_globs,
                     task.project,

@@ -2301,6 +2301,163 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(client["status"], TaskStatus.RUNNING.value)
         self.assertEqual(client["allocation_id"], reference_allocation_id)
 
+    def test_exact_allocation_host_outlives_sibling_and_anchors_clients(self) -> None:
+        target_allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n116",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        other_allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n117",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(
+            target_allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="canary-target",
+        )
+        self.db.update_allocation(
+            other_allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="other-pool",
+        )
+        sibling_id = self.db.create_task(
+            TaskCreate("short-simulation", "~/case", "run", cpus=4, memory_mb=8192)
+        )
+        self.db.update_task(
+            sibling_id,
+            status=TaskStatus.RUNNING.value,
+            allocation_id=target_allocation_id,
+            account_name="a",
+            started_at="CURRENT_TIMESTAMP",
+        )
+        host_id = self.db.create_task(
+            TaskCreate(
+                "node-local-aedt-host",
+                "~/case",
+                "python scripts/aedt_pool_node_canary_host.py",
+                cpus=1,
+                memory_mb=4096,
+                entrypoint="aedt_node_canary_host",
+                requested_allocation_id=target_allocation_id,
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+
+        scheduler.assign_queued_tasks()
+        host = self.db.get_task(host_id)
+        self.assertEqual(host["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(host["allocation_id"], target_allocation_id)
+        self.assertEqual(host["same_node_as_task_id"], 0)
+
+        self.db.update_task(
+            sibling_id,
+            status=TaskStatus.COMPLETED.value,
+            finished_at="CURRENT_TIMESTAMP",
+        )
+        scheduler.fail_stale_same_node_tasks()
+        scheduler.recalculate_allocation_capacity()
+        scheduler.apply_allocation_lifecycle()
+        self.assertEqual(self.db.get_task(host_id)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(
+            self.db.get_allocation(target_allocation_id)["state"],
+            AllocationStatus.ACTIVE.value,
+        )
+
+        client_id = self.db.create_task(
+            TaskCreate(
+                "node-local-aedt-client",
+                "~/case",
+                "attach",
+                cpus=1,
+                memory_mb=1024,
+                same_node_as_task_id=host_id,
+            )
+        )
+        scheduler.assign_queued_tasks()
+        client = self.db.get_task(client_id)
+        self.assertEqual(client["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(client["allocation_id"], target_allocation_id)
+
+    def test_exact_allocation_reservation_revalidates_fit_under_lock(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n116",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="canary-target",
+        )
+        task_ids = [
+            self.db.create_task(
+                TaskCreate(
+                    f"host-{index}",
+                    "~/case",
+                    "host",
+                    cpus=40,
+                    memory_mb=4096,
+                    entrypoint="aedt_node_canary_host",
+                    requested_allocation_id=allocation_id,
+                )
+            )
+            for index in range(2)
+        ]
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        stale_allocation = self.db.get_allocation(allocation_id)
+
+        first = scheduler.reserve_task_on_allocation(
+            self.db.get_task(task_ids[0]), stale_allocation, self.accounts[0]
+        )
+        second = scheduler.reserve_task_on_allocation(
+            self.db.get_task(task_ids[1]), stale_allocation, self.accounts[0]
+        )
+
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(self.db.get_task(task_ids[1])["status"], TaskStatus.QUEUED.value)
+
+    def test_queued_exact_allocation_host_fails_when_target_drains(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n116",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.DRAINING.value,
+            slurm_job_id="canary-target",
+        )
+        host_id = self.db.create_task(
+            TaskCreate(
+                "queued-host",
+                "~/case",
+                "host",
+                entrypoint="aedt_node_canary_host",
+                requested_allocation_id=allocation_id,
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+
+        scheduler.fail_stale_requested_allocation_tasks()
+
+        host = self.db.get_task(host_id)
+        self.assertEqual(host["status"], TaskStatus.FAILED.value)
+        self.assertEqual(
+            host["failure_message"],
+            f"requested allocation {allocation_id} is draining",
+        )
+
     def test_same_node_as_uses_reference_allocation_not_other_same_node_pool(self) -> None:
         reference_allocation_id = self.db.create_allocation(
             account_name="a",
