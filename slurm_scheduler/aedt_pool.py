@@ -282,14 +282,66 @@ class AedtPoolService:
         )
 
     def set_operator_limit(self, max_sessions: int) -> AedtPoolConfig:
-        if type(max_sessions) is not int or not 0 <= max_sessions <= 550:
+        """Compatibility wrapper for the original one-field operator API."""
+        return self.set_operator_limits(max_sessions=max_sessions)
+
+    def set_operator_limits(
+        self,
+        *,
+        max_sessions: int | None = None,
+        target_projects: int | None = None,
+        projects_per_session: int | None = None,
+    ) -> AedtPoolConfig:
+        current = self.config()
+        requested_max = current.max_sessions if max_sessions is None else max_sessions
+        requested_slots = (
+            current.projects_per_session
+            if projects_per_session is None else projects_per_session
+        )
+        if type(requested_max) is not int or not 0 <= requested_max <= 550:
             raise ValueError("max_aedt_sessions must be an integer between 0 and 550")
+        if type(requested_slots) is not int or not 1 <= requested_slots <= 2:
+            raise ValueError("projects_per_aedt must be an integer between 1 and 2")
+        if target_projects is None:
+            requested_target = requested_max * requested_slots
+        else:
+            requested_target = target_projects
+        if type(requested_target) is not int or not 0 <= requested_target <= 1100:
+            raise ValueError(
+                "target_project_concurrency must be an integer between 0 and 1100"
+            )
+        physical_ceiling = requested_max * requested_slots
+        if requested_target > physical_ceiling:
+            raise ValueError(
+                "target_project_concurrency cannot exceed "
+                "max_aedt_sessions * projects_per_aedt"
+            )
         with self._lock:
-            self.db.set_setting("aedt_pool_max_sessions", str(max_sessions))
-            projects_per_session = max(1, int(self._setting("aedt_pool_projects_per_session")))
-            # The UI controls only the Desktop ceiling.  Project concurrency is
-            # the validated per-Desktop capacity derived from that ceiling.
-            self.db.set_setting("aedt_pool_target_projects", str(max_sessions * projects_per_session))
+            if requested_slots != current.projects_per_session:
+                with self.db.connect() as conn:
+                    counted = int(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM aedt_sessions "
+                            "WHERE state IN ('starting','ready','busy','draining','unhealthy')"
+                        ).fetchone()[0]
+                    )
+                if current.enabled or counted:
+                    raise ValueError(
+                        "disable and fully drain the pool before changing projects_per_aedt"
+                    )
+            with self.db.connect() as conn:
+                for key, value in (
+                    ("aedt_pool_max_sessions", requested_max),
+                    ("aedt_pool_target_projects", requested_target),
+                    ("aedt_pool_projects_per_session", requested_slots),
+                ):
+                    conn.execute(
+                        "INSERT INTO scheduler_settings(key, value, updated_at) "
+                        "VALUES(?, ?, CURRENT_TIMESTAMP) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                        "updated_at = CURRENT_TIMESTAMP",
+                        (key, str(value)),
+                    )
         return self.config()
 
     def set_adapter_ready(self, ready: bool) -> AedtPoolConfig:

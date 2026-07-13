@@ -19,6 +19,9 @@ The first integration step is the exclusive 1:1 procedure in
 [`mft_aedt_attach_1to1.md`](mft_aedt_attach_1to1.md).  It must use
 `priority=10000`, `project=MFT_1MW_2026v1`, and exact full Git SHAs.  It leaves
 the production pool disabled and does not satisfy the later 1:2 A/B gate.
+After that pass, use [`mft_aedt_attach_1to2.md`](mft_aedt_attach_1to2.md) for
+the isolated two-project normal and pre-solve-abort cases. The pilot remains
+one scheduler task and does not write a passing live validation automatically.
 
 ## 1. Preflight
 
@@ -196,7 +199,7 @@ UI에는 AEDT ceiling만 입력한다. project target은 자동으로 2배가 �
 ```bash
 curl -sS -X PATCH "$SCHEDULER_URL/api/aedt-pool/config" \
   -H 'Content-Type: application/json' \
-  --data '{"max_aedt_sessions":1}'
+  --data '{"max_aedt_sessions":250,"target_project_concurrency":500,"projects_per_aedt":2}'
 
 curl -sS -X POST "$SCHEDULER_URL/api/aedt-pool/enable" \
   -H 'Content-Type: application/json' \

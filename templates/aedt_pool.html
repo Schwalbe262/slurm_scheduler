@@ -10,11 +10,11 @@
   </div>
 
   <section class="panel">
-    <h2>Operator limit</h2>
+    <h2>Operator limits</h2>
     <p class="muted">
-      This page controls only the hard ceiling for open AEDT processes. Starting, ready,
-      busy, draining, and unhealthy sessions all consume the ceiling. Project capacity is
-      derived from the validated two-projects-per-AEDT policy.
+      Limits are durable even while the pool is disabled. Starting, ready, busy, draining,
+      and unhealthy sessions consume the AEDT ceiling. The project target must not exceed
+      AEDT sessions × projects per AEDT; changing slot count requires a fully drained pool.
     </p>
     <form id="limit-form" class="form-grid">
       <div>
@@ -22,8 +22,12 @@
         <input id="max-aedt-sessions" name="max_aedt_sessions" type="number" min="0" max="550" step="1" required>
       </div>
       <div>
-        <label for="target-projects">Derived project concurrency</label>
-        <input id="target-projects" type="number" readonly>
+        <label for="target-projects">Maximum concurrent projects</label>
+        <input id="target-projects" name="target_project_concurrency" type="number" min="0" max="1100" step="1" required>
+      </div>
+      <div>
+        <label for="projects-per-aedt">Projects per AEDT</label>
+        <input id="projects-per-aedt" name="projects_per_aedt" type="number" min="1" max="2" step="1" required>
       </div>
       <div class="full actions">
         <button type="submit">Save ceiling</button>
@@ -36,6 +40,11 @@
     <h2>Activation gates</h2>
     <div id="gates" class="summary-row"></div>
     <p id="gate-message" class="muted"></p>
+    <div class="actions">
+      <button id="enable-pool" type="button">Enable pool</button>
+      <button id="disable-pool" class="secondary" type="button">Disable pool</button>
+      <span id="enable-result" class="muted" role="status"></span>
+    </div>
   </section>
 
   <section class="panel">
@@ -49,6 +58,16 @@
       <table>
         <thead><tr><th>ID</th><th>State</th><th>Node</th><th>Allocation</th><th>Slots</th><th>Heartbeat</th><th>Failure / quarantine</th></tr></thead>
         <tbody id="session-rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Project leases</h2>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>ID</th><th>State</th><th>Project</th><th>Task</th><th>Session / slot</th><th>Heartbeat</th><th>Failure</th></tr></thead>
+        <tbody id="lease-rows"></tbody>
       </table>
     </div>
   </section>
@@ -79,6 +98,7 @@
     const plan = summary.plan || {};
     document.getElementById("max-aedt-sessions").value = config.max_aedt_sessions ?? 0;
     document.getElementById("target-projects").value = config.target_project_concurrency ?? 0;
+    document.getElementById("projects-per-aedt").value = config.projects_per_aedt ?? 1;
 
     const gates = document.getElementById("gates");
     gates.replaceChildren(
@@ -87,15 +107,20 @@
       summaryItem("1:2 A/B", config.validation_passed ? "passed" : "not passed"),
       summaryItem("Operational", config.operational ? "yes" : "no")
     );
+    const validation = summary.latest_validation || {};
     document.getElementById("gate-message").textContent = config.operational
       ? "The opt-in pooled backend may reconcile demand."
-      : "No Slurm node or AEDT process is opened by this pool until every gate passes.";
+      : `Fail-closed: no pool demand is launched until every gate passes. Latest validation: ${validation.status || "none"}${validation.failure_message ? ` · ${validation.failure_message}` : ""}`;
+    document.getElementById("enable-pool").disabled = Boolean(config.enabled) || !config.adapter_ready || !config.validation_passed;
+    document.getElementById("disable-pool").disabled = !config.enabled;
 
     const capacity = document.getElementById("capacity");
     capacity.replaceChildren(
       summaryItem("Hard-counted AEDT", plan.hard_session_count ?? 0),
       summaryItem("Desired AEDT", plan.desired_sessions ?? 0),
       summaryItem("Live projects", plan.live_projects ?? 0),
+      summaryItem("Queued leases", plan.lease_counts?.queued ?? 0),
+      summaryItem("Active leases", (plan.lease_counts?.leased ?? 0) + (plan.lease_counts?.active ?? 0)),
       summaryItem("Need start", plan.start_needed ?? 0),
       summaryItem("Need drain", plan.drain_needed ?? 0),
       summaryItem("Need nodes", plan.node_requests ?? 0)
@@ -132,6 +157,38 @@
       }
       body.append(row);
     }
+
+    const leaseBody = document.getElementById("lease-rows");
+    leaseBody.replaceChildren();
+    const leases = summary.leases || [];
+    if (!leases.length) {
+      const row = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.colSpan = 7;
+      cell.className = "muted";
+      cell.textContent = "No AEDT project leases.";
+      row.append(cell);
+      leaseBody.append(row);
+    } else {
+      for (const lease of leases) {
+        const row = document.createElement("tr");
+        const values = [
+          lease.id,
+          lease.state,
+          lease.project_name || "-",
+          lease.task_id || "-",
+          lease.session_id ? `${lease.session_id} / ${lease.slot_index ?? "-"}` : "-",
+          lease.last_heartbeat_at || "-",
+          lease.failure_message || "-"
+        ];
+        for (const value of values) {
+          const cell = document.createElement("td");
+          cell.textContent = escapeText(value);
+          row.append(cell);
+        }
+        leaseBody.append(row);
+      }
+    }
   }
 
   async function refresh() {
@@ -146,11 +203,17 @@
     result.className = "muted";
     result.textContent = "Saving…";
     const max = Number(document.getElementById("max-aedt-sessions").value);
+    const target = Number(document.getElementById("target-projects").value);
+    const projectsPerAedt = Number(document.getElementById("projects-per-aedt").value);
     try {
       const response = await fetch("/api/aedt-pool/config", {
         method: "PATCH",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({max_aedt_sessions: max})
+        body: JSON.stringify({
+          max_aedt_sessions: max,
+          target_project_concurrency: target,
+          projects_per_aedt: projectsPerAedt
+        })
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
@@ -161,6 +224,29 @@
       result.textContent = error.message;
     }
   });
+
+  async function setEnabled(enabled) {
+    const result = document.getElementById("enable-result");
+    result.className = "muted";
+    result.textContent = enabled ? "Enabling…" : "Disabling…";
+    try {
+      const response = await fetch("/api/aedt-pool/enable", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({enabled})
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+      result.textContent = payload.operational ? "Pool operational" : "Pool disabled";
+      await refresh();
+    } catch (error) {
+      result.className = "error";
+      result.textContent = error.message;
+    }
+  }
+
+  document.getElementById("enable-pool").addEventListener("click", () => setEnabled(true));
+  document.getElementById("disable-pool").addEventListener("click", () => setEnabled(false));
 
   render(initialSummary);
   setInterval(() => refresh().catch(() => {}), 10000);

@@ -10,10 +10,10 @@
 > clone, never in the dirty live scheduler tree.  Deployment must use an
 > identified GitHub branch and exact commit SHA on cluster-local storage.
 
-> **Current integration gate:** the MFT adapter is restricted to an exclusive
-> one-Desktop/one-project pilot.  See
-> [MFT AEDT attach 1:1 pilot](mft_aedt_attach_1to1.md).  A 1:1 pass does not
-> authorize 1:2 or the 250/500 target.
+> **Current integration gate:** exclusive 1:1 passed in task 30089. Shared 1:2
+> remains an isolated pilot described in
+> [MFT shared AEDT 1:2 pilot](mft_aedt_attach_1to2.md). It does not authorize
+> the 250/500 target until its real evidence passes and is reviewed.
 
 ## 목적과 범위
 
@@ -21,8 +21,10 @@
 Desktop 라이선스가 먼저 포화되는 환경에서 AEDT 하나에 최대 두 프로젝트를 붙이는 opt-in
 경로다. 기존 standalone task와 현재 캠페인은 그대로 유지한다.
 
-WEB UI에서 사용자가 바꾸는 값은 `max_aedt_sessions` 하나뿐이다. 검증된
-`projects_per_aedt=2`를 곱해 프로젝트 동시 실행 목표를 계산한다.
+WEB UI에서 사용자는 AEDT session 상한, 전체 project 병렬 상한,
+`projects_per_aedt`를 각각 설정한다. project 상한은
+`max_aedt_sessions * projects_per_aedt`를 넘을 수 없으며 slot 수 변경은 pool이
+disabled이고 완전히 drain된 경우에만 허용된다.
 
 ```text
 max_aedt_sessions = 250
@@ -176,7 +178,7 @@ Operator:
 
 - `GET /aedt-pool`
 - `GET /api/aedt-pool`
-- `PATCH /api/aedt-pool/config` — body에는 `max_aedt_sessions`만 허용
+- `PATCH /api/aedt-pool/config` — session/project/slot 상한을 durable하게 저장
 - `POST /api/aedt-pool/reconcile?dry_run=true`
 - `POST /api/aedt-pool/enable`
 - `POST /api/aedt-pool/validations`

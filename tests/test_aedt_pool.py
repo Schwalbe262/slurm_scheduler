@@ -136,12 +136,37 @@ class AedtPoolGateTests(AedtPoolTestCase):
         self.assertFalse(config.operational)
         self.assertEqual(self.service.summary()["sessions"], [])
 
-    def test_operator_edits_only_desktop_ceiling_and_project_target_is_derived(self) -> None:
+    def test_legacy_operator_limit_derives_project_target(self) -> None:
         config = self.service.set_operator_limit(250)
         self.assertEqual(config.max_sessions, 250)
         self.assertEqual(config.target_projects, 500)
         with self.assertRaisesRegex(ValueError, "between 0 and 550"):
             self.service.set_operator_limit(551)
+
+    def test_operator_can_set_all_three_durable_limits_while_disabled(self) -> None:
+        config = self.service.set_operator_limits(
+            max_sessions=250,
+            target_projects=400,
+            projects_per_session=2,
+        )
+        self.assertEqual(config.max_sessions, 250)
+        self.assertEqual(config.target_projects, 400)
+        self.assertEqual(config.projects_per_session, 2)
+        self.assertFalse(config.enabled)
+        reloaded = AedtPoolService(self.db, bootstrap_token="secret")
+        self.assertEqual(reloaded.config().target_projects, 400)
+
+    def test_operator_limits_fail_closed_on_invalid_topology(self) -> None:
+        with self.assertRaisesRegex(ValueError, "projects_per_aedt"):
+            self.service.set_operator_limits(projects_per_session=3)
+        with self.assertRaisesRegex(ValueError, "cannot exceed"):
+            self.service.set_operator_limits(
+                max_sessions=100,
+                target_projects=201,
+                projects_per_session=2,
+            )
+        with self.assertRaisesRegex(ValueError, "between 0 and 1100"):
+            self.service.set_operator_limits(target_projects=1101)
 
     def test_activation_requires_adapter_and_fault_injection_validation(self) -> None:
         with self.assertRaisesRegex(ValueError, "validation"):
@@ -188,7 +213,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
         self.assertGreaterEqual(plan["node_requests"], 1)
         self.assertEqual(self.service.starting_sessions(), [])
 
-    def test_api_operator_surface_accepts_only_desktop_ceiling(self) -> None:
+    def test_api_operator_surface_accepts_three_bounded_limits(self) -> None:
         router = create_aedt_pool_router(self.service)
         endpoint = next(
             route.endpoint
@@ -203,8 +228,13 @@ class AedtPoolGateTests(AedtPoolTestCase):
             async def json(self):
                 return self.payload
 
-        response = asyncio.run(endpoint(Request({"max_aedt_sessions": 250})))
-        self.assertEqual(response["target_project_concurrency"], 500)
+        response = asyncio.run(endpoint(Request({
+            "max_aedt_sessions": 250,
+            "target_project_concurrency": 400,
+            "projects_per_aedt": 2,
+        })))
+        self.assertEqual(response["target_project_concurrency"], 400)
+        self.assertEqual(response["projects_per_aedt"], 2)
         from fastapi import HTTPException
 
         with self.assertRaises(HTTPException) as raised:
@@ -213,12 +243,32 @@ class AedtPoolGateTests(AedtPoolTestCase):
                     Request(
                         {
                             "max_aedt_sessions": 250,
-                            "target_project_concurrency": 999,
+                            "unexpected": 999,
                         }
                     )
                 )
             )
         self.assertEqual(raised.exception.status_code, 422)
+
+    def test_projects_per_aedt_change_requires_disabled_drained_pool(self) -> None:
+        self.make_operational()
+        with self.assertRaisesRegex(ValueError, "disable and fully drain"):
+            self.service.set_operator_limits(projects_per_session=1)
+
+    def test_web_ui_exposes_limits_usage_leases_and_fail_closed_gates(self) -> None:
+        template = (
+            Path(__file__).resolve().parents[1] / "templates" / "aedt_pool.html"
+        ).read_text(encoding="utf-8")
+        for required in (
+            'id="max-aedt-sessions"',
+            'id="target-projects"',
+            'id="projects-per-aedt"',
+            'id="lease-rows"',
+            'id="enable-pool"',
+            "latest_validation",
+            'fetch("/api/aedt-pool/enable"',
+        ):
+            self.assertIn(required, template)
 
 
 class AedtLeaseLifecycleTests(AedtPoolTestCase):

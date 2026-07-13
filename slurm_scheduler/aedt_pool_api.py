@@ -36,15 +36,25 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
     @router.patch("/api/aedt-pool/config")
     async def set_aedt_pool_limit(request: Request) -> dict[str, Any]:
         payload = await request.json()
-        # The operator surface intentionally owns one number only.  500
-        # projects is derived from 250 Desktops * the validated 2 slots.
-        if set(payload) - {"max_aedt_sessions"}:
+        allowed = {
+            "max_aedt_sessions",
+            "target_project_concurrency",
+            "projects_per_aedt",
+        }
+        if not payload or set(payload) - allowed:
             raise HTTPException(
                 status_code=422,
-                detail="only max_aedt_sessions is operator-configurable",
+                detail=(
+                    "only max_aedt_sessions, target_project_concurrency, "
+                    "and projects_per_aedt are operator-configurable"
+                ),
             )
         try:
-            config = service.set_operator_limit(payload.get("max_aedt_sessions"))
+            config = service.set_operator_limits(
+                max_sessions=payload.get("max_aedt_sessions"),
+                target_projects=payload.get("target_project_concurrency"),
+                projects_per_session=payload.get("projects_per_aedt"),
+            )
             service.reconcile(execute=True)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
