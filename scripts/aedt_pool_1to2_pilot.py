@@ -55,12 +55,21 @@ TERMINAL_LEASE_STATES = {"released", "failed", "cancelled", "expired"}
 
 
 class SharedPilotControlPlane:
-    """Minimal two-slot loopback protocol with project-local release."""
+    """Minimal bounded-N loopback protocol with project-local release.
 
-    def __init__(self) -> None:
+    The existing 1:2 pilot uses the default of two.  The generic node-local
+    canary may pass a different bound later without duplicating lifecycle
+    logic; production must still cap it at the largest separately validated N.
+    """
+
+    def __init__(self, max_projects: int = 2) -> None:
         import secrets
 
+        if int(max_projects) < 1:
+            raise ValueError("max_projects must be positive")
+
         self.lock = threading.RLock()
+        self.max_projects = int(max_projects)
         self.bootstrap_token = secrets.token_urlsafe(24)
         self.host_token = secrets.token_urlsafe(24)
         self.session = {
@@ -152,7 +161,7 @@ class SharedPilotControlPlane:
 
     def _all_projects_closed(self) -> bool:
         return (
-            len(self.leases) == 2
+            len(self.leases) == self.max_projects
             and all(
                 lease["state"] in TERMINAL_LEASE_STATES
                 for lease in self.leases.values()
@@ -177,8 +186,10 @@ class SharedPilotControlPlane:
                         project_name=str(payload.get("project_name") or ""),
                     )
                     return 409, {"detail": "pilot Desktop is quarantined"}
-                if len(self.leases) >= 2:
-                    return 409, {"detail": "pilot permits exactly two leases"}
+                if len(self.leases) >= self.max_projects:
+                    return 409, {
+                        "detail": f"pilot permits at most {self.max_projects} leases"
+                    }
                 if payload.get("exclusive_session") is not False:
                     return 422, {"detail": "1:2 pilot requires exclusive_session=false"}
                 lease_id = len(self.leases) + 1
