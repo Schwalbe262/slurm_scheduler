@@ -644,6 +644,14 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("module load ansys", script)
         self.assertIn("ansys -b -i input.dat", script)
 
+    def test_task_script_exports_explicit_aedt_backend(self) -> None:
+        standalone = build_task_script({"remote_cwd": "~/case", "command": "true"})
+        pooled = build_task_script(
+            {"remote_cwd": "~/case", "command": "true", "aedt_backend": "pooled"}
+        )
+        self.assertIn("export MFT_AEDT_BACKEND=standalone", standalone)
+        self.assertIn("export MFT_AEDT_BACKEND=pooled", pooled)
+
     def test_task_script_exports_git_ssh_command(self) -> None:
         script = build_task_script(
             {
@@ -8198,6 +8206,7 @@ class ProjectApiTests(unittest.TestCase):
         )
         self.list_tasks = self._route_endpoint("/api/tasks", "GET")
         self.get_task = self._route_endpoint("/api/tasks/{task_id}", "GET")
+        self.create_task = self._route_endpoint("/api/tasks", "POST")
         self.task_capacity = self._route_endpoint("/api/task-capacity", "GET")
 
     def tearDown(self) -> None:
@@ -8243,6 +8252,77 @@ class ProjectApiTests(unittest.TestCase):
         updated = self._post_project({"name": "motor", "max_active_tasks": "9"})
         self.assertEqual(updated["max_active_tasks"], 9)
         self.assertEqual(self.get_project("motor")["max_active_tasks"], 9)
+
+    def test_aedt_backend_defaults_and_task_api_round_trip(self) -> None:
+        standalone = asyncio.run(
+            self.create_task(self._request({"name": "standalone", "remote_cwd": "~/w", "command": "true"}))
+        )
+        self.assertEqual(json.loads(standalone.body)["aedt_backend"], "standalone")
+
+        pooled = asyncio.run(
+            self.create_task(
+                self._request(
+                    {
+                        "name": "pooled",
+                        "remote_cwd": "~/w",
+                        "command": "true",
+                        "scheduling_profile": "fea_bursty",
+                        "aedt_backend": "pooled",
+                    }
+                )
+            )
+        )
+        payload = json.loads(pooled.body)
+        self.assertEqual(payload["aedt_backend"], "pooled")
+        self.assertEqual(self.get_task(payload["id"], include_output=False)["aedt_backend"], "pooled")
+
+    def test_project_aedt_backend_is_inherited_and_invalid_task_value_is_rejected(self) -> None:
+        project = self._post_project({"name": "motor", "aedt_backend": "pooled"})
+        self.assertEqual(project["aedt_backend"], "pooled")
+        response = asyncio.run(
+            self.create_task(
+                self._request(
+                    {
+                        "name": "campaign-task",
+                        "project": "motor",
+                        "remote_cwd": "~/w",
+                        "command": "true",
+                        "scheduling_profile": "fea_bursty",
+                    }
+                )
+            )
+        )
+        self.assertEqual(json.loads(response.body)["aedt_backend"], "pooled")
+
+        from fastapi import HTTPException
+
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(
+                self.create_task(
+                    self._request(
+                        {
+                            "name": "invalid",
+                            "remote_cwd": "~/w",
+                            "command": "true",
+                            "aedt_backend": "shared",
+                        }
+                    )
+                )
+            )
+        self.assertEqual(raised.exception.status_code, 422)
+
+    def test_pooled_backend_queue_diagnostics_fail_closed_until_pool_is_operational(self) -> None:
+        scheduler = self.app.state.scheduler
+        task = {
+            "id": 77,
+            "status": "queued",
+            "aedt_backend": "pooled",
+            "scheduling_profile": "fea_bursty",
+        }
+        scheduler.set_aedt_backend_admission_checker(lambda _task: (False, "canary gate closed"))
+        diagnostics = scheduler.task_queue_diagnostics(task)
+        self.assertEqual(diagnostics["queue_state"], "blocked")
+        self.assertEqual(diagnostics["queue_reason"], "AEDT backend: canary gate closed")
 
     def test_project_api_rejects_invalid_max_active_tasks(self) -> None:
         from fastapi import HTTPException

@@ -28,6 +28,7 @@
         <tr><th>Environment setup</th><td class="mono-cell"><pre>{{ task.env_setup or "" }}</pre></td></tr>
         <tr><th>Capability / Profile</th><td>{{ task.required_capability or "" }} / {{ task.env_profile or "" }}</td></tr>
         <tr><th>Scheduling profile</th><td>{{ task.scheduling_profile or "standard" }}</td></tr>
+        <tr><th>AEDT backend</th><td>{{ task.aedt_backend or "standalone" }}</td></tr>
         <tr><th>CPU / Memory</th><td>{{ task.cpus }} CPUs / {{ task.memory_mb }} MB</td></tr>
         <tr><th>GPU</th><td>{{ task.gpus or 0 }} {{ task.gpu_model or "" }}</td></tr>
         <tr><th>Partition / Requested node</th><td>{{ task.partition or "" }} / {{ task.requested_node_name or "" }}</td></tr>

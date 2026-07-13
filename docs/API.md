@@ -252,6 +252,7 @@ Form fields:
 - `cpus`: CPU cores requested from an allocation.
 - `memory_mb`: memory requested from an allocation. This is a scheduling/reservation and possible Slurm enforcement limit; it does not physically allocate RAM before the process uses it.
 - `scheduling_profile`: `standard` keeps the existing hard CPU/memory slot accounting and per-step `--mem` ceiling. `fea_bursty` gives each overlapping step the allocation CPU pool, omits a per-step `--mem` reservation so workers share the parent allocation memory pool, and treats `memory_mb` as peak/safety metadata. New FEA attaches require fresh `pestat` CPU/Freemem data, preserve configured soft/hard memory floors, and reserve a conservative young-worker growth estimate. The allocation-owned 1x CPU baseline fast-fills up to `max_attach_per_node_per_loop`; only overcommit workers ramp by at most two per physical node per scheduler tick, with a hard 2x allocation CPU cap.
+- `aedt_backend`: independent of `scheduling_profile`; `standalone` is the backward-compatible default and `pooled` requests an admitted AEDT attach session. Project tasks inherit the project's backend unless the task specifies one. Pooled work remains queued with a backend diagnostic while the pool is not operational.
 - `gpus`: GPU count, normally `0` or `1`.
 - `gpu_model`: optional normalized model such as `a6000ada` or `a6000`. Ordered candidates such as `a6000ada,a6000` are accepted.
 - `partition`: `auto` or a specific Slurm partition.

@@ -224,6 +224,14 @@
         </div>
 
         <div>
+          <label for="task_aedt_backend">AEDT backend</label>
+          <select id="task_aedt_backend" name="aedt_backend">
+            <option value="standalone">standalone</option>
+            <option value="pooled">pooled attach</option>
+          </select>
+        </div>
+
+        <div>
           <label for="task_gpus">GPUs</label>
           <input id="task_gpus" name="gpus" type="number" min="0" value="0">
         </div>
@@ -644,6 +652,11 @@
             <input id="project_output_globs" name="output_globs" placeholder="*_result.csv, *.csv">
             <label for="project_sim_subdir">Sim 하위폴더</label>
             <input id="project_sim_subdir" name="sim_subdir" value="simulation">
+            <label for="project_aedt_backend">AEDT backend</label>
+            <select id="project_aedt_backend" name="aedt_backend">
+              <option value="standalone">standalone</option>
+              <option value="pooled">pooled attach</option>
+            </select>
             <label style="display:block;margin-top:8px;"><input type="checkbox" name="auto_pull" value="1"> 매 실행 전 자동 git pull</label>
             <p><button type="submit">저장</button></p>
           </div>
