@@ -8966,6 +8966,7 @@ class WatchdogTests(unittest.TestCase):
 
     def test_watchdog_two_stage_escalation(self) -> None:
         scheduler = self.make_scheduler()
+        scheduler.record_event = mock.Mock()
         scheduler._tick_seq = 7
         scheduler._tick_started_at = time.monotonic() - 10
         suspect = scheduler._watchdog_check_once(-1)
@@ -8974,6 +8975,7 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(self.exits, [])
         suspect = scheduler._watchdog_check_once(suspect)
         self.assertEqual(self.exits, [70])
+        scheduler.record_event.assert_not_called()
 
     def test_watchdog_resets_when_new_tick_stalls(self) -> None:
         scheduler = self.make_scheduler()

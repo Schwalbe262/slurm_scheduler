@@ -38,8 +38,18 @@
   deliberate timeout fault test with sibling completion mandatory for enablement.
 - See `docs/aedt_pool.md` and `docs/aedt_pool_runbook.md`.
 - Added a parent TCP-listener watchdog for the 03:16 WinError 64 incident; it
-  restarts a wedged Uvicorn child without cancelling Slurm allocations. See
+  detects a wedged Uvicorn child without cancelling Slurm allocations. See
   `docs/incident_web_listener_winerror64.md`.
+
+## 2026-07-13 (Codex) - Single scheduler restart authority
+- The Python listener monitor now exits with its only worker instead of
+  self-spawning replacement scheduler generations; `start_web.cmd` or the
+  platform service supervisor is the sole restart authority.
+- Python rejects an already-live configured listener and atomically reserves
+  the Windows endpoint before application/DB startup; the Windows launcher
+  also waits while `0.0.0.0:8000` is owned.
+- The scheduler watchdog no longer re-enters SQLite while escalating a stall,
+  so its terminal path reaches `os._exit` even when the database is wedged.
 
 ## 2026-07-13 (Codex) - Node-local AEDT host-owned placement
 - Added durable `requested_allocation_id` task placement so a node-local AEDT

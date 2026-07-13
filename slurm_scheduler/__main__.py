@@ -4,12 +4,18 @@ import logging
 import logging.handlers
 import os
 import signal
+import socket
 from pathlib import Path
 
 import uvicorn
 
 from .config import load_app_config
-from .web_supervisor import WebWorkerSupervisor
+from .web_supervisor import WebWorkerSupervisor, probe_listener
+
+
+LOGGER = logging.getLogger(__name__)
+DUPLICATE_LISTENER_EXIT_CODE = 98
+UVICORN_STARTUP_FAILURE_EXIT_CODE = 3
 
 
 def configure_logging(log_filename: str = "scheduler.log") -> None:
@@ -35,16 +41,56 @@ def configure_logging(log_filename: str = "scheduler.log") -> None:
         pass
 
 
+def _reserve_listener(host: str, port: int) -> socket.socket:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    listener = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        # Uvicorn's SO_REUSEADDR bind can admit identical pre-listen binds on
+        # Windows.  A plain socket reserves this exact endpoint exclusively
+        # while still coexisting with address-specific Tailscale listeners.
+        if os.name != "nt":
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((host, int(port)))
+        return listener
+    except OSError:
+        listener.close()
+        raise
+
+
 def run_uvicorn_worker(config) -> None:
-    uvicorn.run(
-        "slurm_scheduler.app:app",
-        host=config.bind_host,
-        port=config.bind_port,
-        reload=False,
-        timeout_keep_alive=max(1, int(config.web_timeout_keep_alive_seconds or 5)),
-        timeout_graceful_shutdown=max(1, int(config.web_timeout_graceful_shutdown_seconds or 15)),
-        limit_concurrency=max(1, int(config.web_limit_concurrency or 64)),
-    )
+    try:
+        listener = _reserve_listener(config.bind_host, config.bind_port)
+    except OSError as exc:
+        LOGGER.error(
+            "cannot bind listener %s:%s; refusing duplicate scheduler generation: %s",
+            config.bind_host,
+            config.bind_port,
+            exc,
+        )
+        raise SystemExit(DUPLICATE_LISTENER_EXIT_CODE) from None
+
+    server = None
+    try:
+        uvicorn_config = uvicorn.Config(
+            "slurm_scheduler.app:app",
+            host=config.bind_host,
+            port=config.bind_port,
+            reload=False,
+            timeout_keep_alive=max(1, int(config.web_timeout_keep_alive_seconds or 5)),
+            timeout_graceful_shutdown=max(
+                1, int(config.web_timeout_graceful_shutdown_seconds or 15)
+            ),
+            limit_concurrency=max(1, int(config.web_limit_concurrency or 64)),
+        )
+        server = uvicorn.Server(uvicorn_config)
+        try:
+            server.run(sockets=[listener])
+        except KeyboardInterrupt:
+            pass
+    finally:
+        listener.close()
+    if server is not None and not server.started:
+        raise SystemExit(UVICORN_STARTUP_FAILURE_EXIT_CODE)
 
 
 def main() -> None:
@@ -56,6 +102,17 @@ def main() -> None:
         if worker_mode or not config.web_listener_watchdog_enabled
         else "web-supervisor.log"
     )
+    if probe_listener(
+        config.bind_host,
+        config.bind_port,
+        config.web_listener_probe_timeout_seconds,
+    ):
+        LOGGER.error(
+            "listener %s:%s is already active; refusing to start a duplicate scheduler generation",
+            config.bind_host,
+            config.bind_port,
+        )
+        raise SystemExit(DUPLICATE_LISTENER_EXIT_CODE)
     if worker_mode or not config.web_listener_watchdog_enabled:
         run_uvicorn_worker(config)
         return
@@ -66,7 +123,6 @@ def main() -> None:
         startup_grace_seconds=config.web_listener_startup_grace_seconds,
         failure_threshold=config.web_listener_failure_threshold,
         probe_timeout_seconds=config.web_listener_probe_timeout_seconds,
-        restart_delay_seconds=config.web_listener_restart_delay_seconds,
     )
     signal.signal(signal.SIGTERM, supervisor.request_stop)
     signal.signal(signal.SIGINT, supervisor.request_stop)

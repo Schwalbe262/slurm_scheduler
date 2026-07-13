@@ -58,7 +58,6 @@ class AppConfig:
     web_listener_startup_grace_seconds: int = 30
     web_listener_failure_threshold: int = 3
     web_listener_probe_timeout_seconds: int = 2
-    web_listener_restart_delay_seconds: int = 5
     ssh_command_timeout_seconds: int = 30
     ssh_slow_command_timeout_seconds: int = 300
     scheduler_watchdog_enabled: bool = True

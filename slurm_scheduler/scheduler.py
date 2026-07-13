@@ -675,17 +675,11 @@ class Scheduler:
             )
             self._dump_scheduler_stack()
             self._tick_sessions_force_close()
-            self.record_event(
-                "watchdog", f"tick {seq} stalled for {int(stalled_for)}s; SSH transports force-closed"
-            )
             return seq
         LOGGER.critical(
             "scheduler tick %s still stalled after transport close (%.0fs); exiting for supervisor restart",
             seq,
             stalled_for,
-        )
-        self.record_event(
-            "watchdog", f"tick {seq} still stalled after transport close; exiting for supervisor restart"
         )
         self._watchdog_exit(70)
         return seq

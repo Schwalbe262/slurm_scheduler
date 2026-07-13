@@ -45,13 +45,12 @@ class ListenerFailureGate:
 
 
 class WebWorkerSupervisor:
-    """Keep a replaceable Uvicorn worker behind a stable parent process.
+    """Monitor one Uvicorn worker from a stable parent process.
 
-    A worker restart does not cancel Slurm allocations or remote task steps;
-    those are durable in SQLite/Slurm and are reconciled by the replacement
-    worker.  This watchdog exists for failures where the Python PID survives
-    but the Windows TCP listener disappears (for example WinError 64 in the
-    accept path), which the scheduler tick watchdog cannot observe.
+    The external service launcher is the only restart authority.  This parent
+    detects failures where the worker PID survives but the Windows TCP listener
+    disappears (for example WinError 64 in the accept path), terminates that
+    worker, and exits so the launcher can start one complete new generation.
     """
 
     def __init__(
@@ -63,7 +62,6 @@ class WebWorkerSupervisor:
         startup_grace_seconds: float = 30.0,
         failure_threshold: int = 3,
         probe_timeout_seconds: float = 2.0,
-        restart_delay_seconds: float = 5.0,
         probe: Callable[[str, int, float], bool] = probe_listener,
     ) -> None:
         self.host = host
@@ -72,7 +70,6 @@ class WebWorkerSupervisor:
         self.startup_grace_seconds = max(1.0, float(startup_grace_seconds))
         self.failure_threshold = max(1, int(failure_threshold))
         self.probe_timeout_seconds = max(0.1, float(probe_timeout_seconds))
-        self.restart_delay_seconds = max(0.0, float(restart_delay_seconds))
         self.probe = probe
         self.stop_requested = False
         self.child: subprocess.Popen | None = None
@@ -99,39 +96,45 @@ class WebWorkerSupervisor:
         return subprocess.Popen(command, env=env)
 
     def run(self) -> int:
-        while not self.stop_requested:
-            child = self._spawn()
-            self.child = child
-            gate = ListenerFailureGate(self.failure_threshold)
-            started = time.monotonic()
-            while not self.stop_requested and child.poll() is None:
-                age = time.monotonic() - started
-                healthy = self.probe(self.host, self.port, self.probe_timeout_seconds)
-                if healthy:
-                    gate.observe(True)
-                elif age >= self.startup_grace_seconds:
-                    restart = gate.observe(False)
-                    restart = restart or (
-                        not gate.was_healthy
-                        and gate.consecutive_failures >= self.failure_threshold
+        if self.stop_requested:
+            return 0
+        child = self._spawn()
+        self.child = child
+        gate = ListenerFailureGate(self.failure_threshold)
+        started = time.monotonic()
+        listener_failed = False
+        while not self.stop_requested and child.poll() is None:
+            age = time.monotonic() - started
+            healthy = self.probe(self.host, self.port, self.probe_timeout_seconds)
+            if healthy:
+                gate.observe(True)
+            elif age >= self.startup_grace_seconds:
+                listener_failed = gate.observe(False)
+                listener_failed = listener_failed or (
+                    not gate.was_healthy
+                    and gate.consecutive_failures >= self.failure_threshold
+                )
+                if listener_failed:
+                    LOGGER.error(
+                        "web worker PID %s is alive but listener %s:%s is unavailable for %s probes; stopping generation for external supervisor restart",
+                        child.pid,
+                        self.host,
+                        self.port,
+                        gate.consecutive_failures,
                     )
-                    if restart:
-                        LOGGER.error(
-                            "web worker PID %s is alive but listener %s:%s is unavailable for %s probes; restarting child only",
-                            child.pid,
-                            self.host,
-                            self.port,
-                            gate.consecutive_failures,
-                        )
-                        self._terminate(child)
-                        break
-                if child.poll() is None:
-                    time.sleep(self.probe_interval_seconds)
-            if self.stop_requested:
-                self._terminate(child)
-                return 0
-            exit_code = child.poll()
-            LOGGER.warning("web worker PID %s exited with code %s", child.pid, exit_code)
-            if self.restart_delay_seconds:
-                time.sleep(self.restart_delay_seconds)
-        return 0
+                    self._terminate(child)
+                    break
+            if child.poll() is None:
+                time.sleep(self.probe_interval_seconds)
+        if self.stop_requested:
+            self._terminate(child)
+            return 0
+        exit_code = child.poll()
+        LOGGER.warning(
+            "web worker PID %s exited with code %s; exiting parent for external supervisor restart",
+            child.pid,
+            exit_code,
+        )
+        if listener_failed:
+            return 70
+        return int(exit_code) if exit_code is not None else 1

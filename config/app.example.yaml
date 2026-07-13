@@ -16,7 +16,6 @@ web_listener_probe_interval_seconds: 5
 web_listener_startup_grace_seconds: 30
 web_listener_failure_threshold: 3
 web_listener_probe_timeout_seconds: 2
-web_listener_restart_delay_seconds: 5
 cluster_refresh_interval_seconds: 120
 min_warm_allocations: 1
 allocation_partition: "auto"
