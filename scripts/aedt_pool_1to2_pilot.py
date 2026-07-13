@@ -742,12 +742,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    exit_code = main()
-    # PyAEDT may retain a non-daemon session-registry thread after two
-    # sequential Desktop lifecycles even though both exact PIDs and license
-    # checkouts are already gone.  Evidence and all finally cleanup are
-    # complete when main returns; use a bounded process exit so the disposable
-    # scheduler task cannot occupy its project-cap slot until timeout.
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(exit_code)
+    raise SystemExit(main())

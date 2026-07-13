@@ -63,12 +63,6 @@ python scripts/aedt_pool_1to2_pilot.py \
 `passed=true`, two valid normal results, one valid abort sibling result, both
 project-close ACKs per case, and license cleanup is not a pass.
 
-After evidence and both Desktop/license cleanup sequences finish, the
-entrypoint uses a bounded process exit because two sequential PyAEDT sessions
-can leave an internal non-daemon registry thread alive. This thread is not a
-Desktop or solver and must not hold the scheduler project-cap slot until the
-task timeout.
-
 ## WEB/operator limits
 
 `/aedt-pool` exposes three durable settings:
