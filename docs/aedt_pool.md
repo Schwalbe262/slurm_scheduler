@@ -10,10 +10,13 @@
 > clone, never in the dirty live scheduler tree.  Deployment must use an
 > identified GitHub branch and exact commit SHA on cluster-local storage.
 
-> **Current integration gate:** exclusive 1:1 passed in task 30089. Shared 1:2
-> remains an isolated pilot described in
-> [MFT shared AEDT 1:2 pilot](mft_aedt_attach_1to2.md). It does not authorize
-> the 250/500 target until its real evidence passes and is reviewed.
+> **Current integration gate:** exclusive 1:1 passed in task 30089. The
+> corrected shared 1:2 normal and pre-solve-abort cases passed in task 30445,
+> as recorded in
+> [MFT shared AEDT 1:2 result](mft_aedt_attach_1to2_result_30445.md). Active
+> solve timeout/recycle, cancel/crash recovery, and the complete baseline
+> parity/runtime/license contract remain open. The task 30445 result does not
+> authorize the 250/500 target.
 
 ## 목적과 범위
 

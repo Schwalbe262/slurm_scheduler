@@ -5,7 +5,11 @@ control plane.  It never enables or marks the production AEDT pool ready.
 Case ``normal`` requires two concurrent Matrix-only MFT clients to attach to
 one Desktop and produce independent valid terminal rows.  Case ``abort``
 stops client A while it is intentionally hung before solve, reports a
-project-local pre-solve fault, and requires sibling B to remain valid.
+project-local pre-solve fault, and requires sibling B to remain valid.  The
+separately selected ``timeout`` case waits until both Maxwell solver checkouts
+are visible, stops only client A (never a solver PID), quarantines the
+disposable Desktop, and requires sibling B to produce a terminal result before
+the host recycles that Desktop.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +48,7 @@ from slurm_scheduler.aedt_session_host import (  # noqa: E402
     AedtSessionHost,
     ControlPlaneClient,
 )
+from slurm_scheduler.aedt_attach_client import AedtPoolHttpClient  # noqa: E402
 
 
 TERMINAL_LEASE_STATES = {"released", "failed", "cancelled", "expired"}
@@ -69,6 +75,10 @@ class SharedPilotControlPlane:
         self.project_close_acks: dict[int, bool] = {}
         self.closed_ack = False
         self.events: list[dict[str, Any]] = []
+        self.quarantine_reason = ""
+        self.timeout_owner_lease_id = 0
+        self.requeued_lease_ids: list[int] = []
+        self.rejected_after_quarantine = 0
 
     def event(self, name: str, **values: Any) -> None:
         self.events.append({"time": _now(), "event": name, **values})
@@ -105,6 +115,32 @@ class SharedPilotControlPlane:
             )
             return int(lease["id"])
 
+    def report_solver_timeout(self, project_name: str) -> int:
+        """Quarantine a live solve without pretending it can be stopped locally."""
+        with self.lock:
+            matches = [
+                lease for lease in self.leases.values()
+                if lease.get("project_name") == project_name
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"expected one timeout project {project_name!r}, found {len(matches)}"
+                )
+            lease = matches[0]
+            if lease["state"] not in {"leased", "active"}:
+                raise RuntimeError(f"timeout lease is {lease['state']}")
+            lease["state"] = "releasing"
+            lease["failure_message"] = "solver timeout injection while solve was active"
+            self.timeout_owner_lease_id = int(lease["id"])
+            self.quarantine_reason = "solver_timeout"
+            self.session["state"] = "draining"
+            self.event(
+                "solver_timeout_reported",
+                lease_id=lease["id"],
+                project_name=project_name,
+            )
+            return int(lease["id"])
+
     def _public_lease(self, lease_id: int) -> dict[str, Any]:
         return dict(self.leases[lease_id])
 
@@ -134,6 +170,13 @@ class SharedPilotControlPlane:
 
         with self.lock:
             if method == "POST" and path == "/api/aedt-pool/leases":
+                if self.quarantine_reason:
+                    self.rejected_after_quarantine += 1
+                    self.event(
+                        "lease_rejected_after_quarantine",
+                        project_name=str(payload.get("project_name") or ""),
+                    )
+                    return 409, {"detail": "pilot Desktop is quarantined"}
                 if len(self.leases) >= 2:
                     return 409, {"detail": "pilot permits exactly two leases"}
                 if payload.get("exclusive_session") is not False:
@@ -223,8 +266,11 @@ class SharedPilotControlPlane:
                     return 200, dict(lease)
                 if method == "POST" and suffix == "/fault":
                     kind = str(payload.get("fault_kind") or "")
+                    if kind == "solver_timeout":
+                        self.report_solver_timeout(str(lease.get("project_name") or ""))
+                        return 200, dict(lease)
                     if kind not in {"pre_solve", "script_error"}:
-                        return 409, {"detail": "live 1:2 pilot accepts only project-local faults"}
+                        return 409, {"detail": "unsupported pilot fault"}
                     lease["state"] = "releasing"
                     lease["failure_message"] = str(payload.get("failure_message") or kind)
                     self.event("fault_reported", lease_id=lease_id, kind=kind)
@@ -240,13 +286,30 @@ class SharedPilotControlPlane:
                     close_projects = [
                         dict(lease) for lease in self.leases.values()
                         if lease["state"] == "releasing"
+                        and int(lease["id"]) != self.timeout_owner_lease_id
                     ]
+                    deferred_projects = [
+                        dict(lease) for lease in self.leases.values()
+                        if lease["state"] == "releasing"
+                        and int(lease["id"]) == self.timeout_owner_lease_id
+                    ]
+                    sibling_live = self._live_siblings()
+                    global_stop_allowed = bool(
+                        self.quarantine_reason and sibling_live == 0
+                    )
+                    if global_stop_allowed and not any(
+                        event["event"] == "global_stop_allowed"
+                        for event in self.events
+                    ):
+                        self.event("global_stop_allowed")
                     return 200, {
                         "close_projects": close_projects,
-                        "deferred_projects": [],
-                        "drain": self._all_projects_closed(),
-                        "sibling_live_count": self._live_siblings(),
-                        "global_stop_allowed": False,
+                        "deferred_projects": deferred_projects,
+                        "drain": bool(self.quarantine_reason) or self._all_projects_closed(),
+                        "quarantine_reason": self.quarantine_reason,
+                        "sibling_live_count": sibling_live,
+                        "global_stop_allowed": global_stop_allowed,
+                        "recycle_after_global_stop": global_stop_allowed,
                     }
                 release_match = re.fullmatch(r"/leases/(\d+)/release-complete", suffix)
                 if method == "POST" and release_match:
@@ -262,6 +325,11 @@ class SharedPilotControlPlane:
                     return 200, self._public_lease(lease_id)
                 if method == "POST" and suffix == "/closed":
                     success = payload.get("success") is True
+                    if not success and payload.get("requeue_siblings") is True:
+                        for lease in self.leases.values():
+                            if lease["state"] in {"leased", "active", "releasing"}:
+                                lease["state"] = "queued"
+                                self.requeued_lease_ids.append(int(lease["id"]))
                     self.session["state"] = "closed" if success else "failed"
                     self.closed_ack = True
                     self.event("desktop_closed_ack", success=success)
@@ -458,6 +526,34 @@ def _run_case(
             _terminate(runners["A"]["run"])
             aborted_lease_id = state.abort_pre_solve(str(marker_data["project_name"]))
             injected = True
+        if case == "timeout" and len(owned_solver) >= 2 and not injected:
+            project_a = str(state.leases.get(1, {}).get("project_name") or "")
+            if not project_a or len(state.leases) != 2:
+                raise RuntimeError(
+                    "two solver checkouts appeared before both pilot projects were bound"
+                )
+            # Kill only the disposable Python client.  The owned AEDT and its
+            # solver children remain under the session host so this exercises
+            # quarantine/grace/recycle without repeating the unsafe direct
+            # solver-PID kill experiment.
+            _terminate(runners["A"]["run"])
+            aborted_lease_id = state.report_solver_timeout(project_a)
+            try:
+                AedtPoolHttpClient(scheduler_url).request(
+                    "POST",
+                    "/api/aedt-pool/leases",
+                    {
+                        "request_key": "timeout-quarantine-probe-C",
+                        "project_name": "quarantine-probe-C",
+                        "exclusive_session": False,
+                    },
+                )
+            except urllib.error.HTTPError as error:
+                if error.code != 409:
+                    raise
+            else:
+                raise RuntimeError("quarantined pilot Desktop admitted project C")
+            injected = True
         if time.monotonic() > deadline:
             state.force_drain(f"1:2 {case} pilot timeout")
             for item in runners.values():
@@ -475,9 +571,9 @@ def _run_case(
     for label, item in runners.items():
         stdout = item["stdout_path"].read_text(encoding="utf-8", errors="replace")
         returncode = int(item["run"].returncode)
-        if case == "abort" and label == "A":
+        if case in {"abort", "timeout"} and label == "A":
             if returncode == 0:
-                failures.append("abort_A_unexpected_success")
+                failures.append(f"{case}_A_unexpected_success")
             continue
         if returncode != 0:
             failures.append(f"runner_{label}_exit={returncode}")
@@ -501,11 +597,16 @@ def _run_case(
             failures.append("normal_project_names_not_distinct")
         if solver_peak < 2:
             failures.append(f"maxwell_solver_peak={solver_peak}<2")
-    else:
+    elif case == "abort":
         if not injected or aborted_lease_id is None:
             failures.append("pre_solve_abort_not_injected")
         if set(results) != {"B"}:
             failures.append(f"abort_terminal_result_labels={sorted(results)}")
+    else:
+        if not injected or aborted_lease_id is None:
+            failures.append("solver_timeout_not_injected")
+        if set(results) != {"B"}:
+            failures.append(f"timeout_terminal_result_labels={sorted(results)}")
 
     return {
         "case": case,
@@ -516,6 +617,12 @@ def _run_case(
             label: int(item["run"].returncode) for label, item in runners.items()
         },
         "aborted_lease_id": aborted_lease_id,
+        "timeout_injected_during_two_solver_checkouts": bool(
+            case == "timeout" and injected and solver_peak >= 2
+        ),
+        "new_lease_rejected_after_quarantine": bool(
+            case == "timeout" and state.rejected_after_quarantine > 0
+        ),
         "desktop_checkout_seen": desktop_checkout_seen,
         "maxwell_solver_feature": solver_feature,
         "maxwell_solver_peak": solver_peak,
@@ -534,7 +641,7 @@ def _cleanup_project_workspaces(case_result: dict[str, Any]) -> list[str]:
         project_dir = Path(roots[label]) / "simulation" / project_name
         if project_name and project_dir.exists():
             failures.append(f"runner_{label}_workspace_not_cleaned")
-    if case_result.get("case") == "abort":
+    if case_result.get("case") in {"abort", "timeout"}:
         root = Path(roots["A"]) / "simulation"
         if root.exists():
             for project_dir in root.glob("simulation*"):
@@ -576,7 +683,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--license-server", required=True)
     parser.add_argument("--solver-license-feature", default="elec_solve_maxwell")
     parser.add_argument("--license-return-wait-seconds", type=int, default=180)
+    parser.add_argument(
+        "--cases",
+        default="normal,abort",
+        help="comma-separated subset of normal,abort,timeout",
+    )
     args = parser.parse_args(argv)
+
+    selected_cases = [item.strip() for item in args.cases.split(",") if item.strip()]
+    invalid_cases = sorted(set(selected_cases) - {"normal", "abort", "timeout"})
+    if not selected_cases or invalid_cases or len(selected_cases) != len(set(selected_cases)):
+        parser.error(
+            "--cases must be a non-empty, duplicate-free subset of normal,abort,timeout"
+        )
 
     output = Path(args.output_dir).resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -593,7 +712,7 @@ def main(argv: list[str] | None = None) -> int:
     host = None
     host_thread = None
     try:
-        for case in ("normal", "abort"):
+        for case in selected_cases:
             state = SharedPilotControlPlane()
             case_states.append(state)
             server, _server_thread, scheduler_url = start_control_plane(state)
@@ -616,14 +735,38 @@ def main(argv: list[str] | None = None) -> int:
             host_thread.join(timeout=300)
             if host_thread.is_alive():
                 case_result["failures"].append("session_host_did_not_exit")
-            if host_result != [0]:
+            expected_host_result = [2] if case == "timeout" else [0]
+            if host_result != expected_host_result:
                 case_result["failures"].append(f"session_host_exit={host_result!r}")
-            if state.session.get("state") != "closed" or not state.closed_ack:
+            expected_session_state = "failed" if case == "timeout" else "closed"
+            if state.session.get("state") != expected_session_state or not state.closed_ack:
                 case_result["failures"].append("desktop_close_ack_missing")
-            if set(state.project_close_acks) != {1, 2} or not all(state.project_close_acks.values()):
+            expected_close_acks = {2} if case == "timeout" else {1, 2}
+            if (
+                set(state.project_close_acks) != expected_close_acks
+                or not all(state.project_close_acks.values())
+            ):
                 case_result["failures"].append(
                     f"project_close_acks={state.project_close_acks!r}"
                 )
+            if case == "timeout":
+                if state.timeout_owner_lease_id in state.project_close_acks:
+                    case_result["failures"].append("timeout_owner_locally_closed")
+                if state.requeued_lease_ids != [state.timeout_owner_lease_id]:
+                    case_result["failures"].append(
+                        f"timeout_owner_requeued={state.requeued_lease_ids!r}"
+                    )
+                event_names = [event["event"] for event in state.events]
+                try:
+                    sibling_release = max(
+                        index for index, event in enumerate(state.events)
+                        if event["event"] == "release_requested" and event.get("lease_id") == 2
+                    )
+                    global_stop = event_names.index("global_stop_allowed")
+                    if global_stop <= sibling_release:
+                        case_result["failures"].append("global_stop_preceded_sibling_completion")
+                except (ValueError, StopIteration):
+                    case_result["failures"].append("timeout_recycle_event_order_missing")
             if process_alive(str(state.session.get("process_id") or "")):
                 case_result["failures"].append("desktop_process_still_alive")
             case_result["failures"].extend(_cleanup_project_workspaces(case_result))
@@ -669,6 +812,29 @@ def main(argv: list[str] | None = None) -> int:
                 case_result["failures"].append("desktop_checkout_not_returned")
             if not solver_returned:
                 case_result["failures"].append("maxwell_solver_checkout_not_returned")
+            if case == "timeout":
+                sibling = (case_result.get("results") or {}).get("B") or {}
+                case_result.update({
+                    "sibling_terminal_output_passed": bool(sibling),
+                    "sibling_data_rows_passed": int(sibling.get("result_valid_em") or 0) == 1,
+                    "sibling_field_solution_passed": (
+                        int(sibling.get("matrix_solution_queries") or 0) >= 1
+                        and float(sibling.get("Llt") or 0.0) > 0.0
+                    ),
+                    "fault_checkout_released_after_recycle_passed": solver_returned,
+                    "faulted_desktop_not_reused_passed": bool(
+                        case_result.get("new_lease_rejected_after_quarantine")
+                    ),
+                })
+                for key in (
+                    "sibling_terminal_output_passed",
+                    "sibling_data_rows_passed",
+                    "sibling_field_solution_passed",
+                    "fault_checkout_released_after_recycle_passed",
+                    "faulted_desktop_not_reused_passed",
+                ):
+                    if not case_result[key]:
+                        case_result["failures"].append(key)
             case_result["passed"] = not case_result["failures"]
             case_result["lease_states"] = {
                 str(key): value["state"] for key, value in state.leases.items()
@@ -692,6 +858,7 @@ def main(argv: list[str] | None = None) -> int:
             "production_pool_enabled": False,
             "adapter_ready": False,
             "projects_per_aedt_tested": 2,
+            "selected_cases": selected_cases,
             "passed": not all_failures,
             "failures": all_failures,
             "mft_revision": args.mft_revision,

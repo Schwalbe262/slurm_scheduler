@@ -120,6 +120,91 @@ def test_shared_loopback_closes_aborted_project_without_stopping_sibling(monkeyp
         server_thread.join(timeout=3)
 
 
+def test_shared_loopback_timeout_quarantines_then_recycles_after_sibling(monkeypatch):
+    state = SharedPilotControlPlane()
+    server, server_thread, scheduler_url = start_control_plane(state)
+    desktop = FakeDesktop()
+    host = AedtSessionHost(
+        ControlPlaneClient(scheduler_url, bootstrap_token=state.bootstrap_token),
+        allocation_id=1,
+        node_name="node-test",
+        heartbeat_seconds=5,
+    )
+    host.heartbeat_seconds = 0.05
+    monkeypatch.setattr(host, "_start_desktop", lambda: desktop)
+    bounded_close_calls = []
+
+    def close_desktop(*, global_stop, timeout_seconds=30):
+        bounded_close_calls.append(global_stop)
+        host.desktop = None
+        return True
+
+    monkeypatch.setattr(host, "_bounded_close_desktop", close_desktop)
+    host_result: list[int] = []
+    host_thread = threading.Thread(target=lambda: host_result.append(host.run()))
+    host_thread.start()
+    leases = []
+    try:
+        _wait(lambda: bool(state.session["endpoint"]))
+        for label in ("A", "B"):
+            lease = acquire_project_lease(
+                scheduler_url,
+                f"pending-{label}",
+                request_key=f"unit-timeout-{label}",
+                exclusive_session=False,
+            )
+            lease.wait_until_leased(timeout_seconds=3, heartbeat_seconds=5)
+            lease.bind_project_name(f"simulation_{label}")
+            desktop.projects.append(f"simulation_{label}")
+            leases.append(lease)
+
+        leases[0].report_fault(
+            "solver_timeout",
+            failure_message="injected active-solve timeout",
+            sibling_grace_seconds=60,
+        )
+        _wait(lambda: state.quarantine_reason == "solver_timeout")
+
+        assert state.leases[1]["state"] == "releasing"
+        assert state.leases[2]["state"] == "active"
+        assert desktop.closed == []
+        assert host_thread.is_alive()
+        assert bounded_close_calls == []
+
+        with pytest.raises(urllib.error.HTTPError) as third:
+            AedtPoolHttpClient(scheduler_url).request(
+                "POST",
+                "/api/aedt-pool/leases",
+                {
+                    "request_key": "unit-timeout-C",
+                    "project_name": "simulation_C",
+                    "exclusive_session": False,
+                },
+            )
+        assert third.value.code == 409
+
+        released_b = leases[1].release(wait_seconds=5)
+        host_thread.join(timeout=3)
+
+        assert released_b["state"] == "released"
+        assert host_result == [2]
+        assert desktop.closed == ["simulation_B"]
+        assert state.project_close_acks == {2: True}
+        assert state.leases[1]["state"] == "queued"
+        assert state.requeued_lease_ids == [1]
+        assert state.closed_ack is True
+        assert bounded_close_calls == [True]
+    finally:
+        for lease in leases:
+            lease.stop_heartbeat()
+        if host_thread.is_alive():
+            state.force_drain("unit test cleanup")
+            host_thread.join(timeout=3)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=3)
+
+
 def test_shared_loopback_rejects_exclusive_or_third_lease():
     state = SharedPilotControlPlane()
     server, server_thread, scheduler_url = start_control_plane(state)

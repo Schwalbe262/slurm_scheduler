@@ -20,8 +20,10 @@ The first integration step is the exclusive 1:1 procedure in
 `priority=10000`, `project=MFT_1MW_2026v1`, and exact full Git SHAs.  It leaves
 the production pool disabled and does not satisfy the later 1:2 A/B gate.
 After that pass, use [`mft_aedt_attach_1to2.md`](mft_aedt_attach_1to2.md) for
-the isolated two-project normal and pre-solve-abort cases. The pilot remains
-one scheduler task and does not write a passing live validation automatically.
+the isolated two-project normal and pre-solve-abort cases. Those corrected
+cases passed in task 30445, but the remaining timeout/cancel/crash and full
+baseline contract still block production readiness. The pilot remains one
+scheduler task and does not write a passing live validation automatically.
 
 ## 1. Preflight
 
