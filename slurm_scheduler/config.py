@@ -117,6 +117,11 @@ class AppConfig:
     fea_alloc_util_sample_interval_seconds: int = 60
     fea_shared_memory_estimate_fraction: float = 0.25
     fea_shared_memory_min_estimate_mb: int = 8192
+    fea_adaptive_memory_relax_enabled: bool = True
+    fea_adaptive_memory_window_seconds: int = 3600
+    fea_adaptive_memory_min_coverage_seconds: int = 2700
+    fea_adaptive_memory_margin_percent: float = 5.0
+    fea_adaptive_memory_max_attach_per_tick: int = 1
     # Experimental pooled AEDT backend.  The operator-facing limit lives in
     # scheduler_settings; these fields configure the separately deployed
     # node-side session-host adapter.  Disabled is the production default.
@@ -228,6 +233,11 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
             "alloc_util_sample_interval_seconds": "fea_alloc_util_sample_interval_seconds",
             "shared_memory_estimate_fraction": "fea_shared_memory_estimate_fraction",
             "shared_memory_min_estimate_mb": "fea_shared_memory_min_estimate_mb",
+            "adaptive_memory_relax_enabled": "fea_adaptive_memory_relax_enabled",
+            "adaptive_memory_window_seconds": "fea_adaptive_memory_window_seconds",
+            "adaptive_memory_min_coverage_seconds": "fea_adaptive_memory_min_coverage_seconds",
+            "adaptive_memory_margin_percent": "fea_adaptive_memory_margin_percent",
+            "adaptive_memory_max_attach_per_tick": "fea_adaptive_memory_max_attach_per_tick",
         }
         for source, target in mapping.items():
             if source in fea_bursty:

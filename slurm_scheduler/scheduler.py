@@ -170,6 +170,11 @@ class Scheduler:
         fea_alloc_util_sample_interval_seconds: int = 60,
         fea_shared_memory_estimate_fraction: float = 0.25,
         fea_shared_memory_min_estimate_mb: int = 8192,
+        fea_adaptive_memory_relax_enabled: bool = True,
+        fea_adaptive_memory_window_seconds: int = 3600,
+        fea_adaptive_memory_min_coverage_seconds: int = 2700,
+        fea_adaptive_memory_margin_percent: float = 5.0,
+        fea_adaptive_memory_max_attach_per_tick: int = 1,
         task_refresh_max_per_tick: int = 32,
         cleanup_enabled: bool = True,
         cleanup_interval_seconds: int = 3600,
@@ -288,6 +293,23 @@ class Scheduler:
             1.0, max(0.0, float(fea_shared_memory_estimate_fraction))
         )
         self.fea_shared_memory_min_estimate_mb = max(1, int(fea_shared_memory_min_estimate_mb))
+        self.fea_adaptive_memory_relax_enabled = bool(fea_adaptive_memory_relax_enabled)
+        self.fea_adaptive_memory_window_seconds = max(300, int(fea_adaptive_memory_window_seconds))
+        self.fea_adaptive_memory_min_coverage_seconds = max(
+            0, int(fea_adaptive_memory_min_coverage_seconds)
+        )
+        self.fea_adaptive_memory_margin_percent = max(0.0, float(fea_adaptive_memory_margin_percent))
+        self.fea_adaptive_memory_max_attach_per_tick = max(
+            1, int(fea_adaptive_memory_max_attach_per_tick)
+        )
+        # hostname -> deque[(monotonic, free_memory_mb)]: rolling pestat
+        # observations backing the adaptive memory relax. In-memory only, so a
+        # web-worker restart re-arms the coverage requirement before relaxing.
+        self._node_memory_history: dict[str, deque[tuple[float, int]]] = {}
+        # hostname -> deque[monotonic]: attaches admitted while the node's
+        # memory admission came from the adaptive relax (spends its budget).
+        self._adaptive_memory_attaches: dict[str, deque[float]] = {}
+        self._tick_adaptive_memory_nodes: set[str] = set()
         self._fea_footprint_cache: tuple[int, dict[str, dict[str, float]]] | None = None
         self.fea_alloc_util_enabled = fea_alloc_util_enabled
         self.fea_alloc_util_target = min(1.0, max(0.1, float(fea_alloc_util_target)))
@@ -744,6 +766,7 @@ class Scheduler:
         self._tick_seq += 1
         self._tick_started_at = time.monotonic()
         self._tick_attach_workers_by_node.clear()
+        self._tick_adaptive_memory_nodes.clear()
         self._active_profile_sets_cache = None
         stage_seconds: dict[str, float] = {}
 
@@ -1462,6 +1485,10 @@ class Scheduler:
             "alloc_util_target": self.fea_alloc_util_target,
             "soft_memory_free_percent": self.fea_soft_memory_free_percent,
             "hard_memory_free_percent": self.fea_hard_memory_free_percent,
+            "adaptive_memory_relax_enabled": self.fea_adaptive_memory_relax_enabled,
+            "adaptive_memory_window_seconds": self.fea_adaptive_memory_window_seconds,
+            "adaptive_memory_margin_percent": self.fea_adaptive_memory_margin_percent,
+            "adaptive_memory_max_attach_per_tick": self.fea_adaptive_memory_max_attach_per_tick,
         }
 
     def refresh_allocation_utilization_if_due(self) -> None:
@@ -1897,8 +1924,10 @@ class Scheduler:
                             self.db.replace_node_inventory(parse_sinfo_nodes(sinfo.stdout))
                     pestat_result = ssh.run("pestat")
                     if pestat_result.exit_code == 0 and pestat_result.stdout.strip():
-                        self.db.replace_pestat_nodes(parse_pestat(pestat_result.stdout))
+                        pestat_nodes = parse_pestat(pestat_result.stdout)
+                        self.db.replace_pestat_nodes(pestat_nodes)
                         self._pestat_nodes_cache = None
+                        self._record_node_memory_history(pestat_nodes)
                 return
             except Exception as exc:
                 LOGGER.warning("failed to refresh cluster state through %s: %s", account.name, exc)
@@ -4178,6 +4207,15 @@ class Scheduler:
         if not node_name:
             return
         self._tick_attach_workers_by_node[node_name] = self._tick_attach_workers_by_node.get(node_name, 0) + 1
+        if node_name in self._tick_adaptive_memory_nodes:
+            # Memory admission on this node currently comes from the adaptive
+            # relax; every attach spends its observed-slack budget.
+            ledger = self._adaptive_memory_attaches.setdefault(node_name, deque())
+            now = time.monotonic()
+            ledger.append(now)
+            horizon = now - self.fea_adaptive_memory_window_seconds
+            while ledger and ledger[0] < horizon:
+                ledger.popleft()
         # New ATTACHING rows change both the pressure and young-footprint views.
         self._fea_pressures_cache = None
         self._fea_alloc_pressures_cache = None
@@ -4504,6 +4542,92 @@ class Scheduler:
                 entry["memory_mb"] += float(self.fea_shared_memory_estimate_mb(task))
         return out
 
+    def _record_node_memory_history(self, nodes: list) -> None:
+        """Rolling per-node pestat free-memory samples; the evidence base for
+        the adaptive memory relax (fea_adaptive_memory_*)."""
+        now = time.monotonic()
+        horizon = now - self.fea_adaptive_memory_window_seconds
+        for node in nodes:
+            hostname = str(getattr(node, "hostname", "") or "")
+            if not hostname:
+                continue
+            history = self._node_memory_history.setdefault(hostname, deque())
+            history.append((now, int(getattr(node, "free_memory_mb", 0) or 0)))
+        for hostname in list(self._node_memory_history):
+            history = self._node_memory_history[hostname]
+            while history and history[0][0] < horizon:
+                history.popleft()
+            if not history:
+                del self._node_memory_history[hostname]
+
+    def fea_adaptive_memory_slots(
+        self,
+        node_name: str,
+        memory_total: int,
+        soft_floor: int,
+        memory_estimate_mb: int,
+        node_tick_attaches: int,
+        trace: dict | None = None,
+    ) -> int:
+        """Evidence-based relax for a zero memory budget. The young-worker
+        reservation is a pessimistic prediction; when a full observation
+        window shows the node's worst free memory held a margin above the
+        soft floor anyway, admit a slow trickle. Every admitted worker
+        eventually shows up in pestat free memory, so the window minimum
+        walks down toward the floor and the relax shuts itself off."""
+        record = trace.update if trace is not None else (lambda _values: None)
+        if not self.fea_adaptive_memory_relax_enabled:
+            return 0
+        history = self._node_memory_history.get(node_name)
+        if not history:
+            record({"adaptive_memory_state": "no observation history yet"})
+            return 0
+        now = time.monotonic()
+        coverage = now - history[0][0]
+        if coverage < self.fea_adaptive_memory_min_coverage_seconds:
+            record(
+                {
+                    "adaptive_memory_state": "insufficient coverage",
+                    "adaptive_memory_coverage_seconds": int(coverage),
+                }
+            )
+            return 0
+        frees = [free for _, free in history]
+        min_free = min(frees)
+        avg_free = sum(frees) / len(frees)
+        margin_mb = int(memory_total * (self.fea_adaptive_memory_margin_percent / 100.0))
+        record(
+            {
+                "adaptive_memory_coverage_seconds": int(coverage),
+                "adaptive_memory_min_free_mb": int(min_free),
+                "adaptive_memory_avg_free_mb": int(avg_free),
+                "adaptive_memory_margin_mb": margin_mb,
+            }
+        )
+        if min_free < soft_floor + margin_mb or avg_free < soft_floor + 2 * margin_mb:
+            record({"adaptive_memory_state": "observed history too close to the soft floor"})
+            return 0
+        budget_mb = min_free - soft_floor - margin_mb
+        total_slots = budget_mb // max(1, int(memory_estimate_mb))
+        ledger = self._adaptive_memory_attaches.get(node_name)
+        horizon = now - self.fea_adaptive_memory_window_seconds
+        spent = sum(1 for at in ledger if at >= horizon) if ledger else 0
+        available = max(0, int(total_slots) - spent)
+        slots = max(
+            0,
+            min(available, self.fea_adaptive_memory_max_attach_per_tick - node_tick_attaches),
+        )
+        record(
+            {
+                "adaptive_memory_state": "granting" if slots > 0 else "budget spent this window",
+                "adaptive_memory_budget_mb": int(budget_mb),
+                "adaptive_memory_window_slots": int(total_slots),
+                "adaptive_memory_spent_slots": int(spent),
+                "adaptive_memory_slots": int(slots),
+            }
+        )
+        return slots
+
     def fea_dynamic_extra_slots(self, allocation: dict, task: dict, trace: dict | None = None) -> int:
         """FEA attach budget for one allocation. When `trace` is supplied it is
         filled with every intermediate so the node detail page can explain why
@@ -4548,6 +4672,20 @@ class Scheduler:
         memory_budget = max(0, memory_free - soft_floor)
         memory_estimate_mb = self.fea_shared_memory_estimate_mb(task)
         memory_slots = memory_budget // memory_estimate_mb
+        if memory_slots <= 0:
+            # Prediction says no room; check whether a full hour of observed
+            # free-memory history contradicts it before giving up.
+            adaptive_slots = self.fea_adaptive_memory_slots(
+                node_name,
+                memory_total,
+                soft_floor,
+                memory_estimate_mb,
+                node_tick_attaches,
+                trace,
+            )
+            if adaptive_slots > 0:
+                memory_slots = adaptive_slots
+                self._tick_adaptive_memory_nodes.add(node_name)
         record(
             {
                 "footprint_young_cpus": round(float(footprint.get("cpus") or 0.0), 1),

@@ -7,6 +7,7 @@ import threading
 import tempfile
 import time
 import unittest
+from collections import deque
 from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -7113,6 +7114,96 @@ class SchedulerTests(unittest.TestCase):
         scheduler._fea_footprint_cache = None
         matured = scheduler.fea_dynamic_extra_slots(allocation, task)
         self.assertGreater(matured, discounted)
+
+    def test_fea_adaptive_memory_relax_grants_trickle_when_history_shows_slack(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 4.0 100000 55000 some_job\n"
+            )
+        )
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        self.db.update_allocation(allocation_id, state=AllocationStatus.WARM.value, slurm_job_id="alloc-1")
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, fea_soft_memory_free_percent=40)
+        allocation = self.db.get_allocation(allocation_id)
+        task = {"id": 10, "cpus": 4, "memory_mb": 8192}
+        # Two young workers reserve 2x8192 MB, dropping the predicted free
+        # below the 40% soft floor: the plain memory budget is zero.
+        for index in range(2):
+            task_id = self.db.create_task(
+                TaskCreate(
+                    f"fea-young-{index}",
+                    "~/case",
+                    "run",
+                    cpus=4,
+                    memory_mb=8192,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                )
+            )
+            self.db.update_task(
+                task_id,
+                status=TaskStatus.RUNNING.value,
+                account_name="a",
+                allocation_id=allocation_id,
+                wrapper_pid=str(4000 + index),
+                attached_at="CURRENT_TIMESTAMP",
+            )
+        scheduler._fea_footprint_cache = None
+        # Without observation history the prediction stands: no slots.
+        self.assertEqual(scheduler.fea_dynamic_extra_slots(allocation, task), 0)
+        # A full window of observed free memory holding well above the soft
+        # floor (40000) plus margin (5000) contradicts the prediction.
+        now = time.monotonic()
+        scheduler._node_memory_history["n001"] = deque(
+            (now - age, 55000) for age in (3000, 2000, 1000, 60)
+        )
+        trace: dict = {}
+        self.assertEqual(scheduler.fea_dynamic_extra_slots(allocation, task, trace=trace), 1)
+        self.assertEqual(trace.get("adaptive_memory_state"), "granting")
+        self.assertIn("n001", scheduler._tick_adaptive_memory_nodes)
+        # The admitted attach spends the observed-slack budget: the window
+        # budget (55000-40000-5000 = 10000 MB) holds exactly one 8192 MB
+        # worker, so the relax stays shut until the window slides.
+        scheduler._record_attach_delta(allocation, task)
+        scheduler._tick_attach_workers_by_node.clear()
+        scheduler._tick_adaptive_memory_nodes.clear()
+        scheduler._fea_footprint_cache = None
+        trace = {}
+        self.assertEqual(scheduler.fea_dynamic_extra_slots(allocation, task, trace=trace), 0)
+        self.assertEqual(trace.get("adaptive_memory_state"), "budget spent this window")
+
+    def test_fea_adaptive_memory_relax_requires_coverage_and_distance_from_floor(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 4.0 100000 41000 some_job\n"
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, fea_soft_memory_free_percent=40)
+        now = time.monotonic()
+        # Coverage below the 2700s requirement: stay closed.
+        scheduler._node_memory_history["n001"] = deque([(now - 600, 55000), (now - 60, 55000)])
+        self.assertEqual(
+            scheduler.fea_adaptive_memory_slots("n001", 100000, 40000, 8192, 0), 0
+        )
+        # Enough coverage, but the observed minimum sits inside the margin
+        # band above the floor: the prediction is not contradicted.
+        scheduler._node_memory_history["n001"] = deque(
+            (now - age, 41000) for age in (3000, 2000, 1000, 60)
+        )
+        trace: dict = {}
+        self.assertEqual(
+            scheduler.fea_adaptive_memory_slots("n001", 100000, 40000, 8192, 0, trace=trace), 0
+        )
+        self.assertEqual(
+            trace.get("adaptive_memory_state"), "observed history too close to the soft floor"
+        )
 
     def test_fea_dynamic_extra_slots_caps_attaches_per_node_per_tick(self) -> None:
         self.db.replace_pestat_nodes(

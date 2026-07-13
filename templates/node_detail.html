@@ -49,6 +49,11 @@
     갓 시작한 워커 예약분: 시작 {{ (diagnosis.footprint_maturity_seconds / 60) | round | int }}분 미만 워커 몫으로
     메모리 {{ ((diagnosis.footprint.memory_mb or 0) / 1024) | round | int }} GB를 미리 잡아둠
     (FEA는 메시가 커진 뒤에야 메모리를 쓰기 때문).
+    {% if diagnosis.adaptive_memory_relax_enabled %}<br>
+    실측 기반 완화: 위 예측으로 자리가 0이어도, 최근 {{ (diagnosis.adaptive_memory_window_seconds / 60) | round | int }}분 실측에서
+    최저 여유 메모리가 확보선보다 {{ diagnosis.adaptive_memory_margin_percent | round | int }}%p 이상 계속 높았으면
+    틱당 {{ diagnosis.adaptive_memory_max_attach_per_tick }}개씩 추가 투입 허용 (예측이 실제보다 비관적이라는 증거가 쌓인 경우).
+    {% endif %}
   </p>
   {% for item in diagnosis.allocations %}
     <h3>
@@ -80,6 +85,28 @@
                 − 최소 확보선 {{ (item.trace.memory_soft_floor_mb / 1024) | round | int }} GB
                 = <strong>{{ (item.trace.memory_budget_mb / 1024) | round | int }} GB</strong>
                 → 워커당 {{ (item.trace.memory_estimate_per_worker_mb / 1024) | round | int }} GB 잡으면 <strong>{{ item.trace.memory_slots }}자리</strong>
+              </td>
+            </tr>
+          {% endif %}
+          {% if item.trace.adaptive_memory_state is defined %}
+            <tr>
+              <th>실측 기반 완화</th>
+              <td>
+                {% if item.trace.adaptive_memory_state == "granting" %}
+                  최근 1시간 최저 여유 {{ ((item.trace.adaptive_memory_min_free_mb or 0) / 1024) | round | int }} GB가
+                  확보선+여유분보다 높아 <strong>{{ item.trace.adaptive_memory_slots }}자리</strong> 추가 허용
+                  (이 시간창 허용량 {{ item.trace.adaptive_memory_window_slots }}자리 중 {{ item.trace.adaptive_memory_spent_slots }}자리 사용)
+                {% elif item.trace.adaptive_memory_state == "budget spent this window" %}
+                  이번 시간창의 완화 허용량을 모두 사용 — 실측 여유가 유지되면 창이 밀리며 다시 열림
+                  (허용량 {{ item.trace.adaptive_memory_window_slots }}자리 중 {{ item.trace.adaptive_memory_spent_slots }}자리 사용)
+                {% elif item.trace.adaptive_memory_state == "insufficient coverage" %}
+                  관측 이력 부족 ({{ ((item.trace.adaptive_memory_coverage_seconds or 0) / 60) | round | int }}분) — 재시작 후 45분 이상 쌓여야 완화 발동
+                {% elif item.trace.adaptive_memory_state == "observed history too close to the soft floor" %}
+                  최근 1시간 최저 여유 {{ ((item.trace.adaptive_memory_min_free_mb or 0) / 1024) | round | int }} GB /
+                  평균 {{ ((item.trace.adaptive_memory_avg_free_mb or 0) / 1024) | round | int }} GB가 확보선에 근접 — 완화 없이 예측대로 차단 유지
+                {% else %}
+                  {{ item.trace.adaptive_memory_state }}
+                {% endif %}
               </td>
             </tr>
           {% endif %}
