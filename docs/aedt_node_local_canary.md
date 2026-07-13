@@ -12,6 +12,13 @@ use the explicit MFT shared-canary acknowledgement. The current live canary
 must stay at `N=2`; larger N requires separate license, isolation, memory, and
 solver validation first.
 
+The scheduler admits `aedt_backend=pooled` while the central pool is disabled
+only when a task uses the exact `aedt_node_canary_client` entrypoint,
+references an active `aedt_node_canary_host` through `same_node_as_task_id`,
+and carries matching bundle identity and expected-project count fields in
+`payload_json`. This temporary exception is hard-capped at the currently
+validated N=2.
+
 The host exits only after all N project-local close ACKs and Desktop process
 shutdown. Its final `NODE_CANARY_EVIDENCE` record is passing only when both
 leases were released without a fault. The discovery file is removed on exit.

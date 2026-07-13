@@ -18,6 +18,7 @@ from fastapi.templating import Jinja2Templates
 from .allocation_metrics import annotate_allocation_fea_pressure, annotate_allocation_node_metrics
 from .aedt_pool import AedtPoolRuntime, AedtPoolService
 from .aedt_pool_api import create_aedt_pool_router
+from .aedt_canary_admission import node_local_aedt_canary_admission
 from .conda_sync import CondaEnvSyncManager, conda_bootstrap
 from .config import AppConfig, load_accounts, load_app_config
 from .db import Database
@@ -32,7 +33,6 @@ from .task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, build_git_task_command
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-
 
 def parse_aedt_backend(value: object) -> str:
     try:
@@ -508,10 +508,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     aedt_pool = AedtPoolService(db, bootstrap_token=aedt_pool_bootstrap_token)
     aedt_pool.init()
     scheduler.set_aedt_backend_admission_checker(
-        lambda _task: (
+        lambda task: (
             (True, "")
             if aedt_pool.config().operational
-            else (False, "AEDT pooled backend is not operational")
+            else node_local_aedt_canary_admission(db, task)
         )
     )
     aedt_adapter_configured = bool(
