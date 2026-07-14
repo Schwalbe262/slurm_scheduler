@@ -974,8 +974,8 @@
         <span class="summary-value" data-attached-summary="queued">{{ task_summary.queued }}</span>
       </div>
       <div class="summary-item">
-        <span class="summary-label">FEA solvers</span>
-        <span class="summary-value" data-attached-summary="fea">{{ task_summary.fea }} / session hosts {{ task_summary.session_hosts }}</span>
+        <span class="summary-label">FEA / AEDT</span>
+        <span class="summary-value" data-attached-summary="fea">{{ task_summary.fea }} / {{ task_summary.session_hosts }}</span>
       </div>
       <a class="summary-item" href="/aedt-pool" title="Open AEDT pool controls and lease details">
         <span class="summary-label">AEDT</span>
@@ -1267,7 +1267,7 @@
           setSummaryValue("running", counts.running);
           setSummaryValue("attaching", counts.attaching);
           setSummaryValue("queued", counts.queued);
-          setSummaryValue("fea", `${counts.fea} / session hosts ${counts.sessionHosts}`);
+          setSummaryValue("fea", `${counts.fea} / ${counts.sessionHosts}`);
           setSummaryValue("standard", counts.standard);
           setSummaryValue("gpu", counts.gpu);
           setSummaryValue("same_node", counts.sameNode);
@@ -1906,7 +1906,7 @@
         setText(attached("gpu"), tasks.gpu);
         setText(attached("same_node"), tasks.same_node);
         if (attached("fea") && tasks.fea !== undefined && tasks.session_hosts !== undefined) {
-          attached("fea").textContent = `${tasks.fea} / session hosts ${tasks.session_hosts}`;
+          attached("fea").textContent = `${tasks.fea} / ${tasks.session_hosts}`;
         }
         const pool = data.allocations || {};
         if (allocation("nodes") && pool.nodes !== undefined) {
