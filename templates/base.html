@@ -12,6 +12,7 @@
       --text: #1f2933;
       --muted: #657181;
       --accent: #1d6fb8;
+      --chart-running: #c15f19;
       --danger: #b42318;
       --soft: #eef1f4;
     }
@@ -23,6 +24,7 @@
         --text: #e4e9ee;
         --muted: #94a1b0;
         --accent: #5aa2e0;
+        --chart-running: #f0a45f;
         --danger: #f08578;
         --soft: #262e38;
       }
@@ -256,6 +258,17 @@
       white-space: nowrap;
     }
     .muted { color: var(--muted); }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
     .log-tail {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
       font-size: 12px;
@@ -330,6 +343,45 @@
       font-weight: 750;
       line-height: 1.2;
     }
+    .task-count-history { margin-bottom: 14px; }
+    .task-count-history-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+    .task-count-history-toolbar .actions { gap: 6px; }
+    .task-count-history-toolbar button[aria-pressed="true"] {
+      background: var(--accent);
+      color: #fff;
+    }
+    .task-count-legend {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .task-count-legend span { display: inline-flex; align-items: center; gap: 5px; }
+    .task-count-swatch {
+      width: 18px;
+      height: 3px;
+      border-radius: 999px;
+      background: var(--accent);
+    }
+    .task-count-swatch.running { background: var(--chart-running); }
+    #task-count-chart {
+      display: block;
+      width: 100%;
+      height: 240px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+    #task-count-chart-status { min-height: 1.4em; margin: 6px 0 0; font-size: 12px; }
     svg { width: 100%; height: 220px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
     svg line { stroke: #9aa5b1; stroke-width: 1; }
     svg polyline { fill: none; stroke: var(--accent); stroke-width: 2; }

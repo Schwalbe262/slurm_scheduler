@@ -38,6 +38,7 @@ from .slurm import (
 LOGGER = logging.getLogger(__name__)
 ClientFactory = Callable[[AccountConfig], SlurmAccountClient]
 FEA_PROJECT_CURSOR_SETTING = "fea_project_last_claim_by_priority"
+TASK_COUNT_SAMPLE_INTERVAL_SECONDS = 60
 
 
 LMSTAT_FEATURE_RE = re.compile(
@@ -232,6 +233,7 @@ class Scheduler:
         self._storage_quota_refresh_interval_seconds = max(10, min(30, poll_interval_seconds))
         self.cluster_refresh_interval_seconds = cluster_refresh_interval_seconds
         self._last_cluster_refresh_at = 0.0
+        self._last_task_count_sample_at = 0.0
         self.min_warm_allocations = min_warm_allocations
         self.allocation_partition = allocation_partition
         self.allocation_cpus = allocation_cpus
@@ -778,6 +780,7 @@ class Scheduler:
                 stage_seconds[name] = time.monotonic() - stage_started_at
 
         try:
+            run_stage("task_count_sample", self.sample_task_counts_if_due)
             with self._tick_client_cache():
                 if self._needs_reconcile:
                     self._needs_reconcile = False
@@ -840,6 +843,30 @@ class Scheduler:
 
     def _now(self) -> datetime:
         return datetime.now(timezone.utc)
+
+    def sample_task_counts_if_due(self, now: float | None = None) -> bool:
+        """Persist the dashboard task population on the scheduler tick."""
+        sampled_at = time.time() if now is None else float(now)
+        if (
+            self._last_task_count_sample_at
+            and sampled_at - self._last_task_count_sample_at
+            < TASK_COUNT_SAMPLE_INTERVAL_SECONDS
+        ):
+            return False
+        try:
+            summary = self.db.task_activity_summary()
+            self.db.record_task_count_sample(
+                sampled_at=sampled_at,
+                total_active=summary["total"],
+                running=summary["running"],
+                queued=summary["queued"],
+                attaching=summary["attaching"],
+            )
+        except Exception:
+            LOGGER.warning("failed to record task-count sample", exc_info=True)
+            return False
+        self._last_task_count_sample_at = sampled_at
+        return True
 
     def _timestamp(self, value: str | None) -> datetime | None:
         if not value:

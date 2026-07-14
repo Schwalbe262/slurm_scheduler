@@ -319,41 +319,6 @@ def allocation_usage_summary(allocations: list[dict], pending: int = 0) -> dict[
     }
 
 
-def task_activity_summary(tasks: list[dict]) -> dict[str, int]:
-    summary = {
-        "total": 0,
-        "running": 0,
-        "attaching": 0,
-        "queued": 0,
-        "fea": 0,
-        "fea_running": 0,
-        "standard": 0,
-        "gpu": 0,
-        "cpu": 0,
-        "same_node": 0,
-    }
-    for task in tasks:
-        status = str(task.get("status") or "")
-        if status not in {"running", "attaching", "queued"}:
-            continue
-        summary["total"] += 1
-        if status in summary:
-            summary[status] += 1
-        if normalize_scheduling_profile(str(task.get("scheduling_profile") or "")) == SchedulingProfile.FEA_BURSTY.value:
-            summary["fea"] += 1
-            if status == "running":
-                summary["fea_running"] += 1
-        else:
-            summary["standard"] += 1
-        if int(task.get("gpus") or 0) > 0:
-            summary["gpu"] += 1
-        else:
-            summary["cpu"] += 1
-        if int(task.get("same_node_as_task_id") or 0) > 0:
-            summary["same_node"] += 1
-    return summary
-
-
 def task_state_for_api(status: str) -> str:
     return "succeeded" if status == "completed" else status
 
@@ -1233,12 +1198,9 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             limit=50,
             name_contains=attached_task_name_filter,
         )
-        summary_queued_rows = db.list_tasks_by_statuses(
-            ["queued"],
-            limit=5000,
+        task_summary = db.task_activity_summary(
             name_contains=attached_task_name_filter,
         )
-        task_summary = task_activity_summary(active_running_rows + summary_queued_rows)
         aedt_dashboard_summary = build_aedt_pool_summary(
             aedt_pool,
             allocation_rows=allocations,
@@ -2101,18 +2063,23 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
 
     @app.get("/api/dashboard-summary")
     def api_dashboard_summary() -> dict:
-        active_rows = db.list_tasks_by_statuses(["running", "attaching"], limit=5000)
-        queued_rows = db.list_tasks_by_statuses(["queued"], limit=5000)
         allocations = db.list_allocations_with_live(limit=500, live_limit=10000)
         allocated_rows = [
             item for item in allocations if item["state"] in {"active", "warm", "draining", "closing"}
         ]
         pending_count = sum(1 for item in allocations if item["state"] == "pending")
         return {
-            "tasks": task_activity_summary(active_rows + queued_rows),
+            "tasks": db.task_activity_summary(),
             "allocations": allocation_usage_summary(allocated_rows, pending=pending_count),
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
+
+    @app.get("/api/task-count-history")
+    def api_task_count_history(
+        hours: int = Query(default=24, ge=1, le=168),
+    ) -> list[dict]:
+        cutoff = time.time() - (hours * 60 * 60)
+        return db.list_task_count_samples(since=cutoff, max_points=600)
 
     @app.get("/api/jobs/{job_id}")
     def api_job(job_id: int) -> dict:

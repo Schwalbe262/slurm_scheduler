@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -10,6 +12,7 @@ from .models import AedtBackend, AllocationStatus, JobCreate, JobStatus, Schedul
 
 
 SQLITE_ID_BATCH_SIZE = 500
+TASK_COUNT_SAMPLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 
 def json_dumps(value: Any) -> str:
@@ -194,6 +197,18 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_allocation_id ON tasks(allocation_id);
+
+CREATE TABLE IF NOT EXISTS task_count_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sampled_at INTEGER NOT NULL,
+    total_active INTEGER NOT NULL,
+    running INTEGER NOT NULL,
+    queued INTEGER NOT NULL,
+    attaching INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_count_samples_sampled_at
+ON task_count_samples(sampled_at);
 
 CREATE TABLE IF NOT EXISTS env_sync_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -708,6 +723,152 @@ class Database:
                 (*statuses, *name_params, limit, max(0, int(offset))),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def task_activity_summary(
+        self,
+        name_contains: str = "",
+        active_limit: int = 5000,
+        queued_limit: int = 5000,
+    ) -> dict[str, int]:
+        """Return the dashboard's active-task population and tile counts.
+
+        Keep the running/attaching and queued caps aligned with the dashboard
+        table queries so the sampler, rendered tiles, and live-summary API all
+        observe the same population.
+        """
+        name_filter, name_params = self._name_contains_filter(name_contains)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                WITH active AS (
+                    SELECT status, scheduling_profile, gpus, same_node_as_task_id
+                    FROM tasks
+                    WHERE status IN (?, ?){name_filter}
+                    ORDER BY id DESC
+                    LIMIT ?
+                ),
+                queued_tasks AS (
+                    SELECT status, scheduling_profile, gpus, same_node_as_task_id
+                    FROM tasks
+                    WHERE status = ?{name_filter}
+                    ORDER BY id DESC
+                    LIMIT ?
+                ),
+                population AS (
+                    SELECT * FROM active
+                    UNION ALL
+                    SELECT * FROM queued_tasks
+                )
+                SELECT
+                    COUNT(*) AS total,
+                    COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running,
+                    COALESCE(SUM(CASE WHEN status = 'attaching' THEN 1 ELSE 0 END), 0) AS attaching,
+                    COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued,
+                    COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(scheduling_profile, ''))) = 'fea_bursty' THEN 1 ELSE 0 END), 0) AS fea,
+                    COALESCE(SUM(CASE WHEN status = 'running' AND LOWER(TRIM(COALESCE(scheduling_profile, ''))) = 'fea_bursty' THEN 1 ELSE 0 END), 0) AS fea_running,
+                    COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(scheduling_profile, ''))) != 'fea_bursty' THEN 1 ELSE 0 END), 0) AS standard,
+                    COALESCE(SUM(CASE WHEN COALESCE(gpus, 0) > 0 THEN 1 ELSE 0 END), 0) AS gpu,
+                    COALESCE(SUM(CASE WHEN COALESCE(gpus, 0) <= 0 THEN 1 ELSE 0 END), 0) AS cpu,
+                    COALESCE(SUM(CASE WHEN COALESCE(same_node_as_task_id, 0) > 0 THEN 1 ELSE 0 END), 0) AS same_node
+                FROM population
+                """,
+                (
+                    TaskStatus.RUNNING.value,
+                    TaskStatus.ATTACHING.value,
+                    *name_params,
+                    max(0, int(active_limit)),
+                    TaskStatus.QUEUED.value,
+                    *name_params,
+                    max(0, int(queued_limit)),
+                ),
+            ).fetchone()
+        keys = (
+            "total",
+            "running",
+            "attaching",
+            "queued",
+            "fea",
+            "fea_running",
+            "standard",
+            "gpu",
+            "cpu",
+            "same_node",
+        )
+        return {key: int(row[key] or 0) for key in keys}
+
+    def record_task_count_sample(
+        self,
+        *,
+        total_active: int,
+        running: int,
+        queued: int,
+        attaching: int,
+        sampled_at: float | int | None = None,
+    ) -> int:
+        """Insert one task-count sample and prune history older than seven days."""
+        timestamp = int(time.time() if sampled_at is None else sampled_at)
+        cutoff = timestamp - TASK_COUNT_SAMPLE_RETENTION_SECONDS
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM task_count_samples WHERE sampled_at < ?",
+                (cutoff,),
+            )
+            cursor = conn.execute(
+                """
+                INSERT INTO task_count_samples(
+                    sampled_at, total_active, running, queued, attaching
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp,
+                    max(0, int(total_active)),
+                    max(0, int(running)),
+                    max(0, int(queued)),
+                    max(0, int(attaching)),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def list_task_count_samples(
+        self,
+        *,
+        since: float | int,
+        max_points: int = 600,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT sampled_at, total_active, running, queued, attaching
+                FROM task_count_samples
+                WHERE sampled_at >= ?
+                ORDER BY sampled_at ASC, id ASC
+                """,
+                (int(since),),
+            ).fetchall()
+
+        point_limit = max(1, int(max_points))
+        if len(rows) > point_limit:
+            if point_limit == 1:
+                rows = [rows[-1]]
+            else:
+                last_index = len(rows) - 1
+                rows = [
+                    rows[(index * last_index) // (point_limit - 1)]
+                    for index in range(point_limit)
+                ]
+
+        return [
+            {
+                "t": datetime.fromtimestamp(int(row["sampled_at"]), timezone.utc)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z"),
+                "total": int(row["total_active"]),
+                "running": int(row["running"]),
+                "queued": int(row["queued"]),
+                "attaching": int(row["attaching"]),
+            }
+            for row in rows
+        ]
 
     def list_tasks_by_same_node_task_ids(
         self,

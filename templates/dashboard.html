@@ -939,6 +939,23 @@
       <h2>Attached Tasks</h2>
       <span class="muted" data-live-updated-at></span>
     </div>
+    <details id="task-count-history" class="task-count-history">
+      <summary>실행 추이</summary>
+      <div class="task-count-history-toolbar">
+        <div class="actions" role="group" aria-label="Task history range">
+          <button type="button" class="secondary compact" data-task-history-hours="6" aria-pressed="false">6h</button>
+          <button type="button" class="secondary compact" data-task-history-hours="24" aria-pressed="true">24h</button>
+          <button type="button" class="secondary compact" data-task-history-hours="72" aria-pressed="false">3d</button>
+        </div>
+        <div class="task-count-legend" aria-label="Chart series">
+          <span><i class="task-count-swatch" aria-hidden="true"></i>Total</span>
+          <span><i class="task-count-swatch running" aria-hidden="true"></i>Running</span>
+        </div>
+      </div>
+      <canvas id="task-count-chart" role="img" aria-label="Total and running task counts over time"></canvas>
+      <p id="task-count-chart-status" class="muted">Expand to load task-count history.</p>
+      <span id="task-count-chart-announcer" class="sr-only" aria-live="polite"></span>
+    </details>
     <div class="summary-row" aria-label="Attached task summary">
       <div class="summary-item">
         <span class="summary-label">Total</span>
@@ -1609,6 +1626,259 @@
       );
     });
 
+  })();
+</script>
+
+<script>
+  (() => {
+    const panel = document.getElementById("task-count-history");
+    const canvas = document.getElementById("task-count-chart");
+    const status = document.getElementById("task-count-chart-status");
+    const announcer = document.getElementById("task-count-chart-announcer");
+    const rangeButtons = Array.from(document.querySelectorAll("[data-task-history-hours]"));
+    if (!panel || !canvas || !status || !announcer || !rangeButtons.length) return;
+
+    const rangeKey = "slurmSchedulerTaskHistoryHours";
+    const allowedHours = [6, 24, 72];
+    let selectedHours = 24;
+    let points = [];
+    let pollTimer = null;
+    let requestController = null;
+    let historyUnavailable = false;
+    try {
+      const savedHours = Number(localStorage.getItem(rangeKey));
+      if (allowedHours.includes(savedHours)) selectedHours = savedHours;
+    } catch (_error) {
+      // Storage is optional; keep the 24-hour default.
+    }
+
+    function updateRangeButtons() {
+      rangeButtons.forEach((button) => {
+        button.setAttribute(
+          "aria-pressed",
+          String(Number(button.dataset.taskHistoryHours) === selectedHours),
+        );
+      });
+    }
+
+    function chartColor(name, fallback) {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+    }
+
+    function drawChart() {
+      if (!panel.open) return;
+      const width = Math.max(1, Math.round(canvas.getBoundingClientRect().width || 0));
+      const height = 240;
+      const pixelRatio = Math.max(1, window.devicePixelRatio || 1);
+      canvas.width = Math.round(width * pixelRatio);
+      canvas.height = Math.round(height * pixelRatio);
+      const context = canvas.getContext("2d");
+      if (!context) return;
+      context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      context.clearRect(0, 0, width, height);
+
+      const left = 46;
+      const right = 14;
+      const top = 16;
+      const bottom = 30;
+      const plotWidth = Math.max(1, width - left - right);
+      const plotHeight = Math.max(1, height - top - bottom);
+      const now = Date.now();
+      const parsed = points
+        .map((point) => ({ ...point, time: Date.parse(point.t) }))
+        .filter((point) => Number.isFinite(point.time));
+      const newestTime = parsed.length ? parsed[parsed.length - 1].time : now;
+      const endTime = Math.max(now, newestTime);
+      const startTime = endTime - selectedHours * 60 * 60 * 1000;
+      const visible = parsed.filter((point) => point.time >= startTime && point.time <= endTime);
+      const highest = visible.reduce(
+        (value, point) => Math.max(value, Number(point.total) || 0, Number(point.running) || 0),
+        0,
+      );
+      const yMaximum = Math.max(4, Math.ceil(highest / 4) * 4);
+      const lineColor = chartColor("--line", "#d7dce2");
+      const textColor = chartColor("--muted", "#657181");
+      const totalColor = chartColor("--accent", "#1d6fb8");
+      const runningColor = chartColor("--chart-running", "#c15f19");
+
+      context.font = "11px system-ui, sans-serif";
+      context.lineWidth = 1;
+      context.strokeStyle = lineColor;
+      context.fillStyle = textColor;
+      context.textBaseline = "middle";
+      for (let index = 0; index <= 4; index += 1) {
+        const value = (yMaximum * index) / 4;
+        const y = top + plotHeight - (plotHeight * index) / 4;
+        context.beginPath();
+        context.moveTo(left, y);
+        context.lineTo(left + plotWidth, y);
+        context.stroke();
+        context.textAlign = "right";
+        context.fillText(String(value), left - 7, y);
+      }
+
+      const xTickCount = selectedHours > 24
+        ? (width < 500 ? 2 : 3)
+        : (width < 500 ? 2 : 4);
+      context.textBaseline = "top";
+      for (let index = 0; index <= xTickCount; index += 1) {
+        const x = left + (plotWidth * index) / xTickCount;
+        if (index > 0 && index < xTickCount) {
+          context.beginPath();
+          context.moveTo(x, top);
+          context.lineTo(x, top + plotHeight);
+          context.stroke();
+        }
+        const tickTime = startTime + ((endTime - startTime) * index) / xTickCount;
+        const tickDate = new Date(tickTime);
+        const tickLabel = selectedHours > 24
+          ? tickDate.toLocaleDateString([], { month: "numeric", day: "numeric" })
+          : tickDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        context.textAlign = index === 0 ? "left" : index === xTickCount ? "right" : "center";
+        context.fillText(tickLabel, x, top + plotHeight + 8);
+      }
+
+      function drawSeries(key, color) {
+        if (!visible.length) return;
+        context.beginPath();
+        visible.forEach((point, index) => {
+          const x = left + ((point.time - startTime) / (endTime - startTime)) * plotWidth;
+          const value = Math.max(0, Number(point[key]) || 0);
+          const y = top + plotHeight - (value / yMaximum) * plotHeight;
+          if (index === 0) context.moveTo(x, y);
+          else context.lineTo(x, y);
+        });
+        context.strokeStyle = color;
+        context.lineWidth = 2;
+        context.lineJoin = "round";
+        context.lineCap = "round";
+        context.stroke();
+        if (visible.length === 1) {
+          const point = visible[0];
+          const x = left + ((point.time - startTime) / (endTime - startTime)) * plotWidth;
+          const value = Math.max(0, Number(point[key]) || 0);
+          const y = top + plotHeight - (value / yMaximum) * plotHeight;
+          context.fillStyle = color;
+          context.beginPath();
+          context.arc(x, y, 2.5, 0, Math.PI * 2);
+          context.fill();
+        }
+      }
+
+      drawSeries("total", totalColor);
+      drawSeries("running", runningColor);
+    }
+
+    async function loadHistory({ announce = false } = {}) {
+      if (!panel.open) return;
+      if (requestController) requestController.abort();
+      const controller = new AbortController();
+      requestController = controller;
+      if (announce) status.textContent = "Loading task-count history...";
+      try {
+        const response = await fetch(`/api/task-count-history?hours=${selectedHours}`, {
+          headers: { Accept: "application/json" },
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        if (!panel.open || controller.signal.aborted) return;
+        const recovered = historyUnavailable;
+        historyUnavailable = false;
+        points = Array.isArray(payload) ? payload : [];
+        drawChart();
+        if (!points.length) {
+          const message = "No task-count samples in this range yet.";
+          status.textContent = message;
+          if (announce) announcer.textContent = message;
+          else if (recovered) {
+            announcer.textContent = "Task-count history is available again; this range has no samples.";
+          }
+          canvas.setAttribute("aria-label", `No task-count samples in the last ${selectedHours} hours`);
+          return;
+        }
+        const latest = points[points.length - 1];
+        const latestTime = new Date(latest.t).toLocaleString();
+        const message = `Latest ${latestTime} · Total ${latest.total} · Running ${latest.running}`;
+        status.textContent = message;
+        if (announce) announcer.textContent = message;
+        else if (recovered) announcer.textContent = "Task-count history is available again.";
+        canvas.setAttribute(
+          "aria-label",
+          `Task counts over ${selectedHours} hours. Latest total ${latest.total}, running ${latest.running}.`,
+        );
+      } catch (error) {
+        if (error.name !== "AbortError" && panel.open) {
+          const message = "Task-count history is temporarily unavailable.";
+          if (announce || !historyUnavailable) announcer.textContent = message;
+          historyUnavailable = true;
+          status.textContent = message;
+          canvas.setAttribute(
+            "aria-label",
+            `Task-count history is unavailable for the last ${selectedHours} hours.`,
+          );
+        }
+      } finally {
+        if (requestController === controller) requestController = null;
+      }
+    }
+
+    function startPolling() {
+      if (!panel.open || pollTimer !== null) return;
+      pollTimer = window.setInterval(() => {
+        if (panel.open) loadHistory();
+      }, 60000);
+      loadHistory({ announce: true });
+    }
+
+    function stopPolling() {
+      if (pollTimer !== null) {
+        window.clearInterval(pollTimer);
+        pollTimer = null;
+      }
+      if (requestController) {
+        requestController.abort();
+        requestController = null;
+      }
+      status.textContent = "Expand to load task-count history.";
+    }
+
+    rangeButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        const nextHours = Number(button.dataset.taskHistoryHours);
+        if (!allowedHours.includes(nextHours) || nextHours === selectedHours) return;
+        selectedHours = nextHours;
+        updateRangeButtons();
+        try {
+          localStorage.setItem(rangeKey, String(selectedHours));
+        } catch (_error) {
+          // Keep the selected range for this page even if storage is disabled.
+        }
+        points = [];
+        drawChart();
+        canvas.setAttribute(
+          "aria-label",
+          `Loading task-count history for the last ${selectedHours} hours.`,
+        );
+        if (panel.open) loadHistory({ announce: true });
+      });
+    });
+    panel.addEventListener("toggle", () => {
+      if (panel.open) startPolling();
+      else stopPolling();
+    });
+    if ("ResizeObserver" in window) {
+      new ResizeObserver(() => {
+        if (panel.open && points.length) drawChart();
+      }).observe(canvas);
+    } else {
+      window.addEventListener("resize", () => {
+        if (panel.open && points.length) drawChart();
+      });
+    }
+
+    updateRangeButtons();
+    if (panel.open) startPolling();
   })();
 </script>
 
