@@ -21,6 +21,10 @@ SESSION_COUNTED_STATES = ("starting", "ready", "busy", "draining", "unhealthy")
 SESSION_ASSIGNABLE_STATES = ("ready", "busy")
 LEASE_LIVE_STATES = ("queued", "leased", "active", "releasing")
 LEASE_SLOT_STATES = ("leased", "active", "releasing")
+SESSION_START_ACK_TIMEOUT_MESSAGE = "session start acknowledgement timed out"
+UNHEALTHY_ALLOCATION_RECYCLE_REASON = (
+    "AEDT pool unhealthy/quarantined session allocation recycle"
+)
 
 
 AEDT_POOL_SCHEMA = """
@@ -31,6 +35,7 @@ CREATE TABLE IF NOT EXISTS aedt_sessions (
     account_name TEXT NOT NULL DEFAULT '',
     node_name TEXT NOT NULL DEFAULT '',
     host_id TEXT NOT NULL DEFAULT '',
+    start_claimed_at TEXT,
     endpoint TEXT NOT NULL DEFAULT '',
     process_id TEXT NOT NULL DEFAULT '',
     host_token_hash TEXT NOT NULL DEFAULT '',
@@ -213,6 +218,7 @@ class AedtPoolService:
                 for row in conn.execute("PRAGMA table_info(aedt_sessions)").fetchall()
             }
             for name, ddl in {
+                "start_claimed_at": "TEXT",
                 "quarantine_until": "TEXT",
                 "quarantine_reason": "TEXT NOT NULL DEFAULT ''",
             }.items():
@@ -798,26 +804,77 @@ class AedtPoolService:
         node_name: str,
         host_id: str,
         bootstrap_token: str,
+        session_id: int = 0,
     ) -> dict[str, Any] | None:
         self._authorize_bootstrap(bootstrap_token)
+        normalized_host_id = host_id.strip()
+        if not normalized_host_id:
+            raise ValueError("host_id is required")
+        normalized_node_name = node_name.strip()
+        requested_session_id = max(0, int(session_id or 0))
+        now = _sql_time(self._now())
         with self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                """
-                SELECT * FROM aedt_sessions
-                WHERE state = 'starting' AND host_id = ''
-                  AND allocation_id = ? AND node_name = ?
-                ORDER BY id ASC LIMIT 1
-                """,
-                (int(allocation_id), node_name.strip()),
-            ).fetchone()
+            if requested_session_id:
+                row = conn.execute(
+                    """
+                    SELECT * FROM aedt_sessions
+                    WHERE id = ? AND state = 'starting'
+                      AND allocation_id = ? AND node_name = ?
+                      AND (host_id = '' OR host_id = ?)
+                    """,
+                    (
+                        requested_session_id,
+                        int(allocation_id),
+                        normalized_node_name,
+                        normalized_host_id,
+                    ),
+                ).fetchone()
+            else:
+                # Backward-compatible untargeted hosts first recover their own
+                # claim after an ambiguous HTTP response, then take the oldest
+                # unclaimed row on the allocation.
+                row = conn.execute(
+                    """
+                    SELECT * FROM aedt_sessions
+                    WHERE state = 'starting'
+                      AND allocation_id = ? AND node_name = ?
+                      AND (host_id = '' OR host_id = ?)
+                    ORDER BY CASE WHEN host_id = ? THEN 0 ELSE 1 END, id ASC
+                    LIMIT 1
+                    """,
+                    (
+                        int(allocation_id),
+                        normalized_node_name,
+                        normalized_host_id,
+                        normalized_host_id,
+                    ),
+                ).fetchone()
             if not row:
                 return None
-            conn.execute(
-                "UPDATE aedt_sessions SET host_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND host_id = ''",
-                (host_id.strip(), int(row["id"])),
+            cursor = conn.execute(
+                """
+                UPDATE aedt_sessions
+                SET host_id = ?, start_claimed_at = COALESCE(start_claimed_at, ?),
+                    updated_at = ?
+                WHERE id = ? AND state = 'starting'
+                  AND (host_id = '' OR host_id = ?)
+                """,
+                (
+                    normalized_host_id,
+                    now,
+                    now,
+                    int(row["id"]),
+                    normalized_host_id,
+                ),
             )
-            return dict(conn.execute("SELECT * FROM aedt_sessions WHERE id = ?", (int(row["id"]),)).fetchone())
+            if cursor.rowcount != 1:
+                return None
+            return dict(
+                conn.execute(
+                    "SELECT * FROM aedt_sessions WHERE id = ?", (int(row["id"]),)
+                ).fetchone()
+            )
 
     def register_session(
         self,
@@ -827,9 +884,16 @@ class AedtPoolService:
         endpoint: str,
         process_id: str,
         bootstrap_token: str,
+        host_token: str = "",
     ) -> tuple[dict[str, Any], str]:
         self._authorize_bootstrap(bootstrap_token)
-        host_token = secrets.token_urlsafe(32)
+        normalized_host_id = host_id.strip()
+        if not normalized_host_id:
+            raise ValueError("host_id is required")
+        normalized_endpoint = endpoint.strip()
+        normalized_process_id = process_id.strip()
+        presented_host_token = host_token.strip()
+        issued_host_token = presented_host_token or secrets.token_urlsafe(32)
         now = _sql_time(self._now())
         register_state = "ready" if self.config().enabled else "draining"
         with self.db.connect() as conn:
@@ -837,30 +901,108 @@ class AedtPoolService:
             row = conn.execute("SELECT * FROM aedt_sessions WHERE id = ?", (int(session_id),)).fetchone()
             if not row:
                 raise KeyError(session_id)
-            if row["state"] != "starting" or str(row["host_id"] or "") != host_id.strip():
-                raise ValueError("session start claim is not owned by this host")
-            conn.execute(
-                """
-                UPDATE aedt_sessions
-                SET state = ?, endpoint = ?, process_id = ?,
-                    host_token_hash = ?, started_at = ?, last_heartbeat_at = ?,
-                    idle_since = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    register_state,
-                    endpoint.strip(),
-                    process_id.strip(),
-                    _token_hash(host_token),
-                    now,
-                    now,
-                    now,
-                    now,
-                    int(session_id),
-                ),
+            owns_claim = str(row["host_id"] or "") == normalized_host_id
+            same_registration = bool(
+                owns_claim
+                and presented_host_token
+                and row["host_token_hash"]
+                and secrets.compare_digest(
+                    str(row["host_token_hash"]), _token_hash(presented_host_token)
+                )
+                and str(row["endpoint"] or "") == normalized_endpoint
+                and str(row["process_id"] or "") == normalized_process_id
             )
+            if same_registration and row["state"] in {
+                "ready",
+                "busy",
+                "draining",
+                "unhealthy",
+            }:
+                # The first response may have been lost after commit.  Echo the
+                # token the host already knows instead of rotating it and
+                # invalidating the live process's future heartbeats.
+                issued_host_token = presented_host_token
+            else:
+                recovered_start_timeout = bool(
+                    owns_claim
+                    and row["state"] == "unhealthy"
+                    and str(row["failure_message"] or "")
+                    == SESSION_START_ACK_TIMEOUT_MESSAGE
+                    and not row["started_at"]
+                    and not row["host_token_hash"]
+                )
+                if row["state"] != "starting" and not recovered_start_timeout:
+                    raise ValueError("session start claim is not owned by this host")
+                if not owns_claim:
+                    raise ValueError("session start claim is not owned by this host")
+                if recovered_start_timeout:
+                    allocation = conn.execute(
+                        "SELECT state, drain_reason FROM allocations WHERE id = ?",
+                        (int(row["allocation_id"] or 0),),
+                    ).fetchone()
+                    if not allocation or allocation["state"] not in {
+                        "warm",
+                        "active",
+                        "draining",
+                    }:
+                        raise ValueError("session allocation is no longer available")
+                    if (
+                        allocation["state"] == "draining"
+                        and str(allocation["drain_reason"] or "")
+                        != UNHEALTHY_ALLOCATION_RECYCLE_REASON
+                    ):
+                        # The rightful late owner still needs a token so it can
+                        # close its Desktop cleanly, but it must not cancel an
+                        # unrelated age/operator/scheduler drain.
+                        register_state = "draining"
+                conn.execute(
+                    """
+                    UPDATE aedt_sessions
+                    SET state = ?, endpoint = ?, process_id = ?,
+                        host_token_hash = ?, started_at = ?, last_heartbeat_at = ?,
+                        idle_since = ?, failure_message = '', drain_requested_at = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        register_state,
+                        normalized_endpoint,
+                        normalized_process_id,
+                        _token_hash(issued_host_token),
+                        now,
+                        now,
+                        now,
+                        now,
+                        int(session_id),
+                    ),
+                )
+                if recovered_start_timeout and register_state == "ready":
+                    remaining_unhealthy = conn.execute(
+                        """
+                        SELECT 1 FROM aedt_sessions
+                        WHERE allocation_id = ?
+                          AND (state = 'unhealthy' OR quarantine_reason != '')
+                        LIMIT 1
+                        """,
+                        (int(row["allocation_id"] or 0),),
+                    ).fetchone()
+                    if not remaining_unhealthy:
+                        conn.execute(
+                            """
+                            UPDATE allocations
+                            SET state = 'active',
+                                drain_reason = 'AEDT pool project demand',
+                                drain_at = NULL, failure_message = '', updated_at = ?
+                            WHERE id = ? AND state = 'draining' AND drain_reason = ?
+                            """,
+                            (
+                                now,
+                                int(row["allocation_id"] or 0),
+                                UNHEALTHY_ALLOCATION_RECYCLE_REASON,
+                            ),
+                        )
         self.reconcile(execute=True)
-        return self.get_session(session_id, include_secret_hash=False), host_token
+        return self.get_session(session_id, include_secret_hash=False), issued_host_token
 
     def fail_session_start(
         self,
@@ -905,7 +1047,7 @@ class AedtPoolService:
 
     def heartbeat_session(self, session_id: int, token: str) -> dict[str, Any]:
         session = self._authorize_session(session_id, token)
-        if session["state"] not in {"ready", "busy", "draining"}:
+        if session["state"] not in {"ready", "busy", "draining", "unhealthy"}:
             raise ValueError(f"session is {session['state']}")
         now = _sql_time(self._now())
         with self.db.connect() as conn:
@@ -1436,24 +1578,32 @@ class AedtPoolService:
             conn.execute(
                 """
                 UPDATE aedt_sessions
-                SET state = 'unhealthy', failure_message = 'session start acknowledgement timed out',
+                SET state = 'unhealthy', failure_message = ?,
                     drain_requested_at = COALESCE(drain_requested_at, ?), updated_at = ?
-                WHERE state = 'starting' AND created_at < ?
+                WHERE state = 'starting'
+                  AND COALESCE(start_claimed_at, created_at) < ?
                 """,
-                (now, now, start_cutoff),
+                (SESSION_START_ACK_TIMEOUT_MESSAGE, now, now, start_cutoff),
             )
             conn.execute(
                 """
                 UPDATE allocations
                 SET state = 'draining',
-                    drain_reason = 'AEDT pool unhealthy/quarantined session allocation recycle',
+                    drain_reason = CASE
+                        WHEN state = 'draining'
+                         AND TRIM(COALESCE(drain_reason, '')) NOT IN (
+                             '', 'AEDT pool project demand'
+                         )
+                        THEN drain_reason
+                        ELSE ?
+                    END,
                     drain_at = COALESCE(drain_at, ?), updated_at = ?
                 WHERE id IN (
                     SELECT allocation_id FROM aedt_sessions
                     WHERE state = 'unhealthy' OR quarantine_reason != ''
                 ) AND state IN ('warm','active','draining')
                 """,
-                (now, now),
+                (UNHEALTHY_ALLOCATION_RECYCLE_REASON, now, now),
             )
 
             # Assign oldest requests to a same-allocation/same-node session.
@@ -1862,6 +2012,8 @@ class AedtPoolRuntime:
             str(int(session["allocation_id"])),
             "--node-name",
             str(session["node_name"]),
+            "--session-id",
+            str(int(session["id"])),
             "--bootstrap-token-file",
             self.host_bootstrap_token_file,
         ]

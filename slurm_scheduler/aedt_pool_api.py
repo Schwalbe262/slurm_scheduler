@@ -226,6 +226,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         payload = await request.json()
         try:
             session = service.claim_start(
+                session_id=int(payload.get("session_id") or 0),
                 allocation_id=int(payload.get("allocation_id") or 0),
                 node_name=str(payload.get("node_name") or ""),
                 host_id=str(payload.get("host_id") or ""),
@@ -233,6 +234,8 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
             )
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"session": session}
 
     @router.post(
@@ -243,6 +246,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         session_id: int,
         request: Request,
         x_aedt_bootstrap_token: str = Header(""),
+        x_aedt_host_token: str = Header(""),
     ) -> dict[str, Any]:
         payload = await request.json()
         try:
@@ -252,6 +256,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
                 endpoint=str(payload.get("endpoint") or ""),
                 process_id=str(payload.get("process_id") or ""),
                 bootstrap_token=x_aedt_bootstrap_token,
+                host_token=x_aedt_host_token,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="session not found") from exc

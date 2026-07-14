@@ -4,7 +4,10 @@ import asyncio
 import json
 import os
 import tempfile
+import threading
 import unittest
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -374,6 +377,223 @@ class AedtPoolGateTests(AedtPoolTestCase):
         self.assertNotIn("aedt_pool_summary.node_local", template)
 
 
+class AedtSessionStartRaceTests(AedtPoolTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.allocation_id = self.add_dedicated_allocation()
+
+    def _create_starting_sessions(self, count: int) -> list[dict]:
+        self.service.set_operator_limits(
+            max_sessions=count,
+            min_idle_sessions=count,
+            target_projects=0,
+        )
+        self.make_operational()
+        self.service.reconcile(execute=True)
+        starts = self.service.starting_sessions()
+        self.assertEqual(len(starts), count)
+        return starts
+
+    def test_exact_claims_and_idempotent_registration_reject_true_duplicate(self) -> None:
+        first, second = self._create_starting_sessions(2)
+        first_id = int(first["id"])
+        second_id = int(second["id"])
+
+        claimed_first = self.service.claim_start(
+            session_id=first_id,
+            allocation_id=self.allocation_id,
+            node_name="cpu-01",
+            host_id="host-a",
+            bootstrap_token="secret",
+        )
+        self.assertEqual(int(claimed_first["id"]), first_id)
+        replayed_first = self.service.claim_start(
+            session_id=first_id,
+            allocation_id=self.allocation_id,
+            node_name="cpu-01",
+            host_id="host-a",
+            bootstrap_token="secret",
+        )
+        self.assertEqual(int(replayed_first["id"]), first_id)
+        self.assertIsNone(
+            self.service.claim_start(
+                session_id=first_id,
+                allocation_id=self.allocation_id,
+                node_name="cpu-01",
+                host_id="host-b",
+                bootstrap_token="secret",
+            )
+        )
+        claimed_second = self.service.claim_start(
+            session_id=second_id,
+            allocation_id=self.allocation_id,
+            node_name="cpu-01",
+            host_id="host-b",
+            bootstrap_token="secret",
+        )
+        self.assertEqual(int(claimed_second["id"]), second_id)
+
+        registration_barrier = threading.Barrier(2)
+
+        def register(host_id: str, endpoint: str, process_id: str, token: str):
+            registration_barrier.wait()
+            try:
+                return self.service.register_session(
+                    session_id=first_id,
+                    host_id=host_id,
+                    endpoint=endpoint,
+                    process_id=process_id,
+                    bootstrap_token="secret",
+                    host_token=token,
+                )
+            except Exception as exc:
+                return exc
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            legitimate_future = executor.submit(
+                register, "host-a", "cpu-01:50001", "101", "token-a"
+            )
+            duplicate_future = executor.submit(
+                register, "host-b", "cpu-01:50002", "202", "token-b"
+            )
+            legitimate = legitimate_future.result()
+            duplicate = duplicate_future.result()
+
+        self.assertIsInstance(legitimate, tuple)
+        self.assertIsInstance(duplicate, ValueError)
+        session, token = legitimate
+        self.assertEqual(token, "token-a")
+        self.assertEqual(session["host_id"], "host-a")
+        self.assertEqual(session["endpoint"], "cpu-01:50001")
+        self.assertEqual(session["process_id"], "101")
+
+        retried, retried_token = self.service.register_session(
+            session_id=first_id,
+            host_id="host-a",
+            endpoint="cpu-01:50001",
+            process_id="101",
+            bootstrap_token="secret",
+            host_token="token-a",
+        )
+        self.assertEqual(retried_token, "token-a")
+        self.assertEqual(retried["id"], first_id)
+
+        second_session, second_token = self.service.register_session(
+            session_id=second_id,
+            host_id="host-b",
+            endpoint="cpu-01:50002",
+            process_id="202",
+            bootstrap_token="secret",
+            host_token="token-b",
+        )
+        self.assertEqual(second_token, "token-b")
+        self.assertEqual(second_session["host_id"], "host-b")
+
+    def test_claim_gets_full_ack_window_even_when_row_waited_in_queue(self) -> None:
+        session = self._create_starting_sessions(1)[0]
+        session_id = int(session["id"])
+        timeout = self.service.config().session_start_timeout_seconds
+        self.clock.advance(timeout - 5)
+        claimed = self.service.claim_start(
+            session_id=session_id,
+            allocation_id=self.allocation_id,
+            node_name="cpu-01",
+            host_id="slow-owner",
+            bootstrap_token="secret",
+        )
+        self.assertEqual(claimed["host_id"], "slow-owner")
+
+        self.clock.advance(10)
+        self.service.reconcile(execute=True)
+        self.assertEqual(self.service.get_session(session_id)["state"], "starting")
+        registered, token = self.service.register_session(
+            session_id=session_id,
+            host_id="slow-owner",
+            endpoint="cpu-01:50003",
+            process_id="303",
+            bootstrap_token="secret",
+            host_token="slow-token",
+        )
+        self.assertEqual(token, "slow-token")
+        self.assertIn(registered["state"], {"ready", "busy"})
+
+    def test_claim_owner_can_register_after_ack_timeout_without_409(self) -> None:
+        session = self._create_starting_sessions(1)[0]
+        session_id = int(session["id"])
+        self.service.claim_start(
+            session_id=session_id,
+            allocation_id=self.allocation_id,
+            node_name="cpu-01",
+            host_id="late-owner",
+            bootstrap_token="secret",
+        )
+        self.clock.advance(self.service.config().session_start_timeout_seconds + 1)
+        self.service.reconcile(execute=True)
+        timed_out = self.service.get_session(session_id)
+        self.assertEqual(timed_out["state"], "unhealthy")
+        self.assertIn("acknowledgement timed out", timed_out["failure_message"])
+
+        registered, token = self.service.register_session(
+            session_id=session_id,
+            host_id="late-owner",
+            endpoint="cpu-01:50004",
+            process_id="404",
+            bootstrap_token="secret",
+            host_token="late-token",
+        )
+        self.assertEqual(token, "late-token")
+        self.assertIn(registered["state"], {"ready", "busy", "draining"})
+        heartbeat = self.service.heartbeat_session(session_id, token)
+        self.assertEqual(heartbeat["id"], session_id)
+        with self.assertRaisesRegex(ValueError, "not owned"):
+            self.service.register_session(
+                session_id=session_id,
+                host_id="late-duplicate",
+                endpoint="cpu-01:50005",
+                process_id="405",
+                bootstrap_token="secret",
+                host_token="duplicate-token",
+            )
+
+    def test_late_owner_does_not_cancel_unrelated_allocation_drain(self) -> None:
+        session = self._create_starting_sessions(1)[0]
+        session_id = int(session["id"])
+        self.service.claim_start(
+            session_id=session_id,
+            allocation_id=self.allocation_id,
+            node_name="cpu-01",
+            host_id="draining-owner",
+            bootstrap_token="secret",
+        )
+        self.db.update_allocation(
+            self.allocation_id,
+            state="draining",
+            drain_reason="age limit",
+            drain_at="CURRENT_TIMESTAMP",
+        )
+        self.clock.advance(self.service.config().session_start_timeout_seconds + 1)
+        self.service.reconcile(execute=True)
+        self.assertEqual(
+            self.db.get_allocation(self.allocation_id)["drain_reason"], "age limit"
+        )
+
+        registered, token = self.service.register_session(
+            session_id=session_id,
+            host_id="draining-owner",
+            endpoint="cpu-01:50006",
+            process_id="406",
+            bootstrap_token="secret",
+            host_token="draining-token",
+        )
+        self.assertEqual(token, "draining-token")
+        self.assertEqual(registered["state"], "draining")
+        allocation = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(allocation["state"], "draining")
+        self.assertEqual(allocation["drain_reason"], "age limit")
+        self.assertIsNotNone(allocation["drain_at"])
+        self.assertTrue(self.service.session_commands(session_id, token)["drain"])
+
+
 class AedtLeaseLifecycleTests(AedtPoolTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -678,6 +898,29 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             self.assertEqual(current["state"], "queued")
             self.assertIsNone(current["session_id"])
 
+    def test_client_death_quarantine_does_not_409_legitimate_host_heartbeat(self) -> None:
+        lease, lease_token = self.request(
+            "death-report", allocation_id=self.allocation_id, node="cpu-01"
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        session_id = int(session["id"])
+        self.service.report_project_fault(
+            int(lease["id"]),
+            lease_token,
+            fault_kind="aedt_death",
+            failure_message="attach raced session registration",
+        )
+        quarantined = self.service.get_session(session_id)
+        self.assertEqual(quarantined["state"], "unhealthy")
+        self.assertEqual(quarantined["quarantine_reason"], "aedt_death_reported")
+
+        heartbeat = self.service.heartbeat_session(session_id, host_token)
+        self.assertEqual(heartbeat["state"], "unhealthy")
+        commands = self.service.session_commands(session_id, host_token)
+        self.assertTrue(commands["drain"])
+        with self.assertRaises(PermissionError):
+            self.service.heartbeat_session(session_id, "other-host-token")
+
     def test_counted_session_claim_prevents_allocation_close_safety_check(self) -> None:
         self.request("claim", allocation_id=self.allocation_id, node="cpu-01")
         self.service.reconcile(execute=True)
@@ -786,10 +1029,11 @@ class AedtRuntimeTests(AedtPoolTestCase):
             host_bootstrap_token_file="/shared/aedt-token",
             require_published_control_plane_url=True,
         )
-        session = {"allocation_id": 7, "node_name": "cpu-07"}
+        session = {"id": 17, "allocation_id": 7, "node_name": "cpu-07"}
         self.assertTrue(runtime.host_launch_configured)
         first = runtime._host_command(session)
         self.assertIn("http://gate2:18790", first)
+        self.assertIn("--session-id 17", first)
         self.assertNotIn("static.invalid", first)
 
         self.service.set_control_plane_url("http://gate2:18791/")
@@ -808,9 +1052,10 @@ class AedtRuntimeTests(AedtPoolTestCase):
             host_bootstrap_token_file="/shared/aedt-token",
         )
         command = runtime._host_command(
-            {"allocation_id": 8, "node_name": "cpu-08"}
+            {"id": 18, "allocation_id": 8, "node_name": "cpu-08"}
         )
         self.assertIn("http://scheduler-local:8000", command)
+        self.assertIn("--session-id 18", command)
         self.assertNotIn("gate2", command)
 
     def test_relay_mode_reconciles_after_url_is_published(self) -> None:
@@ -1101,7 +1346,9 @@ class FakeDesktopApi:
 
 class FakeDesktop:
     port = 50001
-    aedt_process_id = 123
+    # An empty fake PID keeps bounded cleanup from ever signalling an unrelated
+    # real process that happens to own a low numeric PID on the test host.
+    aedt_process_id = ""
 
     def __init__(self, events: list[str]) -> None:
         self.events = events
@@ -1146,6 +1393,39 @@ class FakeHostControlPlane:
         raise AssertionError(path)
 
 
+class RegistrationRaceControlPlane(FakeHostControlPlane):
+    def __init__(self, events: list[str], *, conflicts: int) -> None:
+        super().__init__(events)
+        self.conflicts = conflicts
+        self.registration_tokens: list[str] = []
+
+    def request(self, method, path, payload=None, host_token=""):
+        if path.endswith("/register"):
+            self.registration_tokens.append(host_token)
+            self.events.append(f"register-{len(self.registration_tokens)}")
+            if len(self.registration_tokens) <= self.conflicts:
+                raise urllib.error.HTTPError(path, 409, "Conflict", None, None)
+        if path.endswith("/start-failed"):
+            self.events.append("start-failed")
+            return {}
+        return super().request(method, path, payload, host_token=host_token)
+
+
+class ClaimRaceControlPlane(FakeHostControlPlane):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events)
+        self.claim_payloads: list[dict] = []
+
+    def request(self, method, path, payload=None, host_token=""):
+        if path.endswith("claim-start"):
+            self.claim_payloads.append(dict(payload or {}))
+            self.events.append(f"claim-{len(self.claim_payloads)}")
+            if len(self.claim_payloads) == 1:
+                raise urllib.error.URLError("claim response lost after commit")
+            return {"session": {"id": int(payload["session_id"])}}
+        return super().request(method, path, payload, host_token=host_token)
+
+
 class SessionHostTests(unittest.TestCase):
     def test_global_stop_occurs_only_after_control_plane_sibling_grace(self) -> None:
         events: list[str] = []
@@ -1172,6 +1452,68 @@ class SessionHostTests(unittest.TestCase):
         with patch("slurm_scheduler.aedt_session_host.time.sleep", return_value=None):
             self.assertEqual(host.run(), 3)
         self.assertNotIn("closed-ack", events)
+
+    def test_registration_409_is_retried_without_closing_desktop(self) -> None:
+        events: list[str] = []
+        control = RegistrationRaceControlPlane(events, conflicts=1)
+        host = AedtSessionHost(
+            control,
+            allocation_id=1,
+            node_name="cpu-01",
+            session_id=41,
+            heartbeat_seconds=5,
+        )
+        host._start_desktop = lambda: FakeDesktop(events)
+        with patch("slurm_scheduler.aedt_session_host.time.sleep", return_value=None):
+            self.assertEqual(host.run(), 2)
+
+        self.assertEqual(len(control.registration_tokens), 2)
+        self.assertTrue(control.registration_tokens[0])
+        self.assertEqual(control.registration_tokens[0], control.registration_tokens[1])
+        self.assertLess(events.index("register-2"), events.index("desktop-close"))
+
+    def test_lost_claim_response_is_retried_before_desktop_starts(self) -> None:
+        events: list[str] = []
+        control = ClaimRaceControlPlane(events)
+        host = AedtSessionHost(
+            control,
+            allocation_id=1,
+            node_name="cpu-01",
+            session_id=43,
+            heartbeat_seconds=5,
+        )
+
+        def start_desktop():
+            events.append("desktop-start")
+            return FakeDesktop(events)
+
+        host._start_desktop = start_desktop
+        with patch("slurm_scheduler.aedt_session_host.time.sleep", return_value=None):
+            self.assertEqual(host.run(), 2)
+
+        self.assertEqual(len(control.claim_payloads), 2)
+        self.assertEqual(control.claim_payloads[0], control.claim_payloads[1])
+        self.assertEqual(control.claim_payloads[0]["session_id"], 43)
+        self.assertLess(events.index("claim-2"), events.index("desktop-start"))
+
+    def test_registration_conflict_closes_desktop_only_after_retry_exhaustion(self) -> None:
+        events: list[str] = []
+        control = RegistrationRaceControlPlane(events, conflicts=3)
+        host = AedtSessionHost(
+            control,
+            allocation_id=1,
+            node_name="cpu-01",
+            session_id=42,
+            heartbeat_seconds=5,
+        )
+        host._start_desktop = lambda: FakeDesktop(events)
+        with patch("slurm_scheduler.aedt_session_host.time.sleep", return_value=None):
+            self.assertEqual(host.run(), 1)
+
+        self.assertEqual(len(control.registration_tokens), 3)
+        self.assertEqual(len(set(control.registration_tokens)), 1)
+        self.assertLess(events.index("register-3"), events.index("desktop-close"))
+        self.assertIn("start-failed", events)
 
 
 if __name__ == "__main__":

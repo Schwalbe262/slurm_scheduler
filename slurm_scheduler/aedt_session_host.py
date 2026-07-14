@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import signal
 import socket
 import sys
@@ -60,12 +61,14 @@ class AedtSessionHost:
         *,
         allocation_id: int,
         node_name: str,
+        session_id: int = 0,
         heartbeat_seconds: int = 20,
         aedt_version: str = "",
     ) -> None:
         self.client = client
         self.allocation_id = int(allocation_id)
         self.node_name = node_name
+        self.requested_session_id = max(0, int(session_id))
         self.heartbeat_seconds = max(5, int(heartbeat_seconds))
         self.aedt_version = aedt_version
         self.host_id = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
@@ -295,30 +298,59 @@ class AedtSessionHost:
             pass
 
     def run(self) -> int:
-        claimed = self.client.request(
-            "POST",
-            "/api/aedt-pool/hosts/claim-start",
-            {
-                "allocation_id": self.allocation_id,
-                "node_name": self.node_name,
-                "host_id": self.host_id,
-            },
-        ).get("session")
+        claim_payload = {
+            "allocation_id": self.allocation_id,
+            "node_name": self.node_name,
+            "host_id": self.host_id,
+            "session_id": self.requested_session_id,
+        }
+        for attempt in range(3):
+            try:
+                claimed = self.client.request(
+                    "POST",
+                    "/api/aedt-pool/hosts/claim-start",
+                    claim_payload,
+                ).get("session")
+                break
+            except urllib.error.HTTPError as exc:
+                if not 500 <= exc.code < 600 or attempt == 2:
+                    raise
+            except (urllib.error.URLError, OSError, json.JSONDecodeError):
+                if attempt == 2:
+                    raise
+            if self.stop_requested:
+                raise RuntimeError("session host stopped during start claim")
+            time.sleep(1)
         if not claimed:
             return 0
         self.session_id = int(claimed["id"])
         try:
             self.desktop = self._start_desktop()
             endpoint = f"{socket.getfqdn()}:{self._desktop_port(self.desktop)}"
-            registered = self.client.request(
-                "POST",
-                f"/api/aedt-pool/sessions/{self.session_id}/register",
-                {
-                    "host_id": self.host_id,
-                    "endpoint": endpoint,
-                    "process_id": self._desktop_pid(self.desktop),
-                },
-            )
+            registration_token = secrets.token_urlsafe(32)
+            for attempt in range(3):
+                try:
+                    registered = self.client.request(
+                        "POST",
+                        f"/api/aedt-pool/sessions/{self.session_id}/register",
+                        {
+                            "host_id": self.host_id,
+                            "endpoint": endpoint,
+                            "process_id": self._desktop_pid(self.desktop),
+                        },
+                        host_token=registration_token,
+                    )
+                    break
+                except urllib.error.HTTPError as exc:
+                    retryable = exc.code == 409 or 500 <= exc.code < 600
+                    if not retryable or attempt == 2:
+                        raise
+                except (urllib.error.URLError, OSError, json.JSONDecodeError):
+                    if attempt == 2:
+                        raise
+                if self.stop_requested:
+                    raise RuntimeError("session host stopped during registration")
+                time.sleep(1)
             self.host_token = str(registered["host_token"])
             while not self.stop_requested:
                 self.client.request(
@@ -414,6 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scheduler-url", required=True)
     parser.add_argument("--allocation-id", required=True, type=int)
     parser.add_argument("--node-name", required=True)
+    parser.add_argument("--session-id", type=int, default=0)
     parser.add_argument("--bootstrap-token-file", required=True)
     parser.add_argument("--heartbeat-seconds", type=int, default=20)
     parser.add_argument("--aedt-version", default="")
@@ -429,6 +462,7 @@ def main(argv: list[str] | None = None) -> int:
         ControlPlaneClient(args.scheduler_url, bootstrap_token=bootstrap_token),
         allocation_id=args.allocation_id,
         node_name=args.node_name,
+        session_id=args.session_id,
         heartbeat_seconds=args.heartbeat_seconds,
         aedt_version=args.aedt_version,
     )
