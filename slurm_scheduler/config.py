@@ -190,6 +190,7 @@ class AppConfig:
             "PYAEDT_MOTOR_IPMSM_V2": {"electronics_desktop": 1},
         }
     )
+    license_admission_reserve_exempt_projects: list[str] = field(default_factory=list)
     license_admission_unknown_fea_project_policy: str = "block"
     cleanup_db_row_ttl_seconds: int = 1209600
     cleanup_event_ttl_seconds: int = 604800
@@ -306,6 +307,7 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
                 "settlement_seconds": "license_admission_settlement_seconds",
                 "reserve_by_feature": "license_admission_reserve_by_feature",
                 "persistent_cost_by_project": "license_admission_persistent_cost_by_project",
+                "reserve_exempt_projects": "license_admission_reserve_exempt_projects",
                 "unknown_fea_project_policy": "license_admission_unknown_fea_project_policy",
             }.items():
                 if source in admission:

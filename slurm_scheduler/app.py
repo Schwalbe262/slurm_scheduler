@@ -468,6 +468,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         license_admission_settlement_seconds=config.license_admission_settlement_seconds,
         license_admission_reserve_by_feature=config.license_admission_reserve_by_feature,
         license_admission_persistent_cost_by_project=config.license_admission_persistent_cost_by_project,
+        license_admission_reserve_exempt_projects=config.license_admission_reserve_exempt_projects,
         license_admission_unknown_fea_project_policy=config.license_admission_unknown_fea_project_policy,
         cleanup_db_row_ttl_seconds=config.cleanup_db_row_ttl_seconds,
         cleanup_event_ttl_seconds=config.cleanup_event_ttl_seconds,

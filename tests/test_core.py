@@ -188,6 +188,7 @@ class SlurmParsingTests(unittest.TestCase):
                         "    settlement_seconds: 300",
                         "    reserve_by_feature:",
                         "      electronics_desktop: 32",
+                        "    reserve_exempt_projects: ['_aedt_pool_hosts']",
                         "    persistent_cost_by_project:",
                         "      MFT_1MW_2026v1:",
                         "        electronics_desktop: 1",
@@ -202,6 +203,10 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertEqual(config.license_admission_snapshot_max_age_seconds, 120)
         self.assertEqual(config.license_admission_settlement_seconds, 300)
         self.assertEqual(config.license_admission_reserve_by_feature, {"electronics_desktop": 32})
+        self.assertEqual(
+            config.license_admission_reserve_exempt_projects,
+            ["_aedt_pool_hosts"],
+        )
         self.assertEqual(
             config.license_admission_persistent_cost_by_project,
             {"MFT_1MW_2026v1": {"electronics_desktop": 1}},

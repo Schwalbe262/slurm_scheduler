@@ -98,6 +98,8 @@ license_monitor:
     settlement_seconds: 300
     reserve_by_feature:
       electronics_desktop: 32
+    # Let the hard-capped AEDT pool warm-spare host use protected reserve capacity.
+    # reserve_exempt_projects: ["_aedt_pool_hosts"]
     persistent_cost_by_project:
       # Required for license-gated AEDT pool demand and warm-spare hosts.
       _aedt_pool_hosts:

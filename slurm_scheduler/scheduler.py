@@ -219,6 +219,7 @@ class Scheduler:
         watchdog_enabled: bool = True,
         watchdog_stall_seconds: int = 0,
         ssh_parallelism: int = 4,
+        license_admission_reserve_exempt_projects: list[str] | None = None,
     ):
         self.db = db
         self.accounts = accounts
@@ -407,6 +408,11 @@ class Scheduler:
                 if str(feature).strip() and int(cost) > 0
             }
             for project, costs in cost_source.items()
+            if str(project).strip()
+        }
+        self.license_admission_reserve_exempt_projects = {
+            str(project).strip()
+            for project in (license_admission_reserve_exempt_projects or [])
             if str(project).strip()
         }
         unknown_policy = str(license_admission_unknown_fea_project_policy or "block").strip().lower()
@@ -1251,7 +1257,9 @@ class Scheduler:
         return features
 
     def _license_admission_diagnostics_locked(
-        self, candidate_costs: dict[str, int] | None = None
+        self,
+        candidate_costs: dict[str, int] | None = None,
+        exempt_reserve: bool = False,
     ) -> dict:
         candidate_costs = dict(candidate_costs or {})
         required_features = self._license_configured_features() | set(candidate_costs)
@@ -1262,6 +1270,7 @@ class Scheduler:
             "snapshot_age_seconds": None,
             "snapshot_max_age_seconds": self.license_admission_snapshot_max_age_seconds,
             "settlement_seconds": self.license_admission_settlement_seconds,
+            "reserve_exempt": bool(exempt_reserve),
             "reserve_by_feature": dict(self.license_admission_reserve_by_feature),
             "persistent_cost_by_project": {
                 project: dict(costs)
@@ -1338,7 +1347,7 @@ class Scheduler:
                 return diagnostics
             reserve = int(self.license_admission_reserve_by_feature.get(feature, 0))
             effective_used = used + int(unsettled.get(feature, 0))
-            capacity = max(0, total - reserve)
+            capacity = total if exempt_reserve else max(0, total - reserve)
             headroom = capacity - effective_used
             diagnostics["features"][feature] = {
                 "used": used,
@@ -1370,7 +1379,11 @@ class Scheduler:
             return False, profile_error
         if not costs:
             return True, ""
-        diagnostics = self._license_admission_diagnostics_locked(costs)
+        project = str(task.get("project") or "").strip()
+        diagnostics = self._license_admission_diagnostics_locked(
+            costs,
+            exempt_reserve=project in self.license_admission_reserve_exempt_projects,
+        )
         reason = str(diagnostics.get("blocked_reason") or "")
         if reason:
             self._license_last_blocked_reason = reason
@@ -1392,6 +1405,9 @@ class Scheduler:
             "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
             "aedt_backend": AedtBackend.STANDALONE.value,
         }
+        exempt_reserve = (
+            host_task["project"] in self.license_admission_reserve_exempt_projects
+        )
         with self._task_assignment_lock:
             costs, profile_error = self._license_costs_for_task(host_task)
             if profile_error:
@@ -1409,7 +1425,9 @@ class Scheduler:
                 )
                 self._license_last_blocked_reason = reason
                 return 0, reason
-            diagnostics = self._license_admission_diagnostics_locked()
+            diagnostics = self._license_admission_diagnostics_locked(
+                exempt_reserve=exempt_reserve
+            )
             reason = str(diagnostics.get("blocked_reason") or "")
             if reason:
                 self._license_last_blocked_reason = reason
@@ -1430,7 +1448,8 @@ class Scheduler:
                     for feature, cost in costs.items()
                 }
                 requested_diagnostics = self._license_admission_diagnostics_locked(
-                    requested_costs
+                    requested_costs,
+                    exempt_reserve=exempt_reserve,
                 )
                 reason = str(requested_diagnostics.get("blocked_reason") or "") or (
                     f"license admission headroom permits {allowed} of "
