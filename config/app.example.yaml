@@ -63,6 +63,10 @@ fea_bursty:
   hard_memory_free_percent: 40
   load_target: 0.75
   max_attach_per_loop: 24
+  # Per-tick budget for baseline attaches (allocations below their 1x
+  # solver budget); separate from max_attach_per_loop which now bounds
+  # only overcommit attaches.
+  baseline_max_attach_per_loop: 64
   max_attach_per_node_per_loop: 12
   node_name_policy: "preferred"
   # Fast-fill the allocation-owned physical-core baseline (bounded by

@@ -104,6 +104,7 @@ class AppConfig:
     fea_hard_memory_free_percent: float = 40.0
     fea_load_target: float = 0.75
     fea_max_attach_per_loop: int = 24
+    fea_baseline_max_attach_per_loop: int = 64
     fea_node_name_policy: str = "preferred"
     fea_overload_scale_out_load_factor: float = 2.0
     fea_overload_scale_out_seconds: int = 300
@@ -235,6 +236,7 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
             "hard_memory_free_percent": "fea_hard_memory_free_percent",
             "load_target": "fea_load_target",
             "max_attach_per_loop": "fea_max_attach_per_loop",
+            "baseline_max_attach_per_loop": "fea_baseline_max_attach_per_loop",
             "node_name_policy": "fea_node_name_policy",
             "overload_scale_out_load_factor": "fea_overload_scale_out_load_factor",
             "overload_scale_out_seconds": "fea_overload_scale_out_seconds",

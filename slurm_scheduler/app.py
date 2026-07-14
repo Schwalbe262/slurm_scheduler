@@ -413,6 +413,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         fea_hard_memory_free_percent=config.fea_hard_memory_free_percent,
         fea_load_target=config.fea_load_target,
         fea_max_attach_per_loop=config.fea_max_attach_per_loop,
+        fea_baseline_max_attach_per_loop=config.fea_baseline_max_attach_per_loop,
         fea_node_name_policy=config.fea_node_name_policy,
         fea_overload_scale_out_load_factor=config.fea_overload_scale_out_load_factor,
         fea_overload_scale_out_seconds=config.fea_overload_scale_out_seconds,

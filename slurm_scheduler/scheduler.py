@@ -158,6 +158,7 @@ class Scheduler:
         fea_hard_memory_free_percent: float = 40.0,
         fea_load_target: float = 0.75,
         fea_max_attach_per_loop: int = 8,
+        fea_baseline_max_attach_per_loop: int = 64,
         fea_node_name_policy: str = "preferred",
         fea_overload_scale_out_load_factor: float = 2.0,
         fea_overload_scale_out_seconds: int = 300,
@@ -280,6 +281,10 @@ class Scheduler:
         self.fea_hard_memory_free_percent = max(0.0, float(fea_hard_memory_free_percent))
         self.fea_load_target = max(0.0, float(fea_load_target))
         self.fea_max_attach_per_loop = max(1, int(fea_max_attach_per_loop))
+        self.fea_baseline_max_attach_per_loop = max(
+            1, int(fea_baseline_max_attach_per_loop)
+        )
+        self._fea_last_attach_baseline = False
         node_policy = (fea_node_name_policy or "preferred").strip().lower()
         self.fea_node_name_policy = node_policy if node_policy in {"preferred", "strict"} else "preferred"
         self.fea_overload_scale_out_load_factor = max(0.0, float(fea_overload_scale_out_load_factor))
@@ -2999,7 +3004,12 @@ class Scheduler:
         )
 
     def assign_ready_fea_tasks(self, background: bool = False) -> None:
-        attached = 0
+        # Baseline attaches (allocations still below their 1x solver budget)
+        # draw from their own per-tick budget, separate from the global
+        # overcommit cap, so a slow overcommit trickle cannot delay baseline
+        # recovery across many underfilled allocations.
+        attached_overcommit = 0
+        attached_baseline = 0
         for task in self.project_fair_queue_order(
             [
                 item
@@ -3008,10 +3018,17 @@ class Scheduler:
             ],
             self._fea_project_last_claim,
         ):
-            if attached >= self.fea_max_attach_per_loop:
+            if attached_baseline >= self.fea_baseline_max_attach_per_loop:
                 return
-            if self.assign_queued_task(task, background=background):
-                attached += 1
+            baseline_only = attached_overcommit >= self.fea_max_attach_per_loop
+            self._fea_last_attach_baseline = False
+            if self.assign_queued_task(
+                task, background=background, fea_baseline_only=baseline_only
+            ):
+                if self._fea_last_attach_baseline:
+                    attached_baseline += 1
+                else:
+                    attached_overcommit += 1
                 # This is an accepted DB attach claim, not proof that the remote
                 # worker later started. Rotating on claims also prevents a
                 # repeatedly failing project from monopolizing scarce slots.
@@ -3102,7 +3119,9 @@ class Scheduler:
             return ""
         return f"project active cap reached for {project_name}: {active}/{limit} attaching+running"
 
-    def assign_queued_task(self, task: dict, background: bool = False) -> bool:
+    def assign_queued_task(
+        self, task: dict, background: bool = False, fea_baseline_only: bool = False
+    ) -> bool:
         if task.get("status") != TaskStatus.QUEUED.value:
             return False
         if self.aedt_backend_block_reason(task):
@@ -3112,7 +3131,7 @@ class Scheduler:
         # across concurrent callers requires one transactional check/transition.
         if self.project_active_cap_reason(task):
             return False
-        allocation = self.best_allocation_for_task(task)
+        allocation = self.best_allocation_for_task(task, fea_baseline_only=fea_baseline_only)
         if not allocation:
             return False
         account = next((item for item in self.accounts if item.name == allocation["account_name"]), None)
@@ -3294,13 +3313,17 @@ class Scheduler:
         self._license_mark_running(task)
         return True
 
-    def best_allocation_for_task(self, task: dict) -> dict | None:
-        exact = self.best_allocation_for_effective_task(task)
+    def best_allocation_for_task(self, task: dict, fea_baseline_only: bool = False) -> dict | None:
+        exact = self.best_allocation_for_effective_task(task, fea_baseline_only=fea_baseline_only)
         if exact or not self.task_can_relax_preferred_node(task):
             return exact
-        return self.best_allocation_for_effective_task(self.relaxed_preferred_node_task(task))
+        return self.best_allocation_for_effective_task(
+            self.relaxed_preferred_node_task(task), fea_baseline_only=fea_baseline_only
+        )
 
-    def best_allocation_for_effective_task(self, task: dict) -> dict | None:
+    def best_allocation_for_effective_task(
+        self, task: dict, fea_baseline_only: bool = False
+    ) -> dict | None:
         cpu_candidates = []
         gpu_candidates = []
         is_fea = self.task_is_fea_bursty(task)
@@ -3359,6 +3382,37 @@ class Scheduler:
             ]
             if not candidates:
                 return None
+            # Baseline-first: every allocation is entitled to one solver per
+            # requested-CPU share of its own reservation (1x = owned_cpus /
+            # task cpus) before any allocation is overcommitted. Ordering by
+            # physical-node worker count treated a 32-core and a 64-core
+            # allocation as equals, starving large under-baseline allocations
+            # while small ones ran past 1x.
+            under_baseline = [
+                item for item in candidates if self.fea_baseline_ratio(item) < 1.0
+            ]
+            if under_baseline:
+                # Under license scarcity flip from spread-first (fill the most
+                # underfilled allocation) to fill-first (top up the allocation
+                # closest to baseline) so scarce licenses concentrate into
+                # fully usable allocations instead of spreading thinly.
+                headroom = self.fea_license_admit_headroom()
+                fill_first = headroom is not None and headroom < len(under_baseline)
+                direction = -1.0 if fill_first else 1.0
+                chosen = min(
+                    under_baseline,
+                    key=lambda item: (
+                        direction * self.fea_baseline_ratio(item),
+                        -int(item.get("_task_fit_slots") or 0),
+                        -(self.fea_memory_free_percent(item) or 0.0),
+                        -int(item.get("free_memory_mb") or 0),
+                    ),
+                )
+                self._fea_last_attach_baseline = True
+                return chosen
+            if fea_baseline_only:
+                return None
+            self._fea_last_attach_baseline = False
             return max(
                 candidates,
                 key=lambda item: (
@@ -4174,6 +4228,13 @@ class Scheduler:
     def task_is_fea_bursty(self, task: dict) -> bool:
         return self.task_scheduling_profile(task) == SchedulingProfile.FEA_BURSTY.value
 
+    def task_is_fea_infra(self, task: dict) -> bool:
+        """AEDT pool session hosts ride the FEA profile but are not solver
+        workers; they are excluded from the per-allocation solver baseline and
+        requested-CPU accounting so a 64-core reservation keeps its full
+        floor(64/4)=16 solver budget."""
+        return str(task.get("project") or "").strip() == "_aedt_pool_hosts"
+
     def task_can_relax_preferred_node(self, task: dict) -> bool:
         return (
             self.fea_node_name_policy == "preferred"
@@ -4432,6 +4493,8 @@ class Scheduler:
             if task["status"] not in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
                 continue
             if not self.task_is_fea_bursty(task):
+                continue
+            if self.task_is_fea_infra(task):
                 continue
             alloc_id = int(task.get("allocation_id") or 0)
             if alloc_id not in owned_by_alloc:
@@ -5131,6 +5194,32 @@ class Scheduler:
             attached_at=None,
             started_at=None,
         )
+
+    def fea_baseline_ratio(self, allocation: dict) -> float:
+        """Solver-requested CPUs over owned CPUs for one allocation, with
+        infrastructure tasks excluded. Below 1.0 the allocation has not yet
+        received its 1x baseline of solvers (16 four-core solvers on a
+        64-core reservation)."""
+        pressure = self.fea_allocation_pressures().get(int(allocation.get("id") or 0), {})
+        owned = int(pressure.get("owned_cpus") or allocation.get("total_cpus") or 0)
+        if owned <= 0:
+            return 1.0
+        return float(int(pressure.get("requested_cpus") or 0)) / float(owned)
+
+    def fea_license_admit_headroom(self) -> int | None:
+        """electronics_desktop admit headroom from license admission, or None
+        when admission is disabled or no usable snapshot exists."""
+        if not self.license_admission_enabled:
+            return None
+        with self._task_assignment_lock:
+            diagnostics = self._license_admission_diagnostics_locked()
+        status = dict(diagnostics.get("features") or {}).get("electronics_desktop")
+        if not isinstance(status, dict):
+            return None
+        try:
+            return int(status.get("admit_headroom"))
+        except (TypeError, ValueError):
+            return None
 
     def fea_node_cpu_cap_remaining(self, allocation: dict, task: dict) -> int | None:
         """How many more workers of this task fit under the per-ALLOCATION cap:
