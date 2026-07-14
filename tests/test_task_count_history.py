@@ -108,6 +108,16 @@ class TaskCountSamplerTests(unittest.TestCase):
         self.db.update_task(older_active, status=TaskStatus.RUNNING.value)
         self.db.update_task(middle_active, status=TaskStatus.ATTACHING.value)
         self.db.update_task(newer_active, status=TaskStatus.RUNNING.value)
+        session_host = self.db.create_task(
+            TaskCreate(
+                "campaign-session-host",
+                "~/case",
+                "run",
+                scheduling_profile="fea_bursty",
+                project="_aedt_pool_hosts",
+            )
+        )
+        self.db.update_task(session_host, status=TaskStatus.RUNNING.value)
         self.db.create_task(TaskCreate("campaign-older-queued", "~/case", "run"))
         self.db.create_task(TaskCreate("campaign-newer-queued", "~/case", "run"))
         unrelated = self.db.create_task(TaskCreate("unrelated", "~/case", "run"))
@@ -115,22 +125,23 @@ class TaskCountSamplerTests(unittest.TestCase):
 
         summary = self.db.task_activity_summary(
             name_contains="campaign",
-            active_limit=2,
+            active_limit=3,
             queued_limit=1,
         )
 
         self.assertEqual(
             summary,
             {
-                "total": 3,
-                "running": 1,
+                "total": 4,
+                "running": 2,
                 "attaching": 1,
                 "queued": 1,
                 "fea": 1,
                 "fea_running": 1,
+                "session_hosts": 1,
                 "standard": 2,
                 "gpu": 1,
-                "cpu": 2,
+                "cpu": 3,
                 "same_node": 1,
             },
         )

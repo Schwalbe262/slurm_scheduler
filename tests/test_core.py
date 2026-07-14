@@ -2331,7 +2331,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(client["status"], TaskStatus.RUNNING.value)
         self.assertEqual(client["allocation_id"], reference_allocation_id)
 
-    def test_exact_allocation_host_outlives_sibling_and_anchors_clients(self) -> None:
+    def test_legacy_exact_allocation_owner_outlives_sibling_and_anchors_dependents(self) -> None:
         target_allocation_id = self.db.create_allocation(
             account_name="a",
             partition="cpu1",
@@ -2349,7 +2349,7 @@ class SchedulerTests(unittest.TestCase):
         self.db.update_allocation(
             target_allocation_id,
             state=AllocationStatus.ACTIVE.value,
-            slurm_job_id="canary-target",
+            slurm_job_id="legacy-target",
         )
         self.db.update_allocation(
             other_allocation_id,
@@ -2366,24 +2366,23 @@ class SchedulerTests(unittest.TestCase):
             account_name="a",
             started_at="CURRENT_TIMESTAMP",
         )
-        host_id = self.db.create_task(
+        owner_id = self.db.create_task(
             TaskCreate(
-                "node-local-aedt-host",
+                "legacy-allocation-owner",
                 "~/case",
-                "python scripts/aedt_pool_node_canary_host.py",
+                "serve",
                 cpus=1,
                 memory_mb=4096,
-                entrypoint="aedt_node_canary_host",
                 requested_allocation_id=target_allocation_id,
             )
         )
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
 
         scheduler.assign_queued_tasks()
-        host = self.db.get_task(host_id)
-        self.assertEqual(host["status"], TaskStatus.RUNNING.value)
-        self.assertEqual(host["allocation_id"], target_allocation_id)
-        self.assertEqual(host["same_node_as_task_id"], 0)
+        owner = self.db.get_task(owner_id)
+        self.assertEqual(owner["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(owner["allocation_id"], target_allocation_id)
+        self.assertEqual(owner["same_node_as_task_id"], 0)
 
         self.db.update_task(
             sibling_id,
@@ -2393,28 +2392,28 @@ class SchedulerTests(unittest.TestCase):
         scheduler.fail_stale_same_node_tasks()
         scheduler.recalculate_allocation_capacity()
         scheduler.apply_allocation_lifecycle()
-        self.assertEqual(self.db.get_task(host_id)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(self.db.get_task(owner_id)["status"], TaskStatus.RUNNING.value)
         self.assertEqual(
             self.db.get_allocation(target_allocation_id)["state"],
             AllocationStatus.ACTIVE.value,
         )
 
-        client_id = self.db.create_task(
+        dependent_id = self.db.create_task(
             TaskCreate(
-                "node-local-aedt-client",
+                "same-node-dependent",
                 "~/case",
-                "attach",
+                "use-local-service",
                 cpus=1,
                 memory_mb=1024,
-                same_node_as_task_id=host_id,
+                same_node_as_task_id=owner_id,
             )
         )
         scheduler.assign_queued_tasks()
-        client = self.db.get_task(client_id)
-        self.assertEqual(client["status"], TaskStatus.RUNNING.value)
-        self.assertEqual(client["allocation_id"], target_allocation_id)
+        dependent = self.db.get_task(dependent_id)
+        self.assertEqual(dependent["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(dependent["allocation_id"], target_allocation_id)
 
-    def test_exact_allocation_reservation_revalidates_fit_under_lock(self) -> None:
+    def test_legacy_exact_allocation_reservation_revalidates_fit_under_lock(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",
             partition="cpu1",
@@ -2425,17 +2424,16 @@ class SchedulerTests(unittest.TestCase):
         self.db.update_allocation(
             allocation_id,
             state=AllocationStatus.WARM.value,
-            slurm_job_id="canary-target",
+            slurm_job_id="legacy-target",
         )
         task_ids = [
             self.db.create_task(
                 TaskCreate(
-                    f"host-{index}",
+                    f"legacy-owner-{index}",
                     "~/case",
-                    "host",
+                    "serve",
                     cpus=40,
                     memory_mb=4096,
-                    entrypoint="aedt_node_canary_host",
                     requested_allocation_id=allocation_id,
                 )
             )
@@ -2455,7 +2453,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertIsNone(second)
         self.assertEqual(self.db.get_task(task_ids[1])["status"], TaskStatus.QUEUED.value)
 
-    def test_queued_exact_allocation_host_fails_when_target_drains(self) -> None:
+    def test_queued_legacy_exact_allocation_task_fails_when_target_drains(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",
             partition="cpu1",
@@ -2466,14 +2464,13 @@ class SchedulerTests(unittest.TestCase):
         self.db.update_allocation(
             allocation_id,
             state=AllocationStatus.DRAINING.value,
-            slurm_job_id="canary-target",
+            slurm_job_id="legacy-target",
         )
-        host_id = self.db.create_task(
+        task_id = self.db.create_task(
             TaskCreate(
-                "queued-host",
+                "queued-legacy-exact-pin",
                 "~/case",
-                "host",
-                entrypoint="aedt_node_canary_host",
+                "serve",
                 requested_allocation_id=allocation_id,
             )
         )
@@ -2481,10 +2478,10 @@ class SchedulerTests(unittest.TestCase):
 
         scheduler.fail_stale_requested_allocation_tasks()
 
-        host = self.db.get_task(host_id)
-        self.assertEqual(host["status"], TaskStatus.FAILED.value)
+        task = self.db.get_task(task_id)
+        self.assertEqual(task["status"], TaskStatus.FAILED.value)
         self.assertEqual(
-            host["failure_message"],
+            task["failure_message"],
             f"requested allocation {allocation_id} is draining",
         )
 
@@ -8578,7 +8575,7 @@ class ProjectApiTests(unittest.TestCase):
         self.assertEqual(updated["max_active_tasks"], 9)
         self.assertEqual(self.get_project("motor")["max_active_tasks"], 9)
 
-    def test_aedt_backend_defaults_and_task_api_round_trip(self) -> None:
+    def test_aedt_backend_round_trip_and_retired_exact_pin_submission(self) -> None:
         standalone = asyncio.run(
             self.create_task(self._request({"name": "standalone", "remote_cwd": "~/w", "command": "true"}))
         )
@@ -8600,6 +8597,27 @@ class ProjectApiTests(unittest.TestCase):
         payload = json.loads(pooled.body)
         self.assertEqual(payload["aedt_backend"], "pooled")
         self.assertEqual(self.get_task(payload["id"], include_output=False)["aedt_backend"], "pooled")
+
+        from fastapi import HTTPException
+
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(
+                self.create_task(
+                    self._request(
+                        {
+                            "name": "retired-exact-pin",
+                            "remote_cwd": "~/w",
+                            "command": "true",
+                            "requested_allocation_id": 123,
+                        }
+                    )
+                )
+            )
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertEqual(
+            raised.exception.detail,
+            "requested_allocation_id is not accepted for new tasks",
+        )
 
     def test_project_aedt_backend_is_inherited_and_invalid_task_value_is_rejected(self) -> None:
         project = self._post_project({"name": "motor", "aedt_backend": "pooled"})
@@ -8644,10 +8662,12 @@ class ProjectApiTests(unittest.TestCase):
             "aedt_backend": "pooled",
             "scheduling_profile": "fea_bursty",
         }
-        scheduler.set_aedt_backend_admission_checker(lambda _task: (False, "canary gate closed"))
         diagnostics = scheduler.task_queue_diagnostics(task)
         self.assertEqual(diagnostics["queue_state"], "blocked")
-        self.assertEqual(diagnostics["queue_reason"], "AEDT backend: canary gate closed")
+        self.assertEqual(
+            diagnostics["queue_reason"],
+            "AEDT backend: AEDT pooled backend is not operational",
+        )
 
     def test_project_api_rejects_invalid_max_active_tasks(self) -> None:
         from fastapi import HTTPException

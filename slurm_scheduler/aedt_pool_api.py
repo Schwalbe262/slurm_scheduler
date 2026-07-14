@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 
@@ -13,136 +12,11 @@ from .aedt_pool import AedtPoolService
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).resolve().parent.parent / "templates"))
 
-NODE_LOCAL_AEDT_HOST_PROJECT = "_aedt_pool_hosts"
-NODE_LOCAL_AEDT_HOST_PREFIX = "mft-aedt-pooled-"
-NODE_LOCAL_AEDT_HOST_NAME = re.compile(
-    rf"^{re.escape(NODE_LOCAL_AEDT_HOST_PREFIX)}([0-9a-fA-F]{{20}})-host$"
-)
-NODE_LOCAL_AEDT_HOST_STATUSES = ["queued", "attaching", "running"]
-NODE_LOCAL_AEDT_CLIENT_STATUSES = ["attaching", "running"]
-
 
 def _public_lease(lease: dict[str, Any]) -> dict[str, Any]:
     item = dict(lease)
     item.pop("client_token_hash", None)
     return item
-
-
-def build_node_local_aedt_summary(
-    db: Any,
-    *,
-    allocation_rows: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Build the dashboard/detail view of task-backed node-local AEDT sessions."""
-    host_rows = db.list_tasks(
-        limit=None,
-        project=NODE_LOCAL_AEDT_HOST_PROJECT,
-        name_prefix=NODE_LOCAL_AEDT_HOST_PREFIX,
-        statuses=NODE_LOCAL_AEDT_HOST_STATUSES,
-    )
-    parsed_hosts: list[tuple[dict[str, Any], str]] = []
-    for host in host_rows:
-        match = NODE_LOCAL_AEDT_HOST_NAME.fullmatch(str(host.get("name") or ""))
-        if match:
-            parsed_hosts.append((host, match.group(1)))
-
-    if not parsed_hosts:
-        return {
-            "active_host_count": 0,
-            "running_host_count": 0,
-            "attached_client_count": 0,
-            "hosts": [],
-        }
-
-    active_host_ids = {int(host["id"]) for host, _bundle_id in parsed_hosts}
-    running_host_ids = {
-        int(host["id"])
-        for host, _bundle_id in parsed_hosts
-        if str(host.get("status") or "") == "running"
-    }
-    clients_by_host: dict[int, list[dict[str, Any]]] = {
-        host_id: [] for host_id in active_host_ids
-    }
-    for client in db.list_tasks_by_same_node_task_ids(
-        active_host_ids,
-        statuses=NODE_LOCAL_AEDT_CLIENT_STATUSES,
-        aedt_backend="pooled",
-    ):
-        host_id = int(client.get("same_node_as_task_id") or 0)
-        clients_by_host[host_id].append(
-            {
-                "id": int(client["id"]),
-                "name": str(client.get("name") or ""),
-                "project": str(client.get("project") or ""),
-                "status": str(client.get("status") or ""),
-            }
-        )
-
-    allocations = {
-        int(allocation["id"]): allocation for allocation in (allocation_rows or [])
-    }
-    allocation_ids = {
-        int(host.get("allocation_id") or host.get("requested_allocation_id") or 0)
-        for host, _bundle_id in parsed_hosts
-    }
-    allocation_ids.discard(0)
-    missing_allocation_ids = allocation_ids - set(allocations)
-    if missing_allocation_ids:
-        allocations.update(
-            {
-                int(allocation["id"]): allocation
-                for allocation in db.list_allocations_by_ids(missing_allocation_ids)
-            }
-        )
-    hosts: list[dict[str, Any]] = []
-    for host, bundle_id in parsed_hosts:
-        host_id = int(host["id"])
-        allocation_id = int(host.get("allocation_id") or host.get("requested_allocation_id") or 0)
-        allocation = allocations.get(allocation_id, {})
-        hosts.append(
-            {
-                "id": host_id,
-                "bundle_id": bundle_id,
-                "bundle_id_short": bundle_id[:8],
-                "node_name": str(
-                    host.get("allocation_node_name")
-                    or allocation.get("node_name")
-                    or host.get("node_name")
-                    or ""
-                ),
-                "account_name": str(
-                    host.get("account_name")
-                    or host.get("requested_account_name")
-                    or allocation.get("account_name")
-                    or ""
-                ),
-                "status": str(host.get("status") or ""),
-                "started_at": host.get("started_at"),
-                "clients": clients_by_host[host_id],
-            }
-        )
-
-    return {
-        "active_host_count": len(hosts),
-        "running_host_count": len(running_host_ids),
-        "attached_client_count": sum(
-            len(clients_by_host[host_id]) for host_id in running_host_ids
-        ),
-        "hosts": hosts,
-    }
-
-
-def build_aedt_pool_summary(
-    service: AedtPoolService,
-    *,
-    allocation_rows: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    summary = dict(service.summary())
-    summary["node_local"] = build_node_local_aedt_summary(
-        service.db,
-        allocation_rows=allocation_rows,
-    )
-    return summary
 
 
 def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
@@ -160,12 +34,12 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
     def aedt_pool_page(request: Request) -> HTMLResponse:
         return TEMPLATES.TemplateResponse(
             "aedt_pool.html",
-            {"request": request, "summary": build_aedt_pool_summary(service)},
+            {"request": request, "summary": service.summary()},
         )
 
     @router.get("/api/aedt-pool")
     def get_aedt_pool() -> dict[str, Any]:
-        return build_aedt_pool_summary(service)
+        return service.summary()
 
     @router.patch("/api/aedt-pool/config", dependencies=[bootstrap_guard])
     async def set_aedt_pool_limit(request: Request) -> dict[str, Any]:
