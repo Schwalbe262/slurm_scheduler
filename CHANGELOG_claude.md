@@ -1,3 +1,25 @@
+## 2026-07-14 (Claude) - Live deploy: relay enabled + FEA baseline-first assignment
+- Deployed `live/node-canary-260714` to the live service (launcher: scheduled
+  task SlurmSchedulerWebNative / start_web_y.cmd, config Y:/runtime/.../app.yaml):
+  merged the control-plane relay (9bf7944) into the live snapshot (7b58966)
+  and enabled it (account r1jae262, port 18790) — relay state "up", published
+  URL http://172.16.10.37:18790. Central AEDT pool enabled at 2 sessions /
+  4 projects / min_idle 1; bootstrap token injected via launcher env, cluster
+  checkout + token deployed to r1jae262 workspace (aedt_pool_pkg @ this SHA).
+- FEA baseline-first assignment (2bdfd6f): allocations below their 1x
+  solver-CPU baseline are filled first (lowest requested/owned ratio; flips
+  to fill-first under license scarcity), `_aedt_pool_hosts` infra tasks no
+  longer consume solver baseline, and baseline attaches draw from
+  fea_bursty.baseline_max_attach_per_loop (64) separate from the overcommit
+  cap. Fixes: 25/38 allocations idled below 1x while others ran past it.
+- Test suite green after harness updates for the new contract: 424 passed
+  (test_core + test_fea_baseline_assignment + test_aedt_pool +
+  test_control_plane_relay).
+- Ops note: the previous scheduler process tree died at 13:20 with no exit
+  record (external kill, owner unknown); service was down ~18 min until
+  manual recovery. The scheduled-task launcher loop is the restart path —
+  re-run it via `schtasks /Run /TN SlurmSchedulerWebNative` if the tree dies.
+
 
 ## 2026-07-14 (Codex) - Cluster-reachable AEDT control-plane relay (disabled)
 - Added an opt-in supervisor that maintains an SSH reverse tunnel through one

@@ -6116,6 +6116,7 @@ class SchedulerTests(unittest.TestCase):
             30,
             client_factory=FakeClient,
             fea_max_attach_per_loop=4,
+            fea_baseline_max_attach_per_loop=4,
         )
         scheduler.assign_ready_fea_tasks()
 
@@ -6173,8 +6174,9 @@ class SchedulerTests(unittest.TestCase):
             )
         winners = []
 
-        def accept_first(task, background=False):
+        def accept_first(task, background=False, fea_baseline_only=False):
             winners.append(task["project"])
+            scheduler._fea_last_attach_baseline = True
             return True
 
         for _ in range(4):
@@ -6184,6 +6186,7 @@ class SchedulerTests(unittest.TestCase):
                 30,
                 client_factory=FakeClient,
                 fea_max_attach_per_loop=1,
+                fea_baseline_max_attach_per_loop=1,
             )
             scheduler.assign_queued_task = accept_first
             scheduler.assign_ready_fea_tasks(background=True)
@@ -6211,9 +6214,10 @@ class SchedulerTests(unittest.TestCase):
             )
         winners = []
 
-        def accept_and_drain(task, background=False):
+        def accept_and_drain(task, background=False, fea_baseline_only=False):
             winners.append(task["project"])
             self.db.update_task(task["id"], status=TaskStatus.CANCELLED.value)
+            scheduler._fea_last_attach_baseline = True
             return True
 
         for _ in range(4):
@@ -6223,6 +6227,7 @@ class SchedulerTests(unittest.TestCase):
                 30,
                 client_factory=FakeClient,
                 fea_max_attach_per_loop=1,
+                fea_baseline_max_attach_per_loop=1,
             )
             scheduler.assign_queued_task = accept_and_drain
             scheduler.assign_ready_fea_tasks(background=True)
@@ -7494,8 +7499,8 @@ class SchedulerTests(unittest.TestCase):
         original_best = scheduler.best_allocation_for_task
         both_selected = threading.Barrier(2)
 
-        def synchronized_best(task: dict) -> dict | None:
-            selected = original_best(task)
+        def synchronized_best(task: dict, **kwargs) -> dict | None:
+            selected = original_best(task, **kwargs)
             both_selected.wait(timeout=2)
             return selected
 
@@ -9475,8 +9480,8 @@ class LicenseAdmissionTests(unittest.TestCase):
         original_best = scheduler.best_allocation_for_task
         selected = threading.Barrier(2)
 
-        def synchronized_best(task: dict) -> dict | None:
-            allocation = original_best(task)
+        def synchronized_best(task: dict, **kwargs) -> dict | None:
+            allocation = original_best(task, **kwargs)
             selected.wait(timeout=2)
             return allocation
 
