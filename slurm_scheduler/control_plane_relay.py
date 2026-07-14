@@ -211,7 +211,10 @@ RELAY_SCRIPT = textwrap.dedent(
         daemon_threads = True
 
         def __init__(self, *args, **kwargs):
-            self._connection_slots = threading.BoundedSemaphore(64)
+            # Sized for a full pooled campaign: hundreds of thin clients
+            # heartbeat/poll concurrently and a 64-slot cap answered "503
+            # relay busy" to registering session hosts, killing whole waves.
+            self._connection_slots = threading.BoundedSemaphore(256)
             super().__init__(*args, **kwargs)
 
         def process_request(self, request, client_address):
