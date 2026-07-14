@@ -49,23 +49,42 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
             "min_idle_aedt_sessions",
             "target_project_concurrency",
             "projects_per_aedt",
+            "lease_ttl_seconds",
+            "session_heartbeat_timeout_seconds",
         }
         if not payload or set(payload) - allowed:
             raise HTTPException(
                 status_code=422,
                 detail=(
                     "only max_aedt_sessions, min_idle_aedt_sessions, "
-                    "target_project_concurrency, and projects_per_aedt "
+                    "target_project_concurrency, projects_per_aedt, "
+                    "lease_ttl_seconds, and session_heartbeat_timeout_seconds "
                     "are operator-configurable"
                 ),
             )
         try:
-            config = service.set_operator_limits(
-                max_sessions=payload.get("max_aedt_sessions"),
-                min_idle_sessions=payload.get("min_idle_aedt_sessions"),
-                target_projects=payload.get("target_project_concurrency"),
-                projects_per_session=payload.get("projects_per_aedt"),
-            )
+            limit_keys = {
+                "max_aedt_sessions",
+                "min_idle_aedt_sessions",
+                "target_project_concurrency",
+                "projects_per_aedt",
+            }
+            if limit_keys & set(payload):
+                config = service.set_operator_limits(
+                    max_sessions=payload.get("max_aedt_sessions"),
+                    min_idle_sessions=payload.get("min_idle_aedt_sessions"),
+                    target_projects=payload.get("target_project_concurrency"),
+                    projects_per_session=payload.get("projects_per_aedt"),
+                )
+            if {"lease_ttl_seconds", "session_heartbeat_timeout_seconds"} & set(
+                payload
+            ):
+                config = service.set_operator_timeouts(
+                    lease_ttl_seconds=payload.get("lease_ttl_seconds"),
+                    session_heartbeat_timeout_seconds=payload.get(
+                        "session_heartbeat_timeout_seconds"
+                    ),
+                )
             service.reconcile(execute=True)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -74,6 +93,10 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
             "min_idle_aedt_sessions": config.min_idle_sessions,
             "target_project_concurrency": config.target_projects,
             "projects_per_aedt": config.projects_per_session,
+            "lease_ttl_seconds": config.lease_ttl_seconds,
+            "session_heartbeat_timeout_seconds": (
+                config.session_heartbeat_timeout_seconds
+            ),
             "enabled": config.enabled,
             "operational": config.operational,
         }

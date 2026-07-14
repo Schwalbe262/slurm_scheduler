@@ -1,3 +1,17 @@
+## 2026-07-15 (Claude) - Operator knob for pool liveness windows + threadpool root cause
+- Root cause of the recurring "lease_heartbeat_expired" collapses even after
+  the client heartbeat fix: heartbeats land as SQLite writes and serialize
+  behind the scheduler tick's write transactions. Campaign ticks ran 46-107s,
+  so beats missed the 180s lease TTL / 120s session window in bursts and the
+  pool killed itself. PATCH /api/aedt-pool/config now accepts
+  lease_ttl_seconds and session_heartbeat_timeout_seconds (60..3600, service
+  set_operator_timeouts) so the windows can ride out heavy ticks without a
+  live-DB write.
+- Also deepened the anyio sync-endpoint worker pool to 256 tokens (commit
+  399b54a): 40 blocked handlers used to queue every later heartbeat.
+- Test: test_operator_timeouts_update_liveness_windows (pool suites 65
+  passed).
+
 ## 2026-07-15 (Claude) - Relay flap + channel cap fixes (pooled ramp 502 storm)
 - The 300-client ramp collapse had a second layer beyond the client lease
   heartbeat gap: the control-plane relay supervisor tore down a healthy SSH

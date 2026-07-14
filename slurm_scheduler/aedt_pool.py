@@ -385,6 +385,56 @@ class AedtPoolService:
                     )
         return self.config()
 
+    def set_operator_timeouts(
+        self,
+        *,
+        lease_ttl_seconds: int | None = None,
+        session_heartbeat_timeout_seconds: int | None = None,
+    ) -> AedtPoolConfig:
+        """Operator knob for liveness windows.
+
+        Client/host heartbeats land as SQLite writes and serialize behind the
+        scheduler tick's own write transactions; a heavy campaign tick can
+        stall them for minutes.  The expiry windows must ride out the longest
+        realistic tick, otherwise a busy scheduler kills its own pool.
+        """
+        current = self.config()
+        requested_ttl = (
+            current.lease_ttl_seconds
+            if lease_ttl_seconds is None
+            else lease_ttl_seconds
+        )
+        requested_session = (
+            current.session_heartbeat_timeout_seconds
+            if session_heartbeat_timeout_seconds is None
+            else session_heartbeat_timeout_seconds
+        )
+        if type(requested_ttl) is not int or not 60 <= requested_ttl <= 3600:
+            raise ValueError(
+                "lease_ttl_seconds must be an integer between 60 and 3600"
+            )
+        if type(requested_session) is not int or not 60 <= requested_session <= 3600:
+            raise ValueError(
+                "session_heartbeat_timeout_seconds must be an integer "
+                "between 60 and 3600"
+            )
+        with self.db.connect() as conn:
+            for key, value in (
+                ("aedt_pool_lease_ttl_seconds", requested_ttl),
+                (
+                    "aedt_pool_session_heartbeat_timeout_seconds",
+                    requested_session,
+                ),
+            ):
+                conn.execute(
+                    "INSERT INTO scheduler_settings(key, value, updated_at) "
+                    "VALUES(?, ?, CURRENT_TIMESTAMP) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                    "updated_at = CURRENT_TIMESTAMP",
+                    (key, str(value)),
+                )
+        return self.config()
+
     def set_adapter_ready(self, ready: bool) -> AedtPoolConfig:
         """Deployment hook, intentionally not exposed as an operator UI toggle."""
         if ready and not self.bootstrap_token:

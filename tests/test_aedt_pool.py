@@ -170,6 +170,23 @@ class AedtPoolGateTests(AedtPoolTestCase):
         reloaded = AedtPoolService(self.db, bootstrap_token="secret")
         self.assertEqual(reloaded.config().target_projects, 400)
 
+    def test_operator_timeouts_update_liveness_windows(self) -> None:
+        config = self.service.set_operator_timeouts(
+            lease_ttl_seconds=900,
+            session_heartbeat_timeout_seconds=600,
+        )
+        self.assertEqual(config.lease_ttl_seconds, 900)
+        self.assertEqual(config.session_heartbeat_timeout_seconds, 600)
+        with self.assertRaises(ValueError):
+            self.service.set_operator_timeouts(lease_ttl_seconds=59)
+        with self.assertRaises(ValueError):
+            self.service.set_operator_timeouts(
+                session_heartbeat_timeout_seconds=3601
+            )
+        unchanged = self.service.set_operator_timeouts(lease_ttl_seconds=600)
+        self.assertEqual(unchanged.lease_ttl_seconds, 600)
+        self.assertEqual(unchanged.session_heartbeat_timeout_seconds, 600)
+
     def test_operator_limits_fail_closed_on_invalid_topology(self) -> None:
         config = self.service.set_operator_limits(
             max_sessions=100,
