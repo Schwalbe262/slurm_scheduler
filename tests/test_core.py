@@ -7115,6 +7115,32 @@ class SchedulerTests(unittest.TestCase):
         matured = scheduler.fea_dynamic_extra_slots(allocation, task)
         self.assertGreater(matured, discounted)
 
+    def test_fea_node_load_gate_defers_to_fresh_allocation_local_sample(self) -> None:
+        # 64-core node at 83 loadavg (130%): co-tenant load.
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 83.0 100000 90000 some_job\n"
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, fea_load_target=1.0)
+        allocation = {"id": 1, "state": AllocationStatus.WARM.value, "node_name": "n001"}
+        # Without an allocation-local sample the node-wide loadavg gates.
+        self.assertFalse(scheduler.fea_node_load_ok(allocation))
+        # A fresh sstat sample proves our reserved cores are measured
+        # separately: co-tenant load no longer vetoes admission.
+        scheduler._alloc_cpu_util[1] = {"busy_cores": 5.0, "at": time.monotonic()}
+        self.assertTrue(scheduler.fea_node_load_ok(allocation))
+        # Extreme node thrash (over 2x the cores) still blocks.
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 140.0 100000 90000 some_job\n"
+            )
+        )
+        scheduler._pestat_nodes_cache = None
+        self.assertFalse(scheduler.fea_node_load_ok(allocation))
+
     def test_fea_adaptive_memory_relax_grants_trickle_when_history_shows_slack(self) -> None:
         self.db.replace_pestat_nodes(
             parse_pestat(

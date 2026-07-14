@@ -4256,12 +4256,30 @@ class Scheduler:
             return "soft_blocked"
         return "ok"
 
+    def _alloc_util_fresh(self, allocation: dict) -> dict | None:
+        """Fresh allocation-local CPU sample (sstat step deltas), or None."""
+        util_info = self._alloc_cpu_util.get(int(allocation.get("id") or 0))
+        if (
+            self.fea_alloc_util_enabled
+            and util_info
+            and time.monotonic() - util_info["at"] <= 3 * self.fea_alloc_util_sample_interval_seconds
+        ):
+            return util_info
+        return None
+
     def fea_node_load_ok(self, allocation: dict) -> bool:
         node = self.pestat_node_for_allocation(allocation)
         if not node:
             return False
         cpu_total = max(1, int(node.get("cpu_total") or 1))
-        return float(node.get("cpu_load") or 0.0) <= cpu_total * self.fea_load_target
+        node_load = float(node.get("cpu_load") or 0.0)
+        if self._alloc_util_fresh(allocation) is not None:
+            # Slurm reserved these cores for us; co-tenants overcommitting the
+            # rest of the node must not veto admission. How much we add is
+            # governed by the allocation-local sstat budget in
+            # fea_dynamic_extra_slots. Keep only an extreme node-thrash stop.
+            return node_load <= cpu_total * 2.0
+        return node_load <= cpu_total * self.fea_load_target
 
     def fea_allocation_accepts_task(self, allocation: dict) -> bool:
         if self.pestat_node_for_allocation(allocation) is None:
@@ -4727,13 +4745,8 @@ class Scheduler:
             )
             return slots
 
-        util_info = self._alloc_cpu_util.get(int(allocation.get("id") or 0))
-        util_fresh = bool(
-            self.fea_alloc_util_enabled
-            and util_info
-            and time.monotonic() - util_info["at"] <= 3 * self.fea_alloc_util_sample_interval_seconds
-        )
-        if util_fresh:
+        util_info = self._alloc_util_fresh(allocation)
+        if util_info is not None:
             # Allocation-local control: how busy are OUR reserved cores (sstat
             # step CPU deltas), independent of co-tenant load on the node. Keep
             # utilization at the configured target by budgeting the difference.
