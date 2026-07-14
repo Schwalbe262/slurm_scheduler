@@ -117,6 +117,11 @@ class AppConfig:
     fea_alloc_util_sample_interval_seconds: int = 60
     fea_shared_memory_estimate_fraction: float = 0.25
     fea_shared_memory_min_estimate_mb: int = 8192
+    # Completed-task detection budget per tick. Probes are batched (one SSH
+    # session per account, 50 exit-code stats per shell command), so this can
+    # cover the whole fleet cheaply; too-low values leave finished tasks
+    # occupying slots for many ticks before they are reaped.
+    task_refresh_max_per_tick: int = 32
     fea_adaptive_memory_relax_enabled: bool = True
     fea_adaptive_memory_window_seconds: int = 3600
     fea_adaptive_memory_min_coverage_seconds: int = 2700
