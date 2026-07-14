@@ -4167,6 +4167,14 @@ class Scheduler:
         candidates = [120.0, float(max(1, self.poll_interval_seconds) * 4)]
         if self.cluster_refresh_interval_seconds > 0:
             candidates.append(float(self.cluster_refresh_interval_seconds) * 2)
+        if self._last_tick_duration is not None:
+            # The refresh runs inside the tick, so a heavy tick stretches the
+            # gap between observations past any fixed threshold. Scale the
+            # tolerance with the observed tick time instead of fail-closing
+            # every admission decision whenever ticks run long.
+            candidates.append(
+                float(self.cluster_refresh_interval_seconds) + 2.0 * self._last_tick_duration
+            )
         return max(candidates)
 
     def pestat_node_for_allocation(self, allocation: dict, max_age_seconds: float | None = None) -> dict | None:
