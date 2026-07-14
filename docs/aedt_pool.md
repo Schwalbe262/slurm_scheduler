@@ -18,6 +18,12 @@
 > parity/runtime/license contract remain open. The task 30445 result does not
 > authorize the 250/500 target.
 
+> **Historical note (2026-07-14):** Operators retired the scheduler-managed
+> node-local AEDT canary and unified pooled work on the central AEDT pool. New
+> pooled tasks must pass the central pool operational gate. Tasks already
+> running through the retired flow may finish normally; this change does not
+> cancel tasks or alter reconciliation.
+
 ## 목적과 범위
 
 기존 backend는 프로젝트 한 개가 AEDT Desktop 한 개를 열고 소유한다. 새 pooled backend는

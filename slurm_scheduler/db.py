@@ -11,7 +11,6 @@ from typing import Any, Iterator
 from .models import AedtBackend, AllocationStatus, JobCreate, JobStatus, SchedulingProfile, TaskCreate, TaskStatus, normalize_aedt_backend
 
 
-SQLITE_ID_BATCH_SIZE = 500
 TASK_COUNT_SAMPLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 
@@ -347,10 +346,6 @@ class Database:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
             self._ensure_columns(conn)
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_tasks_same_node_as_task_id "
-                "ON tasks(same_node_as_task_id)"
-            )
 
     def get_setting(self, key: str) -> str | None:
         with self.connect() as conn:
@@ -653,7 +648,7 @@ class Database:
 
     def list_tasks(
         self,
-        limit: int | None = 200,
+        limit: int = 200,
         *,
         project: str = "",
         name_prefix: str = "",
@@ -675,12 +670,10 @@ class Database:
             clauses.append(f"status IN ({placeholders})")
             params.extend(statuses)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        limit_sql = "" if limit is None else " LIMIT ?"
-        query_params = tuple(params) if limit is None else (*params, max(0, int(limit)))
         with self.connect() as conn:
             rows = conn.execute(
-                f"SELECT * FROM tasks{where} ORDER BY id DESC{limit_sql}",
-                query_params,
+                f"SELECT * FROM tasks{where} ORDER BY id DESC LIMIT ?",
+                (*params, max(0, int(limit))),
             ).fetchall()
             return [dict(row) for row in rows]
 
@@ -741,14 +734,14 @@ class Database:
             row = conn.execute(
                 f"""
                 WITH active AS (
-                    SELECT status, scheduling_profile, gpus, same_node_as_task_id
+                    SELECT status, scheduling_profile, project, gpus, same_node_as_task_id
                     FROM tasks
                     WHERE status IN (?, ?){name_filter}
                     ORDER BY id DESC
                     LIMIT ?
                 ),
                 queued_tasks AS (
-                    SELECT status, scheduling_profile, gpus, same_node_as_task_id
+                    SELECT status, scheduling_profile, project, gpus, same_node_as_task_id
                     FROM tasks
                     WHERE status = ?{name_filter}
                     ORDER BY id DESC
@@ -764,9 +757,10 @@ class Database:
                     COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running,
                     COALESCE(SUM(CASE WHEN status = 'attaching' THEN 1 ELSE 0 END), 0) AS attaching,
                     COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued,
-                    COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(scheduling_profile, ''))) = 'fea_bursty' THEN 1 ELSE 0 END), 0) AS fea,
-                    COALESCE(SUM(CASE WHEN status = 'running' AND LOWER(TRIM(COALESCE(scheduling_profile, ''))) = 'fea_bursty' THEN 1 ELSE 0 END), 0) AS fea_running,
-                    COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(scheduling_profile, ''))) != 'fea_bursty' THEN 1 ELSE 0 END), 0) AS standard,
+                    COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(scheduling_profile, ''))) = 'fea_bursty' AND TRIM(COALESCE(project, '')) != '_aedt_pool_hosts' THEN 1 ELSE 0 END), 0) AS fea,
+                    COALESCE(SUM(CASE WHEN status = 'running' AND LOWER(TRIM(COALESCE(scheduling_profile, ''))) = 'fea_bursty' AND TRIM(COALESCE(project, '')) != '_aedt_pool_hosts' THEN 1 ELSE 0 END), 0) AS fea_running,
+                    COALESCE(SUM(CASE WHEN TRIM(COALESCE(project, '')) = '_aedt_pool_hosts' THEN 1 ELSE 0 END), 0) AS session_hosts,
+                    COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(scheduling_profile, ''))) != 'fea_bursty' AND TRIM(COALESCE(project, '')) != '_aedt_pool_hosts' THEN 1 ELSE 0 END), 0) AS standard,
                     COALESCE(SUM(CASE WHEN COALESCE(gpus, 0) > 0 THEN 1 ELSE 0 END), 0) AS gpu,
                     COALESCE(SUM(CASE WHEN COALESCE(gpus, 0) <= 0 THEN 1 ELSE 0 END), 0) AS cpu,
                     COALESCE(SUM(CASE WHEN COALESCE(same_node_as_task_id, 0) > 0 THEN 1 ELSE 0 END), 0) AS same_node
@@ -789,6 +783,7 @@ class Database:
             "queued",
             "fea",
             "fea_running",
+            "session_hosts",
             "standard",
             "gpu",
             "cpu",
@@ -869,41 +864,6 @@ class Database:
             }
             for row in rows
         ]
-
-    def list_tasks_by_same_node_task_ids(
-        self,
-        task_ids: list[int] | set[int],
-        *,
-        statuses: list[str] | None = None,
-        aedt_backend: str = "",
-    ) -> list[dict[str, Any]]:
-        parent_ids = sorted({int(task_id) for task_id in task_ids if int(task_id) > 0})
-        if not parent_ids or statuses == []:
-            return []
-        status_values = list(statuses or [])
-        backend = str(aedt_backend or "").strip()
-        rows: list[dict[str, Any]] = []
-        with self.connect() as conn:
-            for start in range(0, len(parent_ids), SQLITE_ID_BATCH_SIZE):
-                batch = parent_ids[start : start + SQLITE_ID_BATCH_SIZE]
-                clauses = [
-                    f"same_node_as_task_id IN ({','.join('?' for _ in batch)})"
-                ]
-                params: list[Any] = list(batch)
-                if status_values:
-                    clauses.append(
-                        f"status IN ({','.join('?' for _ in status_values)})"
-                    )
-                    params.extend(status_values)
-                if backend:
-                    clauses.append("aedt_backend = ?")
-                    params.append(backend)
-                batch_rows = conn.execute(
-                    f"SELECT * FROM tasks WHERE {' AND '.join(clauses)} ORDER BY id DESC",
-                    params,
-                ).fetchall()
-                rows.extend(dict(row) for row in batch_rows)
-        return sorted(rows, key=lambda row: int(row["id"]), reverse=True)
 
     def list_live_task_claims_for_allocation(self, allocation_id: int) -> list[dict[str, Any]]:
         """Return every task claim that still owns an allocation.
@@ -1088,22 +1048,6 @@ class Database:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM allocations WHERE id = ?", (allocation_id,)).fetchone()
             return dict(row) if row else None
-
-    def list_allocations_by_ids(self, allocation_ids: list[int] | set[int]) -> list[dict[str, Any]]:
-        ids = sorted({int(allocation_id) for allocation_id in allocation_ids if int(allocation_id) > 0})
-        if not ids:
-            return []
-        rows: list[dict[str, Any]] = []
-        with self.connect() as conn:
-            for start in range(0, len(ids), SQLITE_ID_BATCH_SIZE):
-                batch = ids[start : start + SQLITE_ID_BATCH_SIZE]
-                placeholders = ",".join("?" for _ in batch)
-                batch_rows = conn.execute(
-                    f"SELECT * FROM allocations WHERE id IN ({placeholders})",
-                    batch,
-                ).fetchall()
-                rows.extend(dict(row) for row in batch_rows)
-        return sorted(rows, key=lambda row: int(row["id"]), reverse=True)
 
     def list_allocations(self, limit: int = 200) -> list[dict[str, Any]]:
         with self.connect() as conn:

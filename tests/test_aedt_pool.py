@@ -19,6 +19,7 @@ from slurm_scheduler.aedt_pool_api import create_aedt_pool_router
 from slurm_scheduler.aedt_session_host import AedtSessionHost, ControlPlaneClient
 from slurm_scheduler.config import AccountConfig
 from slurm_scheduler.db import Database
+from slurm_scheduler.models import TaskCreate, TaskStatus
 from slurm_scheduler.scheduler import Scheduler
 
 
@@ -315,16 +316,31 @@ class AedtPoolGateTests(AedtPoolTestCase):
             'id="aedt-bootstrap-token"',
             '"X-AEDT-Bootstrap-Token"',
             'id="lease-rows"',
-            'id="node-local-session-rows"',
-            'id="node-local-session-summary"',
             'id="enable-pool"',
             "latest_validation",
             "idle_session_count",
-            "summary.node_local",
             "warm_spare_status_reason",
+            "<th>Session ID</th><th>Host task</th><th>Node</th><th>Account</th><th>State</th><th>Started</th><th>Last heartbeat</th><th>Attached projects</th><th>Failure/quarantine reason</th>",
+            "cell.colSpan = 9",
+            "link.href = `/tasks/${taskId}`",
+            "session.allocation_account_name",
+            "session.started_at",
+            "session.last_heartbeat_at",
+            "session.active_lease_count",
+            "session.attached_project_names",
             'fetch("/api/aedt-pool/enable"',
         ):
             self.assertIn(required, template)
+        for removed in ("node-local-session", "summary.node_local", "renderNodeLocal"):
+            self.assertNotIn(removed, template)
+
+        router = create_aedt_pool_router(self.service)
+        endpoint = next(
+            route.endpoint
+            for route in router.routes
+            if getattr(route, "path", "") == "/api/aedt-pool"
+        )
+        self.assertNotIn("node_local", endpoint())
 
     def test_main_dashboard_links_hard_counted_aedt_and_project_limits(self) -> None:
         template = (
@@ -338,11 +354,15 @@ class AedtPoolGateTests(AedtPoolTestCase):
             'id="aedt-dashboard-projects"',
             "aedt_pool_summary.plan.live_projects",
             "aedt_pool_summary.config.target_project_concurrency",
-            'id="aedt-dashboard-node-local"',
-            "aedt_pool_summary.node_local.running_host_count",
-            "aedt_pool_summary.node_local.attached_client_count",
+            '<span class="summary-label">FEA solvers</span>',
+            "task_summary.session_hosts",
+            'data-project="{{ task.project or \'\' }}"',
+            'project === "_aedt_pool_hosts"',
+            "tasks.session_hosts",
         ):
             self.assertIn(required, template)
+        self.assertNotIn('id="aedt-dashboard-node-local"', template)
+        self.assertNotIn("aedt_pool_summary.node_local", template)
 
 
 class AedtLeaseLifecycleTests(AedtPoolTestCase):
@@ -364,6 +384,64 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         )
         self.assertEqual(self.service.get_session(int(session["id"]))["slots_total"], 2)
         self.service.heartbeat_session(int(session["id"]), host_token)
+
+    def test_summary_enriches_session_operator_details(self) -> None:
+        leases = [
+            self.request(f"summary-{index}", allocation_id=self.allocation_id, node="cpu-01")
+            for index in range(2)
+        ]
+        session, _host_token = self.start_one_session(self.allocation_id)
+        session_id = int(session["id"])
+        older_host_task_id = self.db.create_task(
+            TaskCreate(
+                name=f"aedt-session-host-{session_id}",
+                remote_cwd="~/aedt-host",
+                command="run-host",
+                scheduling_profile="fea_bursty",
+                dedupe_key=f"aedt-session-host:{session_id}",
+                project="_aedt_pool_hosts",
+            )
+        )
+        self.db.update_task(
+            older_host_task_id,
+            status=TaskStatus.COMPLETED.value,
+            finished_at="CURRENT_TIMESTAMP",
+        )
+        host_task_id = self.db.create_task(
+            TaskCreate(
+                name=f"aedt-session-host-{session_id}",
+                remote_cwd="~/aedt-host",
+                command="retry-host",
+                scheduling_profile="fea_bursty",
+                project="_aedt_pool_hosts",
+            )
+        )
+        self.db.update_task(
+            host_task_id,
+            status=TaskStatus.FAILED.value,
+            finished_at="CURRENT_TIMESTAMP",
+        )
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE aedt_sessions SET account_name = 'stale-copy' WHERE id = ?",
+                (session_id,),
+            )
+
+        summary_session = next(
+            item for item in self.service.summary()["sessions"] if int(item["id"]) == session_id
+        )
+
+        self.assertEqual(summary_session["host_task_id"], host_task_id)
+        self.assertEqual(summary_session["allocation_account_name"], "a")
+        self.assertEqual(summary_session["active_lease_count"], 2)
+        self.assertEqual(
+            summary_session["attached_project_names"],
+            [f"project-summary-{index}" for index in range(2)],
+        )
+        self.assertEqual(
+            {int(self.service.get_lease(int(lease["id"]))["session_id"]) for lease, _ in leases},
+            {session_id},
+        )
 
     def test_min_idle_session_starts_and_refills_when_last_idle_is_leased(self) -> None:
         self.service.set_operator_limits(

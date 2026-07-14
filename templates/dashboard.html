@@ -974,14 +974,13 @@
         <span class="summary-value" data-attached-summary="queued">{{ task_summary.queued }}</span>
       </div>
       <div class="summary-item">
-        <span class="summary-label">FEA</span>
-        <span class="summary-value" data-attached-summary="fea">{{ task_summary.fea_running }} / {{ task_summary.fea }}</span>
+        <span class="summary-label">FEA solvers</span>
+        <span class="summary-value" data-attached-summary="fea">{{ task_summary.fea }} / session hosts {{ task_summary.session_hosts }}</span>
       </div>
       <a class="summary-item" href="/aedt-pool" title="Open AEDT pool controls and lease details">
         <span class="summary-label">AEDT</span>
         <span class="summary-value" id="aedt-dashboard-sessions">{{ aedt_pool_summary.plan.hard_session_count }} / {{ aedt_pool_summary.config.max_aedt_sessions }}</span>
         <span class="muted" id="aedt-dashboard-projects">projects {{ aedt_pool_summary.plan.live_projects }} / {{ aedt_pool_summary.config.target_project_concurrency }}</span>
-        <span class="muted" id="aedt-dashboard-node-local">node-local {{ aedt_pool_summary.node_local.running_host_count }} sessions / {{ aedt_pool_summary.node_local.attached_client_count }} attached</span>
       </a>
       <div class="summary-item">
         <span class="summary-label">Standard</span>
@@ -1032,6 +1031,7 @@
             data-status="{{ task.status }}"
             data-allocation="{{ task.allocation_id or '' }}"
             data-scheduling="{{ task.scheduling_profile or 'standard' }}"
+            data-project="{{ task.project or '' }}"
             data-gpus="{{ task.gpus or 0 }}"
             data-same-node="{{ task.same_node_as_task_id or 0 }}"
           >
@@ -1240,7 +1240,7 @@
             attaching: 0,
             queued: 0,
             fea: 0,
-            feaRunning: 0,
+            sessionHosts: 0,
             standard: 0,
             gpu: 0,
             sameNode: 0,
@@ -1248,13 +1248,15 @@
           for (const row of visibleRows) {
             const status = row.dataset.status || "";
             const scheduling = row.dataset.scheduling || "standard";
+            const project = (row.dataset.project || "").trim();
             counts.total += 1;
             if (status === "running") counts.running += 1;
             if (status === "attaching") counts.attaching += 1;
             if (status === "queued") counts.queued += 1;
-            if (scheduling === "fea_bursty") {
+            if (project === "_aedt_pool_hosts") {
+              counts.sessionHosts += 1;
+            } else if (scheduling === "fea_bursty") {
               counts.fea += 1;
-              if (status === "running") counts.feaRunning += 1;
             } else {
               counts.standard += 1;
             }
@@ -1265,7 +1267,7 @@
           setSummaryValue("running", counts.running);
           setSummaryValue("attaching", counts.attaching);
           setSummaryValue("queued", counts.queued);
-          setSummaryValue("fea", `${counts.feaRunning} / ${counts.fea}`);
+          setSummaryValue("fea", `${counts.fea} / session hosts ${counts.sessionHosts}`);
           setSummaryValue("standard", counts.standard);
           setSummaryValue("gpu", counts.gpu);
           setSummaryValue("same_node", counts.sameNode);
@@ -1903,8 +1905,8 @@
         setText(attached("standard"), tasks.standard);
         setText(attached("gpu"), tasks.gpu);
         setText(attached("same_node"), tasks.same_node);
-        if (attached("fea") && tasks.fea !== undefined) {
-          attached("fea").textContent = `${tasks.fea_running} / ${tasks.fea}`;
+        if (attached("fea") && tasks.fea !== undefined && tasks.session_hosts !== undefined) {
+          attached("fea").textContent = `${tasks.fea} / session hosts ${tasks.session_hosts}`;
         }
         const pool = data.allocations || {};
         if (allocation("nodes") && pool.nodes !== undefined) {

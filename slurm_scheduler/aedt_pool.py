@@ -1582,9 +1582,38 @@ class AedtPoolService:
             sessions = [
                 dict(row)
                 for row in conn.execute(
-                    "SELECT * FROM aedt_sessions ORDER BY id DESC LIMIT 500"
+                    """
+                    SELECT s.*,
+                           COALESCE(a.account_name, s.account_name) AS allocation_account_name
+                    FROM aedt_sessions s
+                    LEFT JOIN allocations a ON a.id = s.allocation_id
+                    ORDER BY s.id DESC
+                    LIMIT 500
+                    """
                 ).fetchall()
             ]
+            host_tasks = conn.execute(
+                """
+                SELECT id, name, dedupe_key
+                FROM tasks
+                WHERE TRIM(COALESCE(project, '')) = '_aedt_pool_hosts'
+                  AND (
+                      dedupe_key LIKE 'aedt-session-host:%'
+                      OR dedupe_key LIKE 'aedt-session-host-%'
+                      OR name LIKE 'aedt-session-host-%'
+                  )
+                ORDER BY id DESC
+                """
+            ).fetchall()
+            attached_leases = conn.execute(
+                """
+                SELECT session_id, project_name
+                FROM aedt_project_leases
+                WHERE session_id IS NOT NULL
+                  AND state IN ('leased', 'active', 'releasing')
+                ORDER BY id ASC
+                """
+            ).fetchall()
             leases = [
                 dict(row)
                 for row in conn.execute(
@@ -1596,6 +1625,35 @@ class AedtPoolService:
                     """
                 ).fetchall()
             ]
+
+        host_task_by_session: dict[int, int] = {}
+        for task in host_tasks:
+            session_id = 0
+            for value in (task["dedupe_key"], task["name"]):
+                convention = str(value or "").strip()
+                for prefix in ("aedt-session-host:", "aedt-session-host-"):
+                    if convention.startswith(prefix):
+                        suffix = convention[len(prefix):]
+                        if suffix.isdecimal():
+                            session_id = int(suffix)
+                        break
+                if session_id:
+                    break
+            if session_id:
+                host_task_by_session.setdefault(session_id, int(task["id"]))
+
+        attached_projects_by_session: dict[int, list[str]] = {}
+        for lease in attached_leases:
+            attached_projects_by_session.setdefault(int(lease["session_id"]), []).append(
+                str(lease["project_name"] or "")
+            )
+
+        for session in sessions:
+            session_id = int(session["id"])
+            attached_project_names = attached_projects_by_session.get(session_id, [])
+            session["host_task_id"] = host_task_by_session.get(session_id)
+            session["active_lease_count"] = len(attached_project_names)
+            session["attached_project_names"] = attached_project_names
         return {
             "config": {
                 "enabled": config.enabled,

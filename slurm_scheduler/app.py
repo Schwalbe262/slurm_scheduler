@@ -17,17 +17,13 @@ from fastapi.templating import Jinja2Templates
 
 from .allocation_metrics import annotate_allocation_fea_pressure, annotate_allocation_node_metrics
 from .aedt_pool import AedtPoolRuntime, AedtPoolService
-from .aedt_pool_api import build_aedt_pool_summary, create_aedt_pool_router
-from .aedt_canary_admission import (
-    NODE_LOCAL_AEDT_CANARY_HOST_ENTRYPOINT,
-    node_local_aedt_canary_admission,
-)
+from .aedt_pool_api import create_aedt_pool_router
 from .conda_sync import CondaEnvSyncManager, conda_bootstrap
 from .config import AppConfig, load_accounts, load_app_config
 from .control_plane_relay import ControlPlaneRelay
 from .db import Database
 from .git_auth import find_git_credential, git_task_payload
-from .models import AllocationStatus, AedtBackend, JobCreate, SchedulingProfile, TaskCreate, TaskStatus, normalize_aedt_backend, normalize_scheduling_profile
+from .models import AedtBackend, JobCreate, SchedulingProfile, TaskCreate, TaskStatus, normalize_aedt_backend, normalize_scheduling_profile
 from .inventory import partition_rank
 from .pestat import PestatNode, plan_dynamic_allocations
 from .project_env import ProjectEnvManager, repo_dir_name
@@ -496,7 +492,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             ):
                 return False, "AEDT pool control-plane relay is unavailable"
             return True, ""
-        return node_local_aedt_canary_admission(db, task)
+        return False, "AEDT pooled backend is not operational"
 
     scheduler.set_aedt_backend_admission_checker(aedt_backend_admission)
     relay_account = scheduler.account_by_name(config.control_plane_relay_account.strip())
@@ -861,7 +857,6 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "dedupe_key": task.get("dedupe_key") or "",
             "max_workers_per_node": int(task.get("max_workers_per_node") or 0),
             "same_node_as_task_id": int(task.get("same_node_as_task_id") or 0),
-            "requested_allocation_id": int(task.get("requested_allocation_id") or 0),
             "payload_json": payload_json,
         }
 
@@ -902,12 +897,6 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         task = db.get_task(task_id)
         if task:
             scheduler.assign_queued_task(task)
-
-    def maybe_assign_requested_allocation_task(task_id: int) -> None:
-        task = db.get_task(task_id)
-        if not task or scheduler.task_requested_allocation_id(task) <= 0:
-            return
-        scheduler.assign_queued_task(task)
 
     def project_json(project: dict, include_deployments: bool = True) -> dict:
         def _loads(value, default):
@@ -1110,37 +1099,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         )
         requested_allocation_id = max(0, int(payload.get("requested_allocation_id") or 0))
         entrypoint = str(payload.get("entrypoint") or "")
-        if same_node_as_task_id and requested_allocation_id:
-            raise HTTPException(
-                status_code=422,
-                detail="requested_allocation_id cannot be combined with same_node_as_task_id",
-            )
-        if (
-            requested_allocation_id
-            and entrypoint != NODE_LOCAL_AEDT_CANARY_HOST_ENTRYPOINT
-        ):
-            raise HTTPException(
-                status_code=422,
-                detail="requested_allocation_id is reserved for aedt_node_canary_host",
-            )
         if requested_allocation_id:
-            requested_allocation = db.get_allocation(requested_allocation_id)
-            if (
-                not requested_allocation
-                or requested_allocation.get("state") not in {
-                    AllocationStatus.WARM.value,
-                    AllocationStatus.ACTIVE.value,
-                }
-                or not requested_allocation.get("slurm_job_id")
-                or not str(requested_allocation.get("node_name") or "").strip()
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"requested allocation {requested_allocation_id} "
-                        "is not live and attachable"
-                    ),
-                )
+            raise HTTPException(
+                status_code=422,
+                detail="requested_allocation_id is not accepted for new tasks",
+            )
         task = TaskCreate(
             name=str(payload.get("name") or "remote-task"),
             remote_cwd=str(payload.get("remote_cwd") or ""),
@@ -1167,7 +1130,6 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             cleanup_globs=normalize_cleanup_globs(payload.get("cleanup_globs")),
             project=str(payload.get("project") or ""),
             entrypoint=entrypoint,
-            requested_allocation_id=requested_allocation_id,
         )
         if not task.remote_cwd:
             raise HTTPException(status_code=422, detail="remote_cwd is required")
@@ -1176,8 +1138,6 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         task_id = db.create_task(task)
         if task.same_node_as_task_id:
             maybe_assign_same_node_task(task_id)
-        elif task.requested_allocation_id:
-            maybe_assign_requested_allocation_task(task_id)
         return task_id, False
 
     @app.on_event("startup")
@@ -1246,10 +1206,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         task_summary = db.task_activity_summary(
             name_contains=attached_task_name_filter,
         )
-        aedt_dashboard_summary = build_aedt_pool_summary(
-            aedt_pool,
-            allocation_rows=allocations,
-        )
+        aedt_dashboard_summary = aedt_pool.summary()
         active_task_rows = {
             int(task["id"]): task
             for task in (active_running_rows + visible_queued_rows)

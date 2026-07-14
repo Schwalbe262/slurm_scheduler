@@ -1,3 +1,12 @@
+## 2026-07-14 (Codex) - Remove node-local AEDT canary
+- Recorded the operator decision to unify pooled AEDT work on the central pool
+  and removed the scheduler-managed node-local host/client admission exception.
+- Removed task-backed node-local session data from the AEDT API and dashboard,
+  along with the retired host script, runbook, and dedicated tests.
+- New pooled tasks now require the central pool operational gate. Legacy task
+  placement and reconciliation remain intact so already-running tasks are not
+  cancelled or disrupted.
+
 ## 2026-07-14 (Claude) - Live deploy: relay enabled + FEA baseline-first assignment
 - Deployed `live/node-canary-260714` to the live service (launcher: scheduled
   task SlurmSchedulerWebNative / start_web_y.cmd, config Y:/runtime/.../app.yaml):

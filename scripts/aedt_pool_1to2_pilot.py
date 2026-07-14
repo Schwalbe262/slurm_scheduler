@@ -57,9 +57,8 @@ TERMINAL_LEASE_STATES = {"released", "failed", "cancelled", "expired"}
 class SharedPilotControlPlane:
     """Minimal bounded-N loopback protocol with project-local release.
 
-    The existing 1:2 pilot uses the default of two.  The generic node-local
-    canary may pass a different bound later without duplicating lifecycle
-    logic; production must still cap it at the largest separately validated N.
+    The isolated 1:2 pilot uses the default of two. Explicit validation
+    variants may pass a different bound without duplicating lifecycle logic.
     """
 
     def __init__(self, max_projects: int = 2) -> None:
