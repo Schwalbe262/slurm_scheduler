@@ -1141,6 +1141,18 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         return task_id, False
 
     @app.on_event("startup")
+    async def _grow_sync_endpoint_threadpool() -> None:
+        # Most endpoints are sync `def` handlers and share anyio's default
+        # 40-token worker pool.  A pooled campaign runs hundreds of node
+        # clients whose lease/session heartbeats are sync endpoints; when 40
+        # concurrent requests block on the DB during a long scheduler tick,
+        # every later heartbeat queues behind them, misses its TTL, and the
+        # pool collapses.  Deepen the pool so heartbeats keep landing.
+        import anyio.to_thread
+
+        anyio.to_thread.current_default_thread_limiter().total_tokens = 256
+
+    @app.on_event("startup")
     def _startup() -> None:
         cleanup_local_temp_artifacts()
         scheduler.start()
