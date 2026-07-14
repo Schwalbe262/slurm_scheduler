@@ -1427,7 +1427,7 @@ class Scheduler:
         allocation's own reserved cores (co-tenant load excluded)."""
         out: dict[int, dict[str, float]] = {}
         now = time.monotonic()
-        max_age = 3 * self.fea_alloc_util_sample_interval_seconds
+        max_age = self._alloc_util_max_age_seconds()
         for allocation_id, info in self._alloc_cpu_util.items():
             if now - info["at"] > max_age:
                 continue
@@ -4256,13 +4256,19 @@ class Scheduler:
             return "soft_blocked"
         return "ok"
 
+    def _alloc_util_max_age_seconds(self) -> float:
+        # Samples land once per tick, and heavy ticks stretch well past the
+        # nominal interval; utilization drifts slowly, so a sample within ten
+        # minutes still beats falling back to co-tenant node loadavg.
+        return max(3.0 * self.fea_alloc_util_sample_interval_seconds, 600.0)
+
     def _alloc_util_fresh(self, allocation: dict) -> dict | None:
         """Fresh allocation-local CPU sample (sstat step deltas), or None."""
         util_info = self._alloc_cpu_util.get(int(allocation.get("id") or 0))
         if (
             self.fea_alloc_util_enabled
             and util_info
-            and time.monotonic() - util_info["at"] <= 3 * self.fea_alloc_util_sample_interval_seconds
+            and time.monotonic() - util_info["at"] <= self._alloc_util_max_age_seconds()
         ):
             return util_info
         return None
