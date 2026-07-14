@@ -2072,14 +2072,14 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         return scheduler.license_usage()
 
     @app.get("/api/dashboard-summary")
-    def api_dashboard_summary() -> dict:
+    def api_dashboard_summary(task_name_contains: str = "") -> dict:
         allocations = db.list_allocations_with_live(limit=500, live_limit=10000)
         allocated_rows = [
             item for item in allocations if item["state"] in {"active", "warm", "draining", "closing"}
         ]
         pending_count = sum(1 for item in allocations if item["state"] == "pending")
         return {
-            "tasks": db.task_activity_summary(),
+            "tasks": db.task_activity_summary(name_contains=task_name_contains),
             "allocations": allocation_usage_summary(allocated_rows, pending=pending_count),
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }

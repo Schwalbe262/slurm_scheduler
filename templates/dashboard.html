@@ -974,8 +974,8 @@
         <span class="summary-value" data-attached-summary="queued">{{ task_summary.queued }}</span>
       </div>
       <div class="summary-item">
-        <span class="summary-label">FEA solvers</span>
-        <span class="summary-value" data-attached-summary="fea">{{ task_summary.fea }} / session hosts {{ task_summary.session_hosts }}</span>
+        <span class="summary-label">FEA / AEDT</span>
+        <span class="summary-value" data-attached-summary="fea" data-aedt-pool-sessions="{{ task_summary.aedt_pool_sessions }}">{{ task_summary.fea }} / {{ task_summary.aedt }}</span>
       </div>
       <a class="summary-item" href="/aedt-pool" title="Open AEDT pool controls and lease details">
         <span class="summary-label">AEDT</span>
@@ -1031,6 +1031,7 @@
             data-status="{{ task.status }}"
             data-allocation="{{ task.allocation_id or '' }}"
             data-scheduling="{{ task.scheduling_profile or 'standard' }}"
+            data-aedt-backend="{{ task.aedt_backend or 'standalone' }}"
             data-project="{{ task.project or '' }}"
             data-gpus="{{ task.gpus or 0 }}"
             data-same-node="{{ task.same_node_as_task_id or 0 }}"
@@ -1240,25 +1241,29 @@
             attaching: 0,
             queued: 0,
             fea: 0,
-            sessionHosts: 0,
+            standaloneAedt: 0,
             standard: 0,
             gpu: 0,
             sameNode: 0,
           };
           for (const row of visibleRows) {
             const status = row.dataset.status || "";
-            const scheduling = row.dataset.scheduling || "standard";
+            const scheduling = (row.dataset.scheduling || "standard").trim().toLowerCase();
+            const aedtBackend = (row.dataset.aedtBackend || "standalone").trim().toLowerCase();
             const project = (row.dataset.project || "").trim();
             counts.total += 1;
             if (status === "running") counts.running += 1;
             if (status === "attaching") counts.attaching += 1;
             if (status === "queued") counts.queued += 1;
-            if (project === "_aedt_pool_hosts") {
-              counts.sessionHosts += 1;
-            } else if (scheduling === "fea_bursty") {
-              counts.fea += 1;
-            } else {
-              counts.standard += 1;
+            if (project !== "_aedt_pool_hosts") {
+              if (scheduling === "fea_bursty") {
+                if (status === "running" || status === "attaching") counts.fea += 1;
+                if (status === "running" && (aedtBackend === "" || aedtBackend === "standalone")) {
+                  counts.standaloneAedt += 1;
+                }
+              } else {
+                counts.standard += 1;
+              }
             }
             if (numericValue(row, "gpus") > 0) counts.gpu += 1;
             if (numericValue(row, "sameNode") > 0) counts.sameNode += 1;
@@ -1267,7 +1272,9 @@
           setSummaryValue("running", counts.running);
           setSummaryValue("attaching", counts.attaching);
           setSummaryValue("queued", counts.queued);
-          setSummaryValue("fea", `${counts.fea} / session hosts ${counts.sessionHosts}`);
+          const feaAedt = document.querySelector('[data-attached-summary="fea"]');
+          const poolSessions = Number.parseInt(feaAedt?.dataset.aedtPoolSessions || "0", 10) || 0;
+          setSummaryValue("fea", `${counts.fea} / ${poolSessions + counts.standaloneAedt}`);
           setSummaryValue("standard", counts.standard);
           setSummaryValue("gpu", counts.gpu);
           setSummaryValue("same_node", counts.sameNode);
@@ -1893,7 +1900,10 @@
     const stamps = document.querySelectorAll("[data-live-updated-at]");
     async function refreshSummaries() {
       try {
-        const response = await fetch("/api/dashboard-summary");
+        const summaryUrl = new URL("/api/dashboard-summary", window.location.origin);
+        const taskFilter = document.getElementById("attached-task-name-filter")?.value.trim() || "";
+        if (taskFilter) summaryUrl.searchParams.set("task_name_contains", taskFilter);
+        const response = await fetch(summaryUrl);
         if (!response.ok) return;
         const data = await response.json();
         const tasks = data.tasks || {};
@@ -1905,8 +1915,11 @@
         setText(attached("standard"), tasks.standard);
         setText(attached("gpu"), tasks.gpu);
         setText(attached("same_node"), tasks.same_node);
-        if (attached("fea") && tasks.fea !== undefined && tasks.session_hosts !== undefined) {
-          attached("fea").textContent = `${tasks.fea} / session hosts ${tasks.session_hosts}`;
+        if (attached("fea") && tasks.fea !== undefined && tasks.aedt !== undefined) {
+          attached("fea").textContent = `${tasks.fea} / ${tasks.aedt}`;
+          if (tasks.aedt_pool_sessions !== undefined) {
+            attached("fea").dataset.aedtPoolSessions = String(tasks.aedt_pool_sessions);
+          }
         }
         const pool = data.allocations || {};
         if (allocation("nodes") && pool.nodes !== undefined) {

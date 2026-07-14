@@ -9,6 +9,7 @@ from unittest import mock
 
 from starlette.requests import Request
 
+from slurm_scheduler.aedt_pool import AedtPoolService
 from slurm_scheduler.db import Database, TASK_COUNT_SAMPLE_RETENTION_SECONDS
 from slurm_scheduler.models import TaskCreate, TaskStatus
 from slurm_scheduler.scheduler import Scheduler
@@ -138,13 +139,60 @@ class TaskCountSamplerTests(unittest.TestCase):
                 "queued": 1,
                 "fea": 1,
                 "fea_running": 1,
-                "session_hosts": 1,
                 "standard": 2,
                 "gpu": 1,
                 "cpu": 3,
                 "same_node": 1,
+                "aedt_pool_sessions": 0,
+                "aedt": 1,
             },
         )
+
+    def test_fea_aedt_counts_pool_sessions_and_only_standalone_running_desktops(self) -> None:
+        AedtPoolService(self.db).init()
+        with self.db.connect() as conn:
+            conn.executemany(
+                "INSERT INTO aedt_sessions(session_key, state) VALUES (?, ?)",
+                [
+                    ("session-starting", "starting"),
+                    ("session-ready", "ready"),
+                    ("session-busy", "busy"),
+                    ("session-draining", "draining"),
+                    ("session-unhealthy", "unhealthy"),
+                    ("session-closed", "closed"),
+                    ("session-failed", "failed"),
+                ],
+            )
+
+        task_specs = (
+            ("desktop-running-standalone", TaskStatus.RUNNING, "fea_bursty", "standalone", ""),
+            ("desktop-running-pooled", TaskStatus.RUNNING, "fea_bursty", "pooled", ""),
+            ("desktop-attaching-standalone", TaskStatus.ATTACHING, "fea_bursty", "standalone", ""),
+            ("desktop-attaching-pooled", TaskStatus.ATTACHING, "fea_bursty", "pooled", ""),
+            ("desktop-queued-standalone", TaskStatus.QUEUED, "fea_bursty", "standalone", ""),
+            ("desktop-session-host", TaskStatus.RUNNING, "fea_bursty", "standalone", "_aedt_pool_hosts"),
+            ("desktop-standard-running", TaskStatus.RUNNING, "standard", "standalone", ""),
+        )
+        for name, status, profile, backend, project in task_specs:
+            task_id = self.db.create_task(
+                TaskCreate(
+                    name,
+                    "~/case",
+                    "run",
+                    scheduling_profile=profile,
+                    aedt_backend=backend,
+                    project=project,
+                )
+            )
+            if status != TaskStatus.QUEUED:
+                self.db.update_task(task_id, status=status.value)
+
+        summary = self.db.task_activity_summary(name_contains="desktop-")
+
+        self.assertEqual(summary["fea"], 4)
+        self.assertEqual(summary["fea_running"], 2)
+        self.assertEqual(summary["aedt_pool_sessions"], 5)
+        self.assertEqual(summary["aedt"], 6)
 
     def test_scheduler_tick_runs_sampler_before_later_stage_failure(self) -> None:
         scheduler = Scheduler(
@@ -237,6 +285,24 @@ class TaskCountHistoryRouteTests(unittest.TestCase):
             and method in getattr(route, "methods", set())
         )
 
+    def dashboard_request(self, query_string: bytes = b"") -> Request:
+        return Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/",
+                "raw_path": b"/",
+                "query_string": query_string,
+                "headers": [],
+                "client": ("testclient", 50000),
+                "server": ("testserver", 80),
+                "root_path": "",
+                "app": self.app,
+            }
+        )
+
     def test_history_api_downsamples_to_six_hundred_points_and_keeps_endpoints(self) -> None:
         now = int(time.time())
         start = now - (1000 * 60)
@@ -279,23 +345,7 @@ class TaskCountHistoryRouteTests(unittest.TestCase):
         )
 
     def test_dashboard_renders_collapsible_history_above_task_summary(self) -> None:
-        request = Request(
-            {
-                "type": "http",
-                "http_version": "1.1",
-                "method": "GET",
-                "scheme": "http",
-                "path": "/",
-                "raw_path": b"/",
-                "query_string": b"",
-                "headers": [],
-                "client": ("testclient", 50000),
-                "server": ("testserver", 80),
-                "root_path": "",
-                "app": self.app,
-            }
-        )
-        response = self.route_endpoint("/", "GET")(request)
+        response = self.route_endpoint("/", "GET")(self.dashboard_request())
         html = response.body.decode("utf-8")
 
         self.assertEqual(response.status_code, 200)
@@ -308,6 +358,52 @@ class TaskCountHistoryRouteTests(unittest.TestCase):
             html.index('id="task-count-history"'),
             html.index('aria-label="Attached task summary"'),
         )
+
+    def test_dashboard_initial_filtered_and_live_fea_aedt_counts_match(self) -> None:
+        with self.app.state.db.connect() as conn:
+            conn.executemany(
+                "INSERT INTO aedt_sessions(session_key, state) VALUES (?, ?)",
+                [
+                    ("route-ready", "ready"),
+                    ("route-draining", "draining"),
+                    ("route-closed", "closed"),
+                ],
+            )
+
+        task_specs = (
+            ("counter-match-standalone-running", TaskStatus.RUNNING, "standalone"),
+            ("counter-match-pooled-running", TaskStatus.RUNNING, "pooled"),
+            ("counter-match-pooled-attaching", TaskStatus.ATTACHING, "pooled"),
+            ("counter-match-standalone-queued", TaskStatus.QUEUED, "standalone"),
+            ("counter-other-standalone-running", TaskStatus.RUNNING, "standalone"),
+        )
+        for name, status, backend in task_specs:
+            task_id = self.app.state.db.create_task(
+                TaskCreate(
+                    name,
+                    "~/case",
+                    "run",
+                    scheduling_profile="fea_bursty",
+                    aedt_backend=backend,
+                )
+            )
+            if status != TaskStatus.QUEUED:
+                self.app.state.db.update_task(task_id, status=status.value)
+
+        dashboard = self.route_endpoint("/", "GET")
+        initial_html = dashboard(self.dashboard_request()).body.decode("utf-8")
+        filtered_html = dashboard(
+            self.dashboard_request(b"task_name_contains=counter-match")
+        ).body.decode("utf-8")
+        live = self.route_endpoint("/api/dashboard-summary", "GET")(
+            task_name_contains="counter-match"
+        )
+
+        self.assertIn('data-aedt-pool-sessions="2">4 / 4</span>', initial_html)
+        self.assertIn('data-aedt-pool-sessions="2">3 / 3</span>', filtered_html)
+        self.assertEqual(live["tasks"]["fea"], 3)
+        self.assertEqual(live["tasks"]["aedt_pool_sessions"], 2)
+        self.assertEqual(live["tasks"]["aedt"], 3)
 
 
 if __name__ == "__main__":
