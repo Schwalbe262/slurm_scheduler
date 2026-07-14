@@ -102,10 +102,13 @@ class AedtPoolTestCase(unittest.TestCase):
         allocation_id: int = 0,
         node: str = "",
         exclusive_session: bool = False,
+        task_id: int = 0,
+        project_name: str | None = None,
     ):
         return self.service.request_lease(
             request_key=key,
-            project_name=f"project-{key}",
+            project_name=project_name or f"project-{key}",
+            task_id=task_id,
             allocation_id=allocation_id,
             node_name=node,
             exclusive_session=exclusive_session,
@@ -323,19 +326,40 @@ class AedtPoolGateTests(AedtPoolTestCase):
             "latest_validation",
             "idle_session_count",
             "warm_spare_status_reason",
-            "<th>Session ID</th><th>Host task</th><th>Node</th><th>Account</th><th>State</th><th>Started</th><th>Last heartbeat</th><th>Attached projects</th><th>Failure/quarantine reason</th>",
-            "cell.colSpan = 9",
+            "<h3>Current sessions</h3>",
+            "<th>Session ID</th><th>Host task</th><th>Node</th><th>Account</th><th>State</th><th>Started</th><th>Last heartbeat</th><th>Attached FEA</th>",
+            '<details id="session-history" class="section-gap">',
+            '<tbody id="session-history-rows"></tbody>',
+            "<th>Closed</th><th>Failure/quarantine reason</th>",
+            'appendEmptyTableRow(body, 8, "No live AEDT pool sessions.")',
             "link.href = `/tasks/${taskId}`",
             "session.allocation_account_name",
             "session.started_at",
             "session.last_heartbeat_at",
-            "session.active_lease_count",
-            "session.attached_project_names",
+            "liveSessionStates.has",
+            "historySessionStates.has",
+            "lease.task_id",
+            "lease.project_name",
+            "taskLink(taskId)",
+            "session.slots_total",
+            "session.free_slot_count",
+            "${attachedLeases.length}/${slotsTotal} slots",
+            "${freeSlots} free",
+            "sessionFailureReason(session)",
+            ".slice(0, sessionHistoryLimit)",
             'fetch("/api/aedt-pool/enable"',
         ):
             self.assertIn(required, template)
         for removed in ("node-local-session", "summary.node_local", "renderNodeLocal"):
             self.assertNotIn(removed, template)
+
+        current_table_index = template.index('id="session-rows"')
+        history_index = template.index('<details id="session-history"')
+        self.assertLess(current_table_index, history_index)
+        history_opening_tag = template[
+            history_index:template.index(">", history_index) + 1
+        ]
+        self.assertNotIn(" open", history_opening_tag)
 
         router = create_aedt_pool_router(self.service)
         endpoint = next(
@@ -615,12 +639,34 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.service.heartbeat_session(int(session["id"]), host_token)
 
     def test_summary_enriches_session_operator_details(self) -> None:
-        leases = [
-            self.request(f"summary-{index}", allocation_id=self.allocation_id, node="cpu-01")
-            for index in range(2)
+        self.service.set_enabled(False)
+        self.service.set_operator_limits(projects_per_session=3)
+        self.service.set_enabled(True)
+        lease_specs = [
+            (35447, "simulation_741449"),
+            (35448, "simulation_741450"),
+            (35449, "simulation_741451"),
         ]
-        session, _host_token = self.start_one_session(self.allocation_id)
+        leases = [
+            self.request(
+                f"summary-{index}",
+                allocation_id=self.allocation_id,
+                node="cpu-01",
+                task_id=task_id,
+                project_name=project_name,
+            )
+            for index, (task_id, project_name) in enumerate(lease_specs)
+        ]
+        session, host_token = self.start_one_session(self.allocation_id)
         session_id = int(session["id"])
+        released_lease, released_token = leases[-1]
+        self.service.release_lease(int(released_lease["id"]), released_token)
+        self.service.complete_release(
+            session_id,
+            host_token,
+            int(released_lease["id"]),
+            success=True,
+        )
         older_host_task_id = self.db.create_task(
             TaskCreate(
                 name=f"aedt-session-host-{session_id}",
@@ -662,15 +708,88 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
 
         self.assertEqual(summary_session["host_task_id"], host_task_id)
         self.assertEqual(summary_session["allocation_account_name"], "a")
+        self.assertEqual(summary_session["slots_total"], 3)
         self.assertEqual(summary_session["active_lease_count"], 2)
+        self.assertEqual(summary_session["free_slot_count"], 1)
         self.assertEqual(
             summary_session["attached_project_names"],
-            [f"project-summary-{index}" for index in range(2)],
+            [project_name for _task_id, project_name in lease_specs[:2]],
+        )
+        self.assertEqual(
+            [
+                (item["task_id"], item["project_name"], item["state"])
+                for item in summary_session["attached_leases"]
+            ],
+            [
+                (task_id, project_name, "leased")
+                for task_id, project_name in lease_specs[:2]
+            ],
         )
         self.assertEqual(
             {int(self.service.get_lease(int(lease["id"]))["session_id"]) for lease, _ in leases},
             {session_id},
         )
+        self.assertEqual(
+            self.service.get_lease(int(released_lease["id"]))["state"],
+            "released",
+        )
+        self.assertEqual(self.service.summary()["session_history"], [])
+
+    def test_summary_separates_live_sessions_from_recent_history(self) -> None:
+        live_states = ("starting", "ready", "busy", "draining", "unhealthy")
+        history_base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with self.db.connect() as conn:
+            for state in live_states:
+                conn.execute(
+                    """
+                    INSERT INTO aedt_sessions (
+                        session_key, account_name, node_name, slots_total, state
+                    ) VALUES (?, 'a', 'cpu-live', 3, ?)
+                    """,
+                    (f"live-{state}", state),
+                )
+            # Insert newest first so ordering by id would produce the wrong result.
+            for index in range(34, -1, -1):
+                closed_at = (history_base + timedelta(minutes=index)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                conn.execute(
+                    """
+                    INSERT INTO aedt_sessions (
+                        session_key, account_name, node_name, slots_total, state,
+                        failure_message, quarantine_reason, created_at, started_at,
+                        closed_at, updated_at
+                    ) VALUES (?, 'a', 'cpu-history', 3, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"history-{index}",
+                        "failed" if index % 2 else "closed",
+                        f"failure-{index}",
+                        f"solver_timeout-{index}",
+                        closed_at,
+                        closed_at,
+                        closed_at,
+                        closed_at,
+                    ),
+                )
+
+        summary = self.service.summary()
+
+        self.assertEqual(len(summary["sessions"]), len(live_states))
+        self.assertEqual(
+            {session["state"] for session in summary["sessions"]},
+            set(live_states),
+        )
+        history = summary["session_history"]
+        self.assertEqual(len(history), 30)
+        self.assertEqual(
+            [session["session_key"] for session in history],
+            [f"history-{index}" for index in range(34, 4, -1)],
+        )
+        self.assertEqual({session["state"] for session in history}, {"failed", "closed"})
+        self.assertEqual(history[0]["failure_message"], "failure-34")
+        self.assertEqual(history[0]["quarantine_reason"], "solver_timeout-34")
+        self.assertEqual(history[-1]["session_key"], "history-5")
 
     def test_min_idle_session_starts_and_refills_when_last_idle_is_leased(self) -> None:
         self.service.set_operator_limits(

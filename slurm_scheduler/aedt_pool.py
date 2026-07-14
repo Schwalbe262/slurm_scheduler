@@ -18,6 +18,8 @@ from .models import SchedulingProfile, TaskCreate, TaskStatus
 LOGGER = logging.getLogger(__name__)
 
 SESSION_COUNTED_STATES = ("starting", "ready", "busy", "draining", "unhealthy")
+SESSION_HISTORY_STATES = ("failed", "closed")
+SESSION_HISTORY_LIMIT = 30
 SESSION_ASSIGNABLE_STATES = ("ready", "busy")
 LEASE_LIVE_STATES = ("queued", "leased", "active", "releasing")
 LEASE_SLOT_STATES = ("leased", "active", "releasing")
@@ -1728,18 +1730,37 @@ class AedtPoolService:
         config = self.config()
         plan = self.dry_run()
         latest = self.latest_validation()
+        live_state_placeholders = ", ".join("?" for _ in SESSION_COUNTED_STATES)
+        history_state_placeholders = ", ".join("?" for _ in SESSION_HISTORY_STATES)
         with self.db.connect() as conn:
             sessions = [
                 dict(row)
                 for row in conn.execute(
-                    """
+                    f"""
                     SELECT s.*,
                            COALESCE(a.account_name, s.account_name) AS allocation_account_name
                     FROM aedt_sessions s
                     LEFT JOIN allocations a ON a.id = s.allocation_id
+                    WHERE s.state IN ({live_state_placeholders})
                     ORDER BY s.id DESC
-                    LIMIT 500
-                    """
+                    """,
+                    SESSION_COUNTED_STATES,
+                ).fetchall()
+            ]
+            session_history = [
+                dict(row)
+                for row in conn.execute(
+                    f"""
+                    SELECT s.*,
+                           COALESCE(a.account_name, s.account_name) AS allocation_account_name
+                    FROM aedt_sessions s
+                    LEFT JOIN allocations a ON a.id = s.allocation_id
+                    WHERE s.state IN ({history_state_placeholders})
+                    ORDER BY COALESCE(s.closed_at, s.updated_at, s.created_at) DESC,
+                             s.id DESC
+                    LIMIT ?
+                    """,
+                    (*SESSION_HISTORY_STATES, SESSION_HISTORY_LIMIT),
                 ).fetchall()
             ]
             host_tasks = conn.execute(
@@ -1757,11 +1778,11 @@ class AedtPoolService:
             ).fetchall()
             attached_leases = conn.execute(
                 """
-                SELECT session_id, project_name
+                SELECT id, session_id, task_id, project_name, slot_index, state
                 FROM aedt_project_leases
                 WHERE session_id IS NOT NULL
                   AND state IN ('leased', 'active', 'releasing')
-                ORDER BY id ASC
+                ORDER BY session_id ASC, slot_index ASC, id ASC
                 """
             ).fetchall()
             leases = [
@@ -1792,18 +1813,27 @@ class AedtPoolService:
             if session_id:
                 host_task_by_session.setdefault(session_id, int(task["id"]))
 
-        attached_projects_by_session: dict[int, list[str]] = {}
+        attached_leases_by_session: dict[int, list[dict[str, Any]]] = {}
         for lease in attached_leases:
-            attached_projects_by_session.setdefault(int(lease["session_id"]), []).append(
-                str(lease["project_name"] or "")
+            attached_leases_by_session.setdefault(int(lease["session_id"]), []).append(
+                dict(lease)
             )
 
-        for session in sessions:
-            session_id = int(session["id"])
-            attached_project_names = attached_projects_by_session.get(session_id, [])
-            session["host_task_id"] = host_task_by_session.get(session_id)
-            session["active_lease_count"] = len(attached_project_names)
-            session["attached_project_names"] = attached_project_names
+        for session_collection in (sessions, session_history):
+            for session in session_collection:
+                session_id = int(session["id"])
+                session_attached_leases = attached_leases_by_session.get(session_id, [])
+                active_lease_count = len(session_attached_leases)
+                session["host_task_id"] = host_task_by_session.get(session_id)
+                session["active_lease_count"] = active_lease_count
+                session["free_slot_count"] = max(
+                    0, int(session.get("slots_total") or 0) - active_lease_count
+                )
+                session["attached_project_names"] = [
+                    str(lease["project_name"] or "")
+                    for lease in session_attached_leases
+                ]
+                session["attached_leases"] = session_attached_leases
         return {
             "config": {
                 "enabled": config.enabled,
@@ -1820,6 +1850,7 @@ class AedtPoolService:
             "plan": plan,
             "latest_validation": latest,
             "sessions": sessions,
+            "session_history": session_history,
             "leases": leases,
         }
 

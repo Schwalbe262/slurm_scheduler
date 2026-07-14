@@ -63,12 +63,22 @@
 
   <section class="panel">
     <h2>Sessions</h2>
+    <h3>Current sessions</h3>
     <div class="table-scroll">
       <table>
-        <thead><tr><th>Session ID</th><th>Host task</th><th>Node</th><th>Account</th><th>State</th><th>Started</th><th>Last heartbeat</th><th>Attached projects</th><th>Failure/quarantine reason</th></tr></thead>
+        <thead><tr><th>Session ID</th><th>Host task</th><th>Node</th><th>Account</th><th>State</th><th>Started</th><th>Last heartbeat</th><th>Attached FEA</th></tr></thead>
         <tbody id="session-rows"></tbody>
       </table>
     </div>
+    <details id="session-history" class="section-gap">
+      <summary>Session history: recent <span id="session-history-count">0</span></summary>
+      <div class="table-scroll section-gap">
+        <table>
+          <thead><tr><th>Session ID</th><th>Host task</th><th>Node</th><th>Account</th><th>State</th><th>Started</th><th>Closed</th><th>Failure/quarantine reason</th></tr></thead>
+          <tbody id="session-history-rows"></tbody>
+        </table>
+      </div>
+    </details>
   </section>
 
   <section class="panel">
@@ -84,6 +94,9 @@
 
 <script>
   const initialSummary = {{ summary | tojson }};
+  const liveSessionStates = new Set(["starting", "ready", "busy", "draining", "unhealthy"]);
+  const historySessionStates = new Set(["failed", "closed"]);
+  const sessionHistoryLimit = 30;
 
   function escapeText(value) {
     return String(value ?? "");
@@ -103,6 +116,66 @@
       return `${failure} / quarantine: ${quarantine}`;
     }
     return failure || quarantine || "-";
+  }
+
+  function appendHostTaskCell(row, session) {
+    const cell = document.createElement("td");
+    if (session.host_task_id) {
+      cell.append(taskLink(session.host_task_id));
+    } else {
+      cell.textContent = "-";
+    }
+    row.append(cell);
+  }
+
+  function appendTextCells(row, values) {
+    for (const value of values) {
+      const cell = document.createElement("td");
+      cell.textContent = escapeText(value);
+      row.append(cell);
+    }
+  }
+
+  function attachedFeaCell(session) {
+    const cell = document.createElement("td");
+    const attachedLeases = Array.isArray(session.attached_leases)
+      ? session.attached_leases
+      : [];
+    attachedLeases.forEach((lease, index) => {
+      if (index) cell.append(document.createTextNode(", "));
+      const taskId = Number.parseInt(lease.task_id, 10) || 0;
+      if (taskId > 0) {
+        cell.append(taskLink(taskId));
+      } else {
+        cell.append(document.createTextNode("-"));
+      }
+      const projectName = escapeText(lease.project_name).trim() || "-";
+      cell.append(document.createTextNode(` ${projectName}`));
+    });
+
+    const slotsTotal = Math.max(
+      Number.parseInt(session.slots_total, 10) || 0,
+      attachedLeases.length
+    );
+    const reportedFreeSlots = Number.parseInt(session.free_slot_count, 10);
+    const freeSlots = Number.isFinite(reportedFreeSlots)
+      ? Math.max(0, reportedFreeSlots)
+      : Math.max(0, slotsTotal - attachedLeases.length);
+    if (attachedLeases.length) cell.append(document.createTextNode(" "));
+    cell.append(document.createTextNode(
+      `(${attachedLeases.length}/${slotsTotal} slots; ${freeSlots} free)`
+    ));
+    return cell;
+  }
+
+  function appendEmptyTableRow(body, colSpan, message) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = colSpan;
+    cell.className = "muted";
+    cell.textContent = message;
+    row.append(cell);
+    body.append(row);
   }
 
   function summaryItem(label, value) {
@@ -165,15 +238,11 @@
 
     const body = document.getElementById("session-rows");
     body.replaceChildren();
-    const sessions = summary.sessions || [];
+    const sessions = (summary.sessions || []).filter((session) =>
+      liveSessionStates.has(escapeText(session.state).trim())
+    );
     if (!sessions.length) {
-      const row = document.createElement("tr");
-      const cell = document.createElement("td");
-      cell.colSpan = 9;
-      cell.className = "muted";
-      cell.textContent = "No AEDT pool sessions.";
-      row.append(cell);
-      body.append(row);
+      appendEmptyTableRow(body, 8, "No live AEDT pool sessions.");
     } else {
       for (const session of sessions) {
         const row = document.createElement("tr");
@@ -182,46 +251,56 @@
         sessionIdCell.textContent = escapeText(session.id);
         row.append(sessionIdCell);
 
-        const hostTaskCell = document.createElement("td");
-        if (session.host_task_id) {
-          hostTaskCell.append(taskLink(session.host_task_id));
-        } else {
-          hostTaskCell.textContent = "-";
-        }
-        row.append(hostTaskCell);
-
-        for (const value of [
+        appendHostTaskCell(row, session);
+        appendTextCells(row, [
           session.node_name || "-",
           session.allocation_account_name || "-",
           session.state || "-",
           session.started_at || "-",
           session.last_heartbeat_at || "-"
-        ]) {
-          const cell = document.createElement("td");
-          cell.textContent = escapeText(value);
-          row.append(cell);
-        }
-
-        const attachedProjectNames = Array.isArray(session.attached_project_names)
-          ? session.attached_project_names.filter(Boolean)
-          : [];
-        const activeLeaseCount = session.active_lease_count ?? attachedProjectNames.length;
-        const attachedCell = document.createElement("td");
-        const attachedCount = document.createElement("div");
-        attachedCount.textContent = `${activeLeaseCount} active lease${activeLeaseCount === 1 ? "" : "s"}`;
-        attachedCell.append(attachedCount);
-        if (attachedProjectNames.length) {
-          const projectNames = document.createElement("div");
-          projectNames.className = "muted";
-          projectNames.textContent = attachedProjectNames.join(", ");
-          attachedCell.append(projectNames);
-        }
-        row.append(attachedCell);
-
-        const failureCell = document.createElement("td");
-        failureCell.textContent = sessionFailureReason(session);
-        row.append(failureCell);
+        ]);
+        row.append(attachedFeaCell(session));
         body.append(row);
+      }
+    }
+
+    const historyBody = document.getElementById("session-history-rows");
+    historyBody.replaceChildren();
+    const historySource = Array.isArray(summary.session_history)
+      ? summary.session_history
+      : (summary.sessions || []);
+    const sessionHistory = historySource
+      .filter((session) => historySessionStates.has(escapeText(session.state).trim()))
+      .sort((left, right) => {
+        const leftTime = escapeText(
+          left.closed_at || left.updated_at || left.created_at
+        );
+        const rightTime = escapeText(
+          right.closed_at || right.updated_at || right.created_at
+        );
+        return rightTime.localeCompare(leftTime)
+          || (Number(right.id) || 0) - (Number(left.id) || 0);
+      })
+      .slice(0, sessionHistoryLimit);
+    document.getElementById("session-history-count").textContent = sessionHistory.length;
+    if (!sessionHistory.length) {
+      appendEmptyTableRow(historyBody, 8, "No failed or closed AEDT pool sessions.");
+    } else {
+      for (const session of sessionHistory) {
+        const row = document.createElement("tr");
+        const sessionIdCell = document.createElement("td");
+        sessionIdCell.textContent = escapeText(session.id);
+        row.append(sessionIdCell);
+        appendHostTaskCell(row, session);
+        appendTextCells(row, [
+          session.node_name || "-",
+          session.allocation_account_name || "-",
+          session.state || "-",
+          session.started_at || "-",
+          session.closed_at || "-",
+          sessionFailureReason(session)
+        ]);
+        historyBody.append(row);
       }
     }
 
