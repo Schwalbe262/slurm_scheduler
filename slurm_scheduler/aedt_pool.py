@@ -131,6 +131,11 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "aedt_pool_required_capability": "",
     "aedt_pool_env_profile": "",
     "aedt_pool_account_name": "",
+    # Node-visible HTTP base URL published by the optional control-plane
+    # relay.  This is deliberately separate from the scheduler process's
+    # static launch configuration: relay supervision may withdraw or replace
+    # the URL while the web worker remains alive.
+    "aedt_pool_control_plane_url": "",
 }
 
 
@@ -169,6 +174,7 @@ class AedtPoolConfig:
     required_capability: str
     env_profile: str
     account_name: str
+    control_plane_url: str
 
     @property
     def operational(self) -> bool:
@@ -290,6 +296,7 @@ class AedtPoolService:
             required_capability=self._setting("aedt_pool_required_capability").strip(),
             env_profile=self._setting("aedt_pool_env_profile").strip(),
             account_name=self._setting("aedt_pool_account_name").strip(),
+            control_plane_url=self._setting("aedt_pool_control_plane_url").strip().rstrip("/"),
         )
 
     def set_operator_limit(self, max_sessions: int) -> AedtPoolConfig:
@@ -373,6 +380,18 @@ class AedtPoolService:
         self.db.set_setting("aedt_pool_adapter_ready", "1" if ready else "0")
         if not ready and self.config().enabled:
             self._request_all_sessions_drain("session-host adapter disabled")
+        return self.config()
+
+    def set_control_plane_url(self, url: str) -> AedtPoolConfig:
+        """Publish (or withdraw) the node-visible control-plane base URL.
+
+        Relay supervision owns this deployment setting.  Keeping it durable
+        lets the AEDT runtime resolve the current URL on every reconciliation
+        pass instead of capturing a possibly stale address at process start.
+        An empty value intentionally unpublishes the endpoint.
+        """
+        normalized = str(url or "").strip().rstrip("/")
+        self.db.set_setting("aedt_pool_control_plane_url", normalized)
         return self.config()
 
     def set_enabled(self, enabled: bool) -> AedtPoolConfig:
@@ -759,9 +778,14 @@ class AedtPoolService:
             )
         return self.get_lease(lease_id, include_secret_hash=False)
 
-    def _authorize_bootstrap(self, token: str) -> None:
+    def authorize_bootstrap(self, token: str) -> None:
+        """Authorize a control-plane mutation with the shared bootstrap secret."""
         if not self.bootstrap_token or not secrets.compare_digest(self.bootstrap_token, token):
             raise PermissionError("invalid session-host bootstrap token")
+
+    def _authorize_bootstrap(self, token: str) -> None:
+        """Backward-compatible internal alias for bootstrap authorization."""
+        self.authorize_bootstrap(token)
 
     def claim_start(
         self,
@@ -1578,6 +1602,7 @@ class AedtPoolService:
                 "min_idle_aedt_sessions": config.min_idle_sessions,
                 "target_project_concurrency": config.target_projects,
                 "projects_per_aedt": config.projects_per_session,
+                "control_plane_url": config.control_plane_url,
                 "hard_counted_states": list(SESSION_COUNTED_STATES),
             },
             "plan": plan,
@@ -1649,6 +1674,7 @@ class AedtPoolRuntime:
         host_env_setup: str = "",
         host_bootstrap_token_file: str = "",
         host_task_memory_mb: int = 4096,
+        require_published_control_plane_url: bool = False,
     ) -> None:
         self.service = service
         self.scheduler = scheduler
@@ -1661,6 +1687,9 @@ class AedtPoolRuntime:
         self.host_env_setup = host_env_setup
         self.host_bootstrap_token_file = host_bootstrap_token_file.strip()
         self.host_task_memory_mb = max(1024, int(host_task_memory_mb))
+        self.require_published_control_plane_url = bool(
+            require_published_control_plane_url
+        )
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -1684,7 +1713,29 @@ class AedtPoolRuntime:
 
     def tick(self) -> dict[str, Any]:
         config = self.service.config()
+        control_plane_url = self._control_plane_url(config)
+        if self.require_published_control_plane_url and not control_plane_url:
+            # Do not even enter the mutating reconciler while relay
+            # supervision has withdrawn the node-visible endpoint.  In
+            # particular, this prevents new allocations/sessions from being
+            # created when their host processes could not call home.
+            plan = self.service.dry_run()
+            plan.update(
+                {
+                    "control_plane_ready": False,
+                    "control_plane_error": (
+                        "node-visible AEDT control-plane URL is not published"
+                    ),
+                    "node_allocations_opened": 0,
+                    "host_tasks_started": 0,
+                    "empty_allocations_closed": 0,
+                }
+            )
+            return plan
         plan = self.service.reconcile(execute=True)
+        if self.require_published_control_plane_url:
+            plan["control_plane_ready"] = True
+            plan["control_plane_error"] = ""
         if not config.operational:
             return plan
         requests = min(int(plan.get("node_requests") or 0), config.scale_step_nodes)
@@ -1708,25 +1759,43 @@ class AedtPoolRuntime:
                 break
             opened += 1
         plan["node_allocations_opened"] = opened
-        plan["host_tasks_started"] = self._ensure_session_hosts(config)
+        plan["host_tasks_started"] = self._ensure_session_hosts(
+            config, control_plane_url=control_plane_url
+        )
         plan["empty_allocations_closed"] = self._close_empty_dedicated_allocations()
         return plan
+
+    def _control_plane_url(self, config: AedtPoolConfig | None = None) -> str:
+        if self.require_published_control_plane_url:
+            current = config or self.service.config()
+            return current.control_plane_url.strip().rstrip("/")
+        return self.scheduler_url
 
     @property
     def host_launch_configured(self) -> bool:
         return bool(
-            self.scheduler_url
+            self._control_plane_url()
             and self.host_remote_cwd
             and self.host_bootstrap_token_file
         )
 
-    def _host_command(self, session: dict[str, Any]) -> str:
+    def _host_command(
+        self,
+        session: dict[str, Any],
+        *,
+        control_plane_url: str | None = None,
+    ) -> str:
+        scheduler_url = (
+            self._control_plane_url()
+            if control_plane_url is None
+            else control_plane_url.strip().rstrip("/")
+        )
         parts = [
             self.host_python,
             "-m",
             "slurm_scheduler.aedt_session_host",
             "--scheduler-url",
-            self.scheduler_url,
+            scheduler_url,
             "--allocation-id",
             str(int(session["allocation_id"])),
             "--node-name",
@@ -1736,8 +1805,23 @@ class AedtPoolRuntime:
         ]
         return " ".join(shlex.quote(part) for part in parts)
 
-    def _ensure_session_hosts(self, config: AedtPoolConfig) -> int:
-        if not config.operational or not self.host_launch_configured:
+    def _ensure_session_hosts(
+        self,
+        config: AedtPoolConfig,
+        *,
+        control_plane_url: str | None = None,
+    ) -> int:
+        scheduler_url = (
+            self._control_plane_url(config)
+            if control_plane_url is None
+            else control_plane_url.strip().rstrip("/")
+        )
+        if not (
+            config.operational
+            and scheduler_url
+            and self.host_remote_cwd
+            and self.host_bootstrap_token_file
+        ):
             return 0
         started = 0
         for session in self.service.starting_sessions():
@@ -1753,7 +1837,9 @@ class AedtPoolRuntime:
                 TaskCreate(
                     name=f"aedt-session-host-{int(session['id'])}",
                     remote_cwd=self.host_remote_cwd,
-                    command=self._host_command(session),
+                    command=self._host_command(
+                        session, control_plane_url=scheduler_url
+                    ),
                     env_setup=self.host_env_setup,
                     required_capability=config.required_capability,
                     env_profile=config.env_profile,

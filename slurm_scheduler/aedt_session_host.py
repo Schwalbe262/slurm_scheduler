@@ -32,14 +32,15 @@ class ControlPlaneClient:
         headers = {"Accept": "application/json"}
         if body is not None:
             headers["Content-Type"] = "application/json"
+        if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+            headers["X-AEDT-Bootstrap-Token"] = self.bootstrap_token
         if host_token:
             headers["X-AEDT-Host-Token"] = host_token
-        else:
-            headers["X-AEDT-Bootstrap-Token"] = self.bootstrap_token
         request = urllib.request.Request(
             f"{self.base_url}{path}", data=body, headers=headers, method=method
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8") or "{}")
 
 

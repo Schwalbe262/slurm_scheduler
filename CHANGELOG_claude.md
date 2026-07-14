@@ -1,4 +1,17 @@
 
+## 2026-07-14 (Codex) - Cluster-reachable AEDT control-plane relay (disabled)
+- Added an opt-in supervisor that maintains an SSH reverse tunnel through one
+  configured login account and deploys a marker-owned, stdlib-only TCP relay
+  listening on the cluster network. The relay exposes only `/api/aedt-pool/`
+  and `/healthz` by default, publishes its node-visible URL only while an
+  end-to-end probe succeeds, and restarts failed tunnel/relay generations.
+- Added relay health/status APIs and made the AEDT runtime consume the
+  published URL dynamically, failing closed without creating pool capacity
+  while the relay is down.
+- All state-changing AEDT pool routes now require the shared bootstrap token in
+  addition to existing lease/host-scoped tokens. The subsystem remains fully
+  disabled and side-effect-free until explicitly configured and enabled.
+
 ## 2026-07-13 (Codex) - Configurable project concurrency ceiling
 - Added `project_max_active_tasks_ceiling` with a backward-compatible default
   of 300 and made project create/upsert plus project-cap PATCH validation/errors

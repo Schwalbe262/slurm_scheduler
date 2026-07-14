@@ -17,6 +17,10 @@
       AEDT sessions × projects per AEDT; changing slot count requires a fully drained pool.
     </p>
     <form id="limit-form" class="form-grid">
+      <div class="full">
+        <label for="aedt-bootstrap-token">Bootstrap token (required for changes)</label>
+        <input id="aedt-bootstrap-token" type="password" autocomplete="off" spellcheck="false">
+      </div>
       <div>
         <label for="max-aedt-sessions">Maximum open AEDT sessions</label>
         <input id="max-aedt-sessions" name="max_aedt_sessions" type="number" min="0" max="550" step="1" required>
@@ -109,6 +113,13 @@
     val.textContent = escapeText(value);
     item.append(name, val);
     return item;
+  }
+
+  function mutationHeaders() {
+    return {
+      "Content-Type": "application/json",
+      "X-AEDT-Bootstrap-Token": document.getElementById("aedt-bootstrap-token").value
+    };
   }
 
   function taskLink(taskId) {
@@ -332,7 +343,7 @@
     try {
       const response = await fetch("/api/aedt-pool/config", {
         method: "PATCH",
-        headers: {"Content-Type": "application/json"},
+        headers: mutationHeaders(),
         body: JSON.stringify({
           max_aedt_sessions: max,
           min_idle_aedt_sessions: minIdle,
@@ -357,7 +368,7 @@
     try {
       const response = await fetch("/api/aedt-pool/enable", {
         method: "POST",
-        headers: {"Content-Type": "application/json"},
+        headers: mutationHeaders(),
         body: JSON.stringify({enabled})
       });
       const payload = await response.json();

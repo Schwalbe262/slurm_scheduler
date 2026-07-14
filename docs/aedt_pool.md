@@ -186,6 +186,10 @@ Operator:
 - `POST /api/aedt-pool/enable`
 - `POST /api/aedt-pool/validations`
 
+Every `POST` and `PATCH` route requires `X-AEDT-Bootstrap-Token`. Lease and
+session-host mutations additionally require their existing lease/host token;
+the shared bootstrap credential does not replace scoped authorization.
+
 `min_idle_aedt_sessions` defaults to `0`. Setting it to `1` through the
 configuration PATCH keeps one whole `ready` (unleased) Desktop available and
 starts its replacement as soon as the last idle session takes a lease. The

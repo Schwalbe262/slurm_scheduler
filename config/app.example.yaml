@@ -112,6 +112,16 @@ aedt_pool:
   host_env_setup: ""
   host_bootstrap_token_file: ""
   host_task_memory_mb: 4096
+# Optional login-node relay for compute nodes that cannot reach this scheduler
+# directly. It is a strict no-op until enabled and fully configured.
+control_plane_relay:
+  enabled: false
+  account: ""
+  port: 18790
+  remote_path: ""
+  allowed_prefixes:
+    - "/api/aedt-pool/"
+    - "/healthz"
 cleanup:
   enabled: true
   interval_seconds: 3600

@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
@@ -148,6 +148,14 @@ def build_aedt_pool_summary(
 def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
     router = APIRouter()
 
+    def require_bootstrap(x_aedt_bootstrap_token: str = Header("")) -> None:
+        try:
+            service.authorize_bootstrap(x_aedt_bootstrap_token)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    bootstrap_guard = Depends(require_bootstrap)
+
     @router.get("/aedt-pool", response_class=HTMLResponse)
     def aedt_pool_page(request: Request) -> HTMLResponse:
         return TEMPLATES.TemplateResponse(
@@ -159,7 +167,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
     def get_aedt_pool() -> dict[str, Any]:
         return build_aedt_pool_summary(service)
 
-    @router.patch("/api/aedt-pool/config")
+    @router.patch("/api/aedt-pool/config", dependencies=[bootstrap_guard])
     async def set_aedt_pool_limit(request: Request) -> dict[str, Any]:
         payload = await request.json()
         allowed = {
@@ -196,7 +204,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
             "operational": config.operational,
         }
 
-    @router.post("/api/aedt-pool/enable")
+    @router.post("/api/aedt-pool/enable", dependencies=[bootstrap_guard])
     async def set_aedt_pool_enabled(request: Request) -> dict[str, Any]:
         payload = await request.json()
         if type(payload.get("enabled")) is not bool:
@@ -212,7 +220,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
             "adapter_ready": config.adapter_ready,
         }
 
-    @router.post("/api/aedt-pool/validations")
+    @router.post("/api/aedt-pool/validations", dependencies=[bootstrap_guard])
     async def record_aedt_pool_validation(request: Request) -> dict[str, Any]:
         payload = await request.json()
         try:
@@ -220,12 +228,12 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    @router.post("/api/aedt-pool/reconcile")
+    @router.post("/api/aedt-pool/reconcile", dependencies=[bootstrap_guard])
     def reconcile_aedt_pool(dry_run: bool = True) -> dict[str, Any]:
         # Live reconciliation is still triple-gated inside the service.
         return service.dry_run() if dry_run else service.reconcile(execute=True)
 
-    @router.post("/api/aedt-pool/leases")
+    @router.post("/api/aedt-pool/leases", dependencies=[bootstrap_guard])
     async def request_aedt_lease(request: Request) -> dict[str, Any]:
         payload = await request.json()
         try:
@@ -253,7 +261,10 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
 
-    @router.post("/api/aedt-pool/leases/{lease_id}/heartbeat")
+    @router.post(
+        "/api/aedt-pool/leases/{lease_id}/heartbeat",
+        dependencies=[bootstrap_guard],
+    )
     def heartbeat_aedt_lease(
         lease_id: int,
         x_aedt_lease_token: str = Header(""),
@@ -267,7 +278,10 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    @router.post("/api/aedt-pool/leases/{lease_id}/release")
+    @router.post(
+        "/api/aedt-pool/leases/{lease_id}/release",
+        dependencies=[bootstrap_guard],
+    )
     def release_aedt_lease(
         lease_id: int,
         x_aedt_lease_token: str = Header(""),
@@ -279,7 +293,10 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
 
-    @router.patch("/api/aedt-pool/leases/{lease_id}/project-name")
+    @router.patch(
+        "/api/aedt-pool/leases/{lease_id}/project-name",
+        dependencies=[bootstrap_guard],
+    )
     async def bind_aedt_lease_project_name(
         lease_id: int,
         request: Request,
@@ -299,7 +316,10 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    @router.post("/api/aedt-pool/leases/{lease_id}/fault")
+    @router.post(
+        "/api/aedt-pool/leases/{lease_id}/fault",
+        dependencies=[bootstrap_guard],
+    )
     async def report_aedt_lease_fault(
         lease_id: int,
         request: Request,
@@ -321,7 +341,10 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    @router.post("/api/aedt-pool/hosts/claim-start")
+    @router.post(
+        "/api/aedt-pool/hosts/claim-start",
+        dependencies=[bootstrap_guard],
+    )
     async def claim_aedt_start(
         request: Request,
         x_aedt_bootstrap_token: str = Header(""),
@@ -338,7 +361,10 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         return {"session": session}
 
-    @router.post("/api/aedt-pool/sessions/{session_id}/register")
+    @router.post(
+        "/api/aedt-pool/sessions/{session_id}/register",
+        dependencies=[bootstrap_guard],
+    )
     async def register_aedt_session(
         session_id: int,
         request: Request,
@@ -361,7 +387,10 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"session": session, "host_token": token}
 
-    @router.post("/api/aedt-pool/sessions/{session_id}/start-failed")
+    @router.post(
+        "/api/aedt-pool/sessions/{session_id}/start-failed",
+        dependencies=[bootstrap_guard],
+    )
     async def fail_aedt_session_start(
         session_id: int,
         request: Request,
@@ -382,7 +411,10 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    @router.post("/api/aedt-pool/sessions/{session_id}/heartbeat")
+    @router.post(
+        "/api/aedt-pool/sessions/{session_id}/heartbeat",
+        dependencies=[bootstrap_guard],
+    )
     def heartbeat_aedt_session(
         session_id: int,
         x_aedt_host_token: str = Header(""),
@@ -408,7 +440,10 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
 
-    @router.post("/api/aedt-pool/sessions/{session_id}/leases/{lease_id}/release-complete")
+    @router.post(
+        "/api/aedt-pool/sessions/{session_id}/leases/{lease_id}/release-complete",
+        dependencies=[bootstrap_guard],
+    )
     async def complete_aedt_release(
         session_id: int,
         lease_id: int,
@@ -433,7 +468,10 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    @router.post("/api/aedt-pool/sessions/{session_id}/closed")
+    @router.post(
+        "/api/aedt-pool/sessions/{session_id}/closed",
+        dependencies=[bootstrap_guard],
+    )
     async def close_aedt_session(
         session_id: int,
         request: Request,
