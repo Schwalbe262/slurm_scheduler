@@ -85,3 +85,14 @@
 
 ## 2026-07-12 (Claude)
 - docs/bug_idle_active_allocation_leak.md: 태스크 0개 active 할당(6757, 63h)이 유휴 회수에서 누락되는 버그 리포트
+
+## 2026-07-14 — task_refresh_max_per_tick configurable (throughput fix)
+- Root cause: completed MFT tasks stayed "running" for 20-60 min because
+  refresh_tasks probed at most 32 tasks/tick (hardcoded default) while ~360
+  were active; a full sweep took 11+ ticks. Fleet lost ~30% effective
+  capacity to reaping lag (verified: task 33790 wrote exit_code at 08:29:35,
+  scheduler marked it completed ~09:30).
+- Change: expose task_refresh_max_per_tick in AppConfig + app.py pass-through
+  (default unchanged at 32); live config Y:\runtime\slurm_scheduler\config\app.yaml
+  sets 512. Probes are batched (one SSH session per account, 50 exit-code
+  stats per shell command), so a full-fleet sweep per tick is cheap.

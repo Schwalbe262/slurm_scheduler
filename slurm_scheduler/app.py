@@ -460,6 +460,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         fea_alloc_util_sample_interval_seconds=config.fea_alloc_util_sample_interval_seconds,
         fea_shared_memory_estimate_fraction=config.fea_shared_memory_estimate_fraction,
         fea_shared_memory_min_estimate_mb=config.fea_shared_memory_min_estimate_mb,
+        task_refresh_max_per_tick=config.task_refresh_max_per_tick,
         cleanup_enabled=config.cleanup_enabled,
         cleanup_interval_seconds=config.cleanup_interval_seconds,
         cleanup_finished_task_ttl_seconds=config.cleanup_finished_task_ttl_seconds,
