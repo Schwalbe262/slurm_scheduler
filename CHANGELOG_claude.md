@@ -1,3 +1,16 @@
+## 2026-07-14 (Claude) - Bug note: task cancel leaves pooled runner processes alive
+- Observed during the pooled ramp: POST /api/tasks/{id}/cancel marked 27 MFT
+  pooled client tasks cancelled, but their remote runner processes survived on
+  compute nodes and kept requesting/holding AEDT pool leases (6 leased +
+  10 queued minutes after cancellation; leases only cleared via heartbeat
+  expiry). Same class as the 2026-07-09 packed-cancel child-leak, now in the
+  srun-step/pooled-runner form. Zombies self-terminate at the next solver
+  gate, so impact today was wasted session slots only — but a mass cancel at
+  500-task scale would strand hundreds of leases. Needs: cancel path must
+  verify the srun step/process tree is gone (scancel step + remote pkill of
+  the task's process group), and the pool should cancel a task's leases when
+  its task row goes terminal.
+
 ## 2026-07-14 (Codex) - Remove node-local AEDT canary
 - Recorded the operator decision to unify pooled AEDT work on the central pool
   and removed the scheduler-managed node-local host/client admission exception.
