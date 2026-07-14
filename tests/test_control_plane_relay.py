@@ -298,7 +298,7 @@ def _account() -> AccountConfig:
 
 def test_supervisor_reestablishes_tunnel_and_owned_relay_after_health_failure() -> None:
     factory = _FakeSSHFactory()
-    probe_results = iter((True, False, True))
+    probe_results = iter((True, False, False, False, True))
     published: list[str] = []
     relay = ControlPlaneRelay(
         enabled=True,
@@ -319,14 +319,43 @@ def test_supervisor_reestablishes_tunnel_and_owned_relay_after_health_failure() 
         relay.tunnel_port,
     )
 
-    second = relay.tick()
-    assert second["state"] == "up"
+    # A live transport rides out transient probe misses; tearing the tunnel
+    # down on one slow response is itself an outage for every node request.
+    assert relay.tick()["state"] == "up"
+    assert relay.tick()["state"] == "up"
+    assert len(factory.sessions) == 1
+    assert not factory.sessions[0].closed
+
+    final = relay.tick()
+    assert final["state"] == "up"
     assert len(factory.sessions) == 2
     old = factory.sessions[0]
     assert old.closed
     assert old.transport.cancels == [("127.0.0.1", relay.tunnel_port)]
     assert any("kill -TERM" in command for command in old.commands)
     assert published == ["http://gate2:18790", "", "http://gate2:18790"]
+    relay.stop()
+
+
+def test_supervisor_probe_grace_resets_after_a_successful_probe() -> None:
+    factory = _FakeSSHFactory()
+    probe_results = iter((True, False, False, True, False, False))
+    relay = ControlPlaneRelay(
+        enabled=True,
+        account=_account(),
+        relay_port=18790,
+        remote_path="/home/cluster-user/.cache/slurm/control-plane-relay.py",
+        local_port=8000,
+        ssh_factory=factory,
+        probe=lambda _url, _timeout: next(probe_results),
+    )
+
+    for _ in range(6):
+        assert relay.tick()["state"] == "up"
+    # The success at tick 4 reset the failure streak, so the two trailing
+    # failures stay within the grace window and the tunnel is never rebuilt.
+    assert len(factory.sessions) == 1
+    assert not factory.sessions[0].closed
     relay.stop()
 
 

@@ -1,3 +1,20 @@
+## 2026-07-15 (Claude) - Relay flap + channel cap fixes (pooled ramp 502 storm)
+- The 300-client ramp collapse had a second layer beyond the client lease
+  heartbeat gap: the control-plane relay supervisor tore down a healthy SSH
+  tunnel whenever a single /healthz probe missed its 10s timeout (easy under
+  campaign load - web ticks were 46-74s), and the teardown itself 502'd every
+  in-flight node request, killing registering hosts and expiring leases. Now a
+  live transport gets a 3-consecutive-failure grace window before rebuild and
+  the probe timeout is 30s. Transport-inactive / marker-mismatch teardowns
+  stay immediate.
+- Forwarded-channel slots were capped at 64 concurrent tunneled requests;
+  overflow surfaced on nodes as "relay busy"/"Remote end closed connection
+  without response". Raised to 256.
+- Ops: web_limit_concurrency 160 -> 600 (uvicorn was refusing bursts:
+  "Exceeded concurrency limit." + 503 on pool endpoints).
+- Tests: reestablish test updated to the new grace semantics + new
+  probe-grace-reset test (relay suite 13 passed).
+
 ## 2026-07-15 (Claude) - Reap dead-host unhealthy AEDT sessions (pool capacity deadlock fix)
 - Root cause of the overnight zero-capacity stall: close_session requires the
   live host token, so sessions whose host died (usage-error exits, scancel)

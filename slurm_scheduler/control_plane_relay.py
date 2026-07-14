@@ -413,7 +413,12 @@ class ControlPlaneRelay:
         self._thread: threading.Thread | None = None
         self._lock = threading.RLock()
         self._channels_lock = threading.Lock()
-        self._channel_slots = threading.BoundedSemaphore(64)
+        # One slot per concurrent tunneled HTTP request.  A 300-client pooled
+        # ramp bursts well past 64; refused slots surface to nodes as "relay
+        # busy"/closed connections and kill registering session hosts.
+        self._channel_slots = threading.BoundedSemaphore(256)
+        self._probe_failures = 0
+        self._probe_failure_threshold = 3
         self._session: Any = None
         self._transport: Any = None
         tunnel_identity = (
@@ -551,11 +556,28 @@ class ControlPlaneRelay:
                     else:
                         try:
                             if self._probe(self.relay_url + "/healthz", self._probe_timeout):
+                                self._probe_failures = 0
                                 self._mark_up_locked()
                                 return self.status()
                             failure = "end-to-end relay health probe returned non-200"
                         except Exception as exc:
                             failure = f"end-to-end relay health probe failed: {exc}"
+                        # A slow web worker under ramp load can miss a single
+                        # probe while the tunnel is perfectly healthy.  Tearing
+                        # the tunnel down is itself an outage (every in-flight
+                        # node request 502s and registering hosts die), so a
+                        # live transport gets a grace window of consecutive
+                        # probe failures before the rebuild.
+                        self._probe_failures += 1
+                        if self._probe_failures < self._probe_failure_threshold:
+                            LOGGER.warning(
+                                "control-plane relay probe failure %d/%d (tunnel kept): %s",
+                                self._probe_failures,
+                                self._probe_failure_threshold,
+                                failure,
+                            )
+                            return self.status()
+                self._probe_failures = 0
                 self._mark_down_locked(failure)
                 retirement_requested = self._retire_adopted_relay_locked()
                 self._teardown_locked()
@@ -566,6 +588,7 @@ class ControlPlaneRelay:
                 self._establish_locked()
                 if not self._probe(self.relay_url + "/healthz", self._probe_timeout):
                     raise RuntimeError("end-to-end relay health probe returned non-200")
+                self._probe_failures = 0
                 self._mark_up_locked()
             except Exception as exc:
                 LOGGER.warning("control-plane relay unavailable: %s", exc)
@@ -576,7 +599,10 @@ class ControlPlaneRelay:
 
     @property
     def _probe_timeout(self) -> float:
-        return float(max(1, min(10, self.interval_seconds)))
+        # The probe traverses login-node relay -> SSH tunnel -> web worker;
+        # under campaign load the web alone can take >10s, and a timed-out
+        # probe used to trigger a tunnel rebuild (a real outage).
+        return float(max(1, min(30, 3 * self.interval_seconds)))
 
     def _validate_configuration(self) -> None:
         if self.account is None:
