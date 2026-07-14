@@ -342,7 +342,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
         )
         self.assertNotIn("node_local", endpoint())
 
-    def test_main_dashboard_links_hard_counted_aedt_and_project_limits(self) -> None:
+    def test_main_dashboard_uses_fea_aedt_arithmetic_and_links_pool_limits(self) -> None:
         template = (
             Path(__file__).resolve().parents[1] / "templates" / "dashboard.html"
         ).read_text(encoding="utf-8")
@@ -354,13 +354,22 @@ class AedtPoolGateTests(AedtPoolTestCase):
             'id="aedt-dashboard-projects"',
             "aedt_pool_summary.plan.live_projects",
             "aedt_pool_summary.config.target_project_concurrency",
-            '<span class="summary-label">FEA solvers</span>',
-            "task_summary.session_hosts",
+            '<span class="summary-label">FEA / AEDT</span>',
+            "task_summary.fea",
+            "task_summary.aedt",
+            'data-aedt-pool-sessions="{{ task_summary.aedt_pool_sessions }}"',
+            'data-aedt-backend="{{ task.aedt_backend or \'standalone\' }}"',
             'data-project="{{ task.project or \'\' }}"',
-            'project === "_aedt_pool_hosts"',
-            "tasks.session_hosts",
+            'project !== "_aedt_pool_hosts"',
+            'status === "running" || status === "attaching"',
+            "counts.standaloneAedt",
+            "tasks.aedt",
+            "tasks.aedt_pool_sessions",
+            'summaryUrl.searchParams.set("task_name_contains", taskFilter)',
         ):
             self.assertIn(required, template)
+        self.assertNotIn("session hosts", template)
+        self.assertNotIn("tasks.session_hosts", template)
         self.assertNotIn('id="aedt-dashboard-node-local"', template)
         self.assertNotIn("aedt_pool_summary.node_local", template)
 

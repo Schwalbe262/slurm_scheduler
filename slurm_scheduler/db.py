@@ -731,17 +731,30 @@ class Database:
         """
         name_filter, name_params = self._name_contains_filter(name_contains)
         with self.connect() as conn:
+            aedt_pool_sessions = 0
+            aedt_sessions_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'aedt_sessions'"
+            ).fetchone()
+            if aedt_sessions_table:
+                aedt_pool_sessions = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM aedt_sessions
+                        WHERE state IN ('starting','ready','busy','draining','unhealthy')
+                        """
+                    ).fetchone()[0]
+                )
             row = conn.execute(
                 f"""
                 WITH active AS (
-                    SELECT status, scheduling_profile, project, gpus, same_node_as_task_id
+                    SELECT status, scheduling_profile, aedt_backend, project, gpus, same_node_as_task_id
                     FROM tasks
                     WHERE status IN (?, ?){name_filter}
                     ORDER BY id DESC
                     LIMIT ?
                 ),
                 queued_tasks AS (
-                    SELECT status, scheduling_profile, project, gpus, same_node_as_task_id
+                    SELECT status, scheduling_profile, aedt_backend, project, gpus, same_node_as_task_id
                     FROM tasks
                     WHERE status = ?{name_filter}
                     ORDER BY id DESC
@@ -757,9 +770,9 @@ class Database:
                     COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running,
                     COALESCE(SUM(CASE WHEN status = 'attaching' THEN 1 ELSE 0 END), 0) AS attaching,
                     COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued,
-                    COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(scheduling_profile, ''))) = 'fea_bursty' AND TRIM(COALESCE(project, '')) != '_aedt_pool_hosts' THEN 1 ELSE 0 END), 0) AS fea,
+                    COALESCE(SUM(CASE WHEN status IN ('running', 'attaching') AND LOWER(TRIM(COALESCE(scheduling_profile, ''))) = 'fea_bursty' AND TRIM(COALESCE(project, '')) != '_aedt_pool_hosts' THEN 1 ELSE 0 END), 0) AS fea,
                     COALESCE(SUM(CASE WHEN status = 'running' AND LOWER(TRIM(COALESCE(scheduling_profile, ''))) = 'fea_bursty' AND TRIM(COALESCE(project, '')) != '_aedt_pool_hosts' THEN 1 ELSE 0 END), 0) AS fea_running,
-                    COALESCE(SUM(CASE WHEN TRIM(COALESCE(project, '')) = '_aedt_pool_hosts' THEN 1 ELSE 0 END), 0) AS session_hosts,
+                    COALESCE(SUM(CASE WHEN status = 'running' AND LOWER(TRIM(COALESCE(scheduling_profile, ''))) = 'fea_bursty' AND TRIM(COALESCE(project, '')) != '_aedt_pool_hosts' AND LOWER(TRIM(COALESCE(aedt_backend, 'standalone'))) IN ('', 'standalone') THEN 1 ELSE 0 END), 0) AS standalone_aedt,
                     COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(scheduling_profile, ''))) != 'fea_bursty' AND TRIM(COALESCE(project, '')) != '_aedt_pool_hosts' THEN 1 ELSE 0 END), 0) AS standard,
                     COALESCE(SUM(CASE WHEN COALESCE(gpus, 0) > 0 THEN 1 ELSE 0 END), 0) AS gpu,
                     COALESCE(SUM(CASE WHEN COALESCE(gpus, 0) <= 0 THEN 1 ELSE 0 END), 0) AS cpu,
@@ -783,13 +796,16 @@ class Database:
             "queued",
             "fea",
             "fea_running",
-            "session_hosts",
+            "standalone_aedt",
             "standard",
             "gpu",
             "cpu",
             "same_node",
         )
-        return {key: int(row[key] or 0) for key in keys}
+        summary = {key: int(row[key] or 0) for key in keys}
+        summary["aedt_pool_sessions"] = aedt_pool_sessions
+        summary["aedt"] = aedt_pool_sessions + summary.pop("standalone_aedt")
+        return summary
 
     def record_task_count_sample(
         self,
