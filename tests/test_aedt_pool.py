@@ -164,16 +164,23 @@ class AedtPoolGateTests(AedtPoolTestCase):
         self.assertEqual(reloaded.config().target_projects, 400)
 
     def test_operator_limits_fail_closed_on_invalid_topology(self) -> None:
+        config = self.service.set_operator_limits(
+            max_sessions=100,
+            target_projects=300,
+            projects_per_session=3,
+        )
+        self.assertEqual(config.projects_per_session, 3)
+        self.assertEqual(self.service.summary()["plan"]["sessions_per_new_node"], 5)
         with self.assertRaisesRegex(ValueError, "projects_per_aedt"):
-            self.service.set_operator_limits(projects_per_session=3)
+            self.service.set_operator_limits(projects_per_session=4)
         with self.assertRaisesRegex(ValueError, "cannot exceed"):
             self.service.set_operator_limits(
                 max_sessions=100,
-                target_projects=201,
-                projects_per_session=2,
+                target_projects=301,
+                projects_per_session=3,
             )
-        with self.assertRaisesRegex(ValueError, "between 0 and 1100"):
-            self.service.set_operator_limits(target_projects=1101)
+        with self.assertRaisesRegex(ValueError, "between 0 and 1650"):
+            self.service.set_operator_limits(target_projects=1651)
 
     def test_activation_requires_adapter_and_fault_injection_validation(self) -> None:
         with self.assertRaisesRegex(ValueError, "validation"):
@@ -303,8 +310,8 @@ class AedtPoolGateTests(AedtPoolTestCase):
         for required in (
             'id="max-aedt-sessions"',
             'id="min-idle-aedt-sessions"',
-            'id="target-projects"',
-            'id="projects-per-aedt"',
+            'id="target-projects" name="target_project_concurrency" type="number" min="0" max="1650"',
+            'id="projects-per-aedt" name="projects_per_aedt" type="number" min="1" max="3"',
             'id="aedt-bootstrap-token"',
             '"X-AEDT-Bootstrap-Token"',
             'id="lease-rows"',

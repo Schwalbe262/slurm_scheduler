@@ -6,7 +6,7 @@ import unittest
 
 from slurm_scheduler.config import AccountConfig
 from slurm_scheduler.db import Database
-from slurm_scheduler.models import SchedulingProfile, TaskCreate
+from slurm_scheduler.models import AedtBackend, SchedulingProfile, TaskCreate
 from slurm_scheduler.scheduler import Scheduler
 
 
@@ -51,7 +51,12 @@ class LicenseReserveExemptTests(unittest.TestCase):
             **kwargs,
         )
 
-    def make_task(self, project: str) -> int:
+    def make_task(
+        self,
+        project: str,
+        *,
+        aedt_backend: str = AedtBackend.STANDALONE.value,
+    ) -> int:
         return self.db.create_task(
             TaskCreate(
                 f"licensed-{project}",
@@ -61,6 +66,7 @@ class LicenseReserveExemptTests(unittest.TestCase):
                 memory_mb=8192,
                 project=project,
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                aedt_backend=aedt_backend,
             )
         )
 
@@ -135,3 +141,39 @@ class LicenseReserveExemptTests(unittest.TestCase):
         self.assertIn("license capacity exhausted", reason)
         self.assertEqual(warm_spares, 0)
         self.assertIn("license capacity exhausted", warm_spare_reason)
+
+    def test_pooled_task_does_not_consume_a_desktop_seat(self) -> None:
+        scheduler = self.make_scheduler()
+        # The reserve leaves an admission capacity of 90, so another desktop
+        # seat would exceed capacity even though a pooled client needs none.
+        self.set_snapshot(scheduler, used=90, total=100)
+
+        pooled_task_id = self.make_task(
+            self.FLEET_PROJECT,
+            aedt_backend=AedtBackend.POOLED.value,
+        )
+        pooled_admitted, pooled_reason = self.task_admission(
+            scheduler,
+            pooled_task_id,
+        )
+        standalone_admitted, standalone_reason = self.task_admission(
+            scheduler,
+            self.make_task(
+                self.FLEET_PROJECT,
+                aedt_backend=AedtBackend.STANDALONE.value,
+            ),
+        )
+
+        self.assertTrue(pooled_admitted)
+        self.assertEqual(pooled_reason, "")
+        self.assertFalse(standalone_admitted)
+        self.assertIn("license capacity exhausted", standalone_reason)
+
+        scheduler.license_admission_persistent_cost_by_project[
+            self.FLEET_PROJECT
+        ]["solver_feature"] = 2
+        pooled_costs, profile_error = scheduler._license_costs_for_task(
+            self.db.get_task(pooled_task_id)
+        )
+        self.assertEqual(pooled_costs, {"solver_feature": 2})
+        self.assertEqual(profile_error, "")

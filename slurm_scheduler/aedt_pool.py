@@ -328,15 +328,19 @@ class AedtPoolService:
             raise ValueError("min_idle_aedt_sessions must be an integer between 0 and 550")
         if requested_min_idle > requested_max:
             raise ValueError("min_idle_aedt_sessions cannot exceed max_aedt_sessions")
-        if type(requested_slots) is not int or not 1 <= requested_slots <= 2:
-            raise ValueError("projects_per_aedt must be an integer between 1 and 2")
+        if type(requested_slots) is not int or not 1 <= requested_slots <= 3:
+            raise ValueError(
+                "projects_per_aedt must be an integer between 1 and 3; "
+                "3 was operator-accepted on 2026-07-14 after the original "
+                "validated 1:2 contract"
+            )
         if target_projects is None:
             requested_target = requested_max * requested_slots
         else:
             requested_target = target_projects
-        if type(requested_target) is not int or not 0 <= requested_target <= 1100:
+        if type(requested_target) is not int or not 0 <= requested_target <= 1650:
             raise ValueError(
-                "target_project_concurrency must be an integer between 0 and 1100"
+                "target_project_concurrency must be an integer between 0 and 1650"
             )
         physical_ceiling = requested_max * requested_slots
         if requested_target > physical_ceiling:

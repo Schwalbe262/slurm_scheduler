@@ -109,7 +109,8 @@ license_monitor:
       PYAEDT_MOTOR_IPMSM_V2:
         electronics_desktop: 1
     unknown_fea_project_policy: block
-# Experimental and disabled until the live 1-AEDT:2-project A/B gate passes.
+# The central pool allows 1..3 projects per AEDT session. The original validated
+# contract was 1:2; 3 projects per session was operator-accepted on 2026-07-14.
 aedt_pool:
   session_host_enabled: false
   scheduler_url: ""
