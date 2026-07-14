@@ -1,3 +1,20 @@
+## 2026-07-15 (Claude) - Reap dead-host unhealthy AEDT sessions (pool capacity deadlock fix)
+- Root cause of the overnight zero-capacity stall: close_session requires the
+  live host token, so sessions whose host died (usage-error exits, scancel)
+  stayed 'unhealthy' forever. Their counted claim pinned recycle-drained
+  allocations open, the pinned allocations occupied the node ledger, and
+  open_allocation_record returned None silently on every tick - no new pool
+  allocation was created for ~11 hours (last: 8932 @ 07-14 17:20) while the
+  plan kept computing node_requests=10.
+- reconcile() now reaps unhealthy sessions silent beyond
+  max(900s, 5x session_heartbeat_timeout): session -> 'failed', its stuck
+  leased/active/releasing leases -> 'failed'. Recycle-drained allocations then
+  close via the existing empty-allocation janitor and the ledger frees.
+- Recovery windows are preserved: a live host heartbeats every ~30s and the
+  unhealthy->recovered registration path stays usable for 15+ minutes.
+- Test: test_reaps_stale_unhealthy_session_and_frees_its_allocation_claim
+  (pool suites 64 passed).
+
 ## 2026-07-14 (Claude) - Bug note: task cancel leaves pooled runner processes alive
 - Observed during the pooled ramp: POST /api/tasks/{id}/cancel marked 27 MFT
   pooled client tasks cancelled, but their remote runner processes survived on

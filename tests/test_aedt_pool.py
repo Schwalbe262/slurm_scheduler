@@ -875,6 +875,60 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(plan["hard_session_count"], 2)
         self.assertEqual(len(self.service.starting_sessions()), 1)
 
+    def test_reaps_stale_unhealthy_session_and_frees_its_allocation_claim(
+        self,
+    ) -> None:
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO aedt_sessions (
+                    session_key, allocation_id, account_name, node_name,
+                    slots_total, state, failure_message, last_heartbeat_at
+                ) VALUES ('dead-host', ?, 'a', 'cpu-01', 2, 'unhealthy',
+                          'lost heartbeat', '2020-01-01 00:00:00')
+                """,
+                (self.allocation_id,),
+            )
+            stale_id = int(
+                conn.execute(
+                    "SELECT id FROM aedt_sessions WHERE session_key = 'dead-host'"
+                ).fetchone()[0]
+            )
+            conn.execute(
+                """
+                INSERT INTO aedt_project_leases (
+                    request_key, project_name, session_id, state, expires_at,
+                    client_token_hash
+                ) VALUES ('stuck-release', 'p', ?, 'releasing',
+                          '2020-01-01 00:00:00', 'x')
+                """,
+                (stale_id,),
+            )
+            conn.execute(
+                """
+                INSERT INTO aedt_sessions (
+                    session_key, allocation_id, account_name, node_name,
+                    slots_total, state, failure_message
+                ) VALUES ('fresh-unhealthy', ?, 'a', 'cpu-01', 2, 'unhealthy',
+                          'lost heartbeat')
+                """,
+                (self.allocation_id,),
+            )
+
+        self.service.reconcile(execute=True)
+
+        reaped = self.service.get_session(stale_id, include_secret_hash=False)
+        self.assertEqual(reaped["state"], "failed")
+        with self.db.connect() as conn:
+            lease_state = conn.execute(
+                "SELECT state FROM aedt_project_leases WHERE request_key = 'stuck-release'"
+            ).fetchone()[0]
+            fresh_state = conn.execute(
+                "SELECT state FROM aedt_sessions WHERE session_key = 'fresh-unhealthy'"
+            ).fetchone()[0]
+        self.assertEqual(lease_state, "failed")
+        self.assertEqual(fresh_state, "unhealthy")
+
     def test_exclusive_1to1_lease_never_accepts_a_sibling(self) -> None:
         self.service.set_operator_limit(1)
         exclusive, _ = self.request(

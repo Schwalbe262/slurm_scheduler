@@ -1587,6 +1587,53 @@ class AedtPoolService:
                 """,
                 (SESSION_START_ACK_TIMEOUT_MESSAGE, now, now, start_cutoff),
             )
+            # An unhealthy session whose host has been silent far beyond the
+            # heartbeat window can never call close_session (only the live
+            # host holds the token).  Without reaping, its counted claim pins
+            # the drained allocation open forever, which in turn blocks every
+            # new dedicated-node request: the pool deadlocks at zero capacity.
+            reap_cutoff = _sql_time(
+                now_dt
+                - timedelta(
+                    seconds=max(900, 5 * config.session_heartbeat_timeout_seconds)
+                )
+            )
+            stale_unhealthy = [
+                int(row["id"])
+                for row in conn.execute(
+                    """
+                    SELECT id FROM aedt_sessions
+                    WHERE state = 'unhealthy'
+                      AND COALESCE(last_heartbeat_at, started_at, created_at) < ?
+                    """,
+                    (reap_cutoff,),
+                ).fetchall()
+            ]
+            for session_id in stale_unhealthy:
+                conn.execute(
+                    """
+                    UPDATE aedt_project_leases
+                    SET state = 'failed',
+                        failure_message = 'AEDT session host unreachable; session reaped',
+                        finished_at = ?, updated_at = ?
+                    WHERE session_id = ? AND state IN ('leased','active','releasing')
+                    """,
+                    (now, now, session_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE aedt_sessions
+                    SET state = 'failed',
+                        failure_message = CASE
+                            WHEN TRIM(COALESCE(failure_message, '')) != ''
+                            THEN failure_message
+                            ELSE 'session host unreachable; reaped'
+                        END,
+                        closed_at = ?, updated_at = ?
+                    WHERE id = ? AND state = 'unhealthy'
+                    """,
+                    (now, now, session_id),
+                )
             conn.execute(
                 """
                 UPDATE allocations
