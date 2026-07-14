@@ -17,7 +17,7 @@ from fastapi.templating import Jinja2Templates
 
 from .allocation_metrics import annotate_allocation_fea_pressure, annotate_allocation_node_metrics
 from .aedt_pool import AedtPoolRuntime, AedtPoolService
-from .aedt_pool_api import create_aedt_pool_router
+from .aedt_pool_api import build_aedt_pool_summary, create_aedt_pool_router
 from .aedt_canary_admission import (
     NODE_LOCAL_AEDT_CANARY_HOST_ENTRYPOINT,
     node_local_aedt_canary_admission,
@@ -1239,7 +1239,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             name_contains=attached_task_name_filter,
         )
         task_summary = task_activity_summary(active_running_rows + summary_queued_rows)
-        aedt_dashboard_summary = aedt_pool.summary()
+        aedt_dashboard_summary = build_aedt_pool_summary(
+            aedt_pool,
+            allocation_rows=allocations,
+        )
         active_task_rows = {
             int(task["id"]): task
             for task in (active_running_rows + visible_queued_rows)

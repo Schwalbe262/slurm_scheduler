@@ -273,9 +273,12 @@ class AedtPoolGateTests(AedtPoolTestCase):
             'id="target-projects"',
             'id="projects-per-aedt"',
             'id="lease-rows"',
+            'id="node-local-session-rows"',
+            'id="node-local-session-summary"',
             'id="enable-pool"',
             "latest_validation",
             "idle_session_count",
+            "summary.node_local",
             "warm_spare_status_reason",
             'fetch("/api/aedt-pool/enable"',
         ):
@@ -293,6 +296,9 @@ class AedtPoolGateTests(AedtPoolTestCase):
             'id="aedt-dashboard-projects"',
             "aedt_pool_summary.plan.live_projects",
             "aedt_pool_summary.config.target_project_concurrency",
+            'id="aedt-dashboard-node-local"',
+            "aedt_pool_summary.node_local.running_host_count",
+            "aedt_pool_summary.node_local.attached_client_count",
         ):
             self.assertIn(required, template)
 
