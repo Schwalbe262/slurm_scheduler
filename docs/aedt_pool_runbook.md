@@ -37,8 +37,10 @@ scheduler task and does not write a passing live validation automatically.
 이 단계에서는 다음만 확인한다.
 
 ```bash
+export AEDT_BOOTSTRAP_TOKEN='<same secret as SLURM_AEDT_POOL_BOOTSTRAP_TOKEN>'
 curl -sS "$SCHEDULER_URL/api/aedt-pool"
-curl -sS -X POST "$SCHEDULER_URL/api/aedt-pool/reconcile?dry_run=true"
+curl -sS -X POST "$SCHEDULER_URL/api/aedt-pool/reconcile?dry_run=true" \
+  -H "X-AEDT-Bootstrap-Token: $AEDT_BOOTSTRAP_TOKEN"
 ```
 
 `enabled=false`, `adapter_ready=false` 또는 `validation_passed=false` 중 하나라도 false gate이면
@@ -180,6 +182,7 @@ production cancel 구현으로 자동 승격하지 않는다. 공개 AEDT stop A
 
 ```bash
 curl -sS -X POST "$SCHEDULER_URL/api/aedt-pool/validations" \
+  -H "X-AEDT-Bootstrap-Token: $AEDT_BOOTSTRAP_TOKEN" \
   -H 'Content-Type: application/json' \
   --data @validation.json
 ```
@@ -200,10 +203,12 @@ UI에는 AEDT ceiling만 입력한다. project target은 자동으로 2배가 �
 
 ```bash
 curl -sS -X PATCH "$SCHEDULER_URL/api/aedt-pool/config" \
+  -H "X-AEDT-Bootstrap-Token: $AEDT_BOOTSTRAP_TOKEN" \
   -H 'Content-Type: application/json' \
   --data '{"max_aedt_sessions":250,"min_idle_aedt_sessions":1,"target_project_concurrency":500,"projects_per_aedt":2}'
 
 curl -sS -X POST "$SCHEDULER_URL/api/aedt-pool/enable" \
+  -H "X-AEDT-Bootstrap-Token: $AEDT_BOOTSTRAP_TOKEN" \
   -H 'Content-Type: application/json' \
   --data '{"enabled":true}'
 ```
@@ -230,6 +235,7 @@ curl -sS -X POST "$SCHEDULER_URL/api/aedt-pool/enable" \
 
 ```bash
 curl -sS -X POST "$SCHEDULER_URL/api/aedt-pool/enable" \
+  -H "X-AEDT-Bootstrap-Token: $AEDT_BOOTSTRAP_TOKEN" \
   -H 'Content-Type: application/json' \
   --data '{"enabled":false}'
 ```

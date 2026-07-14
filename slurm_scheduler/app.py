@@ -24,6 +24,7 @@ from .aedt_canary_admission import (
 )
 from .conda_sync import CondaEnvSyncManager, conda_bootstrap
 from .config import AppConfig, load_accounts, load_app_config
+from .control_plane_relay import ControlPlaneRelay
 from .db import Database
 from .git_auth import find_git_credential, git_task_payload
 from .models import AllocationStatus, AedtBackend, JobCreate, SchedulingProfile, TaskCreate, TaskStatus, normalize_aedt_backend, normalize_scheduling_profile
@@ -484,17 +485,55 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     aedt_pool.set_warm_spare_admission_checker(
         scheduler.aedt_pool_warm_spare_admission
     )
-    scheduler.set_aedt_backend_admission_checker(
-        lambda task: (
-            (True, "")
-            if aedt_pool.config().operational
-            else node_local_aedt_canary_admission(db, task)
-        )
+    def aedt_backend_admission(task) -> tuple[bool, str]:
+        pool_config = aedt_pool.config()
+        if pool_config.operational:
+            if (
+                config.control_plane_relay_enabled
+                and not pool_config.control_plane_url
+            ):
+                return False, "AEDT pool control-plane relay is unavailable"
+            return True, ""
+        return node_local_aedt_canary_admission(db, task)
+
+    scheduler.set_aedt_backend_admission_checker(aedt_backend_admission)
+    relay_account = scheduler.account_by_name(config.control_plane_relay_account.strip())
+    relay_bind_host = config.bind_host.strip() or "127.0.0.1"
+    if relay_bind_host == "0.0.0.0":
+        relay_bind_host = "127.0.0.1"
+    elif relay_bind_host in {"::", "[::]"}:
+        relay_bind_host = "::1"
+    elif relay_bind_host.startswith("[") and relay_bind_host.endswith("]"):
+        relay_bind_host = relay_bind_host[1:-1]
+    control_plane_relay = ControlPlaneRelay(
+        enabled=config.control_plane_relay_enabled,
+        account=relay_account,
+        relay_port=config.control_plane_relay_port,
+        remote_path=config.control_plane_relay_remote_path,
+        allowed_prefixes=config.control_plane_relay_allowed_prefixes,
+        local_host=relay_bind_host,
+        local_port=config.bind_port,
+        interval_seconds=config.poll_interval_seconds,
+        publish_url=aedt_pool.set_control_plane_url,
+    )
+    control_plane_relay_configured = bool(
+        control_plane_relay.enabled
+        and control_plane_relay.account is not None
+        and control_plane_relay.remote_path
+        and 1 <= control_plane_relay.relay_port <= 65535
+        and 1 <= control_plane_relay.local_port <= 65535
+        and control_plane_relay.allowed_prefixes
+        and all(prefix.startswith("/") for prefix in control_plane_relay.allowed_prefixes)
+    )
+    control_plane_endpoint_configured = (
+        control_plane_relay_configured
+        if config.control_plane_relay_enabled
+        else bool(config.aedt_pool_scheduler_url.strip())
     )
     aedt_adapter_configured = bool(
         config.aedt_pool_session_host_enabled
         and aedt_pool_bootstrap_token
-        and config.aedt_pool_scheduler_url.strip()
+        and control_plane_endpoint_configured
         and config.aedt_pool_host_remote_cwd.strip()
         and config.aedt_pool_host_bootstrap_token_file.strip()
     )
@@ -511,9 +550,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         host_env_setup=config.aedt_pool_host_env_setup,
         host_bootstrap_token_file=config.aedt_pool_host_bootstrap_token_file,
         host_task_memory_mb=config.aedt_pool_host_task_memory_mb,
+        require_published_control_plane_url=config.control_plane_relay_enabled,
     )
     app.state.aedt_pool = aedt_pool
     app.state.aedt_pool_runtime = aedt_pool_runtime
+    app.state.control_plane_relay = control_plane_relay
     app.include_router(create_aedt_pool_router(aedt_pool))
     env_sync_manager = CondaEnvSyncManager(db, accounts)
     app.state.env_sync_manager = env_sync_manager
@@ -1141,11 +1182,13 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     def _startup() -> None:
         cleanup_local_temp_artifacts()
         scheduler.start()
+        control_plane_relay.start()
         aedt_pool_runtime.start()
 
     @app.on_event("shutdown")
     def _shutdown() -> None:
         aedt_pool_runtime.stop()
+        control_plane_relay.stop()
         scheduler.stop()
 
     @app.get("/", response_class=HTMLResponse)
@@ -2005,6 +2048,14 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             )
         )
         return capacity
+
+    @app.get("/healthz", include_in_schema=False)
+    def healthz() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/api/control-plane-relay")
+    def api_control_plane_relay() -> dict:
+        return control_plane_relay.status()
 
     @app.get("/api/health")
     def api_health(response: Response) -> dict:

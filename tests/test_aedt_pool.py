@@ -10,12 +10,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from slurm_scheduler.aedt_attach_client import (
+    AedtPoolHttpClient,
     AedtProjectLease,
     acquire_project_lease,
 )
 from slurm_scheduler.aedt_pool import AedtPoolRuntime, AedtPoolService
 from slurm_scheduler.aedt_pool_api import create_aedt_pool_router
-from slurm_scheduler.aedt_session_host import AedtSessionHost
+from slurm_scheduler.aedt_session_host import AedtSessionHost, ControlPlaneClient
 from slurm_scheduler.config import AccountConfig
 from slurm_scheduler.db import Database
 from slurm_scheduler.scheduler import Scheduler
@@ -258,6 +259,38 @@ class AedtPoolGateTests(AedtPoolTestCase):
             )
         self.assertEqual(raised.exception.status_code, 422)
 
+    def test_every_mutating_api_route_requires_bootstrap_token(self) -> None:
+        from fastapi import HTTPException
+
+        router = create_aedt_pool_router(self.service)
+        mutating_routes = [
+            route
+            for route in router.routes
+            if set(getattr(route, "methods", set())) & {"POST", "PATCH", "PUT", "DELETE"}
+        ]
+        self.assertEqual(len(mutating_routes), 15)
+        guards = set()
+        for route in mutating_routes:
+            route_guards = [
+                dependency.call
+                for dependency in route.dependant.dependencies
+                if getattr(dependency.call, "__name__", "") == "require_bootstrap"
+            ]
+            self.assertEqual(
+                len(route_guards),
+                1,
+                f"{sorted(route.methods)} {route.path} is missing the bootstrap guard",
+            )
+            guards.update(route_guards)
+
+        self.assertEqual(len(guards), 1)
+        guard = guards.pop()
+        for token in ("", "wrong"):
+            with self.assertRaises(HTTPException) as raised:
+                guard(token)
+            self.assertEqual(raised.exception.status_code, 403)
+        guard("secret")
+
     def test_projects_per_aedt_change_requires_disabled_drained_pool(self) -> None:
         self.make_operational()
         with self.assertRaisesRegex(ValueError, "disable and fully drain"):
@@ -272,6 +305,8 @@ class AedtPoolGateTests(AedtPoolTestCase):
             'id="min-idle-aedt-sessions"',
             'id="target-projects"',
             'id="projects-per-aedt"',
+            'id="aedt-bootstrap-token"',
+            '"X-AEDT-Bootstrap-Token"',
             'id="lease-rows"',
             'id="node-local-session-rows"',
             'id="node-local-session-summary"',
@@ -604,6 +639,103 @@ class FakeRuntimeScheduler:
 
 
 class AedtRuntimeTests(AedtPoolTestCase):
+    def test_control_plane_url_setting_is_normalized_and_durable(self) -> None:
+        self.assertEqual(self.service.config().control_plane_url, "")
+        configured = self.service.set_control_plane_url(
+            "  http://gate2:18790/  "
+        )
+        self.assertEqual(configured.control_plane_url, "http://gate2:18790")
+
+        reloaded = AedtPoolService(
+            self.db, bootstrap_token="secret", now=self.clock.now
+        )
+        self.assertEqual(
+            reloaded.config().control_plane_url, "http://gate2:18790"
+        )
+        self.assertEqual(
+            self.service.set_control_plane_url("").control_plane_url, ""
+        )
+
+    def test_relay_mode_fails_closed_before_mutating_reconcile_without_url(self) -> None:
+        self.make_operational()
+        self.request("relay-url-missing")
+        fake = FakeRuntimeScheduler()
+        runtime = AedtPoolRuntime(
+            self.service,
+            fake,
+            interval_seconds=30,
+            require_published_control_plane_url=True,
+        )
+
+        with patch.object(
+            self.service,
+            "reconcile",
+            side_effect=AssertionError("mutating reconcile must not run"),
+        ) as reconcile:
+            plan = runtime.tick()
+
+        reconcile.assert_not_called()
+        self.assertFalse(plan["control_plane_ready"])
+        self.assertIn("not published", plan["control_plane_error"])
+        self.assertEqual(plan["node_allocations_opened"], 0)
+        self.assertEqual(plan["host_tasks_started"], 0)
+        self.assertEqual(fake.open_calls, [])
+
+    def test_relay_mode_resolves_each_published_url_dynamically(self) -> None:
+        self.service.set_control_plane_url("http://gate2:18790")
+        runtime = AedtPoolRuntime(
+            self.service,
+            FakeRuntimeScheduler(),
+            interval_seconds=30,
+            scheduler_url="http://static.invalid:8000",
+            host_remote_cwd="/work/aedt",
+            host_bootstrap_token_file="/shared/aedt-token",
+            require_published_control_plane_url=True,
+        )
+        session = {"allocation_id": 7, "node_name": "cpu-07"}
+        self.assertTrue(runtime.host_launch_configured)
+        first = runtime._host_command(session)
+        self.assertIn("http://gate2:18790", first)
+        self.assertNotIn("static.invalid", first)
+
+        self.service.set_control_plane_url("http://gate2:18791/")
+        second = runtime._host_command(session)
+        self.assertIn("http://gate2:18791", second)
+        self.assertNotEqual(first, second)
+
+    def test_static_scheduler_url_remains_default_when_published_url_exists(self) -> None:
+        self.service.set_control_plane_url("http://gate2:18790")
+        runtime = AedtPoolRuntime(
+            self.service,
+            FakeRuntimeScheduler(),
+            interval_seconds=30,
+            scheduler_url="http://scheduler-local:8000/",
+            host_remote_cwd="/work/aedt",
+            host_bootstrap_token_file="/shared/aedt-token",
+        )
+        command = runtime._host_command(
+            {"allocation_id": 8, "node_name": "cpu-08"}
+        )
+        self.assertIn("http://scheduler-local:8000", command)
+        self.assertNotIn("gate2", command)
+
+    def test_relay_mode_reconciles_after_url_is_published(self) -> None:
+        self.make_operational()
+        self.request("relay-url-ready")
+        self.service.set_control_plane_url("http://gate2:18790")
+        fake = FakeRuntimeScheduler()
+        runtime = AedtPoolRuntime(
+            self.service,
+            fake,
+            interval_seconds=30,
+            require_published_control_plane_url=True,
+        )
+        plan = runtime.tick()
+        self.assertTrue(plan["control_plane_ready"])
+        self.assertEqual(plan["control_plane_error"], "")
+        self.assertEqual(plan["node_allocations_opened"], 1)
+        self.assertEqual(len(fake.open_calls), 1)
+
     def test_node_request_uses_full_scheduler_shape_not_eight_cpu_micro_node(self) -> None:
         self.make_operational()
         self.request("needs-node")
@@ -680,18 +812,105 @@ class AttachClientTests(unittest.TestCase):
                     "client_token": "token",
                 }
 
-        with patch(
-            "slurm_scheduler.aedt_attach_client.AedtPoolHttpClient",
-            return_value=Http(),
-        ):
+        with patch("slurm_scheduler.aedt_attach_client.AedtPoolHttpClient") as client_factory:
+            client_factory.return_value = Http()
             lease = acquire_project_lease(
                 "http://scheduler",
                 "mft-pilot",
+                bootstrap_token="bootstrap",
                 request_key="pilot-1to1",
                 exclusive_session=True,
             )
+        client_factory.assert_called_once_with(
+            "http://scheduler",
+            bootstrap_token="bootstrap",
+            bootstrap_token_file="",
+        )
         self.assertTrue(lease.exclusive_session)
         self.assertTrue(calls[0][2]["exclusive_session"])
+
+
+class ControlPlaneHttpClientTests(unittest.TestCase):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def test_session_host_sends_bootstrap_and_scoped_host_tokens(self) -> None:
+        with patch(
+            "slurm_scheduler.aedt_session_host.urllib.request.build_opener",
+        ) as build_opener:
+            build_opener.return_value.open.return_value = self.Response()
+            ControlPlaneClient(
+                "http://relay",
+                bootstrap_token="bootstrap",
+            ).request(
+                "POST",
+                "/api/aedt-pool/sessions/1/heartbeat",
+                {},
+                host_token="host",
+            )
+
+        request = build_opener.return_value.open.call_args.args[0]
+        headers = {key.lower(): value for key, value in request.header_items()}
+        self.assertEqual(headers["x-aedt-bootstrap-token"], "bootstrap")
+        self.assertEqual(headers["x-aedt-host-token"], "host")
+        self.assertEqual(build_opener.call_args.args[0].proxies, {})
+
+    def test_lease_client_sends_bootstrap_and_scoped_lease_tokens(self) -> None:
+        with patch(
+            "slurm_scheduler.aedt_attach_client.urllib.request.build_opener",
+        ) as build_opener:
+            build_opener.return_value.open.return_value = self.Response()
+            AedtPoolHttpClient(
+                "http://relay",
+                bootstrap_token="bootstrap",
+            ).request(
+                "POST",
+                "/api/aedt-pool/leases/1/heartbeat",
+                {},
+                lease_token="lease",
+            )
+
+        request = build_opener.return_value.open.call_args.args[0]
+        headers = {key.lower(): value for key, value in request.header_items()}
+        self.assertEqual(headers["x-aedt-bootstrap-token"], "bootstrap")
+        self.assertEqual(headers["x-aedt-lease-token"], "lease")
+        self.assertEqual(build_opener.call_args.args[0].proxies, {})
+
+    def test_read_only_control_plane_requests_do_not_expose_bootstrap_token(self) -> None:
+        with patch(
+            "slurm_scheduler.aedt_session_host.urllib.request.build_opener",
+        ) as build_opener:
+            build_opener.return_value.open.return_value = self.Response()
+            ControlPlaneClient(
+                "http://relay",
+                bootstrap_token="bootstrap",
+            ).request("GET", "/api/aedt-pool/sessions/1/commands")
+
+        request = build_opener.return_value.open.call_args.args[0]
+        headers = {key.lower(): value for key, value in request.header_items()}
+        self.assertNotIn("x-aedt-bootstrap-token", headers)
+
+    def test_lease_client_can_load_bootstrap_from_node_token_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            token_file = Path(tmp) / "bootstrap-token"
+            token_file.write_text("from-file\n", encoding="utf-8")
+            with patch.dict(
+                os.environ,
+                {
+                    "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN": "",
+                    "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE": str(token_file),
+                },
+                clear=False,
+            ):
+                client = AedtPoolHttpClient("http://relay")
+        self.assertEqual(client.bootstrap_token, "from-file")
 
 
 class PilotPriorityApiTests(unittest.TestCase):

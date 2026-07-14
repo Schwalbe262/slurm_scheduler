@@ -7,6 +7,7 @@ import time
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 
@@ -15,8 +16,24 @@ class AedtLeaseError(RuntimeError):
 
 
 class AedtPoolHttpClient:
-    def __init__(self, scheduler_url: str) -> None:
+    def __init__(
+        self,
+        scheduler_url: str,
+        *,
+        bootstrap_token: str = "",
+        bootstrap_token_file: str = "",
+    ) -> None:
         self.scheduler_url = scheduler_url.rstrip("/")
+        self.bootstrap_token = (
+            str(bootstrap_token or "").strip()
+            or os.environ.get("SLURM_AEDT_POOL_BOOTSTRAP_TOKEN", "").strip()
+        )
+        token_file = (
+            str(bootstrap_token_file or "").strip()
+            or os.environ.get("SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE", "").strip()
+        )
+        if not self.bootstrap_token and token_file:
+            self.bootstrap_token = Path(token_file).read_text(encoding="utf-8").strip()
 
     def request(
         self,
@@ -31,12 +48,15 @@ class AedtPoolHttpClient:
         headers = {"Accept": "application/json"}
         if data is not None:
             headers["Content-Type"] = "application/json"
+        if self.bootstrap_token and method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+            headers["X-AEDT-Bootstrap-Token"] = self.bootstrap_token
         if lease_token:
             headers["X-AEDT-Lease-Token"] = lease_token
         request = urllib.request.Request(
             f"{self.scheduler_url}{path}", data=data, headers=headers, method=method
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8") or "{}")
 
 
@@ -206,6 +226,8 @@ def acquire_project_lease(
     scheduler_url: str,
     project_name: str,
     *,
+    bootstrap_token: str = "",
+    bootstrap_token_file: str = "",
     request_key: str = "",
     task_id: int = 0,
     allocation_id: int = 0,
@@ -215,7 +237,11 @@ def acquire_project_lease(
     """Create a lease request; call `wait_until_leased` before opening a project."""
     if type(exclusive_session) is not bool:
         raise ValueError("exclusive_session must be a boolean")
-    http = AedtPoolHttpClient(scheduler_url)
+    http = AedtPoolHttpClient(
+        scheduler_url,
+        bootstrap_token=bootstrap_token,
+        bootstrap_token_file=bootstrap_token_file,
+    )
     key = request_key.strip() or (
         f"{project_name}:{task_id or os.getpid()}:{uuid.uuid4().hex}"
     )

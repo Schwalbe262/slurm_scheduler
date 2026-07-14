@@ -137,6 +137,16 @@ class AppConfig:
     aedt_pool_host_env_setup: str = ""
     aedt_pool_host_bootstrap_token_file: str = ""
     aedt_pool_host_task_memory_mb: int = 4096
+    # Optional login-node bridge that makes the local HTTP control plane
+    # reachable from compute nodes.  It remains inert unless explicitly
+    # enabled and supplied with an account and remote deployment path.
+    control_plane_relay_enabled: bool = False
+    control_plane_relay_account: str = ""
+    control_plane_relay_port: int = 18790
+    control_plane_relay_remote_path: str = ""
+    control_plane_relay_allowed_prefixes: list[str] = field(
+        default_factory=lambda: ["/api/aedt-pool/", "/healthz"]
+    )
     cleanup_enabled: bool = True
     cleanup_interval_seconds: int = 3600
     cleanup_finished_task_ttl_seconds: int = 259200
@@ -261,6 +271,18 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
         for source, target in mapping.items():
             if source in aedt_pool:
                 data[target] = aedt_pool[source]
+    control_plane_relay = data.pop("control_plane_relay", None)
+    if isinstance(control_plane_relay, dict):
+        mapping = {
+            "enabled": "control_plane_relay_enabled",
+            "account": "control_plane_relay_account",
+            "port": "control_plane_relay_port",
+            "remote_path": "control_plane_relay_remote_path",
+            "allowed_prefixes": "control_plane_relay_allowed_prefixes",
+        }
+        for source, target in mapping.items():
+            if source in control_plane_relay:
+                data[target] = control_plane_relay[source]
     license_monitor = data.pop("license_monitor", None)
     if isinstance(license_monitor, dict):
         for source, target in {
