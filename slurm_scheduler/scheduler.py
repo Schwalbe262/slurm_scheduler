@@ -1263,10 +1263,19 @@ class Scheduler:
             return diagnostics
         age = max(0.0, time.monotonic() - self._license_snapshot_completed_monotonic)
         diagnostics["snapshot_age_seconds"] = round(age, 3)
-        if age > self.license_admission_snapshot_max_age_seconds:
+        # The snapshot refreshes inside the tick, so heavy ticks stretch its
+        # age past any fixed limit; scale the tolerance with observed tick
+        # time like the pestat gate does, instead of fail-closing admission.
+        max_age = float(self.license_admission_snapshot_max_age_seconds)
+        if self._last_tick_duration is not None:
+            max_age = max(
+                max_age,
+                self.license_monitor_interval_seconds + 2.0 * self._last_tick_duration,
+            )
+        diagnostics["snapshot_max_age_seconds"] = round(max_age, 1)
+        if age > max_age:
             diagnostics["blocked_reason"] = (
-                f"license snapshot is stale: {age:.1f}s > "
-                f"{self.license_admission_snapshot_max_age_seconds}s"
+                f"license snapshot is stale: {age:.1f}s > {max_age:.0f}s"
             )
             return diagnostics
         raw_features = usage.get("features")
