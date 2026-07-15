@@ -4155,6 +4155,63 @@ class SessionHostTests(unittest.TestCase):
             artifact_root=str(artifact_root),
         )
 
+    def test_desktop_launch_enables_session_local_pyaedt_log(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            host = AedtSessionHost(
+                FakeHostControlPlane([]),
+                allocation_id=1,
+                node_name="cpu-01",
+                artifact_root=root,
+            )
+            host.session_id = 41
+            host._prepare_artifacts({"session_key": "local-log"})
+            settings = SimpleNamespace(
+                use_multi_desktop=False,
+                enable_file_logs=False,
+                enable_local_log_file=False,
+                logger_file_path="",
+            )
+            constructor_settings: list[tuple[bool, bool, str]] = []
+
+            def desktop_factory(**kwargs):
+                constructor_settings.append(
+                    (
+                        bool(settings.enable_file_logs),
+                        bool(settings.enable_local_log_file),
+                        str(settings.logger_file_path),
+                    )
+                )
+                Path(settings.logger_file_path).write_text(
+                    "session-local PyAEDT log\n", encoding="utf-8"
+                )
+                return SimpleNamespace(**kwargs)
+
+            ansys_module = ModuleType("ansys")
+            aedt_module = ModuleType("ansys.aedt")
+            core_module = ModuleType("ansys.aedt.core")
+            core_module.Desktop = desktop_factory
+            core_module.settings = settings
+
+            with patch.dict(
+                sys.modules,
+                {
+                    "ansys": ansys_module,
+                    "ansys.aedt": aedt_module,
+                    "ansys.aedt.core": core_module,
+                },
+            ):
+                desktop = host._create_desktop(new_desktop=True, port=45041)
+
+            self.assertEqual(desktop.port, 45041)
+            self.assertEqual(
+                constructor_settings,
+                [(True, True, host.error_log_path)],
+            )
+            self.assertEqual(
+                Path(host.error_log_path).read_text(encoding="utf-8"),
+                "session-local PyAEDT log\n",
+            )
+
     def test_release_closes_project_before_workspace_preparation(self) -> None:
         events: list[str] = []
         host = AedtSessionHost(

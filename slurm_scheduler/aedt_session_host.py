@@ -495,10 +495,14 @@ class AedtSessionHost:
             # PyAEDT releases have moved these settings over time; keep this
             # best-effort and retain the host journal even if a field is absent.
             try:
-                from ansys.aedt.core.generic.settings import settings
-
                 if hasattr(settings, "enable_file_logs"):
                     settings.enable_file_logs = True
+                # PyAEDT 0.22 only installs the path-backed AedtLogger handler
+                # when the local-file switch is enabled. ``enable_file_logs``
+                # alone leaves ``logger_file_path`` unused and the session
+                # artifact advertised by the control plane is never created.
+                if hasattr(settings, "enable_local_log_file"):
+                    settings.enable_local_log_file = True
                 if hasattr(settings, "logger_file_path"):
                     settings.logger_file_path = self.error_log_path
             except Exception as exc:
