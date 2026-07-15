@@ -1014,6 +1014,22 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
             client_token=f"mixed-canary-client-token-{suffix}",
         )
 
+    def activate_slot(
+        self,
+        slot: dict[str, object],
+        *,
+        suffix: str,
+    ) -> tuple[dict[str, object], str]:
+        task_id = self.create_task_for_slot(slot, suffix)
+        lease, token = self.request_slot(
+            slot,
+            task_id=task_id,
+            suffix=suffix,
+        )
+        lease = self.service.accept_lease(int(lease["id"]), token)
+        self.assertEqual(lease["state"], "attaching")
+        return self.service.activate_lease(int(lease["id"]), token), token
+
     def test_bootstrap_admission_forces_three_mixed_tasks_to_exact_empty_session(self) -> None:
         admission = self.service.create_mixed_canary_admission(
             session_id=int(self.session["id"]),
@@ -1028,14 +1044,16 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         )
 
         leases = []
+        tokens = []
         for index, slot in enumerate(admission["slots"]):
             task_id = self.create_task_for_slot(slot, str(index))
-            lease, _token = self.request_slot(
+            lease, token = self.request_slot(
                 slot,
                 task_id=task_id,
                 suffix=str(index),
             )
             leases.append(lease)
+            tokens.append(token)
 
         self.assertEqual({int(item["session_id"]) for item in leases}, {int(self.session["id"])})
         self.assertEqual({item["placement_group"] for item in leases}, {admission["placement_group"]})
@@ -1047,10 +1065,148 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         filled = self.service.get_mixed_canary_admission(int(admission["id"]))
         self.assertEqual(filled["state"], "filled")
         self.assertTrue(all(slot["lease_id"] for slot in filled["slots"]))
+        for lease, token in zip(leases, tokens, strict=True):
+            accepted = self.service.accept_lease(int(lease["id"]), token)
+            self.assertEqual(accepted["state"], "attaching")
+            self.service.activate_lease(int(lease["id"]), token)
+        permitted = [
+            self.service.get_lease(int(lease["id"])) for lease in leases
+        ]
+        self.assertTrue(all(lease["solve_permit_granted"] for lease in permitted))
+        self.assertEqual(
+            len({int(lease["solve_permit_generation"]) for lease in permitted}),
+            1,
+        )
+        self.assertTrue(
+            self.service.get_session(int(self.session["id"]))[
+                "solve_batch_sealed_at"
+            ]
+        )
         # Admission authorizes only this experiment; it never forges the
         # production validation record before full mixed evidence exists.
         self.assertFalse(
             bool(self.service.latest_validation()["mixed_mft_ipmsm_isolation_passed"])
+        )
+
+    def test_underfilled_fallback_cannot_seal_open_mixed_admission(self) -> None:
+        admission = self.service.create_mixed_canary_admission(
+            session_id=int(self.session["id"]),
+        )
+        first, first_token = self.activate_slot(
+            admission["slots"][0],
+            suffix="underfilled-first",
+        )
+        self.assertFalse(first["solve_permit_granted"])
+
+        refused = self.service.request_solve_permit(
+            int(first["id"]),
+            first_token,
+            seal_underfilled=True,
+        )
+        self.assertFalse(refused["solve_permit_granted"])
+        self.assertIsNone(
+            self.service.get_session(int(self.session["id"]))[
+                "solve_batch_sealed_at"
+            ]
+        )
+        self.assertEqual(
+            self.service.get_mixed_canary_admission(int(admission["id"]))[
+                "state"
+            ],
+            "open",
+        )
+
+        second_slot = admission["slots"][1]
+        second_task_id = self.create_task_for_slot(
+            second_slot,
+            "underfilled-second",
+        )
+        second, _second_token = self.request_slot(
+            second_slot,
+            task_id=second_task_id,
+            suffix="underfilled-second",
+        )
+        self.assertEqual(int(second["session_id"]), int(self.session["id"]))
+
+    def test_partial_admission_ttl_aborts_and_recovers_reserved_session(self) -> None:
+        admission = self.service.create_mixed_canary_admission(
+            session_id=int(self.session["id"]),
+            ttl_seconds=60,
+        )
+        lease, token = self.activate_slot(
+            admission["slots"][0],
+            suffix="ttl-owner",
+        )
+        self.clock.advance(61)
+        self.service.reconcile(execute=True)
+
+        aborting = self.service.get_mixed_canary_admission(int(admission["id"]))
+        self.assertEqual(aborting["state"], "aborting")
+        self.assertEqual(
+            self.service.get_lease(int(lease["id"]))["state"],
+            "releasing",
+        )
+        self.assertIsNone(
+            self.service.get_session(int(self.session["id"]))[
+                "solve_batch_sealed_at"
+            ]
+        )
+
+        released = self.service.complete_release(
+            int(self.session["id"]),
+            self.host_token,
+            int(lease["id"]),
+            success=True,
+        )
+        self.assertEqual(released["state"], "released")
+        self.assertEqual(
+            self.service.get_mixed_canary_admission(int(admission["id"]))[
+                "state"
+            ],
+            "aborted",
+        )
+        self.assertEqual(
+            self.service.get_session(int(self.session["id"]))["state"],
+            "ready",
+        )
+        replacement = self.service.create_mixed_canary_admission(
+            session_id=int(self.session["id"]),
+        )
+        self.assertEqual(replacement["state"], "open")
+
+    def test_consumed_slot_cancellation_aborts_unstarted_exact_batch(self) -> None:
+        admission = self.service.create_mixed_canary_admission(
+            session_id=int(self.session["id"]),
+        )
+        first, _first_token = self.activate_slot(
+            admission["slots"][0],
+            suffix="abort-first",
+        )
+        second_slot = admission["slots"][1]
+        second_task_id = self.create_task_for_slot(second_slot, "abort-second")
+        second, second_token = self.request_slot(
+            second_slot,
+            task_id=second_task_id,
+            suffix="abort-second",
+        )
+        cancelled = self.service.cancel_lease(
+            int(second["id"]),
+            second_token,
+            reason="canary member exited before attach",
+        )
+        self.assertEqual(cancelled["state"], "cancelled")
+
+        self.service.reconcile(execute=True)
+        aborting = self.service.get_mixed_canary_admission(int(admission["id"]))
+        self.assertEqual(aborting["state"], "aborting")
+        self.assertEqual(
+            self.service.get_lease(int(first["id"]))["state"],
+            "releasing",
+        )
+        self.assertIsNone(
+            self.service.get_session(int(self.session["id"]))[
+                "solve_batch_sealed_at"
+            ]
         )
 
     def test_wrong_namespace_and_unreserved_clients_cannot_consume_canary(self) -> None:
@@ -1262,14 +1418,20 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertLess(p95, 20)
         self.assertLess(max(durations), 30)
 
-    def test_repeated_native_suspect_freezes_admission_without_recycling(self) -> None:
-        self.request(
+    def test_repeated_native_suspect_with_live_solver_owner_does_not_recycle(
+        self,
+    ) -> None:
+        lease, lease_token = self.request(
             "native-suspect-owner",
             allocation_id=self.allocation_id,
             node="cpu-01",
+            exclusive_session=True,
         )
         session, host_token = self.start_one_session(self.allocation_id)
         session_id = int(session["id"])
+        active = self.service.activate_lease(int(lease["id"]), lease_token)
+        self.assertEqual(active["state"], "active")
+        self.assertIsNotNone(active["solve_permit_at"])
         with self.db.connect() as conn:
             conn.execute(
                 "UPDATE aedt_sessions SET runtime_metadata_json = ? WHERE id = ?",
@@ -1277,6 +1439,9 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             )
         for count in range(1, 5):
             self.clock.advance(300)
+            self.service.heartbeat_lease(
+                int(lease["id"]), lease_token, phase="solving"
+            )
             suspect = self.service.report_session_fault(
                 session_id,
                 host_token,
@@ -1285,6 +1450,10 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
                 evidence={"process_id": "123", "port": 50001},
             )
             self.assertEqual(suspect["state"], "unhealthy")
+            self.assertEqual(
+                suspect["last_heartbeat_at"],
+                self.clock.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
             self.service.reconcile(execute=True)
             self.assertEqual(self.service.get_session(session_id)["state"], "unhealthy")
             self.assertEqual(
@@ -1310,6 +1479,151 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             native_probe="GetVersion",
         )
         self.assertIn(recovered["state"], {"ready", "busy"})
+
+    def test_native_suspect_heartbeat_requires_unexpired_native_owner(self) -> None:
+        lease, _lease_token = self.request(
+            "native-suspect-state-owner",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        session_id = int(session["id"])
+        stale_heartbeat = "2020-01-01 00:00:00"
+
+        for lease_state, protects_heartbeat in (
+            ("leased", True),
+            ("attaching", True),
+            ("active", True),
+            ("releasing", True),
+            ("offered", False),
+            ("queued", False),
+        ):
+            with self.subTest(lease_state=lease_state):
+                self.clock.advance(1)
+                now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+                future = (self.clock.now() + timedelta(seconds=900)).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                with self.db.connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE aedt_sessions
+                        SET state = 'ready', last_heartbeat_at = ?,
+                            quarantine_reason = '', failure_message = ''
+                        WHERE id = ?
+                        """,
+                        (stale_heartbeat, session_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE aedt_project_leases
+                        SET state = ?, session_id = ?, expires_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            lease_state,
+                            None if lease_state == "queued" else session_id,
+                            future,
+                            int(lease["id"]),
+                        ),
+                    )
+
+                suspect = self.service.report_session_fault(
+                    session_id,
+                    host_token,
+                    kind="native_probe_suspect",
+                    failure_message=f"GetVersion blocked in {lease_state}",
+                )
+                self.assertEqual(
+                    suspect["last_heartbeat_at"],
+                    now if protects_heartbeat else stale_heartbeat,
+                )
+
+        self.clock.advance(1)
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        expired = (self.clock.now() - timedelta(seconds=1)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE aedt_sessions
+                SET state = 'ready', last_heartbeat_at = ?,
+                    quarantine_reason = '', failure_message = ''
+                WHERE id = ?
+                """,
+                (stale_heartbeat, session_id),
+            )
+            conn.execute(
+                """
+                UPDATE aedt_project_leases
+                SET state = 'active', session_id = ?, expires_at = ?
+                WHERE id = ?
+                """,
+                (session_id, expired, int(lease["id"])),
+            )
+        suspect = self.service.report_session_fault(
+            session_id,
+            host_token,
+            kind="native_probe_suspect",
+            failure_message="GetVersion blocked after client expiry",
+        )
+        self.assertEqual(suspect["last_heartbeat_at"], stale_heartbeat)
+        self.assertNotEqual(suspect["last_heartbeat_at"], now)
+
+    def test_repeated_idle_native_suspect_eventually_reaps_stuck_host(self) -> None:
+        lease, lease_token = self.request(
+            "idle-native-suspect",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        session_id = int(session["id"])
+        self.service.release_lease(int(lease["id"]), lease_token)
+        released = self.service.complete_release(
+            session_id,
+            host_token,
+            int(lease["id"]),
+            success=True,
+        )
+        self.assertEqual(released["state"], "released")
+        confirmed_heartbeat = self.service.get_session(session_id)[
+            "last_heartbeat_at"
+        ]
+
+        for _count in range(4):
+            self.clock.advance(600)
+            suspect = self.service.report_session_fault(
+                session_id,
+                host_token,
+                kind="native_probe_suspect",
+                failure_message="idle GetVersion worker remains blocked",
+            )
+            self.assertEqual(suspect["last_heartbeat_at"], confirmed_heartbeat)
+            self.service.reconcile(execute=True)
+            self.assertEqual(self.service.get_session(session_id)["state"], "unhealthy")
+
+        # The host still reaches the control plane with suspect reports, but
+        # none is a fresh native-liveness proof.  Once the existing conservative
+        # reap horizon is crossed, the idle stuck Desktop can no longer pin the
+        # allocation forever.
+        self.clock.advance(601)
+        suspect = self.service.report_session_fault(
+            session_id,
+            host_token,
+            kind="native_probe_suspect",
+            failure_message="idle GetVersion worker remains blocked",
+        )
+        self.assertEqual(suspect["last_heartbeat_at"], confirmed_heartbeat)
+        self.service.reconcile(execute=True)
+
+        reaped = self.service.get_session(session_id)
+        self.assertEqual(reaped["state"], "failed")
+        allocation = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(allocation["state"], "draining")
+        self.assertEqual(
+            allocation["drain_reason"], UNHEALTHY_ALLOCATION_RECYCLE_REASON
+        )
 
     def test_durable_request_replays_terminal_or_abandoned_intent_with_new_token(self) -> None:
         first_token = "first-client-token-0001"

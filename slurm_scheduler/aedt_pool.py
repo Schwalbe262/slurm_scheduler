@@ -1113,13 +1113,97 @@ class AedtPoolService:
             ]
             return item
 
-    @staticmethod
-    def _refresh_mixed_canary_admissions(conn: Any, now: str) -> None:
+    def _refresh_mixed_canary_admissions(self, conn: Any, now: str) -> None:
+        """Abort an incomplete one-shot canary without stranding its session.
+
+        The admission TTL bounds the time to assemble and activate the exact
+        three-project batch; it is not a solve-runtime deadline.  Once a solve
+        permit exists, normal sibling completion semantics own the session.
+        Before that point, an expired admission or a consumed slot that can no
+        longer participate makes the exact 2+1 experiment impossible.
+
+        Project-owning leases use the normal two-phase host release.  Queued
+        and merely offered leases can be cancelled immediately.  The session
+        remains reserved while any release is outstanding and becomes reusable
+        after the host confirms that every attached project is closed.
+        """
+
+        abort_candidates = conn.execute(
+            """
+            SELECT ca.id, ca.session_id
+            FROM aedt_mixed_canary_admissions ca
+            WHERE ca.state IN ('open','filled')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM aedt_mixed_canary_slots started_slot
+                  JOIN aedt_project_leases started_lease
+                    ON started_lease.id = started_slot.lease_id
+                  WHERE started_slot.admission_id = ca.id
+                    AND TRIM(COALESCE(started_lease.solve_permit_at, '')) != ''
+              )
+              AND (
+                  ca.expires_at <= ?
+                  OR EXISTS (
+                      SELECT 1
+                      FROM aedt_mixed_canary_slots broken_slot
+                      JOIN aedt_project_leases broken_lease
+                        ON broken_lease.id = broken_slot.lease_id
+                      WHERE broken_slot.admission_id = ca.id
+                        AND broken_lease.state IN (
+                            'releasing','released','failed','cancelled','expired'
+                        )
+                  )
+              )
+            ORDER BY ca.id ASC
+            """,
+            (now,),
+        ).fetchall()
+        abort_reason = "mixed canary admission aborted before exact batch activation"
+        for candidate in abort_candidates:
+            admission_id = int(candidate["id"])
+            session_id = int(candidate["session_id"])
+            conn.execute(
+                """
+                UPDATE aedt_mixed_canary_admissions
+                SET state = 'aborting', updated_at = ?
+                WHERE id = ? AND state IN ('open','filled')
+                """,
+                (now, admission_id),
+            )
+            conn.execute(
+                """
+                UPDATE aedt_project_leases
+                SET state = 'cancelled', session_id = NULL, slot_index = NULL,
+                    failure_message = ?, finished_at = ?, updated_at = ?
+                WHERE id IN (
+                    SELECT lease_id FROM aedt_mixed_canary_slots
+                    WHERE admission_id = ? AND lease_id IS NOT NULL
+                )
+                  AND state IN ('queued','offered')
+                """,
+                (abort_reason, now, now, admission_id),
+            )
+            conn.execute(
+                """
+                UPDATE aedt_project_leases
+                SET state = 'releasing', failure_message = ?,
+                    release_requested_at = COALESCE(release_requested_at, ?),
+                    updated_at = ?
+                WHERE id IN (
+                    SELECT lease_id FROM aedt_mixed_canary_slots
+                    WHERE admission_id = ? AND lease_id IS NOT NULL
+                )
+                  AND state IN ('leased','attaching','active')
+                """,
+                (abort_reason, now, now, admission_id),
+            )
+            self._refresh_session_state(conn, session_id, now)
+
         conn.execute(
             """
             UPDATE aedt_mixed_canary_admissions
-            SET state = 'expired', finished_at = ?, updated_at = ?
-            WHERE state = 'open' AND expires_at <= ?
+            SET state = 'aborted', finished_at = ?, updated_at = ?
+            WHERE state = 'aborting'
               AND NOT EXISTS (
                   SELECT 1
                   FROM aedt_mixed_canary_slots cs
@@ -1130,7 +1214,7 @@ class AedtPoolService:
                     )
               )
             """,
-            (now, now, now),
+            (now, now),
         )
         conn.execute(
             """
@@ -1148,6 +1232,47 @@ class AedtPoolService:
               )
             """,
             (now, now),
+        )
+
+    @staticmethod
+    def _mixed_canary_batch_is_complete(
+        conn: Any,
+        session_id: int,
+    ) -> bool:
+        """Return false while a reserved mixed session lacks its exact batch."""
+
+        admission = conn.execute(
+            """
+            SELECT ca.id, ca.state,
+                   ca.expected_mft_projects + ca.expected_ipmsm_projects
+                       AS expected_projects,
+                   COUNT(cs.id) AS reserved_projects,
+                   SUM(
+                       CASE
+                           WHEN l.session_id = ca.session_id
+                            AND l.state = 'active'
+                           THEN 1 ELSE 0
+                       END
+                   ) AS active_projects
+            FROM aedt_mixed_canary_admissions ca
+            LEFT JOIN aedt_mixed_canary_slots cs ON cs.admission_id = ca.id
+            LEFT JOIN aedt_project_leases l ON l.id = cs.lease_id
+            WHERE ca.session_id = ?
+              AND ca.state IN ('open','filled','aborting')
+            GROUP BY ca.id
+            ORDER BY ca.id DESC
+            LIMIT 1
+            """,
+            (int(session_id),),
+        ).fetchone()
+        if not admission:
+            return True
+        expected = int(admission["expected_projects"] or 0)
+        return bool(
+            str(admission["state"]) == "filled"
+            and expected == 3
+            and int(admission["reserved_projects"] or 0) == expected
+            and int(admission["active_projects"] or 0) == expected
         )
 
     @staticmethod
@@ -1764,6 +1889,7 @@ class AedtPoolService:
 
         if session_id <= 0:
             return False
+        self._refresh_mixed_canary_admissions(conn, now)
         session = conn.execute(
             "SELECT * FROM aedt_sessions WHERE id = ?", (int(session_id),)
         ).fetchone()
@@ -1778,6 +1904,12 @@ class AedtPoolService:
             """,
             (int(session_id),),
         ).fetchall()
+        if not self._mixed_canary_batch_is_complete(conn, int(session_id)):
+            # A one-shot mixed admission is evidence only if all three exact
+            # reserved projects are ACTIVE before the atomic permit.  In
+            # particular, the ordinary bounded underfilled fallback must not
+            # seal this session and make the remaining reservation unusable.
+            return False
         if not occupants or any(str(row["state"]) != "active" for row in occupants):
             return False
         full = len(occupants) >= int(session["slots_total"] or 1)
@@ -2175,6 +2307,27 @@ class AedtPoolService:
         with self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             if normalized == "native_probe_suspect":
+                # A native probe can time out while Analyze owns AEDT's
+                # scripting thread.  Keep that session heartbeat fresh while
+                # an accepted client still owns native work.  Conversely, an
+                # idle proxy that is permanently wedged must not keep itself
+                # alive forever merely by reporting the same suspect probe.
+                #
+                # ``offered`` is only a revocable slot reservation; no client
+                # may touch AEDT until it is accepted.  ``queued`` has no
+                # session ownership at all.  An expired owner is likewise not
+                # evidence that a long solve is still supervised by a live
+                # client.
+                live_native_owner = conn.execute(
+                    """
+                    SELECT 1 FROM aedt_project_leases
+                    WHERE session_id = ?
+                      AND state IN ('leased','attaching','active','releasing')
+                      AND expires_at >= ?
+                    LIMIT 1
+                    """,
+                    (int(session_id), now),
+                ).fetchone()
                 conn.execute(
                     """
                     UPDATE aedt_sessions
@@ -2183,7 +2336,9 @@ class AedtPoolService:
                         last_fault_at = ?,
                         native_snapshot_path = CASE WHEN ? = ''
                             THEN native_snapshot_path ELSE ? END,
-                        drain_requested_at = NULL, last_heartbeat_at = ?,
+                        drain_requested_at = NULL,
+                        last_heartbeat_at = CASE WHEN ?
+                            THEN ? ELSE last_heartbeat_at END,
                         updated_at = ?
                     WHERE id = ? AND state IN ('ready','busy','unhealthy')
                     """,
@@ -2193,6 +2348,7 @@ class AedtPoolService:
                         now,
                         native_snapshot_path,
                         native_snapshot_path,
+                        int(bool(live_native_owner)),
                         now,
                         now,
                         int(session_id),
@@ -3516,7 +3672,7 @@ class AedtPoolService:
                       ? > 0 OR NOT EXISTS (
                           SELECT 1 FROM aedt_mixed_canary_admissions ca
                           WHERE ca.session_id = s.id
-                            AND ca.state IN ('open','filled')
+                            AND ca.state IN ('open','filled','aborting')
                       )
                   )
                   AND (
