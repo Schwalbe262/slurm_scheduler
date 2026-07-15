@@ -547,7 +547,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
             for route in router.routes
             if set(getattr(route, "methods", set())) & {"POST", "PATCH", "PUT", "DELETE"}
         ]
-        self.assertEqual(len(mutating_routes), 22)
+        self.assertEqual(len(mutating_routes), 23)
         bootstrap_routes = []
         client_routes = []
         lease_scoped_routes = []
@@ -576,7 +576,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 self.assertEqual(client_guards, [])
                 bootstrap_routes.append(route)
 
-        self.assertEqual(len(bootstrap_routes), 13)
+        self.assertEqual(len(bootstrap_routes), 14)
         self.assertEqual(len(client_routes), 1)
         self.assertEqual(len(lease_scoped_routes), 8)
         guard = next(
@@ -3614,6 +3614,298 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(self.db.get_allocation(self.allocation_id)["state"], "active")
 
 
+class AedtExactSessionReservationTests(AedtPoolTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.allocation_id = self.add_dedicated_allocation()
+        self.make_operational()
+        self.service.set_enabled(False)
+        self.service.set_operator_limits(
+            max_sessions=2,
+            min_idle_sessions=2,
+            target_projects=6,
+            projects_per_session=3,
+        )
+        self.service.set_enabled(True)
+        self.service.reconcile(execute=True)
+        starts = self.service.starting_sessions()
+        self.assertEqual(len(starts), 2)
+        self.sessions = []
+        for index, start in enumerate(starts):
+            host_id = f"exact-pin-host-{index}"
+            self.service.claim_start(
+                session_id=int(start["id"]),
+                allocation_id=self.allocation_id,
+                node_name="cpu-01",
+                host_id=host_id,
+                bootstrap_token="secret",
+            )
+            session, _token = self.service.register_session(
+                session_id=int(start["id"]),
+                host_id=host_id,
+                endpoint=f"cpu-01:{51001 + index}",
+                process_id=str(5100 + index),
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                bootstrap_token="secret",
+            )
+            self.sessions.append(session)
+        self.sessions.sort(key=lambda item: int(item["id"]))
+
+    def create_pooled_task(self, suffix: str, *, payload_json: str = "") -> int:
+        return self.db.create_task(
+            TaskCreate(
+                name=f"exact-pin-{suffix}",
+                remote_cwd=f"/work/{suffix}",
+                command="true",
+                dedupe_key=f"exact-pin-task:{suffix}",
+                aedt_backend="pooled",
+                payload_json=payload_json,
+            )
+        )
+
+    def request_v2(
+        self,
+        suffix: str,
+        *,
+        task_id: int = 0,
+        requested_session_id: int = 0,
+    ):
+        return self.service.request_lease(
+            request_key=f"exact-pin-lease:{suffix}",
+            project_name=f"mft-exact-pin-{suffix}",
+            workload_family="mft",
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            project_namespace="mft",
+            isolation_policy="family",
+            workspace_path=f"/work/{suffix}",
+            protocol_version=2,
+            task_id=task_id,
+            requested_session_id=requested_session_id,
+            client_token=f"exact-pin-client-token-{suffix}-000000",
+        )
+
+    def reserve(self, key: str, target: dict, task_ids: list[int], **kwargs):
+        return self.service.create_exact_session_reservation(
+            reservation_key=key,
+            session_id=int(target["id"]),
+            session_generation=int(target["generation"]),
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            task_ids=task_ids,
+            ttl_seconds=kwargs.get("ttl_seconds", 1800),
+        )
+
+    def test_three_task_cohort_pins_target_and_reserved_capacity_cannot_be_stolen(
+        self,
+    ) -> None:
+        packing_session, target = self.sessions
+        first, _ = self.request_v2("packing-first")
+        self.assertEqual(int(first["session_id"]), int(packing_session["id"]))
+
+        task_ids = [self.create_pooled_task(f"q19-{index}") for index in range(3)]
+        reservation = self.reserve("q19-session-cohort", target, task_ids)
+        self.assertEqual(len(reservation["slots"]), 3)
+        self.assertTrue(all(slot["state"] == "reserved" for slot in reservation["slots"]))
+
+        second, _ = self.request_v2("packing-second")
+        third, _ = self.request_v2("packing-third")
+        self.assertEqual(int(second["session_id"]), int(packing_session["id"]))
+        self.assertEqual(int(third["session_id"]), int(packing_session["id"]))
+        blocked, _ = self.request_v2("normal-cannot-steal")
+        self.assertEqual(blocked["state"], "queued")
+        self.assertIsNone(blocked["session_id"])
+
+        exact_leases = []
+        for index, task_id in enumerate(task_ids):
+            lease, _ = self.request_v2(
+                f"q19-{index}",
+                task_id=task_id,
+                requested_session_id=(int(target["id"]) if index == 0 else 0),
+            )
+            exact_leases.append(lease)
+        self.assertEqual(
+            {int(lease["session_id"]) for lease in exact_leases},
+            {int(target["id"])},
+        )
+        self.assertEqual(
+            {int(lease["requested_session_generation"]) for lease in exact_leases},
+            {int(target["generation"])},
+        )
+        current = self.service.get_exact_session_reservation(
+            "q19-session-cohort"
+        )
+        self.assertTrue(all(slot["state"] == "consumed" for slot in current["slots"]))
+
+    def test_untrusted_assertion_and_task_payload_cannot_create_a_pin(self) -> None:
+        packing_session, target = self.sessions
+        unreserved_task = self.create_pooled_task(
+            "payload-label-only",
+            payload_json=json.dumps(
+                {"target_session_id": int(target["id"]), "label": "session526"}
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "bootstrap-issued task reservation"):
+            self.request_v2(
+                "forged-pin",
+                task_id=unreserved_task,
+                requested_session_id=int(target["id"]),
+            )
+
+        unpinned, _ = self.request_v2(
+            "payload-is-not-authority",
+            task_id=unreserved_task,
+        )
+        self.assertEqual(int(unpinned["session_id"]), int(packing_session["id"]))
+
+        reserved_task = self.create_pooled_task("wrong-assertion")
+        self.reserve("wrong-assertion-reservation", target, [reserved_task])
+        with self.assertRaisesRegex(ValueError, "does not match task reservation"):
+            self.request_v2(
+                "wrong-assertion",
+                task_id=reserved_task,
+                requested_session_id=int(packing_session["id"]),
+            )
+
+    def test_reservation_replay_is_idempotent_and_conflicts_fail_atomically(
+        self,
+    ) -> None:
+        _packing_session, target = self.sessions
+        task_ids = [self.create_pooled_task(f"replay-{index}") for index in range(2)]
+        first = self.reserve("idempotent-cohort", target, task_ids)
+        replay = self.reserve("idempotent-cohort", target, list(reversed(task_ids)))
+        self.assertEqual(
+            [int(slot["id"]) for slot in first["slots"]],
+            [int(slot["id"]) for slot in replay["slots"]],
+        )
+
+        third_task = self.create_pooled_task("replay-conflict")
+        with self.assertRaisesRegex(ValueError, "different immutable payload"):
+            self.reserve("idempotent-cohort", target, task_ids + [third_task])
+        current = self.service.get_exact_session_reservation("idempotent-cohort")
+        self.assertEqual(
+            [int(slot["task_id"]) for slot in current["slots"]], sorted(task_ids)
+        )
+
+        mismatch_task = self.create_pooled_task("generation-mismatch")
+        with self.assertRaisesRegex(ValueError, "generation does not match"):
+            self.service.create_exact_session_reservation(
+                reservation_key="generation-mismatch",
+                session_id=int(target["id"]),
+                session_generation=int(target["generation"]) + 1,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                task_ids=[mismatch_task],
+            )
+        with self.db.connect() as conn:
+            count = conn.execute(
+                """
+                SELECT COUNT(*) FROM aedt_exact_session_reservations
+                WHERE reservation_key = 'generation-mismatch'
+                """
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+        profile_task = self.create_pooled_task("profile-mismatch")
+        drifted_profile = json.loads(EXPECTED_SESSION_PROFILE_JSON)
+        drifted_profile["aedt_version"] = "2026.1"
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            self.service.create_exact_session_reservation(
+                reservation_key="profile-mismatch",
+                session_id=int(target["id"]),
+                session_generation=int(target["generation"]),
+                session_profile=drifted_profile,
+                task_ids=[profile_task],
+            )
+        with self.db.connect() as conn:
+            count = conn.execute(
+                """
+                SELECT COUNT(*) FROM aedt_exact_session_reservations
+                WHERE reservation_key = 'profile-mismatch'
+                """
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_free_slot_validation_rolls_back_entire_cohort(self) -> None:
+        _packing_session, target = self.sessions
+        task_ids = [self.create_pooled_task(f"overflow-{index}") for index in range(4)]
+        with self.assertRaisesRegex(ValueError, "enough unreserved free slots"):
+            self.reserve("overflow-cohort", target, task_ids)
+        with self.db.connect() as conn:
+            count = conn.execute(
+                """
+                SELECT COUNT(*) FROM aedt_exact_session_reservations
+                WHERE reservation_key = 'overflow-cohort'
+                """
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_terminal_task_and_ttl_release_unconsumed_reservations(self) -> None:
+        packing_session, target = self.sessions
+        terminal_task = self.create_pooled_task("terminal-cleanup")
+        self.reserve("terminal-cleanup", target, [terminal_task])
+        self.db.update_task(terminal_task, status=TaskStatus.CANCELLED.value)
+        self.service.reconcile(execute=False)
+        terminal = self.service.get_exact_session_reservation("terminal-cleanup")
+        self.assertEqual(terminal["slots"][0]["state"], "released")
+
+        ttl_task = self.create_pooled_task("ttl-cleanup")
+        self.reserve("ttl-cleanup", packing_session, [ttl_task], ttl_seconds=60)
+        self.clock.advance(61)
+        self.service.reconcile(execute=False)
+        expired = self.service.get_exact_session_reservation("ttl-cleanup")
+        self.assertEqual(expired["slots"][0]["state"], "expired")
+
+    def test_underfilled_solve_fallback_waits_for_every_exact_reserved_peer(
+        self,
+    ) -> None:
+        _packing_session, target = self.sessions
+        task_ids = [self.create_pooled_task(f"barrier-{index}") for index in range(3)]
+        self.reserve("exact-solve-barrier", target, task_ids)
+
+        leases = []
+        for index, task_id in enumerate(task_ids):
+            lease, token = self.request_v2(f"barrier-{index}", task_id=task_id)
+            leases.append((lease, token))
+            if index == 0:
+                self.service.accept_lease(int(lease["id"]), token)
+                self.service.activate_lease(int(lease["id"]), token)
+                waiting = self.service.request_solve_permit(
+                    int(lease["id"]), token, seal_underfilled=True
+                )
+                self.assertFalse(waiting["solve_permit_granted"])
+
+        for lease, token in leases[1:]:
+            self.service.accept_lease(int(lease["id"]), token)
+            self.service.activate_lease(int(lease["id"]), token)
+
+        for lease, _token in leases:
+            current = self.service.get_lease(int(lease["id"]))
+            self.assertTrue(current["solve_permit_granted"])
+            self.assertEqual(int(current["session_id"]), int(target["id"]))
+
+    def test_unconsumed_exact_reservation_protects_target_from_idle_drain(
+        self,
+    ) -> None:
+        other, target = self.sessions
+        task_id = self.create_pooled_task("idle-drain-guard")
+        self.reserve("idle-drain-guard", target, [task_id])
+        self.service.set_operator_limits(
+            max_sessions=2,
+            min_idle_sessions=0,
+            target_projects=0,
+            projects_per_session=3,
+        )
+        self.service.set_operator_timeouts(idle_ttl_seconds=60)
+        self.clock.advance(61)
+
+        self.service.reconcile(execute=True)
+
+        self.assertEqual(
+            self.service.get_session(int(target["id"]))["state"], "ready"
+        )
+        self.assertEqual(
+            self.service.get_session(int(other["id"]))["state"], "draining"
+        )
+
+
 class FakeRuntimeScheduler:
     allocation_cpus = 64
 
@@ -4528,6 +4820,7 @@ class AttachClientTests(unittest.TestCase):
                 "mft-pilot",
                 bootstrap_token="bootstrap",
                 request_key="pilot-1to1",
+                requested_session_id=526,
                 exclusive_session=True,
             )
         client_factory.assert_called_once_with(
@@ -4537,6 +4830,7 @@ class AttachClientTests(unittest.TestCase):
         )
         self.assertTrue(lease.exclusive_session)
         self.assertTrue(calls[0][2]["exclusive_session"])
+        self.assertEqual(calls[0][2]["requested_session_id"], 526)
         self.assertEqual(calls[0][2]["admission_timeout_seconds"], 1800)
 
 

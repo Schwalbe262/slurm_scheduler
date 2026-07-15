@@ -228,6 +228,38 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @router.post(
+        "/api/aedt-pool/session-reservations",
+        dependencies=[bootstrap_guard],
+    )
+    def create_exact_session_reservation(
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        allowed = {
+            "reservation_key",
+            "session_id",
+            "session_generation",
+            "session_profile",
+            "task_ids",
+            "ttl_seconds",
+        }
+        if not payload or set(payload) - allowed:
+            raise HTTPException(
+                status_code=422,
+                detail="exact-session reservation contains unsupported fields",
+            )
+        try:
+            return service.create_exact_session_reservation(
+                reservation_key=str(payload.get("reservation_key") or ""),
+                session_id=payload.get("session_id"),
+                session_generation=payload.get("session_generation"),
+                session_profile=payload.get("session_profile") or "",
+                task_ids=payload.get("task_ids"),
+                ttl_seconds=payload.get("ttl_seconds", 1800),
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @router.post("/api/aedt-pool/reconcile", dependencies=[bootstrap_guard])
     def reconcile_aedt_pool(dry_run: bool = True) -> dict[str, Any]:
         # Live reconciliation is still triple-gated inside the service.
@@ -239,6 +271,11 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
             task_id = int(payload.get("task_id") or 0)
             allocation_id = int(payload.get("allocation_id") or 0)
             node_name = str(payload.get("node_name") or "")
+            requested_session_id = payload.get("requested_session_id", 0)
+            if type(requested_session_id) is not int or requested_session_id < 0:
+                raise ValueError(
+                    "requested_session_id must be a non-negative integer"
+                )
             if allocation_id and not task_id:
                 raise ValueError(
                     "allocation affinity requires task_id; affinity is "
@@ -290,6 +327,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
                 task_id=task_id,
                 allocation_id=allocation_id,
                 node_name=node_name,
+                requested_session_id=requested_session_id,
                 exclusive_session=payload.get("exclusive_session", False),
             )
         except (TypeError, ValueError) as exc:

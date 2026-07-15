@@ -127,6 +127,9 @@ CREATE TABLE IF NOT EXISTS aedt_project_leases (
     task_id INTEGER NOT NULL DEFAULT 0,
     requested_allocation_id INTEGER NOT NULL DEFAULT 0,
     requested_node_name TEXT NOT NULL DEFAULT '',
+    requested_session_id INTEGER NOT NULL DEFAULT 0,
+    requested_session_generation INTEGER NOT NULL DEFAULT 0,
+    exact_session_reservation_id INTEGER NOT NULL DEFAULT 0,
     exclusive_session INTEGER NOT NULL DEFAULT 0,
     session_id INTEGER,
     slot_index INTEGER,
@@ -163,6 +166,35 @@ WHERE session_id IS NOT NULL
   AND state IN ('offered', 'leased', 'attaching', 'active', 'releasing');
 CREATE INDEX IF NOT EXISTS idx_aedt_leases_project_name
 ON aedt_project_leases(project_name, state);
+
+CREATE TABLE IF NOT EXISTS aedt_exact_session_reservations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_key TEXT NOT NULL,
+    task_id INTEGER NOT NULL,
+    session_id INTEGER NOT NULL,
+    session_generation INTEGER NOT NULL,
+    session_profile TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'reserved',
+    lease_id INTEGER,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    claimed_at TEXT,
+    consumed_at TEXT,
+    finished_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(reservation_key, task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_aedt_exact_reservations_session
+ON aedt_exact_session_reservations(session_id, state);
+CREATE INDEX IF NOT EXISTS idx_aedt_exact_reservations_key
+ON aedt_exact_session_reservations(reservation_key);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aedt_exact_reservations_live_task
+ON aedt_exact_session_reservations(task_id)
+WHERE state IN ('reserved', 'claimed', 'consumed');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aedt_exact_reservations_lease
+ON aedt_exact_session_reservations(lease_id)
+WHERE lease_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS aedt_pool_validations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -451,6 +483,9 @@ class AedtPoolService:
                 "fault_evidence_json": "TEXT NOT NULL DEFAULT '{}'",
                 "mixed_canary_admission_id": "INTEGER NOT NULL DEFAULT 0",
                 "mixed_canary_session_id": "INTEGER NOT NULL DEFAULT 0",
+                "requested_session_id": "INTEGER NOT NULL DEFAULT 0",
+                "requested_session_generation": "INTEGER NOT NULL DEFAULT 0",
+                "exact_session_reservation_id": "INTEGER NOT NULL DEFAULT 0",
             }.items():
                 if name not in lease_columns:
                     conn.execute(
@@ -993,6 +1028,393 @@ class AedtPoolService:
             item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
             return item
 
+    def create_exact_session_reservation(
+        self,
+        *,
+        reservation_key: str,
+        session_id: int,
+        session_generation: int,
+        session_profile: Any,
+        task_ids: list[int],
+        ttl_seconds: int = 1800,
+    ) -> dict[str, Any]:
+        """Atomically reserve exact slots for one operator-authorized task cohort.
+
+        The bootstrap-authenticated reservation is the placement authority.  A
+        lease client's requested_session_id is only an assertion against this
+        server-side record and can never create an exact-session pin itself.
+        """
+
+        normalized_key = str(reservation_key or "").strip()
+        if not normalized_key:
+            raise ValueError("reservation_key is required")
+        if type(session_id) is not int or session_id <= 0:
+            raise ValueError("session_id must be a positive integer")
+        if type(session_generation) is not int or session_generation <= 0:
+            raise ValueError("session_generation must be a positive integer")
+        if type(ttl_seconds) is not int or not 60 <= ttl_seconds <= 3600:
+            raise ValueError("ttl_seconds must be an integer between 60 and 3600")
+        if not isinstance(task_ids, list) or not task_ids:
+            raise ValueError("task_ids must be a non-empty list")
+        if any(type(task_id) is not int or task_id <= 0 for task_id in task_ids):
+            raise ValueError("task_ids must contain positive integers")
+        normalized_task_ids = sorted(set(task_ids))
+        if len(normalized_task_ids) != len(task_ids):
+            raise ValueError("task_ids must be unique")
+        normalized_profile = canonical_expected_session_profile(session_profile)
+
+        now_dt = self._now()
+        now = _sql_time(now_dt)
+        expires = _sql_time(now_dt + timedelta(seconds=ttl_seconds))
+        with self._lock, self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._refresh_exact_session_reservations(conn, now)
+
+            existing_rows = conn.execute(
+                """
+                SELECT * FROM aedt_exact_session_reservations
+                WHERE reservation_key = ? ORDER BY task_id
+                """,
+                (normalized_key,),
+            ).fetchall()
+            if existing_rows:
+                existing_task_ids = [int(row["task_id"]) for row in existing_rows]
+                identical = bool(
+                    existing_task_ids == normalized_task_ids
+                    and all(int(row["session_id"]) == session_id for row in existing_rows)
+                    and all(
+                        int(row["session_generation"]) == session_generation
+                        for row in existing_rows
+                    )
+                    and all(
+                        str(row["session_profile"]) == normalized_profile
+                        for row in existing_rows
+                    )
+                )
+                if not identical:
+                    raise ValueError(
+                        "reservation_key already exists with different immutable payload"
+                    )
+                return self._exact_session_reservation_from_rows(existing_rows)
+
+            session = conn.execute(
+                """
+                SELECT s.*, a.state AS allocation_state
+                FROM aedt_sessions s
+                JOIN allocations a ON a.id = s.allocation_id
+                WHERE s.id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if not session:
+                raise ValueError("requested AEDT session does not exist")
+            if str(session["state"]) not in SESSION_ASSIGNABLE_STATES:
+                raise ValueError("requested AEDT session is not assignable")
+            if str(session["allocation_state"]) not in {"warm", "active"}:
+                raise ValueError("requested AEDT session allocation is not active")
+            if int(session["generation"] or 0) != session_generation:
+                raise ValueError("requested AEDT session generation does not match")
+            if str(session["session_profile"] or "") != normalized_profile:
+                raise ValueError("requested AEDT session profile does not match")
+            if session["solve_batch_sealed_at"] or session["drain_requested_at"]:
+                raise ValueError("requested AEDT session is sealed or draining")
+            mixed_canary = conn.execute(
+                """
+                SELECT 1 FROM aedt_mixed_canary_admissions
+                WHERE session_id = ? AND state IN ('open','filled','aborting')
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if mixed_canary:
+                raise ValueError("requested AEDT session is reserved for a mixed canary")
+
+            placeholders = ",".join("?" for _ in normalized_task_ids)
+            tasks = conn.execute(
+                f"SELECT id, status, aedt_backend FROM tasks WHERE id IN ({placeholders})",
+                tuple(normalized_task_ids),
+            ).fetchall()
+            if len(tasks) != len(normalized_task_ids):
+                raise ValueError("one or more reservation task_ids do not exist")
+            for task in tasks:
+                if str(task["status"]) in TASK_TERMINAL_STATES:
+                    raise ValueError("exact-session reservation task is terminal")
+                if str(task["aedt_backend"] or "").strip().lower() != "pooled":
+                    raise ValueError("exact-session reservation task must use pooled AEDT")
+            live_task_reservation = conn.execute(
+                f"""
+                SELECT task_id FROM aedt_exact_session_reservations
+                WHERE task_id IN ({placeholders})
+                  AND state IN ('reserved','claimed','consumed')
+                LIMIT 1
+                """,
+                tuple(normalized_task_ids),
+            ).fetchone()
+            if live_task_reservation:
+                raise ValueError("task already has a live exact-session reservation")
+            live_task_lease = conn.execute(
+                f"""
+                SELECT task_id FROM aedt_project_leases
+                WHERE task_id IN ({placeholders})
+                  AND state IN (
+                      'queued','offered','leased','attaching','active','releasing'
+                  )
+                LIMIT 1
+                """,
+                tuple(normalized_task_ids),
+            ).fetchone()
+            if live_task_lease:
+                raise ValueError("task already has a live AEDT project lease")
+
+            occupied = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM aedt_project_leases
+                    WHERE session_id = ?
+                      AND state IN ('offered','leased','attaching','active','releasing')
+                    """,
+                    (session_id,),
+                ).fetchone()["count"]
+                or 0
+            )
+            held = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM aedt_exact_session_reservations
+                    WHERE session_id = ? AND state IN ('reserved','claimed')
+                    """,
+                    (session_id,),
+                ).fetchone()["count"]
+                or 0
+            )
+            free_slots = int(session["slots_total"] or 0) - occupied - held
+            if len(normalized_task_ids) > free_slots:
+                raise ValueError(
+                    "requested AEDT session does not have enough unreserved free slots"
+                )
+
+            conn.executemany(
+                """
+                INSERT INTO aedt_exact_session_reservations (
+                    reservation_key, task_id, session_id, session_generation,
+                    session_profile, state, expires_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?, ?)
+                """,
+                (
+                    (
+                        normalized_key,
+                        task_id,
+                        session_id,
+                        session_generation,
+                        normalized_profile,
+                        expires,
+                        now,
+                        now,
+                    )
+                    for task_id in normalized_task_ids
+                ),
+            )
+        return self.get_exact_session_reservation(normalized_key)
+
+    @staticmethod
+    def _exact_session_reservation_from_rows(rows: list[Any]) -> dict[str, Any]:
+        first = rows[0]
+        return {
+            "reservation_key": str(first["reservation_key"]),
+            "session_id": int(first["session_id"]),
+            "session_generation": int(first["session_generation"]),
+            "session_profile": str(first["session_profile"]),
+            "expires_at": str(first["expires_at"]),
+            "slots": [dict(row) for row in rows],
+        }
+
+    def get_exact_session_reservation(self, reservation_key: str) -> dict[str, Any]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM aedt_exact_session_reservations
+                WHERE reservation_key = ? ORDER BY task_id
+                """,
+                (str(reservation_key or "").strip(),),
+            ).fetchall()
+            if not rows:
+                raise KeyError(reservation_key)
+            return self._exact_session_reservation_from_rows(rows)
+
+    @staticmethod
+    def _refresh_exact_session_reservations(conn: Any, now: str) -> None:
+        """Release capacity after task/lease terminal state and expire admissions."""
+
+        conn.execute(
+            """
+            UPDATE aedt_exact_session_reservations
+            SET state = 'released', finished_at = ?, updated_at = ?
+            WHERE state IN ('reserved','claimed','consumed')
+              AND EXISTS (
+                  SELECT 1 FROM tasks t
+                  WHERE t.id = aedt_exact_session_reservations.task_id
+                    AND t.status IN ('completed','failed','cancelled')
+              )
+            """,
+            (now, now),
+        )
+        conn.execute(
+            """
+            UPDATE aedt_exact_session_reservations
+            SET state = 'released', finished_at = ?, updated_at = ?
+            WHERE state IN ('claimed','consumed')
+              AND lease_id IS NOT NULL
+              AND EXISTS (
+                  SELECT 1 FROM aedt_project_leases l
+                  WHERE l.id = aedt_exact_session_reservations.lease_id
+                    AND l.state IN ('released','failed','cancelled','expired')
+              )
+            """,
+            (now, now),
+        )
+        invalid_targets = conn.execute(
+            """
+            SELECT r.id, r.lease_id
+            FROM aedt_exact_session_reservations r
+            LEFT JOIN aedt_sessions s ON s.id = r.session_id
+            LEFT JOIN allocations a ON a.id = s.allocation_id
+            WHERE r.state IN ('reserved','claimed')
+              AND (
+                  s.id IS NULL
+                  OR s.generation != r.session_generation
+                  OR s.session_profile != r.session_profile
+                  OR s.state NOT IN ('ready','busy')
+                  OR s.solve_batch_sealed_at IS NOT NULL
+                  OR s.drain_requested_at IS NOT NULL
+                  OR a.state NOT IN ('warm','active')
+              )
+            """
+        ).fetchall()
+        for row in invalid_targets:
+            lease_id = int(row["lease_id"] or 0)
+            if lease_id:
+                conn.execute(
+                    """
+                    UPDATE aedt_project_leases
+                    SET state = 'expired', failure_message =
+                            'exact-session reservation target became unavailable',
+                        finished_at = ?, updated_at = ?
+                    WHERE id = ? AND state = 'queued'
+                    """,
+                    (now, now, lease_id),
+                )
+            conn.execute(
+                """
+                UPDATE aedt_exact_session_reservations
+                SET state = 'expired', finished_at = ?, updated_at = ?
+                WHERE id = ? AND state IN ('reserved','claimed')
+                """,
+                (now, now, int(row["id"])),
+            )
+        expiring_claims = conn.execute(
+            """
+            SELECT id, lease_id FROM aedt_exact_session_reservations
+            WHERE state IN ('reserved','claimed') AND expires_at <= ?
+            """,
+            (now,),
+        ).fetchall()
+        for row in expiring_claims:
+            lease_id = int(row["lease_id"] or 0)
+            if lease_id:
+                conn.execute(
+                    """
+                    UPDATE aedt_project_leases
+                    SET state = 'expired', failure_message =
+                            'exact-session reservation expired before placement',
+                        finished_at = ?, updated_at = ?
+                    WHERE id = ? AND state = 'queued'
+                    """,
+                    (now, now, lease_id),
+                )
+            conn.execute(
+                """
+                UPDATE aedt_exact_session_reservations
+                SET state = 'expired', finished_at = ?, updated_at = ?
+                WHERE id = ? AND state IN ('reserved','claimed')
+                """,
+                (now, now, int(row["id"])),
+            )
+
+    @staticmethod
+    def _authorize_exact_session_reservation(
+        conn: Any,
+        *,
+        task_id: int,
+        requested_session_id: int,
+        session_profile: str,
+        request_key: str,
+        token_hash: str,
+        now: str,
+    ) -> dict[str, Any] | None:
+        assertion = int(requested_session_id or 0)
+        if task_id <= 0:
+            if assertion:
+                raise ValueError(
+                    "requested_session_id requires a bootstrap-issued task reservation"
+                )
+            return None
+        reservation = conn.execute(
+            """
+            SELECT * FROM aedt_exact_session_reservations
+            WHERE task_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        if not reservation:
+            if assertion:
+                raise ValueError(
+                    "requested_session_id has no bootstrap-issued task reservation"
+                )
+            return None
+        if assertion and assertion != int(reservation["session_id"]):
+            raise ValueError("requested_session_id does not match task reservation")
+        if str(reservation["session_profile"]) != session_profile:
+            raise ValueError("lease session profile does not match task reservation")
+        existing_lease_id = int(reservation["lease_id"] or 0)
+        if existing_lease_id:
+            existing = conn.execute(
+                """
+                SELECT request_key, client_token_hash
+                FROM aedt_project_leases WHERE id = ?
+                """,
+                (existing_lease_id,),
+            ).fetchone()
+            replay = bool(
+                existing
+                and str(existing["request_key"]) == request_key
+                and secrets.compare_digest(str(existing["client_token_hash"]), token_hash)
+            )
+            if replay:
+                return dict(reservation)
+            if str(reservation["state"]) in {"claimed", "consumed"}:
+                raise ValueError("exact-session task reservation is already claimed")
+        if str(reservation["state"]) != "reserved":
+            raise ValueError(
+                "task exact-session reservation is no longer active; "
+                "unpinned fallback is forbidden"
+            )
+        if str(reservation["expires_at"]) <= now:
+            raise ValueError("exact-session reservation expired")
+        session = conn.execute(
+            "SELECT * FROM aedt_sessions WHERE id = ?",
+            (int(reservation["session_id"]),),
+        ).fetchone()
+        if not session or str(session["state"]) not in SESSION_ASSIGNABLE_STATES:
+            raise ValueError("reserved AEDT session is not assignable")
+        if int(session["generation"] or 0) != int(reservation["session_generation"]):
+            raise ValueError("reserved AEDT session generation drifted")
+        if str(session["session_profile"] or "") != str(reservation["session_profile"]):
+            raise ValueError("reserved AEDT session profile drifted")
+        if session["solve_batch_sealed_at"] or session["drain_requested_at"]:
+            raise ValueError("reserved AEDT session is sealed or draining")
+        return dict(reservation)
+
     def create_mixed_canary_admission(
         self,
         *,
@@ -1071,6 +1493,16 @@ class AedtPoolService:
             ).fetchone()
             if active:
                 raise ValueError("mixed canary session already has an active admission")
+            exact_reservation = conn.execute(
+                """
+                SELECT 1 FROM aedt_exact_session_reservations
+                WHERE session_id = ? AND state IN ('reserved','claimed')
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if exact_reservation:
+                raise ValueError("mixed canary session has exact-session reservations")
             placement_group = f"mixed-canary-{session_id}-{secrets.token_hex(8)}"
             cursor = conn.execute(
                 """
@@ -1303,6 +1735,35 @@ class AedtPoolService:
         )
 
     @staticmethod
+    def _exact_session_reservations_are_active(
+        conn: Any,
+        session_id: int,
+    ) -> bool:
+        """Prevent underfilled sealing while exact reserved peers are pending."""
+
+        rows = conn.execute(
+            """
+            SELECT r.state, r.session_id AS reserved_session_id,
+                   l.session_id AS lease_session_id, l.state AS lease_state
+            FROM aedt_exact_session_reservations r
+            LEFT JOIN aedt_project_leases l ON l.id = r.lease_id
+            WHERE r.session_id = ?
+              AND r.state IN ('reserved','claimed','consumed')
+            ORDER BY r.id
+            """,
+            (int(session_id),),
+        ).fetchall()
+        if not rows:
+            return True
+        return all(
+            str(row["state"]) == "consumed"
+            and int(row["lease_session_id"] or 0)
+            == int(row["reserved_session_id"])
+            and str(row["lease_state"] or "") == "active"
+            for row in rows
+        )
+
+    @staticmethod
     def _authorize_mixed_canary_lease(
         conn: Any,
         *,
@@ -1406,6 +1867,7 @@ class AedtPoolService:
         task_id: int = 0,
         allocation_id: int = 0,
         node_name: str = "",
+        requested_session_id: int = 0,
         exclusive_session: bool = False,
     ) -> tuple[dict[str, Any], str]:
         request_key = request_key.strip()
@@ -1424,6 +1886,8 @@ class AedtPoolService:
                 raise ValueError("placement_group must not be empty")
         if type(exclusive_session) is not bool:
             raise ValueError("exclusive_session must be a boolean")
+        if type(requested_session_id) is not int or requested_session_id < 0:
+            raise ValueError("requested_session_id must be a non-negative integer")
         if type(protocol_version) is not int or protocol_version not in {1, 2}:
             raise ValueError("protocol_version must be 1 or 2")
         resolved_family = _normalized_family(workload_family, project_name)
@@ -1494,6 +1958,7 @@ class AedtPoolService:
         with self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._refresh_mixed_canary_admissions(conn, now)
+            self._refresh_exact_session_reservations(conn, now)
             # task_id is provenance.  Central-pool requests remain unpinned
             # unless the caller explicitly supplies allocation_id.  When it
             # does, derive and verify the affinity from the scheduler task.
@@ -1535,6 +2000,24 @@ class AedtPoolService:
                         resolved_allocation_id = task_allocation_id
                         resolved_node_name = task_node_name
             token_hash = _token_hash(token)
+            exact_reservation = self._authorize_exact_session_reservation(
+                conn,
+                task_id=requested_task_id,
+                requested_session_id=requested_session_id,
+                session_profile=resolved_profile,
+                request_key=request_key,
+                token_hash=token_hash,
+                now=now,
+            )
+            exact_reservation_id = int(
+                (exact_reservation or {}).get("id") or 0
+            )
+            exact_session_id = int(
+                (exact_reservation or {}).get("session_id") or 0
+            )
+            exact_session_generation = int(
+                (exact_reservation or {}).get("session_generation") or 0
+            )
             mixed_canary: dict[str, Any] | None = None
             mixed_canary_admission_id = 0
             mixed_canary_session_id = 0
@@ -1555,6 +2038,10 @@ class AedtPoolService:
                 # The operator reservation, not the untrusted lease payload,
                 # owns both the placement group and exact host session.
                 resolved_placement_group = str(mixed_canary["placement_group"])
+                if exact_reservation is not None:
+                    raise ValueError(
+                        "exact-session reservation cannot be combined with mixed canary admission"
+                    )
             existing = conn.execute(
                 """
                 SELECT l.*, t.status AS scheduler_task_status
@@ -1645,11 +2132,13 @@ class AedtPoolService:
                         workload_family, session_profile, project_namespace,
                         isolation_policy, workspace_path, protocol_version, task_id,
                         requested_allocation_id, requested_node_name,
+                        requested_session_id, requested_session_generation,
+                        exact_session_reservation_id,
                         mixed_canary_admission_id, mixed_canary_session_id,
                         exclusive_session, state, client_token_hash,
                         last_heartbeat_at, expires_at, client_deadline_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                              'queued', ?, ?, ?, ?)
+                              ?, ?, ?, 'queued', ?, ?, ?, ?)
                     """,
                     (
                         request_key,
@@ -1664,6 +2153,9 @@ class AedtPoolService:
                         requested_task_id,
                         resolved_allocation_id,
                         resolved_node_name,
+                        exact_session_id,
+                        exact_session_generation,
+                        exact_reservation_id,
                         mixed_canary_admission_id,
                         mixed_canary_session_id,
                         int(exclusive_session),
@@ -1674,6 +2166,19 @@ class AedtPoolService:
                     ),
                 )
                 lease_id = int(cursor.lastrowid)
+                if exact_reservation is not None:
+                    claimed = conn.execute(
+                        """
+                        UPDATE aedt_exact_session_reservations
+                        SET state = 'claimed', lease_id = ?, claimed_at = ?, updated_at = ?
+                        WHERE id = ? AND state = 'reserved' AND lease_id IS NULL
+                        """,
+                        (lease_id, now, now, exact_reservation_id),
+                    )
+                    if claimed.rowcount != 1:
+                        raise ValueError(
+                            "exact-session task reservation was consumed concurrently"
+                        )
                 if mixed_canary is not None:
                     claimed = conn.execute(
                         """
@@ -1921,6 +2426,7 @@ class AedtPoolService:
         if session_id <= 0:
             return False
         self._refresh_mixed_canary_admissions(conn, now)
+        self._refresh_exact_session_reservations(conn, now)
         session = conn.execute(
             "SELECT * FROM aedt_sessions WHERE id = ?", (int(session_id),)
         ).fetchone()
@@ -1940,6 +2446,10 @@ class AedtPoolService:
             # reserved projects are ACTIVE before the atomic permit.  In
             # particular, the ordinary bounded underfilled fallback must not
             # seal this session and make the remaining reservation unusable.
+            return False
+        if not self._exact_session_reservations_are_active(conn, int(session_id)):
+            # A bounded underfilled fallback must not seal the Desktop while a
+            # bootstrap-reserved peer still owns an exact slot on this session.
             return False
         if not occupants or any(str(row["state"]) != "active" for row in occupants):
             return False
@@ -3627,6 +4137,11 @@ class AedtPoolService:
                 SELECT COUNT(*) FROM aedt_sessions
                 WHERE state = 'ready'
                   AND COALESCE(idle_since, created_at) <= ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM aedt_exact_session_reservations r
+                      WHERE r.session_id = aedt_sessions.id
+                        AND r.state IN ('reserved','claimed')
+                  )
                 """,
                 (idle_cutoff,),
             ).fetchone()[0]
@@ -3755,13 +4270,27 @@ class AedtPoolService:
         lease: Any,
         session: Any,
         occupants: list[Any],
+        *,
+        reserved_slots_for_others: int = 0,
     ) -> bool:
-        if int(session["used_slots"] or 0) >= int(session["slots_total"]):
+        if (
+            int(session["used_slots"] or 0) + int(reserved_slots_for_others)
+            >= int(session["slots_total"])
+        ):
             return False
         if any(bool(item["exclusive_session"]) for item in occupants):
             return False
         if bool(lease["exclusive_session"]) and occupants:
             return False
+
+        requested_session_id = int(lease["requested_session_id"] or 0)
+        if requested_session_id:
+            if int(session["id"]) != requested_session_id:
+                return False
+            if int(session["generation"] or 0) != int(
+                lease["requested_session_generation"] or 0
+            ):
+                return False
 
         canary_admission_id = int(lease["mixed_canary_admission_id"] or 0)
         canary_session_id = int(lease["mixed_canary_session_id"] or 0)
@@ -3825,6 +4354,7 @@ class AedtPoolService:
         if not config.operational:
             return 0
         self._refresh_mixed_canary_admissions(conn, now)
+        self._refresh_exact_session_reservations(conn, now)
         ready_cutoff = _sql_time(
             _parse_utc_time(now) - timedelta(seconds=config.queued_stale_seconds)
         )
@@ -3883,6 +4413,10 @@ class AedtPoolService:
                   AND (? = '' OR a.created_at > ?)
                   AND (? = 0 OR s.allocation_id = ?)
                   AND (? = '' OR s.node_name = ?)
+                  AND (
+                      ? = 0
+                      OR (s.id = ? AND s.generation = ?)
+                  )
                   AND (? = 0 OR s.id = ?)
                   AND (
                       ? > 0 OR NOT EXISTS (
@@ -3904,6 +4438,9 @@ class AedtPoolService:
                     int(lease["requested_allocation_id"] or 0),
                     str(lease["requested_node_name"] or ""),
                     str(lease["requested_node_name"] or ""),
+                    int(lease["requested_session_id"] or 0),
+                    int(lease["requested_session_id"] or 0),
+                    int(lease["requested_session_generation"] or 0),
                     int(lease["mixed_canary_session_id"] or 0),
                     int(lease["mixed_canary_session_id"] or 0),
                     int(lease["mixed_canary_session_id"] or 0),
@@ -3926,7 +4463,47 @@ class AedtPoolService:
                     """,
                     (int(session["id"]),),
                 ).fetchall()
-                if self._lease_fits_session(lease, session, occupants):
+                exact_reservation_id = int(
+                    lease["exact_session_reservation_id"] or 0
+                )
+                if exact_reservation_id:
+                    exact_reservation = conn.execute(
+                        """
+                        SELECT state, lease_id
+                        FROM aedt_exact_session_reservations WHERE id = ?
+                        """,
+                        (exact_reservation_id,),
+                    ).fetchone()
+                    if not (
+                        exact_reservation
+                        and str(exact_reservation["state"]) == "claimed"
+                        and int(exact_reservation["lease_id"] or 0)
+                        == int(lease["id"])
+                    ):
+                        continue
+                reserved_slots_for_others = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS count
+                        FROM aedt_exact_session_reservations
+                        WHERE session_id = ?
+                          AND state IN ('reserved','claimed')
+                          AND (? = 0 OR id != ?)
+                        """,
+                        (
+                            int(session["id"]),
+                            exact_reservation_id,
+                            exact_reservation_id,
+                        ),
+                    ).fetchone()["count"]
+                    or 0
+                )
+                if self._lease_fits_session(
+                    lease,
+                    session,
+                    occupants,
+                    reserved_slots_for_others=reserved_slots_for_others,
+                ):
                     selected = session
                     selected_occupants = list(occupants)
                     break
@@ -3964,6 +4541,27 @@ class AedtPoolService:
             )
             if cursor.rowcount != 1:
                 continue
+            exact_reservation_id = int(
+                lease["exact_session_reservation_id"] or 0
+            )
+            if exact_reservation_id:
+                consumed = conn.execute(
+                    """
+                    UPDATE aedt_exact_session_reservations
+                    SET state = 'consumed', consumed_at = ?, updated_at = ?
+                    WHERE id = ? AND state = 'claimed' AND lease_id = ?
+                    """,
+                    (
+                        now,
+                        now,
+                        exact_reservation_id,
+                        int(lease["id"]),
+                    ),
+                )
+                if consumed.rowcount != 1:
+                    raise RuntimeError(
+                        "exact-session reservation changed during placement"
+                    )
             profile = str(lease["session_profile"] or "")
             if profile and not str(selected["session_profile"] or ""):
                 conn.execute(
@@ -3987,6 +4585,7 @@ class AedtPoolService:
         now = _sql_time(now_dt)
         with self._lock, self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._refresh_exact_session_reservations(conn, now)
 
             if execute and config.allocation_max_age_seconds:
                 allocation_age_cutoff = _sql_time(
@@ -4097,6 +4696,14 @@ class AedtPoolService:
                         failure_message = 'lease offer requeued after ACK window',
                         updated_at = ?
                     WHERE id = ? AND state = 'offered'
+                    """,
+                    (now, int(row["id"])),
+                )
+                conn.execute(
+                    """
+                    UPDATE aedt_exact_session_reservations
+                    SET state = 'claimed', consumed_at = NULL, updated_at = ?
+                    WHERE lease_id = ? AND state = 'consumed'
                     """,
                     (now, int(row["id"])),
                 )
@@ -4395,6 +5002,11 @@ class AedtPoolService:
                                   AND l.state IN ('offered','leased','attaching','active','releasing')) AS used_slots
                         FROM aedt_sessions s
                         WHERE s.state IN ('ready','busy')
+                          AND NOT EXISTS (
+                              SELECT 1 FROM aedt_exact_session_reservations r
+                              WHERE r.session_id = s.id
+                                AND r.state IN ('reserved','claimed')
+                          )
                         ORDER BY used_slots ASC, COALESCE(s.idle_since, s.created_at) ASC, s.id ASC
                         """
                     ).fetchall()

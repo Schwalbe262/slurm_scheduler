@@ -960,6 +960,7 @@ def acquire_project_lease(
     task_id: int = 0,
     allocation_id: int = 0,
     node_name: str = "",
+    requested_session_id: int = 0,
     exclusive_session: bool = False,
     workload_family: str = "",
     session_profile: Any = "",
@@ -973,6 +974,8 @@ def acquire_project_lease(
     """Create a lease request; call `wait_until_leased` before opening a project."""
     if type(exclusive_session) is not bool:
         raise ValueError("exclusive_session must be a boolean")
+    if type(requested_session_id) is not int or requested_session_id < 0:
+        raise ValueError("requested_session_id must be a non-negative integer")
     http = AedtPoolHttpClient(
         scheduler_url,
         bootstrap_token=bootstrap_token,
@@ -992,6 +995,7 @@ def acquire_project_lease(
             "task_id": max(0, int(task_id)),
             "allocation_id": max(0, int(allocation_id)),
             "node_name": node_name,
+            "requested_session_id": requested_session_id,
             "exclusive_session": exclusive_session,
             "workload_family": workload_family,
             "session_profile": session_profile,
