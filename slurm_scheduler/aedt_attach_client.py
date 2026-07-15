@@ -62,7 +62,7 @@ def _lease_keepalive_worker(
 ) -> None:
     """Independent keepalive so a blocked solver/main interpreter cannot starve it."""
 
-    http = AedtPoolHttpClient(scheduler_url, bootstrap_token=bootstrap_token)
+    client = AedtPoolHttpClient(scheduler_url, bootstrap_token=bootstrap_token)
     interval = max(5, int(heartbeat_seconds))
     cycle = 0
     if stop_event.wait(
@@ -73,7 +73,7 @@ def _lease_keepalive_worker(
         return
     while not stop_event.is_set():
         try:
-            http.request(
+            client.request(
                 "POST",
                 f"/api/aedt-pool/leases/{int(lease_id)}/heartbeat",
                 {},

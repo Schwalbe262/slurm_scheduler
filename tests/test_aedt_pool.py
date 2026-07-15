@@ -23,6 +23,7 @@ from slurm_scheduler.aedt_attach_client import (
     AedtPoolHttpClient,
     AedtProjectLease,
     _keepalive_delay,
+    _lease_keepalive_worker,
     acquire_project_lease,
 )
 from slurm_scheduler.aedt_automation_lock import (
@@ -3744,6 +3745,48 @@ class AttachClientTests(unittest.TestCase):
         self.assertTrue(all(0 <= item <= 20 for item in initial))
         self.assertTrue(all(15 <= item <= 25 for item in periodic))
         self.assertGreater(len({round(item, 3) for item in initial}), 490)
+
+    def test_keepalive_worker_retries_after_connection_refusal(self) -> None:
+        class Http:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def request(self, *_args, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise urllib.error.URLError(
+                        ConnectionRefusedError(10061, "connection refused")
+                    )
+                return {"state": "active"}
+
+        class StopEvent:
+            def __init__(self) -> None:
+                self.wait_calls = 0
+
+            def wait(self, _timeout) -> bool:
+                self.wait_calls += 1
+                return self.wait_calls >= 3
+
+            def is_set(self) -> bool:
+                return False
+
+        http = Http()
+        stop_event = StopEvent()
+        with patch(
+            "slurm_scheduler.aedt_attach_client.AedtPoolHttpClient",
+            return_value=http,
+        ):
+            _lease_keepalive_worker(
+                "http://scheduler",
+                "bootstrap",
+                7,
+                "lease-token",
+                5,
+                stop_event,
+            )
+
+        self.assertEqual(http.calls, 2)
+        self.assertEqual(stop_event.wait_calls, 3)
 
     def test_connect_does_not_activate_until_project_is_bound(self) -> None:
         calls: list[tuple[str, str, dict | None]] = []
