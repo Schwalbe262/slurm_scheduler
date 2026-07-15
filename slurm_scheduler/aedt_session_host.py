@@ -1700,10 +1700,6 @@ class AedtSessionHost:
                 # is blocked in GetVersion.  Never launch a second native call.
                 return NATIVE_PROBE_FAILED
             return consume_finished_probe()
-        odesktop = getattr(self.desktop, "odesktop", None)
-        probe = getattr(odesktop, "GetVersion", None)
-        if not callable(probe):
-            return NATIVE_PROBE_FAILED
         self._native_probe_errors = []
         self._native_probe_outcome = NATIVE_PROBE_NOT_RUN
 
@@ -1727,6 +1723,15 @@ class AedtSessionHost:
                     except TimeoutError:
                         self._native_probe_outcome = NATIVE_PROBE_DEFERRED_BUSY
                         return
+                # Resolving ``desktop.odesktop`` and ``GetVersion`` can itself
+                # enter a blocking AEDT gRPC property call.  Keep every access
+                # to the native proxy behind the cross-process lock and inside
+                # this bounded daemon so the session host's heartbeat thread
+                # can never wedge indefinitely before ``probe()`` is invoked.
+                odesktop = getattr(self.desktop, "odesktop", None)
+                probe = getattr(odesktop, "GetVersion", None)
+                if not callable(probe):
+                    raise RuntimeError("Desktop GetVersion API is unavailable")
                 probe()
                 self._native_probe_outcome = NATIVE_PROBE_OK
             except BaseException as exc:

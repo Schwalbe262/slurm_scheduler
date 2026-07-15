@@ -4810,6 +4810,51 @@ class SessionHostTests(unittest.TestCase):
         )
         self.assertIsNone(host._native_probe_thread)
 
+    def test_blocked_native_proxy_resolution_is_bounded_in_probe_thread(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        resolutions = 0
+
+        class BlockingDesktop:
+            @property
+            def odesktop(self):
+                nonlocal resolutions
+                resolutions += 1
+                entered.set()
+                release.wait(2)
+                return SimpleNamespace(GetVersion=lambda: "2025.2")
+
+        host = AedtSessionHost(
+            FakeHostControlPlane([]), allocation_id=1, node_name="cpu-01"
+        )
+        host.desktop = BlockingDesktop()
+
+        started = time.monotonic()
+        self.assertEqual(
+            host._native_desktop_responds(timeout_seconds=0.1),
+            NATIVE_PROBE_FAILED,
+        )
+        self.assertLess(time.monotonic() - started, 0.75)
+        self.assertTrue(entered.is_set())
+        self.assertEqual(resolutions, 1)
+
+        # A second heartbeat-side check must observe the one bounded worker;
+        # it must not launch another property lookup while the first is stuck.
+        self.assertEqual(
+            host._native_desktop_responds(timeout_seconds=0.1),
+            NATIVE_PROBE_FAILED,
+        )
+        self.assertEqual(resolutions, 1)
+
+        release.set()
+        assert host._native_probe_thread is not None
+        host._native_probe_thread.join(timeout=1)
+        self.assertEqual(
+            host._native_desktop_responds(timeout_seconds=0.1),
+            NATIVE_PROBE_OK,
+        )
+        self.assertIsNone(host._native_probe_thread)
+
     def test_client_automation_lock_defers_probe_without_getversion_or_failure(
         self,
     ) -> None:
@@ -4818,19 +4863,25 @@ class SessionHostTests(unittest.TestCase):
                 str(Path(root) / "desktop-automation.lock")
             )
             get_version_calls = 0
+            odesktop_resolutions = 0
 
             def get_version():
                 nonlocal get_version_calls
                 get_version_calls += 1
                 return "2025.2"
 
+            class CountingDesktop:
+                @property
+                def odesktop(self):
+                    nonlocal odesktop_resolutions
+                    odesktop_resolutions += 1
+                    return SimpleNamespace(GetVersion=get_version)
+
             host = AedtSessionHost(
                 FakeHostControlPlane([]), allocation_id=1, node_name="cpu-01"
             )
             host.automation_lock_path = lock_path
-            host.desktop = SimpleNamespace(
-                odesktop=SimpleNamespace(GetVersion=get_version)
-            )
+            host.desktop = CountingDesktop()
             host.desktop_process_id = "3824121"
             host.desktop_process_marker = "marker"
             host.desktop_port = 44773
@@ -4855,6 +4906,7 @@ class SessionHostTests(unittest.TestCase):
                 # never call GetVersion later when this lock is released.
                 time.sleep(0.15)
                 self.assertEqual(get_version_calls, 0)
+                self.assertEqual(odesktop_resolutions, 0)
                 self.assertEqual(host._native_probe_errors, [])
                 self.assertIsNone(host._native_probe_thread)
 
@@ -4863,6 +4915,7 @@ class SessionHostTests(unittest.TestCase):
                 host.last_native_probe_outcome, NATIVE_PROBE_DEFERRED_BUSY
             )
             self.assertEqual(get_version_calls, 0)
+            self.assertEqual(odesktop_resolutions, 0)
             self.assertEqual(host.native_probe_failures, 2)
             self.assertEqual(host.native_probe_first_failure_at, 91.0)
             self.assertIsNone(host._native_probe_thread)
