@@ -40,6 +40,19 @@ LEASE_LIVE_STATES = (
 )
 LEASE_SLOT_STATES = ("offered", "leased", "attaching", "active", "releasing")
 LEASE_TERMINAL_STATES = ("released", "failed", "cancelled", "expired")
+TASK_TERMINAL_STATES = (
+    TaskStatus.COMPLETED.value,
+    TaskStatus.FAILED.value,
+    TaskStatus.CANCELLED.value,
+)
+DEAD_SESSION_IDENTITY_FIELDS = (
+    "generation",
+    "allocation_id",
+    "host_id",
+    "host_task_id",
+    "host_process_id",
+    "process_id",
+)
 SESSION_START_ACK_TIMEOUT_MESSAGE = "session start acknowledgement timed out"
 SESSION_HEARTBEAT_TIMEOUT_MESSAGE = "session heartbeat expired"
 FAULTED_DESKTOP_ALLOCATION_RECYCLE_REASON = (
@@ -374,6 +387,9 @@ class AedtPoolService:
         self._now = now
         self._lock = threading.RLock()
         self._warm_spare_admission_checker: Callable[[int], tuple[int, str]] | None = None
+        self._dead_session_process_checker: (
+            Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]] | None
+        ) = None
         self._config_cache: AedtPoolConfig | None = None
         self._config_cache_until = 0.0
 
@@ -513,6 +529,17 @@ class AedtPoolService:
     ) -> None:
         """Install the scheduler's fail-closed license headroom check."""
         self._warm_spare_admission_checker = checker
+
+    def set_dead_session_process_checker(
+        self,
+        checker: Callable[
+            [dict[str, Any]], tuple[bool, dict[str, Any]]
+        ]
+        | None,
+    ) -> None:
+        """Install the scheduler-owned, fail-closed remote PID probe."""
+
+        self._dead_session_process_checker = checker
 
     def latest_validation(self) -> dict[str, Any] | None:
         with self.db.connect() as conn:
@@ -3075,6 +3102,191 @@ class AedtPoolService:
                 if config.operational:
                     self._place_queued_leases(conn, now, config=config)
         return self.get_lease(lease_id, include_secret_hash=False)
+
+    def _validate_dead_session_reap_candidate(
+        self,
+        conn: Any,
+        session_id: int,
+        expected_identity: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        row = conn.execute(
+            "SELECT * FROM aedt_sessions WHERE id = ?", (int(session_id),)
+        ).fetchone()
+        if not row:
+            raise KeyError(session_id)
+        session = dict(row)
+        if str(session["state"]) not in {"unhealthy", "draining"}:
+            raise ValueError(
+                "dead-session reap requires an unhealthy or draining session"
+            )
+
+        normalized_expected = {
+            "generation": int(expected_identity.get("generation") or 0),
+            "allocation_id": int(expected_identity.get("allocation_id") or 0),
+            "host_id": str(expected_identity.get("host_id") or "").strip(),
+            "host_task_id": int(expected_identity.get("host_task_id") or 0),
+            "host_process_id": str(
+                expected_identity.get("host_process_id") or ""
+            ).strip(),
+            "process_id": str(expected_identity.get("process_id") or "").strip(),
+        }
+        if any(
+            not normalized_expected[field]
+            for field in DEAD_SESSION_IDENTITY_FIELDS
+        ):
+            raise ValueError("complete expected session identity is required")
+        for field in DEAD_SESSION_IDENTITY_FIELDS:
+            actual = session.get(field)
+            if field in {"generation", "allocation_id", "host_task_id"}:
+                actual = int(actual or 0)
+            else:
+                actual = str(actual or "").strip()
+            if actual != normalized_expected[field]:
+                raise ValueError(f"session {field} does not match expected identity")
+
+        live_placeholders = ",".join("?" for _ in LEASE_LIVE_STATES)
+        live = int(
+            conn.execute(
+                f"""
+                SELECT COUNT(*) FROM aedt_project_leases
+                WHERE session_id = ? AND state IN ({live_placeholders})
+                """,
+                (int(session_id), *LEASE_LIVE_STATES),
+            ).fetchone()[0]
+        )
+        if live:
+            raise ValueError("dead-session reap requires zero live project leases")
+
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (int(session["host_task_id"]),)
+        ).fetchone()
+        if not task:
+            raise ValueError("session host task no longer exists")
+        host_task = dict(task)
+        if str(host_task.get("status") or "") not in TASK_TERMINAL_STATES:
+            raise ValueError("session host task is not terminal")
+        allocation_id = int(session["allocation_id"] or 0)
+        if (
+            int(host_task.get("requested_allocation_id") or 0) != allocation_id
+            or int(host_task.get("allocation_id") or 0) != allocation_id
+        ):
+            raise ValueError("session host task identity does not match its allocation")
+        return session, host_task
+
+    def reap_dead_session(
+        self,
+        session_id: int,
+        *,
+        expected_identity: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Close one proven-dead empty session without touching its allocation.
+
+        The remote PID check deliberately runs outside SQLite's write
+        transaction.  The second validation is a compare-and-swap barrier: a
+        heartbeat, lease, task transition, or session identity change that
+        races the probe makes the operation fail closed.
+        """
+
+        checker = self._dead_session_process_checker
+        if checker is None:
+            raise RuntimeError("dead-session process identity checker is unavailable")
+        with self.db.connect() as conn:
+            candidate, _host_task = self._validate_dead_session_reap_candidate(
+                conn, int(session_id), expected_identity
+            )
+        snapshot = {
+            key: candidate.get(key)
+            for key in (
+                "id",
+                "state",
+                "generation",
+                "allocation_id",
+                "account_name",
+                "node_name",
+                "host_id",
+                "host_task_id",
+                "host_process_id",
+                "host_slurm_job_id",
+                "actual_node_name",
+                "endpoint",
+                "process_id",
+                "last_heartbeat_at",
+                "updated_at",
+            )
+        }
+        try:
+            processes_absent, probe_evidence = checker(dict(candidate))
+        except Exception as exc:
+            raise RuntimeError(f"dead-session process identity probe failed: {exc}") from exc
+        if processes_absent is not True:
+            raise ValueError("session host or AEDT process identity is still present")
+        evidence = dict(probe_evidence or {})
+
+        now = _sql_time(self._now())
+        with self._lock, self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current, host_task = self._validate_dead_session_reap_candidate(
+                conn, int(session_id), expected_identity
+            )
+            for field, value in snapshot.items():
+                if current.get(field) != value:
+                    raise ValueError(
+                        f"session changed during process identity probe ({field})"
+                    )
+            cursor = conn.execute(
+                """
+                UPDATE aedt_sessions
+                SET state = 'closed', closed_at = ?, updated_at = ?
+                WHERE id = ? AND state = ? AND updated_at = ?
+                """,
+                (
+                    now,
+                    now,
+                    int(session_id),
+                    str(snapshot["state"]),
+                    str(snapshot["updated_at"]),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("session changed during process identity probe")
+            audit = {
+                "action": "verified_dead_session_reap",
+                "allocation_id": int(current["allocation_id"] or 0),
+                "generation": int(current["generation"] or 0),
+                "host_id": str(current["host_id"] or ""),
+                "host_task_id": int(current["host_task_id"] or 0),
+                "host_task_status": str(host_task.get("status") or ""),
+                "host_process_id": str(current["host_process_id"] or ""),
+                "process_id": str(current["process_id"] or ""),
+                "process_probe": evidence,
+            }
+            conn.execute(
+                """
+                INSERT INTO scheduler_events(
+                    kind, message, entity_type, entity_id, account_name
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    "aedt_session_reaped",
+                    json.dumps(
+                        audit,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "aedt_session",
+                    str(int(session_id)),
+                    str(current["account_name"] or ""),
+                ),
+            )
+
+        # Replenish pool capacity only after the verified close commits.
+        plan = self.reconcile(execute=True)
+        return {
+            "session": self.get_session(session_id, include_secret_hash=False),
+            "process_probe": evidence,
+            "plan": plan,
+        }
 
     def close_session(
         self,

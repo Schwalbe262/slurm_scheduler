@@ -680,4 +680,53 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @router.post(
+        "/api/aedt-pool/sessions/{session_id}/reap-dead",
+        dependencies=[bootstrap_guard],
+    )
+    def reap_dead_aedt_session(
+        session_id: int,
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        required = {
+            "generation",
+            "allocation_id",
+            "host_id",
+            "host_task_id",
+            "host_process_id",
+            "process_id",
+        }
+        if set(payload) != required:
+            raise HTTPException(
+                status_code=422,
+                detail="complete expected session identity is required",
+            )
+        if any(
+            type(payload[field]) is not int or int(payload[field]) <= 0
+            for field in ("generation", "allocation_id", "host_task_id")
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="generation, allocation_id, and host_task_id must be positive integers",
+            )
+        if any(
+            not isinstance(payload[field], str) or not payload[field].strip()
+            for field in ("host_id", "host_process_id", "process_id")
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="host_id, host_process_id, and process_id are required",
+            )
+        try:
+            return service.reap_dead_session(
+                session_id,
+                expected_identity=payload,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="session not found") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     return router

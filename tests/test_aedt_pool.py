@@ -547,7 +547,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
             for route in router.routes
             if set(getattr(route, "methods", set())) & {"POST", "PATCH", "PUT", "DELETE"}
         ]
-        self.assertEqual(len(mutating_routes), 21)
+        self.assertEqual(len(mutating_routes), 22)
         bootstrap_routes = []
         client_routes = []
         lease_scoped_routes = []
@@ -576,7 +576,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 self.assertEqual(client_guards, [])
                 bootstrap_routes.append(route)
 
-        self.assertEqual(len(bootstrap_routes), 12)
+        self.assertEqual(len(bootstrap_routes), 13)
         self.assertEqual(len(client_routes), 1)
         self.assertEqual(len(lease_scoped_routes), 8)
         guard = next(
@@ -1957,6 +1957,220 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         super().setUp()
         self.allocation_id = self.add_dedicated_allocation()
         self.make_operational()
+
+    def make_dead_reap_candidate(
+        self, *, empty: bool = True
+    ) -> tuple[dict, dict, int, int]:
+        lease, lease_token = self.request(
+            f"dead-reap-{time.time_ns()}",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        session_id = int(session["id"])
+        if empty:
+            self.service.release_lease(int(lease["id"]), lease_token)
+            self.service.complete_release(
+                session_id, host_token, int(lease["id"]), success=True
+            )
+        task_id = self.db.create_task(
+            TaskCreate(
+                name=f"aedt-session-host-{session_id}",
+                remote_cwd="/work/aedt",
+                command="python -m slurm_scheduler.aedt_session_host",
+                account_name="a",
+                project="_aedt_pool_hosts",
+                requested_allocation_id=self.allocation_id,
+            )
+        )
+        self.db.update_task(
+            task_id,
+            status=TaskStatus.CANCELLED.value,
+            allocation_id=self.allocation_id,
+            finished_at="CURRENT_TIMESTAMP",
+        )
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE aedt_sessions
+                SET state = 'unhealthy', host_task_id = ?,
+                    host_process_id = '22001', host_slurm_job_id = ?,
+                    actual_node_name = 'cpu-01', process_id = '23001',
+                    failure_message = 'session heartbeat expired',
+                    drain_requested_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    task_id,
+                    f"job-{self.allocation_id}",
+                    self.clock.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    self.clock.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    session_id,
+                ),
+            )
+        current = self.service.get_session(session_id)
+        expected = {
+            field: current[field]
+            for field in (
+                "generation",
+                "allocation_id",
+                "host_id",
+                "host_task_id",
+                "host_process_id",
+                "process_id",
+            )
+        }
+        return lease, expected, task_id, session_id
+
+    def test_operator_reaps_only_verified_dead_empty_session_atomically(self) -> None:
+        _lease, expected, _task_id, session_id = self.make_dead_reap_candidate()
+        allocation_before = dict(self.db.get_allocation(self.allocation_id))
+        self.service.set_dead_session_process_checker(
+            lambda session: (
+                True,
+                {
+                    "status": "absent",
+                    "checked_process_ids": [
+                        session["host_process_id"],
+                        session["process_id"],
+                    ],
+                },
+            )
+        )
+
+        result = self.service.reap_dead_session(
+            session_id, expected_identity=expected
+        )
+
+        self.assertEqual(result["session"]["state"], "closed")
+        self.assertEqual(result["session"]["failure_message"], "session heartbeat expired")
+        allocation_after = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(allocation_after["state"], allocation_before["state"])
+        self.assertEqual(
+            allocation_after["slurm_job_id"], allocation_before["slurm_job_id"]
+        )
+        event = next(
+            item
+            for item in self.db.list_events(limit=20)
+            if item["kind"] == "aedt_session_reaped"
+        )
+        self.assertEqual(event["entity_id"], str(session_id))
+        audit = json.loads(event["message"])
+        self.assertEqual(audit["host_task_status"], TaskStatus.CANCELLED.value)
+        self.assertEqual(audit["process_probe"]["status"], "absent")
+
+    def test_dead_session_reap_rejects_live_lease_nonterminal_task_and_pid(self) -> None:
+        _lease, expected, task_id, session_id = self.make_dead_reap_candidate(
+            empty=False
+        )
+        calls = []
+        self.service.set_dead_session_process_checker(
+            lambda _session: (calls.append("probe") or True, {"status": "absent"})
+        )
+        with self.assertRaisesRegex(ValueError, "zero live project leases"):
+            self.service.reap_dead_session(session_id, expected_identity=expected)
+        self.assertEqual(calls, [])
+
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE aedt_project_leases
+                SET state = 'released', finished_at = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            )
+        self.db.update_task(task_id, status=TaskStatus.RUNNING.value, finished_at=None)
+        with self.assertRaisesRegex(ValueError, "host task is not terminal"):
+            self.service.reap_dead_session(session_id, expected_identity=expected)
+        self.assertEqual(calls, [])
+
+        self.db.update_task(
+            task_id,
+            status=TaskStatus.CANCELLED.value,
+            finished_at="CURRENT_TIMESTAMP",
+        )
+        self.service.set_dead_session_process_checker(
+            lambda _session: (False, {"status": "present"})
+        )
+        with self.assertRaisesRegex(ValueError, "process identity is still present"):
+            self.service.reap_dead_session(session_id, expected_identity=expected)
+        self.assertEqual(self.service.get_session(session_id)["state"], "unhealthy")
+
+    def test_dead_session_reap_revalidates_live_lease_after_remote_probe(self) -> None:
+        lease, expected, _task_id, session_id = self.make_dead_reap_candidate()
+
+        def racing_probe(_session):
+            with self.db.connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE aedt_project_leases
+                    SET state = 'active', session_id = ?, slot_index = 0,
+                        finished_at = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (session_id, int(lease["id"])),
+                )
+            return True, {"status": "absent"}
+
+        self.service.set_dead_session_process_checker(racing_probe)
+        with self.assertRaisesRegex(ValueError, "zero live project leases"):
+            self.service.reap_dead_session(session_id, expected_identity=expected)
+        self.assertEqual(self.service.get_session(session_id)["state"], "unhealthy")
+
+    def test_scheduler_pid_probe_is_read_only_exact_allocation_srun(self) -> None:
+        _lease, _expected, _task_id, session_id = self.make_dead_reap_candidate()
+        scheduler = Scheduler(
+            self.db,
+            [AccountConfig("a", "invalid", 22, "a", "key", "/work")],
+            30,
+            client_factory=lambda _account: object(),
+        )
+
+        class ProbeSSH:
+            def __init__(self, result):
+                self.result = result
+                self.commands = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def run(self, command, timeout=None):
+                self.commands.append((command, timeout))
+                return self.result
+
+        absent_ssh = ProbeSSH(
+            SimpleNamespace(stdout="ABSENT\n", stderr="", exit_code=0)
+        )
+        with patch(
+            "slurm_scheduler.scheduler.SSHSession", return_value=absent_ssh
+        ):
+            absent, evidence = scheduler.aedt_session_processes_absent(
+                self.service.get_session(session_id)
+            )
+        self.assertTrue(absent)
+        self.assertEqual(evidence["status"], "absent")
+        command = absent_ssh.commands[0][0]
+        self.assertIn(f"--jobid=job-{self.allocation_id}", command)
+        self.assertIn("--nodelist=cpu-01", command)
+        self.assertIn("22001", command)
+        self.assertIn("23001", command)
+        self.assertNotIn("scancel", command)
+
+        present_ssh = ProbeSSH(
+            SimpleNamespace(stdout="PRESENT 23001\n", stderr="", exit_code=3)
+        )
+        with patch(
+            "slurm_scheduler.scheduler.SSHSession", return_value=present_ssh
+        ):
+            absent, evidence = scheduler.aedt_session_processes_absent(
+                self.service.get_session(session_id)
+            )
+        self.assertFalse(absent)
+        self.assertEqual(evidence["present_process_ids"], ["23001"])
 
     def test_one_session_has_exactly_two_slots(self) -> None:
         leases = [self.request(f"r{i}", allocation_id=self.allocation_id, node="cpu-01") for i in range(2)]

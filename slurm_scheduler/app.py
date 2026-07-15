@@ -650,6 +650,9 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     aedt_pool.set_warm_spare_admission_checker(
         scheduler.aedt_pool_warm_spare_admission
     )
+    aedt_pool.set_dead_session_process_checker(
+        scheduler.aedt_session_processes_absent
+    )
     def aedt_backend_admission(task) -> tuple[bool, str]:
         pool_config = aedt_pool.config()
         if pool_config.operational:

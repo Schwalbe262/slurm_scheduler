@@ -2048,6 +2048,95 @@ class Scheduler:
     def account_by_name(self, name: str) -> AccountConfig | None:
         return next((item for item in self.accounts if item.name == name), None)
 
+    def aedt_session_processes_absent(
+        self, session: dict[str, Any]
+    ) -> tuple[bool, dict[str, Any]]:
+        """Prove that both recorded owner PIDs are absent on the exact node.
+
+        This is intentionally a read-only ``srun --overlap`` probe.  An SSH,
+        Slurm, allocation-identity, or output ambiguity raises instead of
+        treating the process as dead; no allocation or sibling task is ever
+        cancelled by this check.
+        """
+
+        allocation_id = int(session.get("allocation_id") or 0)
+        allocation = self.db.get_allocation(allocation_id)
+        if not allocation:
+            raise RuntimeError("session allocation no longer exists")
+        account_name = str(allocation.get("account_name") or "").strip()
+        session_account = str(session.get("account_name") or "").strip()
+        if session_account and session_account != account_name:
+            raise RuntimeError("session account does not match its allocation")
+        account = self.account_by_name(account_name)
+        if not account:
+            raise RuntimeError("session allocation account is unavailable")
+
+        allocation_job = str(allocation.get("slurm_job_id") or "").strip()
+        session_job = str(session.get("host_slurm_job_id") or "").strip()
+        if not allocation_job or (session_job and session_job != allocation_job):
+            raise RuntimeError("session Slurm job identity does not match its allocation")
+        allocation_node = str(allocation.get("node_name") or "").strip()
+        session_node = str(
+            session.get("actual_node_name") or session.get("node_name") or ""
+        ).strip()
+        if (
+            not allocation_node
+            or not session_node
+            or allocation_node.split(".", 1)[0]
+            != session_node.split(".", 1)[0]
+        ):
+            raise RuntimeError("session node identity does not match its allocation")
+
+        host_pid = str(session.get("host_process_id") or "").strip()
+        aedt_pid = str(session.get("process_id") or "").strip()
+        if not re.fullmatch(r"[1-9][0-9]*", host_pid) or not re.fullmatch(
+            r"[1-9][0-9]*", aedt_pid
+        ):
+            raise RuntimeError("session process identity is incomplete")
+        process_ids = list(dict.fromkeys((host_pid, aedt_pid)))
+        pid_words = " ".join(process_ids)
+        probe_script = (
+            "present=''; "
+            f"for pid in {pid_words}; do "
+            "if ps -p \"$pid\" >/dev/null 2>&1; then "
+            "present=\"$present $pid\"; fi; done; "
+            "if [ -n \"$present\" ]; then "
+            "printf 'PRESENT%s\\n' \"$present\"; exit 3; fi; "
+            "echo ABSENT"
+        )
+        command = (
+            f"srun --jobid={shlex.quote(allocation_job)} --overlap "
+            "--nodes=1 --ntasks=1 --cpus-per-task=1 "
+            f"--nodelist={shlex.quote(allocation_node)} "
+            f"bash -lc {shlex.quote(probe_script)}"
+        )
+        try:
+            with SSHSession(account, default_timeout=45) as ssh:
+                result = ssh.run(command, timeout=40)
+        except Exception as exc:
+            raise RuntimeError(f"remote PID absence probe failed: {exc}") from exc
+
+        lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        evidence: dict[str, Any] = {
+            "allocation_id": allocation_id,
+            "slurm_job_id": allocation_job,
+            "node_name": allocation_node,
+            "checked_process_ids": process_ids,
+        }
+        if result.exit_code == 0 and lines == ["ABSENT"]:
+            evidence["status"] = "absent"
+            return True, evidence
+        if result.exit_code == 3 and len(lines) == 1 and lines[0].startswith("PRESENT "):
+            present = lines[0].split()[1:]
+            if present and set(present).issubset(set(process_ids)):
+                evidence["status"] = "present"
+                evidence["present_process_ids"] = present
+                return False, evidence
+        raise RuntimeError(
+            "remote PID absence probe returned an inconclusive result "
+            f"(exit={int(result.exit_code)})"
+        )
+
     def account_supports(
         self,
         account: AccountConfig | None,
