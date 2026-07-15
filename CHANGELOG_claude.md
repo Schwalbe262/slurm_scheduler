@@ -1,3 +1,20 @@
+## 2026-07-15 (Codex, supervised) - Session-host resilience + unhealthy recovery
+- Hosts survive control-plane outages: bounded retry with backoff/jitter for a
+  360s budget on all host HTTP calls; terminal 4xx still exits immediately
+  (83f77ee 409 semantics preserved). Lease clients retry through relay blips.
+- PyAEDT 0.22 workarounds: psutil.process_iter cmdline=None shim, explicit-port
+  launch/attach recovery, PID/port validation, 3 launch attempts with cleanup.
+  Evidence showed 'Desktop released' was cleanup after registration failure.
+- Server: heartbeat-only unhealthy sessions auto-recover to ready/busy;
+  fault/quarantine never auto-recovers. New durable knob
+  aedt_pool_unhealthy_recycle_grace_seconds (default 180) delays allocation
+  recycle so a blip+recovery causes no churn. Same-allocation host launches
+  staggered (AEDT_POOL_HOST_LAUNCH_STAGGER_SECONDS); one-tick grace after the
+  relay republishes before host launches.
+- Tests: pool suites + relay 101 passed; core 363 passed. Commit e97fb30.
+- Deploy note: node checkouts must be synced for host-side fixes to act;
+  protocol is backward compatible either way.
+
 ## 2026-07-15 (Claude) - Operator knob for pool liveness windows + threadpool root cause
 - Root cause of the recurring "lease_heartbeat_expired" collapses even after
   the client heartbeat fix: heartbeats land as SQLite writes and serialize
