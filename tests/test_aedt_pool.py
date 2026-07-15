@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
+import io
 import json
 import os
 import tempfile
@@ -10,6 +12,7 @@ import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from slurm_scheduler.aedt_attach_client import (
@@ -17,9 +20,17 @@ from slurm_scheduler.aedt_attach_client import (
     AedtProjectLease,
     acquire_project_lease,
 )
-from slurm_scheduler.aedt_pool import AedtPoolRuntime, AedtPoolService
+from slurm_scheduler.aedt_pool import (
+    UNHEALTHY_ALLOCATION_RECYCLE_REASON,
+    AedtPoolRuntime,
+    AedtPoolService,
+)
 from slurm_scheduler.aedt_pool_api import create_aedt_pool_router
-from slurm_scheduler.aedt_session_host import AedtSessionHost, ControlPlaneClient
+from slurm_scheduler.aedt_session_host import (
+    AedtSessionHost,
+    ControlPlaneClient,
+    _install_pyaedt_psutil_cmdline_shim,
+)
 from slurm_scheduler.config import AccountConfig
 from slurm_scheduler.db import Database
 from slurm_scheduler.models import TaskCreate, TaskStatus
@@ -141,6 +152,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
         self.assertEqual(config.max_sessions, 250)
         self.assertEqual(config.min_idle_sessions, 0)
         self.assertEqual(config.target_projects, 500)
+        self.assertEqual(config.unhealthy_recycle_grace_seconds, 180)
         self.assertFalse(config.enabled)
         self.assertFalse(config.operational)
         self.assertEqual(self.service.summary()["sessions"], [])
@@ -174,18 +186,25 @@ class AedtPoolGateTests(AedtPoolTestCase):
         config = self.service.set_operator_timeouts(
             lease_ttl_seconds=900,
             session_heartbeat_timeout_seconds=600,
+            unhealthy_recycle_grace_seconds=240,
         )
         self.assertEqual(config.lease_ttl_seconds, 900)
         self.assertEqual(config.session_heartbeat_timeout_seconds, 600)
+        self.assertEqual(config.unhealthy_recycle_grace_seconds, 240)
         with self.assertRaises(ValueError):
             self.service.set_operator_timeouts(lease_ttl_seconds=59)
         with self.assertRaises(ValueError):
             self.service.set_operator_timeouts(
                 session_heartbeat_timeout_seconds=3601
             )
+        with self.assertRaises(ValueError):
+            self.service.set_operator_timeouts(
+                unhealthy_recycle_grace_seconds=3601
+            )
         unchanged = self.service.set_operator_timeouts(lease_ttl_seconds=600)
         self.assertEqual(unchanged.lease_ttl_seconds, 600)
         self.assertEqual(unchanged.session_heartbeat_timeout_seconds, 600)
+        self.assertEqual(unchanged.unhealthy_recycle_grace_seconds, 240)
 
     def test_operator_limits_fail_closed_on_invalid_topology(self) -> None:
         config = self.service.set_operator_limits(
@@ -259,34 +278,25 @@ class AedtPoolGateTests(AedtPoolTestCase):
             if getattr(route, "path", "") == "/api/aedt-pool/config"
         )
 
-        class Request:
-            def __init__(self, payload):
-                self.payload = payload
-
-            async def json(self):
-                return self.payload
-
-        response = asyncio.run(endpoint(Request({
-            "max_aedt_sessions": 250,
-            "min_idle_aedt_sessions": 1,
-            "target_project_concurrency": 400,
-            "projects_per_aedt": 2,
-        })))
+        response = endpoint(
+            {
+                "max_aedt_sessions": 250,
+                "min_idle_aedt_sessions": 1,
+                "target_project_concurrency": 400,
+                "projects_per_aedt": 2,
+            }
+        )
         self.assertEqual(response["target_project_concurrency"], 400)
         self.assertEqual(response["min_idle_aedt_sessions"], 1)
         self.assertEqual(response["projects_per_aedt"], 2)
         from fastapi import HTTPException
 
         with self.assertRaises(HTTPException) as raised:
-            asyncio.run(
-                endpoint(
-                    Request(
-                        {
-                            "max_aedt_sessions": 250,
-                            "unexpected": 999,
-                        }
-                    )
-                )
+            endpoint(
+                {
+                    "max_aedt_sessions": 250,
+                    "unexpected": 999,
+                }
             )
         self.assertEqual(raised.exception.status_code, 422)
 
@@ -945,6 +955,36 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             ).fetchone()[0]
         self.assertEqual(lease_state, "failed")
         self.assertEqual(fresh_state, "unhealthy")
+        allocation = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(allocation["state"], "draining")
+        self.assertEqual(
+            allocation["drain_reason"], UNHEALTHY_ALLOCATION_RECYCLE_REASON
+        )
+
+    def test_reaped_allocation_is_not_reused_by_same_reconcile_plan(self) -> None:
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO aedt_sessions (
+                    session_key, allocation_id, account_name, node_name,
+                    slots_total, state, failure_message, last_heartbeat_at
+                ) VALUES ('stale-only-host', ?, 'a', 'cpu-01', 2, 'unhealthy',
+                          'lost heartbeat', '2020-01-01 00:00:00')
+                """,
+                (self.allocation_id,),
+            )
+
+        lease, _token = self.request(
+            "replace-stale-host",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+
+        self.assertEqual(lease["state"], "queued")
+        allocation = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(allocation["state"], "draining")
+        self.assertEqual(self.service.starting_sessions(), [])
+        self.assertGreaterEqual(self.service.summary()["plan"]["node_requests"], 1)
 
     def test_exclusive_1to1_lease_never_accepts_a_sibling(self) -> None:
         self.service.set_operator_limit(1)
@@ -1002,6 +1042,354 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(self.service.get_lease(int(third["id"]))["state"], "leased")
         self.assertEqual(self.service.get_lease(int(second["id"]))["state"], "leased")
 
+    def test_release_completion_exact_replay_is_idempotent(self) -> None:
+        lease, lease_token = self.request(
+            "release-replay", allocation_id=self.allocation_id, node="cpu-01"
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        self.service.release_lease(int(lease["id"]), lease_token)
+
+        first = self.service.complete_release(
+            int(session["id"]), host_token, int(lease["id"]), success=True
+        )
+        replay = self.service.complete_release(
+            int(session["id"]), host_token, int(lease["id"]), success=True
+        )
+
+        self.assertEqual(first["state"], "released")
+        self.assertEqual(replay["state"], "released")
+        with self.assertRaisesRegex(ValueError, "lease is released"):
+            self.service.complete_release(
+                int(session["id"]),
+                host_token,
+                int(lease["id"]),
+                success=False,
+                failure_message="contradictory replay",
+            )
+
+        failed_lease, failed_token = self.request(
+            "failed-release-replay",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        self.service.release_lease(int(failed_lease["id"]), failed_token)
+        failed = self.service.complete_release(
+            int(session["id"]),
+            host_token,
+            int(failed_lease["id"]),
+            success=False,
+            failure_message=" close failed ",
+        )
+        failed_replay = self.service.complete_release(
+            int(session["id"]),
+            host_token,
+            int(failed_lease["id"]),
+            success=False,
+            failure_message="close failed",
+        )
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed_replay["state"], "failed")
+        with self.assertRaisesRegex(ValueError, "lease is failed"):
+            self.service.complete_release(
+                int(session["id"]),
+                host_token,
+                int(failed_lease["id"]),
+                success=False,
+                failure_message="different failure",
+            )
+
+    def test_valid_heartbeat_recovers_only_heartbeat_timeout_unhealthy(self) -> None:
+        self.service.set_operator_timeouts(
+            lease_ttl_seconds=900,
+            session_heartbeat_timeout_seconds=600,
+        )
+        self.request(
+            "heartbeat-recovery",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        self.clock.advance(self.service.config().session_heartbeat_timeout_seconds + 1)
+        self.service.reconcile(execute=True)
+        timed_out = self.service.get_session(int(session["id"]))
+        self.assertEqual(timed_out["state"], "unhealthy")
+        self.assertEqual(timed_out["failure_message"], "session heartbeat expired")
+        self.assertIsNotNone(timed_out["drain_requested_at"])
+        allocation = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(allocation["state"], "active")
+        self.assertIsNone(allocation["drain_at"])
+
+        recovered = self.service.heartbeat_session(int(session["id"]), host_token)
+
+        self.assertEqual(recovered["state"], "busy")
+        self.assertEqual(recovered["failure_message"], "")
+        self.assertIsNone(recovered["drain_requested_at"])
+        self.assertFalse(
+            self.service.session_commands(int(session["id"]), host_token)["drain"]
+        )
+        self.assertEqual(self.db.get_allocation(self.allocation_id)["state"], "active")
+
+    def test_valid_heartbeat_recovers_idle_session_to_ready(self) -> None:
+        self.service.set_operator_timeouts(
+            lease_ttl_seconds=900,
+            session_heartbeat_timeout_seconds=600,
+        )
+        lease, lease_token = self.request(
+            "ready-heartbeat-recovery",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        self.service.release_lease(int(lease["id"]), lease_token)
+        self.service.complete_release(
+            int(session["id"]), host_token, int(lease["id"]), success=True
+        )
+        self.assertEqual(
+            self.service.get_session(int(session["id"]))["state"], "ready"
+        )
+        self.clock.advance(self.service.config().session_heartbeat_timeout_seconds + 1)
+        self.service.reconcile(execute=True)
+        timed_out = self.service.get_session(int(session["id"]))
+        self.assertEqual(timed_out["state"], "unhealthy")
+        self.assertEqual(timed_out["failure_message"], "session heartbeat expired")
+        self.assertIsNotNone(timed_out["drain_requested_at"])
+
+        recovered = self.service.heartbeat_session(int(session["id"]), host_token)
+
+        self.assertEqual(recovered["state"], "ready")
+        self.assertEqual(recovered["failure_message"], "")
+        self.assertIsNone(recovered["drain_requested_at"])
+        self.assertEqual(self.db.get_allocation(self.allocation_id)["state"], "active")
+
+    def test_unhealthy_allocation_recycle_waits_for_configured_grace(self) -> None:
+        self.service.set_operator_timeouts(
+            lease_ttl_seconds=900,
+            session_heartbeat_timeout_seconds=600,
+            unhealthy_recycle_grace_seconds=180,
+        )
+        self.request(
+            "heartbeat-recycle-grace",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, _host_token = self.start_one_session(self.allocation_id)
+        self.clock.advance(self.service.config().session_heartbeat_timeout_seconds + 1)
+        self.service.reconcile(execute=True)
+        unhealthy = self.service.get_session(int(session["id"]))
+        self.assertEqual(unhealthy["failure_message"], "session heartbeat expired")
+        self.assertEqual(self.db.get_allocation(self.allocation_id)["state"], "active")
+
+        self.clock.advance(self.service.config().unhealthy_recycle_grace_seconds)
+        self.service.reconcile(execute=True)
+        self.assertEqual(self.db.get_allocation(self.allocation_id)["state"], "active")
+
+        self.clock.advance(1)
+        self.service.reconcile(execute=True)
+        allocation = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(allocation["state"], "draining")
+        self.assertEqual(
+            allocation["drain_reason"], UNHEALTHY_ALLOCATION_RECYCLE_REASON
+        )
+
+    def test_late_heartbeat_cancels_only_heartbeat_recycle_drain(self) -> None:
+        self.service.set_operator_timeouts(
+            lease_ttl_seconds=900,
+            session_heartbeat_timeout_seconds=600,
+            unhealthy_recycle_grace_seconds=180,
+        )
+        self.request(
+            "late-heartbeat-recovery",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        self.clock.advance(self.service.config().session_heartbeat_timeout_seconds + 1)
+        self.service.reconcile(execute=True)
+        self.clock.advance(self.service.config().unhealthy_recycle_grace_seconds + 1)
+        self.service.reconcile(execute=True)
+        draining = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(draining["state"], "draining")
+        self.assertEqual(
+            draining["drain_reason"], UNHEALTHY_ALLOCATION_RECYCLE_REASON
+        )
+
+        recovered = self.service.heartbeat_session(int(session["id"]), host_token)
+
+        self.assertEqual(recovered["state"], "busy")
+        self.assertEqual(recovered["failure_message"], "")
+        allocation = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(allocation["state"], "active")
+        self.assertIsNone(allocation["drain_at"])
+
+    def test_long_recycle_grace_delays_reap_until_allocation_recycles(self) -> None:
+        self.service.set_operator_timeouts(
+            lease_ttl_seconds=3600,
+            session_heartbeat_timeout_seconds=600,
+            unhealthy_recycle_grace_seconds=3600,
+        )
+        lease, lease_token = self.request(
+            "long-recycle-grace",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        self.service.release_lease(int(lease["id"]), lease_token)
+        self.service.complete_release(
+            int(session["id"]), host_token, int(lease["id"]), success=True
+        )
+        self.clock.advance(self.service.config().session_heartbeat_timeout_seconds + 1)
+        self.service.reconcile(execute=True)
+        self.assertEqual(
+            self.service.get_session(int(session["id"]))["state"], "unhealthy"
+        )
+
+        # Cross the stale-host reap horizon while still inside the configured
+        # unhealthy recycle grace.  The recoverable row must remain intact.
+        self.clock.advance(
+            5 * self.service.config().session_heartbeat_timeout_seconds
+        )
+        self.service.reconcile(execute=True)
+        self.assertEqual(
+            self.service.get_session(int(session["id"]))["state"], "unhealthy"
+        )
+        self.assertEqual(self.db.get_allocation(self.allocation_id)["state"], "active")
+
+        self.clock.advance(self.service.config().unhealthy_recycle_grace_seconds)
+        self.service.reconcile(execute=True)
+        self.assertEqual(
+            self.service.get_session(int(session["id"]))["state"], "failed"
+        )
+        self.assertEqual(
+            self.db.get_allocation(self.allocation_id)["state"], "draining"
+        )
+
+    def test_heartbeat_does_not_revive_session_that_was_already_draining(self) -> None:
+        self.service.set_operator_timeouts(
+            lease_ttl_seconds=900,
+            session_heartbeat_timeout_seconds=600,
+        )
+        self.request(
+            "draining-heartbeat-timeout",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE aedt_sessions
+                SET state = 'draining', failure_message = 'operator drain',
+                    drain_requested_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (int(session["id"]),),
+            )
+        self.clock.advance(self.service.config().session_heartbeat_timeout_seconds + 1)
+        self.service.reconcile(execute=True)
+
+        heartbeat = self.service.heartbeat_session(int(session["id"]), host_token)
+
+        self.assertEqual(heartbeat["state"], "unhealthy")
+        self.assertIn("already draining", heartbeat["failure_message"])
+        self.assertTrue(
+            self.service.session_commands(int(session["id"]), host_token)["drain"]
+        )
+
+    def test_lease_expiry_after_host_timeout_prevents_heartbeat_recovery(self) -> None:
+        self.service.set_operator_timeouts(
+            lease_ttl_seconds=900,
+            session_heartbeat_timeout_seconds=600,
+            unhealthy_recycle_grace_seconds=3600,
+        )
+        lease, _lease_token = self.request(
+            "lease-expiry-after-host-timeout",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        self.clock.advance(self.service.config().session_heartbeat_timeout_seconds + 1)
+        self.service.reconcile(execute=True)
+        heartbeat_only = self.service.get_session(int(session["id"]))
+        self.assertEqual(heartbeat_only["failure_message"], "session heartbeat expired")
+        self.assertEqual(heartbeat_only["quarantine_reason"], "")
+
+        self.clock.advance(
+            self.service.config().lease_ttl_seconds
+            - self.service.config().session_heartbeat_timeout_seconds
+        )
+        self.service.reconcile(execute=True)
+        quarantined = self.service.get_session(int(session["id"]))
+        self.assertEqual(
+            self.service.get_lease(int(lease["id"]))["state"], "releasing"
+        )
+        self.assertEqual(quarantined["state"], "unhealthy")
+        self.assertEqual(
+            quarantined["quarantine_reason"], "lease_heartbeat_expired"
+        )
+        self.assertEqual(self.db.get_allocation(self.allocation_id)["state"], "draining")
+
+        heartbeat = self.service.heartbeat_session(int(session["id"]), host_token)
+
+        self.assertEqual(heartbeat["state"], "unhealthy")
+        self.assertEqual(heartbeat["quarantine_reason"], "lease_heartbeat_expired")
+        self.assertTrue(
+            self.service.session_commands(int(session["id"]), host_token)["drain"]
+        )
+
+    def test_operator_disable_prevents_heartbeat_timeout_recovery(self) -> None:
+        self.service.set_operator_timeouts(
+            lease_ttl_seconds=900,
+            session_heartbeat_timeout_seconds=600,
+        )
+        self.request(
+            "disabled-heartbeat-recovery",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        self.clock.advance(self.service.config().session_heartbeat_timeout_seconds + 1)
+        self.service.reconcile(execute=True)
+        self.assertEqual(
+            self.service.get_session(int(session["id"]))["state"], "unhealthy"
+        )
+
+        self.service.set_enabled(False)
+        heartbeat = self.service.heartbeat_session(int(session["id"]), host_token)
+
+        self.assertEqual(heartbeat["state"], "draining")
+        self.assertIn("operator disabled", heartbeat["failure_message"])
+        self.assertTrue(
+            self.service.session_commands(int(session["id"]), host_token)["drain"]
+        )
+
+    def test_default_liveness_windows_cover_five_minute_control_plane_outage(
+        self,
+    ) -> None:
+        config = self.service.config()
+        self.assertGreaterEqual(config.lease_ttl_seconds, 360)
+        self.assertGreaterEqual(config.session_heartbeat_timeout_seconds, 360)
+        lease, lease_token = self.request(
+            "five-minute-live-work",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+
+        self.clock.advance(300)
+        self.service.reconcile(execute=True)
+
+        self.assertIn(
+            self.service.get_lease(int(lease["id"]))["state"], {"leased", "active"}
+        )
+        self.assertEqual(
+            self.service.get_session(int(session["id"]))["state"], "busy"
+        )
+        self.service.heartbeat_lease(int(lease["id"]), lease_token)
+        self.service.heartbeat_session(int(session["id"]), host_token)
+        self.assertFalse(
+            self.service.session_commands(int(session["id"]), host_token)["drain"]
+        )
+
     def test_client_binds_actual_aedt_project_name_after_session_attach(self) -> None:
         lease, token = self.request("temporary", allocation_id=self.allocation_id, node="cpu-01")
         self.start_one_session(self.allocation_id)
@@ -1019,7 +1407,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.clock.advance(170)
         self.service.reconcile(execute=True)
         self.assertEqual(self.service.get_lease(int(lease["id"]))["state"], "queued")
-        self.clock.advance(181)
+        self.clock.advance(self.service.config().lease_ttl_seconds)
         self.service.reconcile(execute=True)
         self.assertEqual(self.service.get_lease(int(lease["id"]))["state"], "expired")
 
@@ -1103,9 +1491,16 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         quarantined = self.service.get_session(session_id)
         self.assertEqual(quarantined["state"], "unhealthy")
         self.assertEqual(quarantined["quarantine_reason"], "aedt_death_reported")
+        failure_message = quarantined["failure_message"]
+        drain_requested_at = quarantined["drain_requested_at"]
+        allocation = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(allocation["state"], "draining")
 
         heartbeat = self.service.heartbeat_session(session_id, host_token)
         self.assertEqual(heartbeat["state"], "unhealthy")
+        self.assertEqual(heartbeat["failure_message"], failure_message)
+        self.assertEqual(heartbeat["drain_requested_at"], drain_requested_at)
+        self.assertEqual(self.db.get_allocation(self.allocation_id)["state"], "draining")
         commands = self.service.session_commands(session_id, host_token)
         self.assertTrue(commands["drain"])
         with self.assertRaises(PermissionError):
@@ -1163,6 +1558,22 @@ class FakeRuntimeScheduler:
     def open_allocation_record(self, reason: str, **kwargs):
         self.open_calls.append({"reason": reason, **kwargs})
         return {"id": len(self.open_calls), "state": "pending"}
+
+
+class FakeHostLaunchScheduler(FakeRuntimeScheduler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.account = object()
+        self.host_tasks: list[dict] = []
+
+    def account_by_name(self, _name: str):
+        return self.account
+
+    def reserve_task_on_allocation(self, task, _allocation, _account):
+        return task
+
+    def start_background_task_attach(self, task, _allocation, _account) -> None:
+        self.host_tasks.append(task)
 
 
 class AedtRuntimeTests(AedtPoolTestCase):
@@ -1265,6 +1676,62 @@ class AedtRuntimeTests(AedtPoolTestCase):
         self.assertEqual(plan["node_allocations_opened"], 1)
         self.assertEqual(len(fake.open_calls), 1)
 
+    def test_relay_recovery_skips_session_host_starts_for_one_tick(self) -> None:
+        self.make_operational()
+        runtime = AedtPoolRuntime(
+            self.service,
+            FakeRuntimeScheduler(),
+            interval_seconds=30,
+            require_published_control_plane_url=True,
+        )
+
+        self.assertFalse(runtime.tick()["control_plane_ready"])
+        self.service.set_control_plane_url("http://gate2:18790")
+        with patch.object(runtime, "_ensure_session_hosts", return_value=2) as ensure:
+            recovery = runtime.tick()
+            settled = runtime.tick()
+            self.service.set_control_plane_url("")
+            runtime.tick()
+            self.service.set_control_plane_url("http://gate2:18790")
+            second_recovery = runtime.tick()
+
+        self.assertEqual(recovery["host_tasks_started"], 0)
+        self.assertEqual(settled["host_tasks_started"], 2)
+        self.assertEqual(second_recovery["host_tasks_started"], 0)
+        ensure.assert_called_once()
+
+    def test_same_allocation_session_host_launches_are_staggered(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=3,
+            min_idle_sessions=3,
+            target_projects=0,
+        )
+        self.add_dedicated_allocation()
+        self.make_operational()
+        self.service.reconcile(execute=True)
+        scheduler = FakeHostLaunchScheduler()
+        runtime = AedtPoolRuntime(
+            self.service,
+            scheduler,
+            interval_seconds=30,
+            scheduler_url="http://scheduler:8000",
+            host_remote_cwd="/work/aedt",
+            host_bootstrap_token_file="/shared/aedt-token",
+            host_launch_stagger_seconds=15,
+        )
+
+        started = runtime._ensure_session_hosts(self.service.config())
+
+        self.assertEqual(started, 3)
+        commands = [task["command"] for task in scheduler.host_tasks]
+        self.assertFalse(commands[0].startswith("sleep "))
+        self.assertTrue(commands[1].startswith("sleep 15 && exec "))
+        self.assertTrue(commands[2].startswith("sleep 30 && exec "))
+        self.assertTrue(all("--session-id" in command for command in commands))
+        self.assertTrue(
+            all("control-plane-outage" not in command for command in commands)
+        )
+
     def test_node_request_uses_full_scheduler_shape_not_eight_cpu_micro_node(self) -> None:
         self.make_operational()
         self.request("needs-node")
@@ -1315,7 +1782,35 @@ class FakeLeaseHttp:
         return {"id": 1, "state": "leased", "endpoint": "cpu-01:50001"}
 
 
+class TransientLeaseHeartbeatHttp:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def request(self, method, path, payload=None, lease_token=""):
+        self.calls += 1
+        if self.calls < 3:
+            raise urllib.error.HTTPError(
+                path, 503, "Service Unavailable", None, None
+            )
+        return {"id": 1, "state": "active", "endpoint": "cpu-01:50001"}
+
+
 class AttachClientTests(unittest.TestCase):
+    def test_lease_heartbeat_retries_transient_5xx(self) -> None:
+        http = TransientLeaseHeartbeatHttp()
+        lease = AedtProjectLease(http, 1, "token", "p")
+        with (
+            patch("slurm_scheduler.aedt_attach_client.time.sleep") as sleep,
+            patch(
+                "slurm_scheduler.aedt_attach_client.random.uniform", return_value=0
+            ),
+        ):
+            heartbeat = lease.heartbeat()
+
+        self.assertEqual(heartbeat["state"], "active")
+        self.assertEqual(http.calls, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.5, 1.0])
+
     def test_waiting_client_heartbeats_while_queued(self) -> None:
         http = FakeLeaseHttp()
         lease = AedtProjectLease(http, 1, "token", "p")
@@ -1616,7 +2111,322 @@ class ClaimRaceControlPlane(FakeHostControlPlane):
         return super().request(method, path, payload, host_token=host_token)
 
 
+class RetryClock:
+    def __init__(self) -> None:
+        self.seconds = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.seconds
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.seconds += seconds
+
+
+class FiveMinuteOutageControlPlane(FakeHostControlPlane):
+    def __init__(self, events: list[str], clock: RetryClock) -> None:
+        super().__init__(events)
+        self.clock = clock
+        self.heartbeat_attempts = 0
+
+    def request(self, method, path, payload=None, host_token=""):
+        if path.endswith("/heartbeat"):
+            self.heartbeat_attempts += 1
+            if self.clock.seconds < 300:
+                # Model the real client's 30-second request timeout, including
+                # a final failed call that straddles relay recovery at t=300.
+                self.clock.seconds += 30
+                self.events.append("heartbeat-503")
+                raise urllib.error.HTTPError(
+                    path, 503, "Service Unavailable", None, None
+                )
+            self.events.append("heartbeat-recovered")
+        return super().request(method, path, payload, host_token=host_token)
+
+
+class TerminalRegistrationControlPlane(FakeHostControlPlane):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events)
+        self.registration_attempts = 0
+
+    def request(self, method, path, payload=None, host_token=""):
+        if path.endswith("/register"):
+            self.registration_attempts += 1
+            body = io.BytesIO(
+                json.dumps(
+                    {"detail": "session start claim is not owned by this host"}
+                ).encode("utf-8")
+            )
+            raise urllib.error.HTTPError(path, 409, "Conflict", None, body)
+        if path.endswith("/start-failed"):
+            self.events.append("start-failed")
+            return {}
+        return super().request(method, path, payload, host_token=host_token)
+
+
+class TerminalHeartbeatControlPlane(FakeHostControlPlane):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events)
+        self.heartbeat_attempts = 0
+
+    def request(self, method, path, payload=None, host_token=""):
+        if path.endswith("/heartbeat"):
+            self.heartbeat_attempts += 1
+            raise urllib.error.HTTPError(path, 403, "Forbidden", None, None)
+        return super().request(method, path, payload, host_token=host_token)
+
+
+class RemoteDisconnectRegistrationControlPlane(FakeHostControlPlane):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events)
+        self.registration_attempts = 0
+
+    def request(self, method, path, payload=None, host_token=""):
+        if path.endswith("/register"):
+            self.registration_attempts += 1
+            self.events.append(f"register-{self.registration_attempts}")
+            if self.registration_attempts == 1:
+                raise http.client.RemoteDisconnected(
+                    "Remote end closed connection without response"
+                )
+        return super().request(method, path, payload, host_token=host_token)
+
+
 class SessionHostTests(unittest.TestCase):
+    def test_psutil_shim_sanitizes_none_cmdline_and_is_idempotent(self) -> None:
+        calls: list[tuple[tuple, dict]] = []
+        processes = [
+            SimpleNamespace(info={"pid": 10, "cmdline": None}),
+            SimpleNamespace(info={"pid": 11, "cmdline": ["ansysedt", "-ng"]}),
+        ]
+
+        def process_iter(*args, **kwargs):
+            calls.append((args, kwargs))
+            return iter(processes)
+
+        fake_psutil = SimpleNamespace(process_iter=process_iter)
+        _install_pyaedt_psutil_cmdline_shim(fake_psutil)
+        installed = fake_psutil.process_iter
+        _install_pyaedt_psutil_cmdline_shim(fake_psutil)
+
+        yielded = list(fake_psutil.process_iter(attrs=("pid", "cmdline")))
+
+        self.assertIs(fake_psutil.process_iter, installed)
+        self.assertEqual(yielded, processes)
+        self.assertEqual(processes[0].info["cmdline"], [])
+        self.assertEqual(processes[1].info["cmdline"], ["ansysedt", "-ng"])
+        self.assertEqual(calls, [((), {"attrs": ("pid", "cmdline")})])
+
+    def test_failed_launch_cleanup_matches_exact_current_user_port(self) -> None:
+        matching = SimpleNamespace(
+            info={
+                "pid": 3824121,
+                "name": "ansysedt",
+                "username": "cluster-user",
+                "cmdline": ["/ansys/ansysedt", "-grpcsrv", "44773", "-ng"],
+                "create_time": 105.0,
+            }
+        )
+        wrong_port = SimpleNamespace(
+            info={
+                **matching.info,
+                "pid": 3824122,
+                "cmdline": ["/ansys/ansysedt", "-grpcsrv", "44774", "-ng"],
+            }
+        )
+        processes = [matching, wrong_port]
+        fake_psutil = SimpleNamespace(
+            Process=lambda _pid: SimpleNamespace(username=lambda: "cluster-user"),
+            process_iter=lambda **_kwargs: iter(processes),
+        )
+
+        with patch.dict("sys.modules", {"psutil": fake_psutil}):
+            self.assertEqual(
+                AedtSessionHost._owned_desktop_pid_on_port(44773, 100.0),
+                "3824121",
+            )
+            processes.append(
+                SimpleNamespace(info={**matching.info, "pid": 3824123})
+            )
+            self.assertEqual(
+                AedtSessionHost._owned_desktop_pid_on_port(44773, 100.0), ""
+            )
+
+    def test_desktop_launch_failure_recovers_by_explicit_port_attach(self) -> None:
+        host = AedtSessionHost(
+            FakeHostControlPlane([]), allocation_id=1, node_name="cpu-01"
+        )
+        calls: list[dict] = []
+        recovered = SimpleNamespace(
+            port=44773, aedt_process_id="3824121", odesktop=object()
+        )
+
+        def create_desktop(*, new_desktop: bool, port: int):
+            calls.append({"new_desktop": new_desktop, "port": port})
+            if new_desktop:
+                raise RuntimeError("session initialization failed")
+            return recovered
+
+        host._create_desktop = create_desktop
+        with (
+            patch.object(host, "_find_free_desktop_port", return_value=44773),
+            patch.object(host, "_desktop_port_is_listening", return_value=True),
+            patch(
+                "slurm_scheduler.aedt_session_host._install_pyaedt_psutil_cmdline_shim"
+            ) as shim,
+            patch("slurm_scheduler.aedt_session_host.time.sleep") as sleep,
+        ):
+            desktop = host._start_desktop()
+
+        self.assertIs(desktop, recovered)
+        self.assertEqual(
+            calls,
+            [
+                {"new_desktop": True, "port": 44773},
+                {"new_desktop": False, "port": 44773},
+            ],
+        )
+        shim.assert_called_once_with()
+        sleep.assert_not_called()
+
+    def test_desktop_launch_retries_two_full_cycles_before_success(self) -> None:
+        host = AedtSessionHost(
+            FakeHostControlPlane([]), allocation_id=1, node_name="cpu-01"
+        )
+        calls: list[dict] = []
+
+        def create_desktop(*, new_desktop: bool, port: int):
+            calls.append({"new_desktop": new_desktop, "port": port})
+            if len(calls) < 3:
+                raise RuntimeError(f"launch call {len(calls)} failed")
+            return SimpleNamespace(
+                port=port, aedt_process_id="3824121", odesktop=object()
+            )
+
+        host._create_desktop = create_desktop
+        with (
+            patch.object(
+                host,
+                "_find_free_desktop_port",
+                side_effect=[44001, 44002, 44003],
+            ),
+            patch.object(host, "_desktop_port_is_listening", return_value=False),
+            patch.object(host, "_cleanup_failed_desktop_launch") as cleanup,
+            patch(
+                "slurm_scheduler.aedt_session_host._install_pyaedt_psutil_cmdline_shim"
+            ),
+            patch("slurm_scheduler.aedt_session_host.time.sleep") as sleep,
+        ):
+            desktop = host._start_desktop()
+
+        self.assertEqual(desktop.port, 44003)
+        self.assertEqual(
+            [(item["new_desktop"], item["port"]) for item in calls],
+            [
+                (True, 44001),
+                (True, 44002),
+                (True, 44003),
+            ],
+        )
+        self.assertEqual(cleanup.call_count, 2)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list], [2.0, 2.0]
+        )
+
+    def test_registration_remote_disconnect_retries_without_closing_desktop(
+        self,
+    ) -> None:
+        events: list[str] = []
+        control = RemoteDisconnectRegistrationControlPlane(events)
+        host = AedtSessionHost(control, allocation_id=1, node_name="cpu-01")
+        host._start_desktop = lambda: FakeDesktop(events)
+
+        with (
+            patch("slurm_scheduler.aedt_session_host.time.sleep", return_value=None),
+            patch("slurm_scheduler.aedt_session_host.random.uniform", return_value=0),
+        ):
+            self.assertEqual(host.run(), 2)
+
+        self.assertEqual(control.registration_attempts, 2)
+        self.assertLess(events.index("register-2"), events.index("desktop-close"))
+
+    def test_transient_5xx_outage_survives_five_minutes_with_desktop(self) -> None:
+        events: list[str] = []
+        clock = RetryClock()
+        control = FiveMinuteOutageControlPlane(events, clock)
+        host = AedtSessionHost(
+            control,
+            allocation_id=1,
+            node_name="cpu-01",
+            heartbeat_seconds=5,
+        )
+        host._start_desktop = lambda: FakeDesktop(events)
+
+        with (
+            patch(
+                "slurm_scheduler.aedt_session_host.time.monotonic",
+                side_effect=clock.monotonic,
+            ),
+            patch(
+                "slurm_scheduler.aedt_session_host.time.sleep",
+                side_effect=clock.sleep,
+            ),
+            patch(
+                "slurm_scheduler.aedt_session_host.random.uniform", return_value=0
+            ) as jitter,
+        ):
+            self.assertEqual(host.run(), 2)
+
+        self.assertGreaterEqual(host.control_plane_outage_seconds, 300)
+        self.assertGreater(control.heartbeat_attempts, 1)
+        self.assertGreaterEqual(clock.seconds, 300)
+        self.assertEqual(clock.sleeps[:6], [0.5, 1, 2, 4, 8, 10])
+        jitter.assert_called()
+        self.assertLess(
+            events.index("heartbeat-recovered"), events.index("desktop-close")
+        )
+
+    def test_control_plane_outage_budget_must_be_finite(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be finite"):
+            AedtSessionHost(
+                FakeHostControlPlane([]),
+                allocation_id=1,
+                node_name="cpu-01",
+                control_plane_outage_seconds=float("inf"),
+            )
+
+    def test_terminal_registration_409_exits_immediately(self) -> None:
+        events: list[str] = []
+        control = TerminalRegistrationControlPlane(events)
+        host = AedtSessionHost(control, allocation_id=1, node_name="cpu-01")
+        host._start_desktop = lambda: FakeDesktop(events)
+
+        with patch(
+            "slurm_scheduler.aedt_session_host.time.sleep", return_value=None
+        ) as sleep:
+            self.assertEqual(host.run(), 1)
+
+        self.assertEqual(control.registration_attempts, 1)
+        sleep.assert_not_called()
+        self.assertIn("desktop-close", events)
+
+    def test_terminal_403_heartbeat_exits_without_retry(self) -> None:
+        events: list[str] = []
+        control = TerminalHeartbeatControlPlane(events)
+        host = AedtSessionHost(control, allocation_id=1, node_name="cpu-01")
+        host._start_desktop = lambda: FakeDesktop(events)
+
+        with patch(
+            "slurm_scheduler.aedt_session_host.time.sleep", return_value=None
+        ) as sleep:
+            self.assertEqual(host.run(), 1)
+
+        self.assertEqual(control.heartbeat_attempts, 1)
+        self.assertEqual(control.command_count, 0)
+        sleep.assert_not_called()
+        self.assertIn("desktop-close", events)
+
     def test_global_stop_occurs_only_after_control_plane_sibling_grace(self) -> None:
         events: list[str] = []
         host = AedtSessionHost(

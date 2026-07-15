@@ -1,14 +1,36 @@
 from __future__ import annotations
 
+import http.client
 import json
+import math
 import os
+import random
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+
+DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS = 360.0
+CONTROL_PLANE_OUTAGE_ENV = "AEDT_POOL_CONTROL_PLANE_OUTAGE_SECONDS"
+TRANSIENT_HTTP_STATUSES = {408, 425, 429}
+
+
+def _control_plane_outage_seconds_from_env() -> float:
+    value = os.environ.get(CONTROL_PLANE_OUTAGE_ENV, "").strip()
+    if not value:
+        return DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS
+    try:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError
+        return max(0.0, parsed)
+    except ValueError:
+        return DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS
 
 
 class AedtLeaseError(RuntimeError):
@@ -71,9 +93,18 @@ class AedtProjectLease:
     state: str = "queued"
     endpoint: str = ""
     exclusive_session: bool = False
+    control_plane_outage_seconds: float = field(
+        default_factory=_control_plane_outage_seconds_from_env
+    )
     _heartbeat_stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _heartbeat_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     heartbeat_error: str = field(default="", init=False)
+
+    def __post_init__(self) -> None:
+        outage_seconds = float(self.control_plane_outage_seconds)
+        if not math.isfinite(outage_seconds):
+            raise ValueError("control-plane outage budget must be finite")
+        self.control_plane_outage_seconds = max(0.0, outage_seconds)
 
     def _call(self, method: str, suffix: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         return self.http.request(
@@ -90,9 +121,44 @@ class AedtProjectLease:
         return status
 
     def heartbeat(self) -> dict[str, Any]:
-        status = self._call("POST", "/heartbeat", {})
+        outage_started_at = time.monotonic()
+        retry_index = 0
+        while True:
+            try:
+                status = self._call("POST", "/heartbeat", {})
+                break
+            except urllib.error.HTTPError as exc:
+                if not (
+                    exc.code in TRANSIENT_HTTP_STATUSES or 500 <= exc.code < 600
+                ):
+                    raise
+                last_error: BaseException = exc
+            except (
+                urllib.error.URLError,
+                OSError,
+                json.JSONDecodeError,
+                http.client.HTTPException,
+            ) as exc:
+                last_error = exc
+            remaining = self.control_plane_outage_seconds - max(
+                0.0, time.monotonic() - outage_started_at
+            )
+            if remaining <= 0:
+                raise last_error
+            base_delay = min(20.0, 2 ** min(retry_index, 20))
+            delay = min(
+                remaining,
+                base_delay * 0.5 + random.uniform(0.0, base_delay * 0.5),
+            )
+            if self._heartbeat_thread is threading.current_thread():
+                if self._heartbeat_stop.wait(delay):
+                    raise AedtLeaseError("lease heartbeat retry stopped") from last_error
+            else:
+                time.sleep(delay)
+            retry_index += 1
         self.state = str(status.get("state") or "")
         self.endpoint = str(status.get("endpoint") or "")
+        self.heartbeat_error = ""
         return status
 
     def wait_until_leased(

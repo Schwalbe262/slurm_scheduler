@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import secrets
 import shlex
 import threading
@@ -24,9 +25,12 @@ SESSION_ASSIGNABLE_STATES = ("ready", "busy")
 LEASE_LIVE_STATES = ("queued", "leased", "active", "releasing")
 LEASE_SLOT_STATES = ("leased", "active", "releasing")
 SESSION_START_ACK_TIMEOUT_MESSAGE = "session start acknowledgement timed out"
+SESSION_HEARTBEAT_TIMEOUT_MESSAGE = "session heartbeat expired"
 UNHEALTHY_ALLOCATION_RECYCLE_REASON = (
     "AEDT pool unhealthy/quarantined session allocation recycle"
 )
+DEFAULT_HOST_LAUNCH_STAGGER_SECONDS = 15
+HOST_LAUNCH_STAGGER_ENV = "AEDT_POOL_HOST_LAUNCH_STAGGER_SECONDS"
 
 
 AEDT_POOL_SCHEMA = """
@@ -130,8 +134,11 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "aedt_pool_projects_per_session": "2",
     "aedt_pool_project_cpus": "4",
     "aedt_pool_node_cpu_factor": "1.0",
-    "aedt_pool_lease_ttl_seconds": "180",
-    "aedt_pool_session_heartbeat_timeout_seconds": "120",
+    # Both defaults exceed the node/client six-minute retry budget so a
+    # five-minute control-plane outage cannot expire otherwise-live work.
+    "aedt_pool_lease_ttl_seconds": "600",
+    "aedt_pool_session_heartbeat_timeout_seconds": "600",
+    "aedt_pool_unhealthy_recycle_grace_seconds": "180",
     "aedt_pool_session_start_timeout_seconds": "600",
     "aedt_pool_idle_ttl_seconds": "900",
     "aedt_pool_scale_step_nodes": "4",
@@ -175,6 +182,7 @@ class AedtPoolConfig:
     node_cpu_factor: float
     lease_ttl_seconds: int
     session_heartbeat_timeout_seconds: int
+    unhealthy_recycle_grace_seconds: int
     session_start_timeout_seconds: int
     idle_ttl_seconds: int
     scale_step_nodes: int
@@ -296,6 +304,9 @@ class AedtPoolService:
             session_heartbeat_timeout_seconds=max(
                 30, int(self._setting("aedt_pool_session_heartbeat_timeout_seconds"))
             ),
+            unhealthy_recycle_grace_seconds=max(
+                0, int(self._setting("aedt_pool_unhealthy_recycle_grace_seconds"))
+            ),
             session_start_timeout_seconds=max(
                 60, int(self._setting("aedt_pool_session_start_timeout_seconds"))
             ),
@@ -390,6 +401,7 @@ class AedtPoolService:
         *,
         lease_ttl_seconds: int | None = None,
         session_heartbeat_timeout_seconds: int | None = None,
+        unhealthy_recycle_grace_seconds: int | None = None,
     ) -> AedtPoolConfig:
         """Operator knob for liveness windows.
 
@@ -409,6 +421,11 @@ class AedtPoolService:
             if session_heartbeat_timeout_seconds is None
             else session_heartbeat_timeout_seconds
         )
+        requested_recycle_grace = (
+            current.unhealthy_recycle_grace_seconds
+            if unhealthy_recycle_grace_seconds is None
+            else unhealthy_recycle_grace_seconds
+        )
         if type(requested_ttl) is not int or not 60 <= requested_ttl <= 3600:
             raise ValueError(
                 "lease_ttl_seconds must be an integer between 60 and 3600"
@@ -418,12 +435,24 @@ class AedtPoolService:
                 "session_heartbeat_timeout_seconds must be an integer "
                 "between 60 and 3600"
             )
+        if (
+            type(requested_recycle_grace) is not int
+            or not 0 <= requested_recycle_grace <= 3600
+        ):
+            raise ValueError(
+                "unhealthy_recycle_grace_seconds must be an integer "
+                "between 0 and 3600"
+            )
         with self.db.connect() as conn:
             for key, value in (
                 ("aedt_pool_lease_ttl_seconds", requested_ttl),
                 (
                     "aedt_pool_session_heartbeat_timeout_seconds",
                     requested_session,
+                ),
+                (
+                    "aedt_pool_unhealthy_recycle_grace_seconds",
+                    requested_recycle_grace,
                 ),
             ):
                 conn.execute(
@@ -479,8 +508,10 @@ class AedtPoolService:
                 SET state = 'draining', failure_message = ?,
                     drain_requested_at = COALESCE(drain_requested_at, ?), updated_at = ?
                 WHERE state IN ('ready','busy')
+                   OR (state = 'unhealthy' AND failure_message = ?
+                       AND quarantine_reason = '')
                 """,
-                (reason, now, now),
+                (reason, now, now, SESSION_HEARTBEAT_TIMEOUT_MESSAGE),
             )
 
     def record_validation(self, evidence: dict[str, Any]) -> dict[str, Any]:
@@ -1098,15 +1129,136 @@ class AedtPoolService:
         return session
 
     def heartbeat_session(self, session_id: int, token: str) -> dict[str, Any]:
-        session = self._authorize_session(session_id, token)
-        if session["state"] not in {"ready", "busy", "draining", "unhealthy"}:
-            raise ValueError(f"session is {session['state']}")
         now = _sql_time(self._now())
         with self.db.connect() as conn:
-            conn.execute(
-                "UPDATE aedt_sessions SET last_heartbeat_at = ?, updated_at = ? WHERE id = ?",
-                (now, now, int(session_id)),
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM aedt_sessions WHERE id = ?", (int(session_id),)
+            ).fetchone()
+            if not row:
+                raise KeyError(session_id)
+            session = dict(row)
+            if not session.get("host_token_hash") or not secrets.compare_digest(
+                str(session["host_token_hash"]), _token_hash(token)
+            ):
+                raise PermissionError("invalid session token")
+            if session["state"] not in {"ready", "busy", "draining", "unhealthy"}:
+                raise ValueError(f"session is {session['state']}")
+            setting_rows = {
+                str(item["key"]): str(item["value"])
+                for item in conn.execute(
+                    """
+                    SELECT key, value FROM scheduler_settings
+                    WHERE key IN ('aedt_pool_enabled', 'aedt_pool_adapter_ready')
+                    """
+                ).fetchall()
+            }
+            validation = conn.execute(
+                "SELECT status FROM aedt_pool_validations ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            pool_operational = bool(
+                _bool_setting(
+                    setting_rows.get(
+                        "aedt_pool_enabled", DEFAULT_SETTINGS["aedt_pool_enabled"]
+                    )
+                )
+                and _bool_setting(
+                    setting_rows.get(
+                        "aedt_pool_adapter_ready",
+                        DEFAULT_SETTINGS["aedt_pool_adapter_ready"],
+                    )
+                )
+                and validation
+                and validation["status"] == "passed"
             )
+            recovered = False
+            if (
+                pool_operational
+                and session["state"] == "unhealthy"
+                and str(session.get("failure_message") or "")
+                == SESSION_HEARTBEAT_TIMEOUT_MESSAGE
+                and not str(session.get("quarantine_reason") or "")
+            ):
+                allocation = conn.execute(
+                    "SELECT state, drain_reason FROM allocations WHERE id = ?",
+                    (int(session.get("allocation_id") or 0),),
+                ).fetchone()
+                recoverable_allocation = bool(
+                    allocation
+                    and (
+                        allocation["state"] in {"warm", "active"}
+                        or (
+                            allocation["state"] == "draining"
+                            and str(allocation["drain_reason"] or "")
+                            == UNHEALTHY_ALLOCATION_RECYCLE_REASON
+                        )
+                    )
+                )
+                if recoverable_allocation:
+                    live = int(
+                        conn.execute(
+                            """
+                            SELECT COUNT(*) FROM aedt_project_leases
+                            WHERE session_id = ?
+                              AND state IN ('leased','active','releasing')
+                            """,
+                            (int(session_id),),
+                        ).fetchone()[0]
+                    )
+                    cursor = conn.execute(
+                        """
+                        UPDATE aedt_sessions
+                        SET state = ?, failure_message = '', drain_requested_at = NULL,
+                            last_heartbeat_at = ?, idle_since = ?, updated_at = ?
+                        WHERE id = ? AND state = 'unhealthy'
+                          AND failure_message = ? AND quarantine_reason = ''
+                        """,
+                        (
+                            "busy" if live else "ready",
+                            now,
+                            None if live else now,
+                            now,
+                            int(session_id),
+                            SESSION_HEARTBEAT_TIMEOUT_MESSAGE,
+                        ),
+                    )
+                    recovered = cursor.rowcount == 1
+                if recovered:
+                    # A valid host token proves this was a control-plane gap,
+                    # not a dead host.  Cancel only the recycle drain created
+                    # for that gap, and only after every sibling has recovered.
+                    remaining_unhealthy = conn.execute(
+                        """
+                        SELECT 1 FROM aedt_sessions
+                        WHERE allocation_id = ?
+                          AND (state = 'unhealthy' OR quarantine_reason != '')
+                        LIMIT 1
+                        """,
+                        (int(session.get("allocation_id") or 0),),
+                    ).fetchone()
+                    if not remaining_unhealthy:
+                        conn.execute(
+                            """
+                            UPDATE allocations
+                            SET state = 'active',
+                                drain_reason = 'AEDT pool project demand',
+                                drain_at = NULL, failure_message = '', updated_at = ?
+                            WHERE id = ? AND state = 'draining' AND drain_reason = ?
+                            """,
+                            (
+                                now,
+                                int(session.get("allocation_id") or 0),
+                                UNHEALTHY_ALLOCATION_RECYCLE_REASON,
+                            ),
+                        )
+            if not recovered:
+                conn.execute(
+                    """
+                    UPDATE aedt_sessions
+                    SET last_heartbeat_at = ?, updated_at = ? WHERE id = ?
+                    """,
+                    (now, now, int(session_id)),
+                )
         return self.get_session(session_id, include_secret_hash=False)
 
     def session_commands(self, session_id: int, token: str) -> dict[str, Any]:
@@ -1175,6 +1327,9 @@ class AedtPoolService:
     ) -> dict[str, Any]:
         self._authorize_session(session_id, token)
         now = _sql_time(self._now())
+        expected_state = "released" if success else "failed"
+        normalized_failure = "" if success else failure_message.strip()
+        replayed = False
         with self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             lease = conn.execute(
@@ -1184,23 +1339,30 @@ class AedtPoolService:
             if not lease:
                 raise KeyError(lease_id)
             if lease["state"] != "releasing":
-                raise ValueError(f"lease is {lease['state']}")
-            conn.execute(
-                """
-                UPDATE aedt_project_leases
-                SET state = ?, failure_message = ?, finished_at = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    "released" if success else "failed",
-                    "" if success else failure_message.strip(),
-                    now,
-                    now,
-                    int(lease_id),
-                ),
-            )
-            self._refresh_session_state(conn, int(session_id), now)
-        self.reconcile(execute=True)
+                replayed = bool(
+                    lease["state"] == expected_state
+                    and str(lease["failure_message"] or "") == normalized_failure
+                )
+                if not replayed:
+                    raise ValueError(f"lease is {lease['state']}")
+            if not replayed:
+                conn.execute(
+                    """
+                    UPDATE aedt_project_leases
+                    SET state = ?, failure_message = ?, finished_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        expected_state,
+                        normalized_failure,
+                        now,
+                        now,
+                        int(lease_id),
+                    ),
+                )
+                self._refresh_session_state(conn, int(session_id), now)
+        if not replayed:
+            self.reconcile(execute=True)
         return self.get_lease(lease_id, include_secret_hash=False)
 
     def close_session(
@@ -1315,20 +1477,39 @@ class AedtPoolService:
             ("busy" if live else "ready", None if live else now, now, session_id),
         )
 
-    def _dedicated_allocations(self, states: set[str]) -> list[dict[str, Any]]:
+    def _dedicated_allocations(
+        self, states: set[str], *, conn: Any | None = None
+    ) -> list[dict[str, Any]]:
         # Dedicated allocation ownership prevents this opt-in pool from
         # silently placing AEDT hosts inside an unrelated production campaign.
+        if conn is None:
+            rows = self.db.list_allocations_with_live(limit=1000, live_limit=10000)
+        elif states:
+            ordered_states = sorted(states)
+            placeholders = ",".join("?" for _ in ordered_states)
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    f"SELECT * FROM allocations WHERE state IN ({placeholders}) "
+                    "ORDER BY id DESC LIMIT 10000",
+                    tuple(ordered_states),
+                ).fetchall()
+            ]
+        else:
+            rows = []
         return [
             row
-            for row in self.db.list_allocations_with_live(limit=1000, live_limit=10000)
+            for row in rows
             if row.get("state") in states
             and str(row.get("drain_reason") or "").startswith("AEDT pool")
         ]
 
-    def _eligible_allocations(self) -> list[dict[str, Any]]:
+    def _eligible_allocations(self, *, conn: Any | None = None) -> list[dict[str, Any]]:
         return [
             row
-            for row in self._dedicated_allocations({"warm", "active"})
+            for row in self._dedicated_allocations(
+                {"warm", "active"}, conn=conn
+            )
             if str(row.get("node_name") or "").strip()
         ]
 
@@ -1453,8 +1634,8 @@ class AedtPoolService:
                 (idle_cutoff,),
             ).fetchone()[0]
         )
-        allocations = self._eligible_allocations()
-        pending_allocations = self._dedicated_allocations({"pending"})
+        allocations = self._eligible_allocations(conn=conn)
+        pending_allocations = self._dedicated_allocations({"pending"}, conn=conn)
         current_by_allocation = {
             int(row["allocation_id"]): int(row["count"])
             for row in conn.execute(
@@ -1594,13 +1775,18 @@ class AedtPoolService:
                             quarantine_until = COALESCE(quarantine_until, ?),
                             failure_message = 'project lease heartbeat expired',
                             drain_requested_at = COALESCE(drain_requested_at, ?), updated_at = ?
-                        WHERE id = ? AND state IN ('ready','busy')
+                        WHERE id = ? AND (
+                            state IN ('ready','busy')
+                            OR (state = 'unhealthy' AND failure_message = ?
+                                AND quarantine_reason = '')
+                        )
                         """,
                         (
                             _sql_time(now_dt + timedelta(seconds=900)),
                             now,
                             now,
                             int(row["session_id"]),
+                            SESSION_HEARTBEAT_TIMEOUT_MESSAGE,
                         ),
                     )
                 else:
@@ -1619,12 +1805,16 @@ class AedtPoolService:
             conn.execute(
                 """
                 UPDATE aedt_sessions
-                SET state = 'unhealthy', failure_message = 'session heartbeat expired',
+                SET state = 'unhealthy', failure_message = CASE
+                        WHEN state = 'draining'
+                        THEN 'session heartbeat expired while already draining'
+                        ELSE ?
+                    END,
                     drain_requested_at = COALESCE(drain_requested_at, ?), updated_at = ?
                 WHERE state IN ('ready','busy','draining')
                   AND COALESCE(last_heartbeat_at, started_at, created_at) < ?
                 """,
-                (now, now, heartbeat_cutoff),
+                (SESSION_HEARTBEAT_TIMEOUT_MESSAGE, now, now, heartbeat_cutoff),
             )
             start_cutoff = _sql_time(now_dt - timedelta(seconds=config.session_start_timeout_seconds))
             conn.execute(
@@ -1636,6 +1826,42 @@ class AedtPoolService:
                   AND COALESCE(start_claimed_at, created_at) < ?
                 """,
                 (SESSION_START_ACK_TIMEOUT_MESSAGE, now, now, start_cutoff),
+            )
+            unhealthy_recycle_cutoff = _sql_time(
+                now_dt
+                - timedelta(seconds=config.unhealthy_recycle_grace_seconds)
+            )
+            # Mark the allocation before stale-session reaping changes the
+            # session out of the unhealthy state used by this selection.
+            conn.execute(
+                """
+                UPDATE allocations
+                SET state = 'draining',
+                    drain_reason = CASE
+                        WHEN state = 'draining'
+                         AND TRIM(COALESCE(drain_reason, '')) NOT IN (
+                             '', 'AEDT pool project demand'
+                         )
+                        THEN drain_reason
+                        ELSE ?
+                    END,
+                    drain_at = COALESCE(drain_at, ?), updated_at = ?
+                WHERE id IN (
+                    SELECT allocation_id FROM aedt_sessions
+                    WHERE quarantine_reason != ''
+                       OR (state = 'unhealthy'
+                           AND COALESCE(
+                               drain_requested_at, last_heartbeat_at,
+                               updated_at, created_at
+                           ) < ?)
+                ) AND state IN ('warm','active','draining')
+                """,
+                (
+                    UNHEALTHY_ALLOCATION_RECYCLE_REASON,
+                    now,
+                    now,
+                    unhealthy_recycle_cutoff,
+                ),
             )
             # An unhealthy session whose host has been silent far beyond the
             # heartbeat window can never call close_session (only the live
@@ -1655,8 +1881,12 @@ class AedtPoolService:
                     SELECT id FROM aedt_sessions
                     WHERE state = 'unhealthy'
                       AND COALESCE(last_heartbeat_at, started_at, created_at) < ?
+                      AND COALESCE(
+                          drain_requested_at, last_heartbeat_at,
+                          updated_at, created_at
+                      ) < ?
                     """,
-                    (reap_cutoff,),
+                    (reap_cutoff, unhealthy_recycle_cutoff),
                 ).fetchall()
             ]
             for session_id in stale_unhealthy:
@@ -1684,27 +1914,6 @@ class AedtPoolService:
                     """,
                     (now, now, session_id),
                 )
-            conn.execute(
-                """
-                UPDATE allocations
-                SET state = 'draining',
-                    drain_reason = CASE
-                        WHEN state = 'draining'
-                         AND TRIM(COALESCE(drain_reason, '')) NOT IN (
-                             '', 'AEDT pool project demand'
-                         )
-                        THEN drain_reason
-                        ELSE ?
-                    END,
-                    drain_at = COALESCE(drain_at, ?), updated_at = ?
-                WHERE id IN (
-                    SELECT allocation_id FROM aedt_sessions
-                    WHERE state = 'unhealthy' OR quarantine_reason != ''
-                ) AND state IN ('warm','active','draining')
-                """,
-                (UNHEALTHY_ALLOCATION_RECYCLE_REASON, now, now),
-            )
-
             # Assign oldest requests to a same-allocation/same-node session.
             # Empty placement constraints allow the controller to choose any
             # dedicated AEDT allocation; explicit constraints are never relaxed.
@@ -1724,7 +1933,9 @@ class AedtPoolService:
                                   AND l.state IN ('leased','active','releasing')
                                   AND l.exclusive_session = 1) AS exclusive_slots
                         FROM aedt_sessions s
+                        JOIN allocations a ON a.id = s.allocation_id
                         WHERE s.state IN ('ready','busy')
+                          AND a.state IN ('warm','active')
                           AND (? = 0 OR s.allocation_id = ?)
                           AND (? = '' OR s.node_name = ?)
                         ORDER BY used_slots ASC, s.id ASC
@@ -2015,6 +2226,7 @@ class AedtPoolRuntime:
         host_bootstrap_token_file: str = "",
         host_task_memory_mb: int = 4096,
         require_published_control_plane_url: bool = False,
+        host_launch_stagger_seconds: int | None = None,
     ) -> None:
         self.service = service
         self.scheduler = scheduler
@@ -2030,6 +2242,26 @@ class AedtPoolRuntime:
         self.require_published_control_plane_url = bool(
             require_published_control_plane_url
         )
+        configured_stagger: Any = host_launch_stagger_seconds
+        if configured_stagger is None:
+            configured_stagger = os.environ.get(
+                HOST_LAUNCH_STAGGER_ENV, DEFAULT_HOST_LAUNCH_STAGGER_SECONDS
+            )
+        try:
+            self.host_launch_stagger_seconds = max(
+                0, min(60, int(configured_stagger))
+            )
+        except (TypeError, ValueError):
+            LOGGER.warning(
+                "Ignoring invalid %s=%r; using %ss",
+                HOST_LAUNCH_STAGGER_ENV,
+                configured_stagger,
+                DEFAULT_HOST_LAUNCH_STAGGER_SECONDS,
+            )
+            self.host_launch_stagger_seconds = DEFAULT_HOST_LAUNCH_STAGGER_SECONDS
+        # Treat runtime startup as unpublished.  The first observed relay URL
+        # gets the same one-tick settling grace as a later relay recovery.
+        self._control_plane_was_published = False
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -2054,6 +2286,15 @@ class AedtPoolRuntime:
     def tick(self) -> dict[str, Any]:
         config = self.service.config()
         control_plane_url = self._control_plane_url(config)
+        control_plane_just_published = bool(
+            self.require_published_control_plane_url
+            and control_plane_url
+            and not self._control_plane_was_published
+        )
+        if self.require_published_control_plane_url:
+            # Update before the unpublished early return so a later publication
+            # is recognized as a recovery transition.
+            self._control_plane_was_published = bool(control_plane_url)
         if self.require_published_control_plane_url and not control_plane_url:
             # Do not even enter the mutating reconciler while relay
             # supervision has withdrawn the node-visible endpoint.  In
@@ -2099,9 +2340,14 @@ class AedtPoolRuntime:
                 break
             opened += 1
         plan["node_allocations_opened"] = opened
-        plan["host_tasks_started"] = self._ensure_session_hosts(
-            config, control_plane_url=control_plane_url
-        )
+        if control_plane_just_published:
+            # Publishing precedes full tunnel readiness.  One normal tick is a
+            # small, bounded grace that avoids launching into that half-up gap.
+            plan["host_tasks_started"] = 0
+        else:
+            plan["host_tasks_started"] = self._ensure_session_hosts(
+                config, control_plane_url=control_plane_url
+            )
         plan["empty_allocations_closed"] = self._close_empty_dedicated_allocations()
         return plan
 
@@ -2124,6 +2370,7 @@ class AedtPoolRuntime:
         session: dict[str, Any],
         *,
         control_plane_url: str | None = None,
+        launch_delay_seconds: int = 0,
     ) -> str:
         scheduler_url = (
             self._control_plane_url()
@@ -2145,7 +2392,13 @@ class AedtPoolRuntime:
             "--bootstrap-token-file",
             self.host_bootstrap_token_file,
         ]
-        return " ".join(shlex.quote(part) for part in parts)
+        command = " ".join(shlex.quote(part) for part in parts)
+        delay = max(0, int(launch_delay_seconds))
+        if delay:
+            # Delay in the node-side shell, keeping the host CLI compatible
+            # with older cluster checkouts that do not know scheduler changes.
+            return f"sleep {delay} && exec {command}"
+        return command
 
     def _ensure_session_hosts(
         self,
@@ -2166,21 +2419,29 @@ class AedtPoolRuntime:
         ):
             return 0
         started = 0
+        launches_by_allocation: dict[int, int] = {}
         for session in self.service.starting_sessions():
             if str(session.get("host_id") or ""):
                 continue
             dedupe_key = f"aedt-session-host:{int(session['id'])}"
             if self.service.db.find_active_task_by_dedupe_key(dedupe_key):
                 continue
-            allocation = self.service.db.get_allocation(int(session["allocation_id"]))
+            allocation_id = int(session["allocation_id"])
+            allocation = self.service.db.get_allocation(allocation_id)
             if not allocation or allocation.get("state") not in {"warm", "active"}:
                 continue
+            allocation_launch_index = launches_by_allocation.get(allocation_id, 0)
+            launch_delay_seconds = (
+                allocation_launch_index * self.host_launch_stagger_seconds
+            )
             task_id = self.service.db.create_task(
                 TaskCreate(
                     name=f"aedt-session-host-{int(session['id'])}",
                     remote_cwd=self.host_remote_cwd,
                     command=self._host_command(
-                        session, control_plane_url=scheduler_url
+                        session,
+                        control_plane_url=scheduler_url,
+                        launch_delay_seconds=launch_delay_seconds,
                     ),
                     env_setup=self.host_env_setup,
                     required_capability=config.required_capability,
@@ -2224,6 +2485,7 @@ class AedtPoolRuntime:
                 )
                 continue
             self.scheduler.start_background_task_attach(reserved, allocation, account)
+            launches_by_allocation[allocation_id] = allocation_launch_index + 1
             started += 1
         return started
 
