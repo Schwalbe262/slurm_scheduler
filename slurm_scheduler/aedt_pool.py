@@ -2458,7 +2458,9 @@ class AedtPoolService:
         with self.db.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, request_key, project_name, task_id, slot_index, state, failure_message
+                SELECT id, request_key, project_name, task_id, slot_index,
+                       state, failure_message, project_namespace,
+                       workspace_path, protocol_version
                 FROM aedt_project_leases
                 WHERE session_id = ? AND state = 'releasing'
                 ORDER BY id ASC

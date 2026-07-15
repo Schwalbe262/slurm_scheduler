@@ -12,6 +12,7 @@ import re
 import secrets
 import signal
 import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -1083,6 +1084,288 @@ class AedtSessionHost:
             raise RuntimeError("AEDT Desktop object has no project-close API")
         odesktop.CloseProject(project_name)
 
+    @staticmethod
+    def _released_project_component(value: Any, label: str) -> str:
+        """Validate one lease-owned filesystem component."""
+
+        try:
+            component = os.fsdecode(os.fspath(value)).strip()
+        except TypeError as exc:
+            raise RuntimeError(
+                f"released AEDT {label} is unavailable"
+            ) from exc
+        if (
+            not component
+            or component in {".", ".."}
+            or "\x00" in component
+            or "/" in component
+            or "\\" in component
+        ):
+            raise RuntimeError(
+                f"unsafe released AEDT {label}: {component!r}"
+            )
+        return component
+
+    @staticmethod
+    def _plain_directory(path: str, label: str) -> os.stat_result:
+        try:
+            metadata = os.lstat(path)
+        except OSError as exc:
+            raise RuntimeError(
+                f"released AEDT {label} is unavailable: {path}"
+            ) from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError(
+                f"released AEDT {label} is not a plain directory: {path}"
+            )
+        return metadata
+
+    @classmethod
+    def _released_project_paths(
+        cls, lease: dict[str, Any]
+    ) -> tuple[str, str] | None:
+        """Resolve the exact direct-child workspace owned by one v2 lease."""
+
+        if int(lease.get("protocol_version") or 1) < 2:
+            return None
+        lease_id = int(lease.get("id") or 0)
+        if lease_id <= 0:
+            raise RuntimeError("released AEDT lease identity is unavailable")
+        project_name = cls._released_project_component(
+            lease.get("project_name"), "project name"
+        )
+        namespace_text = str(lease.get("project_namespace") or "").strip()
+        if namespace_text:
+            # Namespace is a logical collision domain, not a required filename
+            # prefix (pyaedt_motor deliberately binds ``ipmsm-*`` projects in
+            # the ``pyaedt_motor`` namespace).
+            cls._released_project_component(
+                namespace_text, "project namespace"
+            )
+
+        raw_workspace = str(lease.get("workspace_path") or "").strip()
+        if not raw_workspace or not os.path.isabs(raw_workspace):
+            raise RuntimeError(
+                "released AEDT lease workspace must be an absolute path"
+            )
+        workspace = os.path.normpath(raw_workspace)
+        if workspace != raw_workspace.rstrip("/\\") or workspace == os.path.abspath(
+            os.path.sep
+        ):
+            raise RuntimeError(
+                f"unsafe released AEDT lease workspace: {raw_workspace!r}"
+            )
+        cls._plain_directory(workspace, "lease workspace")
+
+        project_path = os.path.join(workspace, project_name)
+        if (
+            os.path.dirname(project_path) != workspace
+            or os.path.basename(project_path) != project_name
+        ):
+            raise RuntimeError(
+                f"released AEDT project path escaped its workspace: {project_path!r}"
+            )
+        workspace_real = os.path.realpath(workspace)
+        project_real = os.path.realpath(project_path)
+        try:
+            contained = (
+                os.path.commonpath((workspace_real, project_real))
+                == workspace_real
+            )
+        except ValueError:
+            contained = False
+        if not contained or project_real == workspace_real:
+            raise RuntimeError(
+                "released AEDT project path escaped its lease workspace: "
+                f"project={project_path!r}, workspace={workspace!r}"
+            )
+        return workspace, project_path
+
+    @staticmethod
+    def _prepare_plain_directory_for_cross_account_delete(
+        path: str,
+        metadata: os.stat_result,
+        host_uid: int,
+        lease_owner_uid: int,
+    ) -> bool:
+        """Add delete traversal only to host-owned directories.
+
+        On Linux the descriptor is opened with ``O_NOFOLLOW`` and the inode is
+        rechecked before ``fchmod``.  The path fallback exists only for local
+        non-POSIX unit tests; production session hosts are Linux processes.
+        """
+
+        mode = stat.S_IMODE(metadata.st_mode)
+        owner_uid = int(metadata.st_uid)
+        if owner_uid != int(host_uid):
+            if (
+                owner_uid != int(lease_owner_uid)
+                and mode & stat.S_IRWXO != stat.S_IRWXO
+            ):
+                raise RuntimeError(
+                    "released AEDT directory has an unexpected owner and is not "
+                    f"cross-account removable: path={path}, mode={mode:04o}"
+                )
+            return False
+        desired_mode = mode | stat.S_IRWXG | stat.S_IRWXO
+        if desired_mode == mode:
+            return False
+
+        if os.name == "posix":
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            directory = getattr(os, "O_DIRECTORY", 0)
+            if not nofollow or not directory:
+                raise RuntimeError(
+                    "released AEDT cleanup requires O_NOFOLLOW/O_DIRECTORY"
+                )
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                opened = os.fstat(descriptor)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or int(opened.st_dev) != int(metadata.st_dev)
+                    or int(opened.st_ino) != int(metadata.st_ino)
+                ):
+                    raise RuntimeError(
+                        f"released AEDT directory changed during attestation: {path}"
+                    )
+                os.fchmod(descriptor, desired_mode)
+            finally:
+                os.close(descriptor)
+        else:
+            current = os.lstat(path)
+            if (
+                stat.S_ISLNK(current.st_mode)
+                or not stat.S_ISDIR(current.st_mode)
+                or int(current.st_dev) != int(metadata.st_dev)
+                or int(current.st_ino) != int(metadata.st_ino)
+            ):
+                raise RuntimeError(
+                    f"released AEDT directory changed during attestation: {path}"
+                )
+            os.chmod(path, desired_mode)
+        return True
+
+    @classmethod
+    def _prepare_released_project_workspace(
+        cls, lease: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Make one closed lease workspace removable by its client account.
+
+        AEDT creates result/cache directories as the long-lived session-host
+        UID with mode 0755.  The client intentionally waits for the host close
+        ACK before deleting its disposable project, so the host prepares only
+        directories inside that exact direct-child project.  It never removes
+        data, changes file modes, or follows a symlink.
+        """
+
+        resolved = cls._released_project_paths(lease)
+        if resolved is None:
+            return {"state": "legacy", "directories_changed": 0}
+        workspace, project_path = resolved
+        if not os.path.lexists(project_path):
+            return {
+                "state": "absent",
+                "project_path": project_path,
+                "directories_changed": 0,
+            }
+        project_metadata = cls._plain_directory(
+            project_path, "project workspace"
+        )
+        workspace_real = os.path.realpath(workspace)
+        try:
+            host_uid = int(os.geteuid())
+        except AttributeError:  # Windows-only unit-test fallback.
+            host_uid = int(os.lstat(project_path).st_uid)
+        lease_owner_uid = int(project_metadata.st_uid)
+
+        def fail_walk(error: OSError) -> None:
+            raise RuntimeError(
+                "released AEDT workspace traversal failed: "
+                f"{getattr(error, 'filename', project_path)}"
+            ) from error
+
+        directories: list[tuple[str, os.stat_result]] = []
+        for root, names, files in os.walk(
+            project_path,
+            topdown=True,
+            onerror=fail_walk,
+            followlinks=False,
+        ):
+            root_metadata = cls._plain_directory(root, "project directory")
+            if (
+                os.path.commonpath((workspace_real, os.path.realpath(root)))
+                != workspace_real
+            ):
+                raise RuntimeError(
+                    f"released AEDT directory escaped its workspace: {root}"
+                )
+            directories.append((root, root_metadata))
+            for name in [*names, *files]:
+                child = os.path.join(root, name)
+                child_metadata = os.lstat(child)
+                if stat.S_ISLNK(child_metadata.st_mode):
+                    raise RuntimeError(
+                        f"released AEDT workspace contains a symlink: {child}"
+                    )
+                if stat.S_ISDIR(child_metadata.st_mode):
+                    if (
+                        os.path.commonpath(
+                            (workspace_real, os.path.realpath(child))
+                        )
+                        != workspace_real
+                    ):
+                        raise RuntimeError(
+                            "released AEDT directory escaped its workspace: "
+                            f"{child}"
+                        )
+
+        # Fail before any chmod if a third-party directory would remain
+        # unreachable.  The host must never partially prepare an ambiguous
+        # mixed-ownership tree.
+        for path, metadata in directories:
+            mode = stat.S_IMODE(metadata.st_mode)
+            if (
+                int(metadata.st_uid) not in {host_uid, lease_owner_uid}
+                and mode & stat.S_IRWXO != stat.S_IRWXO
+            ):
+                raise RuntimeError(
+                    "released AEDT directory has an unexpected owner and is not "
+                    f"cross-account removable: path={path}, mode={mode:04o}"
+                )
+
+        changed = 0
+        # Parents first: a host-owned 0700 parent must become traversable before
+        # the lease client can reach any already-attested child directory.
+        for path, metadata in directories:
+            if cls._prepare_plain_directory_for_cross_account_delete(
+                path, metadata, host_uid, lease_owner_uid
+            ):
+                changed += 1
+        return {
+            "state": "prepared",
+            "project_path": project_path,
+            "directories_seen": len(directories),
+            "directories_changed": changed,
+        }
+
+    def _close_and_prepare_project_release(
+        self, lease: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Close one exact project before preparing its owned workspace."""
+
+        self._close_project(str(lease["project_name"]))
+        result = self._prepare_released_project_workspace(lease)
+        self._journal(
+            "released_project_workspace_prepared",
+            lease_id=int(lease["id"]),
+            **result,
+        )
+        return result
+
     def _global_stop(self) -> None:
         """Global by AEDT design; caller must honor the sibling grace gate."""
         with self._automation_guard():
@@ -1560,7 +1843,7 @@ class AedtSessionHost:
                     success = True
                     failure = ""
                     try:
-                        self._close_project(str(lease["project_name"]))
+                        self._close_and_prepare_project_release(lease)
                     except Exception as exc:
                         success = False
                         failure = str(exc)

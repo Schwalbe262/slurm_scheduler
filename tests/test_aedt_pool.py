@@ -5,6 +5,7 @@ import http.client
 import io
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -1284,6 +1285,13 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(active["state"], "active")
         releasing = self.service.cancel_lease(int(lease["id"]), token)
         self.assertEqual(releasing["state"], "releasing")
+        close_command = self.service.session_commands(
+            int(session["id"]), host_token
+        )["close_projects"][0]
+        self.assertEqual(close_command["project_name"], "mft-v2-unique")
+        self.assertEqual(close_command["project_namespace"], "mft-v2")
+        self.assertEqual(close_command["workspace_path"], "/shared/mft-v2")
+        self.assertEqual(int(close_command["protocol_version"]), 2)
         released = self.service.complete_release(
             int(session["id"]), host_token, int(lease["id"]), success=True
         )
@@ -4134,6 +4142,215 @@ class RemoteDisconnectRegistrationControlPlane(FakeHostControlPlane):
 
 
 class SessionHostTests(unittest.TestCase):
+    def test_release_closes_project_before_workspace_preparation(self) -> None:
+        events: list[str] = []
+        host = AedtSessionHost(
+            FakeHostControlPlane(events), allocation_id=1, node_name="cpu-01"
+        )
+        host._close_project = lambda project: events.append(f"close:{project}")
+
+        def prepare(_lease):
+            events.append("prepare")
+            return {"state": "prepared", "directories_changed": 2}
+
+        host._prepare_released_project_workspace = prepare
+        host._journal = lambda event, **_fields: events.append(event)
+        result = host._close_and_prepare_project_release({
+            "id": 31,
+            "project_name": "mft-task-31",
+        })
+
+        self.assertEqual(result["state"], "prepared")
+        self.assertEqual(
+            events,
+            [
+                "close:mft-task-31",
+                "prepare",
+                "released_project_workspace_prepared",
+            ],
+        )
+
+    def test_release_prepares_only_exact_project_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Path(root) / "simulation"
+            project = workspace / "mft-task-17-lease-9"
+            outside = workspace / "unrelated-project"
+            foreign_cache = (
+                project
+                / "mft-task-17-lease-9.aedtresults"
+                / "maxwell_matrix.results"
+                / "OperationDataCache.tmp"
+            )
+            foreign_cache.mkdir(parents=True)
+            outside.mkdir()
+            prepared: list[str] = []
+
+            def record(path, _metadata, _host_uid, _lease_owner_uid):
+                prepared.append(path)
+                return True
+
+            with patch.object(
+                AedtSessionHost,
+                "_prepare_plain_directory_for_cross_account_delete",
+                side_effect=record,
+            ):
+                result = AedtSessionHost._prepare_released_project_workspace({
+                    "id": 9,
+                    "protocol_version": 2,
+                    "project_namespace": "mft",
+                    "project_name": "mft-task-17-lease-9",
+                    "workspace_path": str(workspace),
+                })
+
+            self.assertEqual(result["state"], "prepared")
+            self.assertEqual(result["project_path"], str(project))
+            self.assertEqual(result["directories_seen"], 4)
+            self.assertEqual(result["directories_changed"], 4)
+            self.assertEqual(
+                set(prepared),
+                {
+                    str(project),
+                    str(project / "mft-task-17-lease-9.aedtresults"),
+                    str(
+                        project
+                        / "mft-task-17-lease-9.aedtresults"
+                        / "maxwell_matrix.results"
+                    ),
+                    str(foreign_cache),
+                },
+            )
+            self.assertNotIn(str(outside), prepared)
+            self.assertTrue(project.is_dir())
+            self.assertTrue(foreign_cache.is_dir())
+
+    def test_release_refuses_unremovable_third_party_directory(self) -> None:
+        metadata = SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o755,
+            st_uid=7001,
+        )
+        with self.assertRaisesRegex(RuntimeError, "unexpected owner"):
+            AedtSessionHost._prepare_plain_directory_for_cross_account_delete(
+                "/shared/mft/project/cache",
+                metadata,
+                host_uid=7002,
+                lease_owner_uid=7003,
+            )
+        lease_owned = SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o755,
+            st_uid=7003,
+        )
+        self.assertFalse(
+            AedtSessionHost._prepare_plain_directory_for_cross_account_delete(
+                "/shared/mft/project/client-owned",
+                lease_owned,
+                host_uid=7002,
+                lease_owner_uid=7003,
+            )
+        )
+
+    def test_release_chmod_rechecks_host_owned_directory_without_following(self) -> None:
+        metadata = SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o755,
+            st_uid=7002,
+            st_dev=17,
+            st_ino=23,
+        )
+        with (
+            patch(
+                "slurm_scheduler.aedt_session_host.os.name", "posix"
+            ),
+            patch(
+                "slurm_scheduler.aedt_session_host.os.O_NOFOLLOW",
+                0x20000,
+                create=True,
+            ),
+            patch(
+                "slurm_scheduler.aedt_session_host.os.O_DIRECTORY",
+                0x10000,
+                create=True,
+            ),
+            patch(
+                "slurm_scheduler.aedt_session_host.os.open", return_value=41
+            ) as open_directory,
+            patch(
+                "slurm_scheduler.aedt_session_host.os.fstat",
+                return_value=metadata,
+            ),
+            patch(
+                "slurm_scheduler.aedt_session_host.os.fchmod"
+            ) as chmod_directory,
+            patch(
+                "slurm_scheduler.aedt_session_host.os.close"
+            ) as close_directory,
+        ):
+            changed = (
+                AedtSessionHost._prepare_plain_directory_for_cross_account_delete(
+                    "/shared/mft/project/OperationDataCache.tmp",
+                    metadata,
+                    host_uid=7002,
+                    lease_owner_uid=7003,
+                )
+            )
+
+        self.assertTrue(changed)
+        self.assertTrue(open_directory.call_args.args[1] & 0x20000)
+        self.assertTrue(open_directory.call_args.args[1] & 0x10000)
+        chmod_directory.assert_called_once_with(41, 0o777)
+        close_directory.assert_called_once_with(41)
+
+    def test_release_workspace_rejects_traversal_but_allows_logical_namespace(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Path(root) / "simulation"
+            workspace.mkdir()
+            with self.assertRaisesRegex(RuntimeError, "lease identity"):
+                AedtSessionHost._prepare_released_project_workspace({
+                    "protocol_version": 2,
+                    "project_namespace": "mft",
+                    "project_name": "mft-case-no-lease",
+                    "workspace_path": str(workspace),
+                })
+            with self.assertRaisesRegex(RuntimeError, "unsafe.*project name"):
+                AedtSessionHost._prepare_released_project_workspace({
+                    "id": 10,
+                    "protocol_version": 2,
+                    "project_namespace": "mft",
+                    "project_name": "../outside",
+                    "workspace_path": str(workspace),
+                })
+            result = AedtSessionHost._prepare_released_project_workspace({
+                "id": 11,
+                "protocol_version": 2,
+                "project_namespace": "pyaedt_motor",
+                "project_name": "ipmsm-case-1",
+                "workspace_path": str(workspace),
+            })
+            self.assertEqual(result["state"], "absent")
+
+    def test_release_workspace_never_follows_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Path(root) / "simulation"
+            project = workspace / "mft-case-1"
+            outside = Path(root) / "outside"
+            project.mkdir(parents=True)
+            outside.mkdir()
+            link = project / "OperationDataCache.tmp"
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"directory symlinks unavailable: {exc}")
+
+            with self.assertRaisesRegex(RuntimeError, "contains a symlink"):
+                AedtSessionHost._prepare_released_project_workspace({
+                    "id": 12,
+                    "protocol_version": 2,
+                    "project_namespace": "mft",
+                    "project_name": "mft-case-1",
+                    "workspace_path": str(workspace),
+                })
+            self.assertTrue(outside.is_dir())
+
     def test_native_liveness_never_declares_death_while_pid_and_port_are_alive(
         self,
     ) -> None:
