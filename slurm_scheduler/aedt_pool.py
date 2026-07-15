@@ -29,6 +29,7 @@ SESSION_HEARTBEAT_TIMEOUT_MESSAGE = "session heartbeat expired"
 UNHEALTHY_ALLOCATION_RECYCLE_REASON = (
     "AEDT pool unhealthy/quarantined session allocation recycle"
 )
+ALLOCATION_AGE_ROTATION_REASON = "AEDT pool allocation age rotation"
 DEFAULT_HOST_LAUNCH_STAGGER_SECONDS = 15
 HOST_LAUNCH_STAGGER_ENV = "AEDT_POOL_HOST_LAUNCH_STAGGER_SECONDS"
 
@@ -140,7 +141,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "aedt_pool_session_heartbeat_timeout_seconds": "600",
     "aedt_pool_unhealthy_recycle_grace_seconds": "180",
     "aedt_pool_session_start_timeout_seconds": "600",
-    "aedt_pool_idle_ttl_seconds": "900",
+    "aedt_pool_idle_ttl_seconds": "3600",
+    "aedt_pool_allocation_max_age_seconds": "158400",
     "aedt_pool_scale_step_nodes": "4",
     "aedt_pool_required_capability": "",
     "aedt_pool_env_profile": "",
@@ -185,6 +187,7 @@ class AedtPoolConfig:
     unhealthy_recycle_grace_seconds: int
     session_start_timeout_seconds: int
     idle_ttl_seconds: int
+    allocation_max_age_seconds: int
     scale_step_nodes: int
     required_capability: str
     env_profile: str
@@ -311,6 +314,9 @@ class AedtPoolService:
                 60, int(self._setting("aedt_pool_session_start_timeout_seconds"))
             ),
             idle_ttl_seconds=max(0, int(self._setting("aedt_pool_idle_ttl_seconds"))),
+            allocation_max_age_seconds=max(
+                0, int(self._setting("aedt_pool_allocation_max_age_seconds"))
+            ),
             scale_step_nodes=max(1, int(self._setting("aedt_pool_scale_step_nodes"))),
             required_capability=self._setting("aedt_pool_required_capability").strip(),
             env_profile=self._setting("aedt_pool_env_profile").strip(),
@@ -402,6 +408,8 @@ class AedtPoolService:
         lease_ttl_seconds: int | None = None,
         session_heartbeat_timeout_seconds: int | None = None,
         unhealthy_recycle_grace_seconds: int | None = None,
+        idle_ttl_seconds: int | None = None,
+        allocation_max_age_seconds: int | None = None,
     ) -> AedtPoolConfig:
         """Operator knob for liveness windows.
 
@@ -426,6 +434,16 @@ class AedtPoolService:
             if unhealthy_recycle_grace_seconds is None
             else unhealthy_recycle_grace_seconds
         )
+        requested_idle_ttl = (
+            current.idle_ttl_seconds
+            if idle_ttl_seconds is None
+            else idle_ttl_seconds
+        )
+        requested_allocation_max_age = (
+            current.allocation_max_age_seconds
+            if allocation_max_age_seconds is None
+            else allocation_max_age_seconds
+        )
         if type(requested_ttl) is not int or not 60 <= requested_ttl <= 3600:
             raise ValueError(
                 "lease_ttl_seconds must be an integer between 60 and 3600"
@@ -443,6 +461,20 @@ class AedtPoolService:
                 "unhealthy_recycle_grace_seconds must be an integer "
                 "between 0 and 3600"
             )
+        if (
+            type(requested_idle_ttl) is not int
+            or not 60 <= requested_idle_ttl <= 86400
+        ):
+            raise ValueError(
+                "idle_ttl_seconds must be an integer between 60 and 86400"
+            )
+        if (
+            type(requested_allocation_max_age) is not int
+            or not 0 <= requested_allocation_max_age <= 172800
+        ):
+            raise ValueError(
+                "allocation_max_age_seconds must be an integer between 0 and 172800"
+            )
         with self.db.connect() as conn:
             for key, value in (
                 ("aedt_pool_lease_ttl_seconds", requested_ttl),
@@ -453,6 +485,11 @@ class AedtPoolService:
                 (
                     "aedt_pool_unhealthy_recycle_grace_seconds",
                     requested_recycle_grace,
+                ),
+                ("aedt_pool_idle_ttl_seconds", requested_idle_ttl),
+                (
+                    "aedt_pool_allocation_max_age_seconds",
+                    requested_allocation_max_age,
                 ),
             ):
                 conn.execute(
@@ -502,17 +539,42 @@ class AedtPoolService:
             # Starting is left claimable: a host may already have launched AEDT
             # between claim and register. register_session observes disabled
             # state and registers it directly as draining.
-            conn.execute(
-                """
-                UPDATE aedt_sessions
-                SET state = 'draining', failure_message = ?,
-                    drain_requested_at = COALESCE(drain_requested_at, ?), updated_at = ?
-                WHERE state IN ('ready','busy')
-                   OR (state = 'unhealthy' AND failure_message = ?
-                       AND quarantine_reason = '')
-                """,
-                (reason, now, now, SESSION_HEARTBEAT_TIMEOUT_MESSAGE),
-            )
+            self._request_sessions_drain(conn, reason, now)
+
+    @staticmethod
+    def _request_sessions_drain(
+        conn: Any,
+        reason: str,
+        now: str,
+        *,
+        allocation_ids: list[int] | None = None,
+    ) -> None:
+        if allocation_ids == []:
+            return
+        allocation_filter = ""
+        parameters: list[Any] = [
+            reason,
+            now,
+            now,
+            SESSION_HEARTBEAT_TIMEOUT_MESSAGE,
+        ]
+        if allocation_ids is not None:
+            placeholders = ",".join("?" for _ in allocation_ids)
+            allocation_filter = f" AND allocation_id IN ({placeholders})"
+            parameters.extend(allocation_ids)
+        conn.execute(
+            f"""
+            UPDATE aedt_sessions
+            SET state = 'draining', failure_message = ?,
+                drain_requested_at = COALESCE(drain_requested_at, ?), updated_at = ?
+            WHERE (
+                state IN ('ready','busy')
+                OR (state = 'unhealthy' AND failure_message = ?
+                    AND quarantine_reason = '')
+            ){allocation_filter}
+            """,
+            parameters,
+        )
 
     def record_validation(self, evidence: dict[str, Any]) -> dict[str, Any]:
         """Evaluate the mandatory 2x standalone vs 1x pooled A/B contract."""
@@ -1752,6 +1814,48 @@ class AedtPoolService:
         now = _sql_time(now_dt)
         with self._lock, self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+
+            if execute and config.allocation_max_age_seconds:
+                allocation_age_cutoff = _sql_time(
+                    now_dt
+                    - timedelta(seconds=config.allocation_max_age_seconds)
+                )
+                conn.execute(
+                    """
+                    UPDATE allocations
+                    SET state = 'draining', drain_reason = ?,
+                        drain_at = COALESCE(drain_at, ?), updated_at = ?
+                    WHERE state IN ('warm','active')
+                      AND drain_reason LIKE 'AEDT pool%'
+                      AND created_at <= ?
+                    """,
+                    (
+                        ALLOCATION_AGE_ROTATION_REASON,
+                        now,
+                        now,
+                        allocation_age_cutoff,
+                    ),
+                )
+            if execute:
+                rotating_allocation_ids = [
+                    int(row["id"])
+                    for row in conn.execute(
+                        """
+                        SELECT id FROM allocations
+                        WHERE state = 'draining' AND drain_reason = ?
+                        """,
+                        (ALLOCATION_AGE_ROTATION_REASON,),
+                    ).fetchall()
+                ]
+                # Keep using the normal session-drain lifecycle on every pass.
+                # This also catches a host that registered after its allocation
+                # crossed the age boundary in the preceding pass.
+                self._request_sessions_drain(
+                    conn,
+                    ALLOCATION_AGE_ROTATION_REASON,
+                    now,
+                    allocation_ids=rotating_allocation_ids,
+                )
 
             queued_cutoff = _sql_time(
                 now_dt - timedelta(seconds=min(config.lease_ttl_seconds, 300))

@@ -21,6 +21,7 @@ from slurm_scheduler.aedt_attach_client import (
     acquire_project_lease,
 )
 from slurm_scheduler.aedt_pool import (
+    ALLOCATION_AGE_ROTATION_REASON,
     UNHEALTHY_ALLOCATION_RECYCLE_REASON,
     AedtPoolRuntime,
     AedtPoolService,
@@ -84,6 +85,7 @@ class AedtPoolTestCase(unittest.TestCase):
         self.tmp.cleanup()
 
     def add_dedicated_allocation(self, *, cpus: int = 64, node: str = "cpu-01") -> int:
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
         allocation_id = self.db.create_allocation(
             account_name="a",
             partition="cpu",
@@ -96,7 +98,8 @@ class AedtPoolTestCase(unittest.TestCase):
             state="active",
             slurm_job_id=f"job-{allocation_id}",
             drain_reason="AEDT pool project demand",
-            started_at="CURRENT_TIMESTAMP",
+            created_at=now,
+            started_at=now,
         )
         return allocation_id
 
@@ -153,6 +156,8 @@ class AedtPoolGateTests(AedtPoolTestCase):
         self.assertEqual(config.min_idle_sessions, 0)
         self.assertEqual(config.target_projects, 500)
         self.assertEqual(config.unhealthy_recycle_grace_seconds, 180)
+        self.assertEqual(config.idle_ttl_seconds, 3600)
+        self.assertEqual(config.allocation_max_age_seconds, 158400)
         self.assertFalse(config.enabled)
         self.assertFalse(config.operational)
         self.assertEqual(self.service.summary()["sessions"], [])
@@ -187,10 +192,14 @@ class AedtPoolGateTests(AedtPoolTestCase):
             lease_ttl_seconds=900,
             session_heartbeat_timeout_seconds=600,
             unhealthy_recycle_grace_seconds=240,
+            idle_ttl_seconds=7200,
+            allocation_max_age_seconds=86400,
         )
         self.assertEqual(config.lease_ttl_seconds, 900)
         self.assertEqual(config.session_heartbeat_timeout_seconds, 600)
         self.assertEqual(config.unhealthy_recycle_grace_seconds, 240)
+        self.assertEqual(config.idle_ttl_seconds, 7200)
+        self.assertEqual(config.allocation_max_age_seconds, 86400)
         with self.assertRaises(ValueError):
             self.service.set_operator_timeouts(lease_ttl_seconds=59)
         with self.assertRaises(ValueError):
@@ -201,10 +210,29 @@ class AedtPoolGateTests(AedtPoolTestCase):
             self.service.set_operator_timeouts(
                 unhealthy_recycle_grace_seconds=3601
             )
+        for invalid_idle_ttl in (59, True, 86401):
+            with self.subTest(invalid_idle_ttl=invalid_idle_ttl):
+                with self.assertRaisesRegex(ValueError, "between 60 and 86400"):
+                    self.service.set_operator_timeouts(
+                        idle_ttl_seconds=invalid_idle_ttl
+                    )
+        for invalid_max_age in (-1, True, 172801):
+            with self.subTest(invalid_max_age=invalid_max_age):
+                with self.assertRaisesRegex(ValueError, "between 0 and 172800"):
+                    self.service.set_operator_timeouts(
+                        allocation_max_age_seconds=invalid_max_age
+                    )
         unchanged = self.service.set_operator_timeouts(lease_ttl_seconds=600)
         self.assertEqual(unchanged.lease_ttl_seconds, 600)
         self.assertEqual(unchanged.session_heartbeat_timeout_seconds, 600)
         self.assertEqual(unchanged.unhealthy_recycle_grace_seconds, 240)
+        self.assertEqual(unchanged.idle_ttl_seconds, 7200)
+        self.assertEqual(unchanged.allocation_max_age_seconds, 86400)
+
+        disabled = self.service.set_operator_timeouts(
+            allocation_max_age_seconds=0
+        )
+        self.assertEqual(disabled.allocation_max_age_seconds, 0)
 
     def test_operator_limits_fail_closed_on_invalid_topology(self) -> None:
         config = self.service.set_operator_limits(
@@ -316,6 +344,47 @@ class AedtPoolGateTests(AedtPoolTestCase):
         config = self.service.config()
         self.assertEqual(config.target_projects, 401)
         self.assertEqual(config.max_sessions, 201)
+
+    def test_api_operator_surface_accepts_durable_rotation_and_idle_timeouts(
+        self,
+    ) -> None:
+        from fastapi import HTTPException
+
+        router = create_aedt_pool_router(self.service)
+        endpoint = next(
+            route.endpoint
+            for route in router.routes
+            if getattr(route, "path", "") == "/api/aedt-pool/config"
+        )
+
+        response = endpoint(
+            {
+                "idle_ttl_seconds": 7200,
+                "allocation_max_age_seconds": 86400,
+            }
+        )
+
+        self.assertEqual(response["idle_ttl_seconds"], 7200)
+        self.assertEqual(response["allocation_max_age_seconds"], 86400)
+        reloaded = AedtPoolService(self.db, bootstrap_token="secret")
+        self.assertEqual(reloaded.config().idle_ttl_seconds, 7200)
+        self.assertEqual(reloaded.config().allocation_max_age_seconds, 86400)
+
+        invalid_cases = (
+            ({"idle_ttl_seconds": 59}, "between 60 and 86400"),
+            ({"idle_ttl_seconds": 86401}, "between 60 and 86400"),
+            ({"allocation_max_age_seconds": -1}, "between 0 and 172800"),
+            ({"allocation_max_age_seconds": 172801}, "between 0 and 172800"),
+        )
+        for payload, message in invalid_cases:
+            with self.subTest(payload=payload):
+                with self.assertRaises(HTTPException) as raised:
+                    endpoint(payload)
+                self.assertEqual(raised.exception.status_code, 422)
+                self.assertIn(message, raised.exception.detail)
+
+        disabled = endpoint({"allocation_max_age_seconds": 0})
+        self.assertEqual(disabled["allocation_max_age_seconds"], 0)
 
     def test_api_concurrent_simulations_uses_same_request_project_slots(self) -> None:
         router = create_aedt_pool_router(self.service)
@@ -759,6 +828,83 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         )
         self.assertEqual(self.service.get_session(int(session["id"]))["slots_total"], 2)
         self.service.heartbeat_session(int(session["id"]), host_token)
+
+    def test_allocation_age_rotation_drains_only_old_capacity(self) -> None:
+        existing_lease, existing_token = self.request(
+            "rotation-existing",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        active_lease = self.service.heartbeat_lease(
+            int(existing_lease["id"]), existing_token
+        )
+        self.assertEqual(active_lease["state"], "active")
+
+        younger_allocation_id = self.add_dedicated_allocation(node="cpu-02")
+        max_age_seconds = 300
+        self.db.update_allocation(
+            self.allocation_id,
+            created_at=(
+                self.clock.now() - timedelta(seconds=max_age_seconds + 1)
+            ).strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        self.db.update_allocation(
+            younger_allocation_id,
+            created_at=self.clock.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+        self.service.set_operator_timeouts(allocation_max_age_seconds=0)
+        self.service.reconcile(execute=True)
+        self.assertEqual(
+            self.db.get_allocation(self.allocation_id)["state"], "active"
+        )
+
+        self.service.set_operator_timeouts(
+            allocation_max_age_seconds=max_age_seconds
+        )
+        queued_lease, _queued_token = self.request(
+            "rotation-new-placement",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+
+        rotated_allocation = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(rotated_allocation["state"], "draining")
+        self.assertEqual(
+            rotated_allocation["drain_reason"],
+            ALLOCATION_AGE_ROTATION_REASON,
+        )
+        self.assertIsNotNone(rotated_allocation["drain_at"])
+        younger_allocation = self.db.get_allocation(younger_allocation_id)
+        self.assertEqual(younger_allocation["state"], "active")
+        self.assertEqual(
+            younger_allocation["drain_reason"], "AEDT pool project demand"
+        )
+        self.assertIsNone(younger_allocation["drain_at"])
+
+        draining_session = self.service.get_session(int(session["id"]))
+        self.assertEqual(draining_session["state"], "draining")
+        self.assertEqual(
+            draining_session["failure_message"],
+            ALLOCATION_AGE_ROTATION_REASON,
+        )
+        self.assertIsNotNone(draining_session["drain_requested_at"])
+        preserved_lease = self.service.get_lease(int(existing_lease["id"]))
+        self.assertEqual(preserved_lease["state"], "active")
+        self.assertEqual(preserved_lease["session_id"], session["id"])
+        self.assertEqual(
+            self.service.get_lease(int(queued_lease["id"]))["state"], "queued"
+        )
+        commands = self.service.session_commands(int(session["id"]), host_token)
+        self.assertTrue(commands["drain"])
+        self.assertFalse(commands["global_stop_allowed"])
+
+        starting_sessions = self.service.starting_sessions()
+        self.assertEqual(len(starting_sessions), 1)
+        self.assertEqual(
+            int(starting_sessions[0]["allocation_id"]), younger_allocation_id
+        )
 
     def test_summary_enriches_session_operator_details(self) -> None:
         self.service.set_enabled(False)
@@ -1689,17 +1835,30 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertTrue(self.db.allocation_has_aedt_pool_claim(self.allocation_id))
 
     def test_idle_session_waits_for_ttl_before_drain(self) -> None:
-        lease, token = self.request("idle-ttl", allocation_id=self.allocation_id, node="cpu-01")
+        lease, token = self.request(
+            "idle-ttl", allocation_id=self.allocation_id, node="cpu-01"
+        )
         session, host_token = self.start_one_session(self.allocation_id)
         self.service.release_lease(int(lease["id"]), token)
-        self.service.complete_release(int(session["id"]), host_token, int(lease["id"]), success=True)
+        self.service.complete_release(
+            int(session["id"]), host_token, int(lease["id"]), success=True
+        )
         self.assertEqual(self.service.get_session(int(session["id"]))["state"], "ready")
         self.service.reconcile(execute=True)
         self.assertEqual(self.service.get_session(int(session["id"]))["state"], "ready")
-        for _ in range(9):
-            self.clock.advance(100)
+
+        idle_ttl_seconds = self.service.config().idle_ttl_seconds
+        elapsed = 0
+        while elapsed < idle_ttl_seconds - 1:
+            step = min(300, idle_ttl_seconds - 1 - elapsed)
+            self.clock.advance(step)
             self.service.heartbeat_session(int(session["id"]), host_token)
+            elapsed += step
+        self.service.reconcile(execute=True)
+        self.assertEqual(self.service.get_session(int(session["id"]))["state"], "ready")
+
         self.clock.advance(1)
+        self.service.heartbeat_session(int(session["id"]), host_token)
         self.service.reconcile(execute=True)
         self.assertEqual(self.service.get_session(int(session["id"]))["state"], "draining")
 

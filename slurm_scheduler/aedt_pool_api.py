@@ -52,6 +52,8 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
             "projects_per_aedt",
             "lease_ttl_seconds",
             "session_heartbeat_timeout_seconds",
+            "idle_ttl_seconds",
+            "allocation_max_age_seconds",
         }
         if not payload or set(payload) - allowed:
             raise HTTPException(
@@ -60,7 +62,8 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
                     "only concurrent_simulations, max_aedt_sessions, "
                     "min_idle_aedt_sessions, "
                     "target_project_concurrency, projects_per_aedt, "
-                    "lease_ttl_seconds, and session_heartbeat_timeout_seconds "
+                    "lease_ttl_seconds, session_heartbeat_timeout_seconds, "
+                    "idle_ttl_seconds, and allocation_max_age_seconds "
                     "are operator-configurable"
                 ),
             )
@@ -120,13 +123,21 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
                     target_projects=target_projects,
                     projects_per_session=payload.get("projects_per_aedt"),
                 )
-            if {"lease_ttl_seconds", "session_heartbeat_timeout_seconds"} & set(
-                payload
-            ):
+            timeout_keys = {
+                "lease_ttl_seconds",
+                "session_heartbeat_timeout_seconds",
+                "idle_ttl_seconds",
+                "allocation_max_age_seconds",
+            }
+            if timeout_keys & set(payload):
                 config = service.set_operator_timeouts(
                     lease_ttl_seconds=payload.get("lease_ttl_seconds"),
                     session_heartbeat_timeout_seconds=payload.get(
                         "session_heartbeat_timeout_seconds"
+                    ),
+                    idle_ttl_seconds=payload.get("idle_ttl_seconds"),
+                    allocation_max_age_seconds=payload.get(
+                        "allocation_max_age_seconds"
                     ),
                 )
             service.reconcile(execute=True)
@@ -142,6 +153,8 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
             "session_heartbeat_timeout_seconds": (
                 config.session_heartbeat_timeout_seconds
             ),
+            "idle_ttl_seconds": config.idle_ttl_seconds,
+            "allocation_max_age_seconds": config.allocation_max_age_seconds,
             "enabled": config.enabled,
             "operational": config.operational,
         }
