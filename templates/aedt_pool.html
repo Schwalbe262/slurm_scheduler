@@ -102,6 +102,20 @@
     return String(value ?? "");
   }
 
+  // DB timestamps are UTC ("YYYY-MM-DD HH:MM:SS"); display them in KST.
+  function kst(value) {
+    const text = String(value ?? "").trim();
+    if (!text || text === "-") return "-";
+    const parsed = new Date(text.replace(" ", "T") + "Z");
+    if (Number.isNaN(parsed.getTime())) return text;
+    return new Intl.DateTimeFormat("sv-SE", {
+      timeZone: "Asia/Seoul",
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+      hour12: false,
+    }).format(parsed);
+  }
+
   function taskLink(taskId) {
     const link = document.createElement("a");
     link.href = `/tasks/${taskId}`;
@@ -256,8 +270,8 @@
           session.node_name || "-",
           session.allocation_account_name || "-",
           session.state || "-",
-          session.started_at || "-",
-          session.last_heartbeat_at || "-"
+          kst(session.started_at),
+          kst(session.last_heartbeat_at)
         ]);
         row.append(attachedFeaCell(session));
         body.append(row);
@@ -296,8 +310,8 @@
           session.node_name || "-",
           session.allocation_account_name || "-",
           session.state || "-",
-          session.started_at || "-",
-          session.closed_at || "-",
+          kst(session.started_at),
+          kst(session.closed_at),
           sessionFailureReason(session)
         ]);
         historyBody.append(row);
@@ -324,7 +338,7 @@
           lease.project_name || "-",
           lease.task_id || "-",
           lease.session_id ? `${lease.session_id} / ${lease.slot_index ?? "-"}` : "-",
-          lease.last_heartbeat_at || "-",
+          kst(lease.last_heartbeat_at),
           lease.failure_message || "-"
         ];
         for (const value of values) {
