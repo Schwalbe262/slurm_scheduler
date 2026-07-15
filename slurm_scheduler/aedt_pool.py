@@ -641,7 +641,9 @@ class AedtPoolService:
             raise ValueError("exclusive_session must be a boolean")
         token = secrets.token_urlsafe(32)
         config = self.config()
-        expires = _sql_time(self._now() + timedelta(seconds=config.lease_ttl_seconds))
+        now_dt = self._now()
+        now = _sql_time(now_dt)
+        expires = _sql_time(now_dt + timedelta(seconds=config.lease_ttl_seconds))
         with self.db.connect() as conn:
             try:
                 cursor = conn.execute(
@@ -649,8 +651,9 @@ class AedtPoolService:
                     INSERT INTO aedt_project_leases (
                         request_key, project_name, task_id,
                         requested_allocation_id, requested_node_name,
-                        exclusive_session, state, client_token_hash, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                        exclusive_session, state, client_token_hash,
+                        last_heartbeat_at, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
                     """,
                     (
                         request_key,
@@ -660,6 +663,7 @@ class AedtPoolService:
                         node_name.strip(),
                         int(exclusive_session),
                         _token_hash(token),
+                        now,
                         expires,
                     ),
                 )
@@ -1749,47 +1753,26 @@ class AedtPoolService:
         with self._lock, self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
 
-            # A dead client may still have a solve executing in AEDT.  Never
-            # reuse that slot: request project cleanup and drain the session.
+            queued_cutoff = _sql_time(
+                now_dt - timedelta(seconds=min(config.lease_ttl_seconds, 300))
+            )
             expired = conn.execute(
                 """
-                SELECT id, session_id FROM aedt_project_leases
-                WHERE state IN ('queued','leased','active') AND expires_at < ?
+                SELECT id, session_id, state FROM aedt_project_leases
+                WHERE state IN ('queued','leased','active')
+                  AND (
+                      expires_at < ?
+                      OR (
+                          state = 'queued'
+                          AND last_heartbeat_at IS NOT NULL
+                          AND last_heartbeat_at < ?
+                      )
+                  )
                 """,
-                (now,),
+                (now, queued_cutoff),
             ).fetchall()
             for row in expired:
-                if row["session_id"]:
-                    conn.execute(
-                        """
-                        UPDATE aedt_project_leases
-                        SET state = 'releasing', failure_message = 'lease heartbeat expired',
-                            release_requested_at = ?, updated_at = ? WHERE id = ?
-                        """,
-                        (now, now, int(row["id"])),
-                    )
-                    conn.execute(
-                        """
-                        UPDATE aedt_sessions SET state = 'draining',
-                            quarantine_reason = 'lease_heartbeat_expired',
-                            quarantine_until = COALESCE(quarantine_until, ?),
-                            failure_message = 'project lease heartbeat expired',
-                            drain_requested_at = COALESCE(drain_requested_at, ?), updated_at = ?
-                        WHERE id = ? AND (
-                            state IN ('ready','busy')
-                            OR (state = 'unhealthy' AND failure_message = ?
-                                AND quarantine_reason = '')
-                        )
-                        """,
-                        (
-                            _sql_time(now_dt + timedelta(seconds=900)),
-                            now,
-                            now,
-                            int(row["session_id"]),
-                            SESSION_HEARTBEAT_TIMEOUT_MESSAGE,
-                        ),
-                    )
-                else:
+                if row["state"] == "queued":
                     conn.execute(
                         """
                         UPDATE aedt_project_leases
@@ -1798,6 +1781,45 @@ class AedtPoolService:
                         """,
                         (now, now, int(row["id"])),
                     )
+                    continue
+
+                # A lease that never became active cannot own a running solve.
+                # Ask the host to close its pending project, but keep the
+                # Desktop and every sibling lease serving normally.
+                conn.execute(
+                    """
+                    UPDATE aedt_project_leases
+                    SET state = 'releasing', failure_message = 'lease heartbeat expired',
+                        release_requested_at = ?, updated_at = ? WHERE id = ?
+                    """,
+                    (now, now, int(row["id"])),
+                )
+                if row["state"] != "active" or not row["session_id"]:
+                    continue
+
+                # A dead active client may still have a solve executing in
+                # AEDT.  Preserve the conservative whole-session quarantine.
+                conn.execute(
+                    """
+                    UPDATE aedt_sessions SET state = 'draining',
+                        quarantine_reason = 'lease_heartbeat_expired',
+                        quarantine_until = COALESCE(quarantine_until, ?),
+                        failure_message = 'project lease heartbeat expired',
+                        drain_requested_at = COALESCE(drain_requested_at, ?), updated_at = ?
+                    WHERE id = ? AND (
+                        state IN ('ready','busy')
+                        OR (state = 'unhealthy' AND failure_message = ?
+                            AND quarantine_reason = '')
+                    )
+                    """,
+                    (
+                        _sql_time(now_dt + timedelta(seconds=900)),
+                        now,
+                        now,
+                        int(row["session_id"]),
+                        SESSION_HEARTBEAT_TIMEOUT_MESSAGE,
+                    ),
+                )
 
             heartbeat_cutoff = _sql_time(
                 now_dt - timedelta(seconds=config.session_heartbeat_timeout_seconds)

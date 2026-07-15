@@ -1301,12 +1301,16 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             session_heartbeat_timeout_seconds=600,
             unhealthy_recycle_grace_seconds=3600,
         )
-        lease, _lease_token = self.request(
+        lease, lease_token = self.request(
             "lease-expiry-after-host-timeout",
             allocation_id=self.allocation_id,
             node="cpu-01",
         )
         session, host_token = self.start_one_session(self.allocation_id)
+        self.assertEqual(
+            self.service.heartbeat_lease(int(lease["id"]), lease_token)["state"],
+            "active",
+        )
         self.clock.advance(self.service.config().session_heartbeat_timeout_seconds + 1)
         self.service.reconcile(execute=True)
         heartbeat_only = self.service.get_session(int(session["id"]))
@@ -1334,6 +1338,67 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(heartbeat["quarantine_reason"], "lease_heartbeat_expired")
         self.assertTrue(
             self.service.session_commands(int(session["id"]), host_token)["drain"]
+        )
+
+    def test_stale_leased_never_active_releases_without_harming_session(self) -> None:
+        self.service.set_operator_timeouts(
+            lease_ttl_seconds=600,
+            session_heartbeat_timeout_seconds=3600,
+        )
+        stale, _stale_token = self.request(
+            "stale-never-active",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        sibling, sibling_token = self.request(
+            "live-sibling",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        self.assertEqual(self.service.get_lease(int(stale["id"]))["state"], "leased")
+        self.assertEqual(
+            self.service.heartbeat_lease(int(sibling["id"]), sibling_token)["state"],
+            "active",
+        )
+        sibling_before = self.service.get_lease(int(sibling["id"]))
+
+        self.clock.advance(599)
+        self.service.heartbeat_lease(int(sibling["id"]), sibling_token)
+        self.clock.advance(2)
+        self.service.heartbeat_session(int(session["id"]), host_token)
+        self.service.reconcile(execute=True)
+
+        expired = self.service.get_lease(int(stale["id"]))
+        live_sibling = self.service.get_lease(int(sibling["id"]))
+        current_session = self.service.get_session(int(session["id"]))
+        commands = self.service.session_commands(int(session["id"]), host_token)
+        self.assertEqual(expired["state"], "releasing")
+        self.assertEqual(live_sibling["state"], "active")
+        self.assertEqual(live_sibling["session_id"], session["id"])
+        self.assertEqual(live_sibling["slot_index"], sibling_before["slot_index"])
+        self.assertEqual(
+            live_sibling["failure_message"], sibling_before["failure_message"]
+        )
+        self.assertEqual(current_session["state"], "busy")
+        self.assertEqual(current_session["quarantine_reason"], "")
+        self.assertFalse(commands["drain"])
+        self.assertEqual(
+            [int(item["id"]) for item in commands["close_projects"]],
+            [int(stale["id"])],
+        )
+        self.assertEqual(commands["deferred_projects"], [])
+        self.assertEqual(self.db.get_allocation(self.allocation_id)["state"], "active")
+
+        released = self.service.complete_release(
+            int(session["id"]), host_token, int(stale["id"]), success=True
+        )
+        self.assertEqual(released["state"], "released")
+        self.assertEqual(
+            self.service.get_lease(int(sibling["id"]))["state"], "active"
+        )
+        self.assertEqual(
+            self.service.get_session(int(session["id"]))["state"], "busy"
         )
 
     def test_operator_disable_prevents_heartbeat_timeout_recovery(self) -> None:
@@ -1410,6 +1475,23 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.clock.advance(self.service.config().lease_ttl_seconds)
         self.service.reconcile(execute=True)
         self.assertEqual(self.service.get_lease(int(lease["id"]))["state"], "expired")
+
+    def test_stale_queued_lease_expires_after_short_heartbeat_grace(self) -> None:
+        self.service.set_operator_timeouts(lease_ttl_seconds=3600)
+        self.service.set_enabled(False)
+        lease, _token = self.request("stale-queued")
+        self.assertEqual(lease["state"], "queued")
+        self.assertEqual(lease["last_heartbeat_at"], "2026-07-13 00:00:00")
+
+        self.clock.advance(300)
+        self.service.reconcile(execute=True)
+        self.assertEqual(self.service.get_lease(int(lease["id"]))["state"], "queued")
+
+        self.clock.advance(1)
+        self.service.reconcile(execute=True)
+        expired = self.service.get_lease(int(lease["id"]))
+        self.assertEqual(expired["state"], "expired")
+        self.assertEqual(expired["failure_message"], "lease request heartbeat expired")
 
     def test_solver_timeout_quarantines_session_and_preserves_sibling_grace(self) -> None:
         first, first_token = self.request("timeout", allocation_id=self.allocation_id, node="cpu-01")
