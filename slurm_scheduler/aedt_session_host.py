@@ -90,6 +90,10 @@ NATIVE_PROBE_OK = "ok"
 NATIVE_PROBE_FAILED = "failed"
 NATIVE_PROBE_DEFERRED_BUSY = "deferred_busy"
 NATIVE_PROBE_NOT_RUN = "not_run"
+# Project release runs on the heartbeat thread.  Never let a sibling's long
+# modeling transaction turn one close command into a missed-heartbeat outage.
+# This remains well below the minimum five-second heartbeat interval.
+PROJECT_RELEASE_LOCK_TIMEOUT_SECONDS = 1.0
 TRANSIENT_HTTP_STATUSES = {408, 425, 429}
 TERMINAL_REGISTRATION_CONFLICT_MARKERS = (
     "not owned",
@@ -1415,10 +1419,40 @@ class AedtSessionHost:
 
     def _close_and_prepare_project_release(
         self, lease: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Close one exact project before preparing its owned workspace."""
+    ) -> dict[str, Any] | None:
+        """Close one exact project, or defer while sibling automation is busy."""
 
-        self._close_project(str(lease["project_name"]))
+        project_name = str(lease["project_name"])
+        if self.automation_lock_path:
+            # Do not reuse ``self._automation_lock`` here: its production
+            # timeout is intentionally long for host lifecycle operations.
+            # A separate same-path instance gives release a bounded attempt.
+            # Once it owns the shared path gate, call the unlocked primitive;
+            # nesting through ``_close_project`` would try to reacquire that
+            # gate through the long-timeout instance and deadlock this loop.
+            release_lock = SessionAutomationLock(
+                self.automation_lock_path,
+                timeout_seconds=PROJECT_RELEASE_LOCK_TIMEOUT_SECONDS,
+            )
+            try:
+                release_lock.acquire()
+            except TimeoutError:
+                self._journal(
+                    "project_release_deferred_busy",
+                    lease_id=int(lease["id"]),
+                    project_name=project_name,
+                    automation_lock_path=self.automation_lock_path,
+                    timeout_seconds=PROJECT_RELEASE_LOCK_TIMEOUT_SECONDS,
+                )
+                return None
+            try:
+                self._close_project_unlocked(project_name)
+            finally:
+                release_lock.release()
+        else:
+            # Unit/legacy hosts without prepared session artifacts retain the
+            # original guard. Production hosts always advertise a lock path.
+            self._close_project(project_name)
         result = self._prepare_released_project_workspace(lease)
         self._journal(
             "released_project_workspace_prepared",
@@ -1900,14 +1934,26 @@ class AedtSessionHost:
                     self._journal("control_plane_offline_safe", error=str(exc))
                     time.sleep(min(5, self.heartbeat_seconds))
                     continue
+                release_deferred_busy = False
                 for lease in commands.get("close_projects") or []:
                     success = True
                     failure = ""
                     try:
-                        self._close_and_prepare_project_release(lease)
+                        release_result = self._close_and_prepare_project_release(
+                            lease
+                        )
                     except Exception as exc:
                         success = False
                         failure = str(exc)
+                    else:
+                        if release_result is None:
+                            # Keep the lease in ``releasing``.  The control
+                            # plane will return it after the next heartbeat,
+                            # when this short lock attempt is retried.
+                            release_deferred_busy = True
+                            # Every project in one Desktop shares this lock, so
+                            # further close attempts can only add bounded waits.
+                            break
                     try:
                         self._control_plane_request(
                             "POST",
@@ -1922,6 +1968,13 @@ class AedtSessionHost:
                             success=success,
                             error=str(exc),
                         )
+                if release_deferred_busy:
+                    # A drain/global-stop response was computed before this
+                    # close attempt.  Do not act on it and bypass the promised
+                    # retry; first publish another heartbeat and refresh the
+                    # commands after the client transaction releases the lock.
+                    time.sleep(self.heartbeat_seconds)
+                    continue
                 if commands.get("global_stop_allowed"):
                     # Never use this path until the control plane says the
                     # sibling finished or its explicitly bounded grace elapsed.

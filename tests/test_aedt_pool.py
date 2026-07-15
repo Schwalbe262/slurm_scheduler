@@ -4240,6 +4240,159 @@ class SessionHostTests(unittest.TestCase):
             ],
         )
 
+    def test_busy_release_defers_ack_while_heartbeats_continue_then_closes_once(
+        self,
+    ) -> None:
+        events: list[str] = []
+        start_holder = threading.Event()
+        holder_acquired = threading.Event()
+        release_holder = threading.Event()
+        holder_released = threading.Event()
+        holder_errors: list[BaseException] = []
+        lease = {"id": 71, "project_name": "mft-task-71"}
+
+        class ReleaseRetryControl(FakeHostControlPlane):
+            def __init__(self) -> None:
+                super().__init__(events)
+                self.heartbeat_count = 0
+                self.release_acks: list[dict] = []
+                self.released = False
+
+            def request(self, method, path, payload=None, host_token=""):
+                if path.endswith("/heartbeat"):
+                    self.heartbeat_count += 1
+                    events.append(f"heartbeat:{self.heartbeat_count}")
+                    return {}
+                if path.endswith("/commands"):
+                    self.command_count += 1
+                    events.append(f"commands:{self.command_count}")
+                    if self.command_count == 1:
+                        start_holder.set()
+                        if not holder_acquired.wait(2):
+                            raise AssertionError("client did not acquire automation lock")
+                    elif self.command_count == 2:
+                        if not holder_released.wait(2):
+                            raise AssertionError("client did not release automation lock")
+                    if not self.released:
+                        return {
+                            "close_projects": [dict(lease)],
+                            "global_stop_allowed": False,
+                            # Even a precomputed drain must not bypass the
+                            # promised retry after a busy release close.
+                            "drain": True,
+                            "sibling_live_count": 0,
+                        }
+                    return {
+                        "close_projects": [],
+                        "global_stop_allowed": True,
+                        "drain": True,
+                        "sibling_live_count": 0,
+                    }
+                if path.endswith("/release-complete"):
+                    self.release_acks.append(dict(payload or {}))
+                    self.released = True
+                    events.append("release-ack")
+                    return {}
+                return super().request(
+                    method, path, payload, host_token=host_token
+                )
+
+        with tempfile.TemporaryDirectory() as root:
+            control = ReleaseRetryControl()
+            host = AedtSessionHost(
+                control,
+                allocation_id=1,
+                node_name="cpu-01",
+                artifact_root=root,
+            )
+            # Keep the state-machine test fast without changing the production
+            # constructor's five-second heartbeat floor.
+            host.heartbeat_seconds = 0
+            host._start_desktop = lambda: FakeDesktop(events)
+            trust_fake_desktop_liveness(host)
+
+            def forbidden_nested_close(_project_name):
+                raise AssertionError(
+                    "bounded same-path release must call the unlocked close"
+                )
+
+            host._close_project = forbidden_nested_close
+            host._close_project_unlocked = (
+                lambda project_name: events.append(f"close:{project_name}")
+            )
+
+            def prepare(_lease):
+                events.append("prepare")
+                return {"state": "prepared", "directories_changed": 1}
+
+            host._prepare_released_project_workspace = prepare
+            original_journal = host._journal
+
+            def journal(event, **fields):
+                events.append(f"journal:{event}")
+                original_journal(event, **fields)
+                if event == "project_release_deferred_busy":
+                    release_holder.set()
+
+            host._journal = journal
+
+            def hold_client_automation_lock() -> None:
+                try:
+                    if not start_holder.wait(2):
+                        raise AssertionError("release command was not requested")
+                    with SessionAutomationLock(
+                        host.automation_lock_path, timeout_seconds=1.0
+                    ):
+                        events.append("client-lock-acquired")
+                        holder_acquired.set()
+                        if not release_holder.wait(2):
+                            raise AssertionError("busy release was not deferred")
+                    events.append("client-lock-released")
+                except BaseException as exc:
+                    holder_errors.append(exc)
+                finally:
+                    holder_released.set()
+
+            holder = threading.Thread(
+                target=hold_client_automation_lock,
+                name="test-aedt-client-lock-holder",
+                daemon=True,
+            )
+            holder.start()
+            try:
+                with patch(
+                    "slurm_scheduler.aedt_session_host."
+                    "PROJECT_RELEASE_LOCK_TIMEOUT_SECONDS",
+                    0.05,
+                ):
+                    self.assertEqual(host.run(), 0)
+            finally:
+                release_holder.set()
+                holder.join(timeout=2)
+
+            journal_text = Path(host.journal_path).read_text(encoding="utf-8")
+
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(holder_errors, [])
+        self.assertGreaterEqual(control.heartbeat_count, 2)
+        self.assertEqual(
+            control.release_acks,
+            [{"success": True, "failure_message": ""}],
+        )
+        self.assertEqual(events.count("close:mft-task-71"), 1)
+        self.assertEqual(events.count("prepare"), 1)
+        self.assertEqual(events.count("release-ack"), 1)
+        deferred = events.index("journal:project_release_deferred_busy")
+        second_heartbeat = events.index("heartbeat:2")
+        close = events.index("close:mft-task-71")
+        prepare = events.index("prepare")
+        ack = events.index("release-ack")
+        self.assertLess(deferred, second_heartbeat)
+        self.assertLess(second_heartbeat, close)
+        self.assertLess(close, prepare)
+        self.assertLess(prepare, ack)
+        self.assertIn('"event": "project_release_deferred_busy"', journal_text)
+
     def test_release_prepares_only_exact_project_directories(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             host = self._release_test_host(root)
