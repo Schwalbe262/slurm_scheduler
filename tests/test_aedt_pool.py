@@ -300,6 +300,91 @@ class AedtPoolGateTests(AedtPoolTestCase):
             )
         self.assertEqual(raised.exception.status_code, 422)
 
+    def test_api_concurrent_simulations_derives_project_and_session_limits(self) -> None:
+        router = create_aedt_pool_router(self.service)
+        endpoint = next(
+            route.endpoint
+            for route in router.routes
+            if getattr(route, "path", "") == "/api/aedt-pool/config"
+        )
+
+        response = endpoint({"concurrent_simulations": 401})
+
+        self.assertEqual(response["concurrent_simulations"], 401)
+        self.assertEqual(response["target_project_concurrency"], 401)
+        self.assertEqual(response["max_aedt_sessions"], 201)
+        config = self.service.config()
+        self.assertEqual(config.target_projects, 401)
+        self.assertEqual(config.max_sessions, 201)
+
+    def test_api_concurrent_simulations_uses_same_request_project_slots(self) -> None:
+        router = create_aedt_pool_router(self.service)
+        endpoint = next(
+            route.endpoint
+            for route in router.routes
+            if getattr(route, "path", "") == "/api/aedt-pool/config"
+        )
+
+        response = endpoint(
+            {
+                "concurrent_simulations": 1650,
+                "projects_per_aedt": 3,
+            }
+        )
+
+        self.assertEqual(response["concurrent_simulations"], 1650)
+        self.assertEqual(response["target_project_concurrency"], 1650)
+        self.assertEqual(response["max_aedt_sessions"], 550)
+        self.assertEqual(response["projects_per_aedt"], 3)
+
+    def test_api_concurrent_simulations_rejects_derived_session_overflow(self) -> None:
+        from fastapi import HTTPException
+
+        router = create_aedt_pool_router(self.service)
+        endpoint = next(
+            route.endpoint
+            for route in router.routes
+            if getattr(route, "path", "") == "/api/aedt-pool/config"
+        )
+
+        with self.assertRaises(HTTPException) as raised:
+            endpoint({"concurrent_simulations": 1101})
+
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertIn("maximum is 550", raised.exception.detail)
+
+        for invalid_value in (-1, True, 1651):
+            with self.subTest(invalid_value=invalid_value):
+                with self.assertRaises(HTTPException) as invalid:
+                    endpoint({"concurrent_simulations": invalid_value})
+                self.assertEqual(invalid.exception.status_code, 422)
+                self.assertIn("integer between 0 and 1650", invalid.exception.detail)
+
+    def test_api_concurrent_simulations_rejects_derived_key_mixing(self) -> None:
+        from fastapi import HTTPException
+
+        router = create_aedt_pool_router(self.service)
+        endpoint = next(
+            route.endpoint
+            for route in router.routes
+            if getattr(route, "path", "") == "/api/aedt-pool/config"
+        )
+
+        for explicit_key in (
+            "max_aedt_sessions",
+            "target_project_concurrency",
+        ):
+            with self.subTest(explicit_key=explicit_key):
+                with self.assertRaises(HTTPException) as raised:
+                    endpoint(
+                        {
+                            "concurrent_simulations": 400,
+                            explicit_key: 200,
+                        }
+                    )
+                self.assertEqual(raised.exception.status_code, 422)
+                self.assertIn("cannot be combined", raised.exception.detail)
+
     def test_every_mutating_api_route_requires_bootstrap_token(self) -> None:
         from fastapi import HTTPException
 
@@ -342,6 +427,16 @@ class AedtPoolGateTests(AedtPoolTestCase):
             Path(__file__).resolve().parents[1] / "templates" / "aedt_pool.html"
         ).read_text(encoding="utf-8")
         for required in (
+            'id="concurrent-simulations-form"',
+            'id="concurrent-simulations" name="concurrent_simulations" type="number" min="0" max="1650"',
+            'id="derived-aedt-sessions"',
+            '<details id="advanced-operator-limits" class="section-gap">',
+            "동시 시뮬레이션 수",
+            "Math.ceil(simulations / projectsPerAedt)",
+            "localStorage.getItem(bootstrapTokenStorageKey)",
+            "localStorage.setItem(",
+            "bootstrap token 오류",
+            "HTTP ${response.status}",
             'id="max-aedt-sessions"',
             'id="min-idle-aedt-sessions"',
             'id="target-projects" name="target_project_concurrency" type="number" min="0" max="1650"',

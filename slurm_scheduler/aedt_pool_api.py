@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import ceil
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
     @router.patch("/api/aedt-pool/config", dependencies=[bootstrap_guard])
     def set_aedt_pool_limit(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         allowed = {
+            "concurrent_simulations",
             "max_aedt_sessions",
             "min_idle_aedt_sessions",
             "target_project_concurrency",
@@ -55,24 +57,67 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    "only max_aedt_sessions, min_idle_aedt_sessions, "
+                    "only concurrent_simulations, max_aedt_sessions, "
+                    "min_idle_aedt_sessions, "
                     "target_project_concurrency, projects_per_aedt, "
                     "lease_ttl_seconds, and session_heartbeat_timeout_seconds "
                     "are operator-configurable"
                 ),
             )
+        derived_keys = {"max_aedt_sessions", "target_project_concurrency"}
+        if "concurrent_simulations" in payload and derived_keys & set(payload):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "concurrent_simulations cannot be combined with "
+                    "max_aedt_sessions or target_project_concurrency"
+                ),
+            )
         try:
             limit_keys = {
+                "concurrent_simulations",
                 "max_aedt_sessions",
                 "min_idle_aedt_sessions",
                 "target_project_concurrency",
                 "projects_per_aedt",
             }
             if limit_keys & set(payload):
+                max_sessions = payload.get("max_aedt_sessions")
+                target_projects = payload.get("target_project_concurrency")
+                if "concurrent_simulations" in payload:
+                    concurrent_simulations = payload["concurrent_simulations"]
+                    if (
+                        type(concurrent_simulations) is not int
+                        or not 0 <= concurrent_simulations <= 1650
+                    ):
+                        raise ValueError(
+                            "concurrent_simulations must be an integer between "
+                            "0 and 1650"
+                        )
+                    projects_per_session = payload.get(
+                        "projects_per_aedt",
+                        service.config().projects_per_session,
+                    )
+                    if (
+                        type(projects_per_session) is not int
+                        or not 1 <= projects_per_session <= 3
+                    ):
+                        raise ValueError(
+                            "projects_per_aedt must be an integer between 1 and 3"
+                        )
+                    max_sessions = ceil(
+                        concurrent_simulations / projects_per_session
+                    )
+                    if max_sessions > 550:
+                        raise ValueError(
+                            "concurrent_simulations would require "
+                            f"{max_sessions} max_aedt_sessions; maximum is 550"
+                        )
+                    target_projects = concurrent_simulations
                 config = service.set_operator_limits(
-                    max_sessions=payload.get("max_aedt_sessions"),
+                    max_sessions=max_sessions,
                     min_idle_sessions=payload.get("min_idle_aedt_sessions"),
-                    target_projects=payload.get("target_project_concurrency"),
+                    target_projects=target_projects,
                     projects_per_session=payload.get("projects_per_aedt"),
                 )
             if {"lease_ttl_seconds", "session_heartbeat_timeout_seconds"} & set(
@@ -88,6 +133,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {
+            "concurrent_simulations": config.target_projects,
             "max_aedt_sessions": config.max_sessions,
             "min_idle_aedt_sessions": config.min_idle_sessions,
             "target_project_concurrency": config.target_projects,
