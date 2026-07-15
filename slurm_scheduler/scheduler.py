@@ -2269,6 +2269,25 @@ class Scheduler:
             reason = info.pending_reason
             if reason and reason != (allocation.get("pending_reason") or ""):
                 self.db.update_allocation(allocation["id"], pending_reason=reason)
+        elif status == JobStatus.SUBMITTED and allocation["state"] == AllocationStatus.CLOSING.value:
+            # The batched probe reports jobs missing from BOTH squeue and the
+            # sacct window as SUBMITTED (see SlurmClient.job_states). A CLOSING
+            # allocation already had its scancel issued, so "Slurm has no
+            # record" means the job is gone for good; without this branch the
+            # row stays 'closing' forever and pins the node ledger (observed
+            # 26h+ stuck rows blocking pool scale-out).
+            self.db.update_allocation(
+                allocation["id"],
+                state=AllocationStatus.CLOSED.value,
+                closed_at="CURRENT_TIMESTAMP",
+            )
+            self.record_event(
+                "allocation_closed",
+                f"slurm job {allocation.get('slurm_job_id')} vanished while closing",
+                entity_type="allocation",
+                entity_id=allocation["id"],
+                account_name=str(allocation.get("account_name") or ""),
+            )
         elif status in {JobStatus.COMPLETED, JobStatus.CANCELLED}:
             self.db.update_allocation(allocation["id"], state=AllocationStatus.CLOSED.value, closed_at="CURRENT_TIMESTAMP")
             self.record_event(
