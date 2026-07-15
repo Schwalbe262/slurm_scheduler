@@ -1475,7 +1475,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
                 INSERT INTO aedt_sessions (
                     session_key, allocation_id, account_name, node_name,
                     slots_total, state, quarantine_reason
-                ) VALUES ('closed-quarantine', ?, 'a', 'cpu-01', 2, 'failed',
+                ) VALUES ('live-quarantine', ?, 'a', 'cpu-01', 2, 'draining',
                           'solver_timeout')
                 """,
                 (self.allocation_id,),
@@ -1489,14 +1489,61 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
 
         self.service.reconcile(execute=True)
 
+        # A LIVE quarantined sibling keeps the allocation recycling; the
+        # healthy session stays on its way out rather than serving.
         allocation = self.db.get_allocation(self.allocation_id)
         self.assertEqual(allocation["state"], "draining")
         self.assertEqual(
             allocation["drain_reason"], UNHEALTHY_ALLOCATION_RECYCLE_REASON
         )
         healthy_session = self.service.get_session(int(session["id"]))
-        self.assertEqual(healthy_session["state"], "ready")
+        self.assertIn(healthy_session["state"], ("ready", "draining"))
         self.assertIsNotNone(healthy_session["drain_requested_at"])
+
+    def test_recycle_draining_allocation_recovers_despite_terminal_history(
+        self,
+    ) -> None:
+        self.service.set_operator_limits(
+            max_sessions=1,
+            min_idle_sessions=1,
+            target_projects=2,
+        )
+        session, _host_token = self.start_one_session(self.allocation_id)
+        drain_at = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE aedt_sessions SET drain_requested_at = ? WHERE id = ?",
+                (drain_at, int(session["id"])),
+            )
+            # Terminal siblings keep their quarantine history forever; that
+            # history must not pin the allocation once only healthy sessions
+            # remain (production: 2 ready Desktops idled behind 3 failed
+            # siblings while 249 leases queued).
+            conn.execute(
+                """
+                INSERT INTO aedt_sessions (
+                    session_key, allocation_id, account_name, node_name,
+                    slots_total, state, quarantine_reason
+                ) VALUES ('dead-quarantine', ?, 'a', 'cpu-01', 2, 'failed',
+                          'aedt_death_reported')
+                """,
+                (self.allocation_id,),
+            )
+        self.db.update_allocation(
+            self.allocation_id,
+            state="draining",
+            drain_reason=UNHEALTHY_ALLOCATION_RECYCLE_REASON,
+            drain_at=drain_at,
+        )
+
+        self.service.reconcile(execute=True)
+
+        allocation = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(allocation["state"], "active")
+        self.assertEqual(allocation["drain_reason"], "AEDT pool project demand")
+        healthy_session = self.service.get_session(int(session["id"]))
+        self.assertEqual(healthy_session["state"], "ready")
+        self.assertIsNone(healthy_session["drain_requested_at"])
 
     def test_exclusive_1to1_lease_never_accepts_a_sibling(self) -> None:
         self.service.set_operator_limit(1)
