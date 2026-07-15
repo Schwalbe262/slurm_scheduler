@@ -21,6 +21,7 @@ from .aedt_session_host import (
     SUPPORTED_DSO_PROFILES,
     canonical_expected_session_profile,
 )
+from .aedt_automation_lock import automation_lock_path
 
 
 LOGGER = logging.getLogger(__name__)
@@ -1207,6 +1208,7 @@ class AedtPoolService:
                 SELECT l.*, s.session_key, s.endpoint, s.node_name AS session_node_name,
                        s.allocation_id AS session_allocation_id,
                        s.process_id AS session_process_id,
+                       s.artifact_dir AS session_artifact_dir,
                        s.slots_total AS session_slots_total,
                        s.solve_batch_sealed_at,
                        (SELECT COUNT(*) FROM aedt_project_leases live
@@ -1226,6 +1228,9 @@ class AedtPoolService:
             if not row:
                 raise KeyError(lease_id)
             item = dict(row)
+            item["automation_lock_path"] = automation_lock_path(
+                str(item.get("session_artifact_dir") or "")
+            )
             item["expected_aedt_version"] = (
                 EXPECTED_AEDT_VERSION
                 if str(item.get("session_profile") or "")

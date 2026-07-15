@@ -15,9 +15,12 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from .aedt_automation_lock import SessionAutomationLock
 
 DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS = 360.0
 CONTROL_PLANE_OUTAGE_ENV = "AEDT_POOL_CONTROL_PLANE_OUTAGE_SECONDS"
@@ -227,6 +230,7 @@ class AedtProjectLease:
     project_namespace: str = ""
     isolation_policy: str = "family"
     workspace_path: str = ""
+    automation_lock_path: str = ""
     session_key: str = ""
     session_process_id: str = ""
     expected_aedt_version: str = ""
@@ -244,6 +248,9 @@ class AedtProjectLease:
     _keepalive_process: Any = field(default=None, init=False, repr=False)
     _keepalive_stop: Any = field(default=None, init=False, repr=False)
     _desktop_proxy: Any = field(default=None, init=False, repr=False)
+    _automation_lock: SessionAutomationLock | None = field(
+        default=None, init=False, repr=False
+    )
     heartbeat_error: str = field(default="", init=False)
     detach_error: str = field(default="", init=False)
 
@@ -310,6 +317,9 @@ class AedtProjectLease:
     def _apply_status(self, status: dict[str, Any]) -> None:
         self.state = str(status.get("state") or "")
         self.endpoint = str(status.get("endpoint") or "")
+        self.automation_lock_path = str(
+            status.get("automation_lock_path") or self.automation_lock_path
+        )
         self.session_key = str(status.get("session_key") or self.session_key)
         self.session_process_id = str(
             status.get("session_process_id") or self.session_process_id
@@ -589,34 +599,82 @@ class AedtProjectLease:
             resolved_version = self.expected_aedt_version
         if resolved_version:
             kwargs["version"] = resolved_version
-        desktop = desktop_factory(**kwargs)
-        self._desktop_proxy = desktop
-        # Attaching is intentionally distinct from active: the client must
-        # create/open and bind its AEDT project successfully before activation.
-        try:
-            self._attest_attached_desktop(desktop)
-        except Exception as exc:
+        with self.automation_guard():
+            desktop = desktop_factory(**kwargs)
+            self._desktop_proxy = desktop
+            # Attaching is intentionally distinct from active: the client must
+            # create/open and fully model its first design before activation.
             try:
-                self.report_fault(
-                    "attach_failed",
-                    phase="attach",
-                    evidence={
-                        "session_key": self.session_key,
-                        "expected_endpoint": self.endpoint,
-                        "expected_process_id": self.session_process_id,
-                        "expected_aedt_version": self.expected_aedt_version,
-                    },
-                    failure_message=str(exc),
-                )
-            except Exception:
-                pass
-            if self.state in {"released", "failed", "cancelled", "expired"}:
-                self._detach_wrapper_best_effort()
-            raise AedtLeaseError(f"AEDT attach identity check failed: {exc}") from exc
+                self._attest_attached_desktop(desktop)
+            except Exception as exc:
+                try:
+                    self.report_fault(
+                        "attach_failed",
+                        phase="attach",
+                        evidence={
+                            "session_key": self.session_key,
+                            "expected_endpoint": self.endpoint,
+                            "expected_process_id": self.session_process_id,
+                            "expected_aedt_version": self.expected_aedt_version,
+                        },
+                        failure_message=str(exc),
+                    )
+                except Exception:
+                    pass
+                if self.state in {"released", "failed", "cancelled", "expired"}:
+                    self._detach_wrapper_best_effort()
+                raise AedtLeaseError(f"AEDT attach identity check failed: {exc}") from exc
         self.heartbeat()
         if not self._keepalive_process:
             self.start_heartbeat()
         return desktop
+
+    def automation_lock(self) -> SessionAutomationLock:
+        """Return this session's re-entrant Desktop-global automation lock."""
+
+        if not self.automation_lock_path:
+            self.status()
+        if not self.automation_lock_path:
+            raise AedtLeaseError(
+                "authorized AEDT session has no automation lock path"
+            )
+        if (
+            self._automation_lock is None
+            or self._automation_lock.path != self.automation_lock_path
+        ):
+            raw_timeout = os.environ.get(
+                "AEDT_POOL_AUTOMATION_LOCK_TIMEOUT_SECONDS", "1800"
+            ).strip()
+            try:
+                timeout_seconds = float(raw_timeout)
+            except (TypeError, ValueError) as exc:
+                raise AedtLeaseError(
+                    "AEDT_POOL_AUTOMATION_LOCK_TIMEOUT_SECONDS must be numeric"
+                ) from exc
+            if not 30 <= timeout_seconds <= 7200:
+                raise AedtLeaseError(
+                    "AEDT_POOL_AUTOMATION_LOCK_TIMEOUT_SECONDS must be between "
+                    "30 and 7200"
+                )
+            self._automation_lock = SessionAutomationLock(
+                self.automation_lock_path,
+                timeout_seconds=timeout_seconds,
+            )
+        return self._automation_lock
+
+    def automation_guard(self):
+        """Protocol-v1 compatibility; v2 always requires the host lock."""
+
+        if self.protocol_version < 2:
+            return nullcontext()
+        return self.automation_lock()
+
+    def native_solve_window(self):
+        """Release a held automation transaction around exact native Analyze."""
+
+        if self.protocol_version < 2:
+            return nullcontext()
+        return self.automation_lock().suspended()
 
     @staticmethod
     def _endpoint_is_listening(machine: str, port: int) -> bool:
@@ -657,11 +715,12 @@ class AedtProjectLease:
         if desktop is None:
             return
         try:
-            desktop.release_desktop(
-                close_projects=False,
-                close_on_exit=False,
-            )
-            self.detach_error = ""
+            with self.automation_guard():
+                desktop.release_desktop(
+                    close_projects=False,
+                    close_on_exit=False,
+                )
+                self.detach_error = ""
         except Exception as exc:
             self.detach_error = str(exc)
         finally:
@@ -768,7 +827,7 @@ class AedtProjectLease:
             return self.status()
         if fill_timeout_seconds is None:
             raw_timeout = os.environ.get(
-                "MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS", "120"
+                "MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS", "900"
             ).strip()
             try:
                 fill_timeout_seconds = float(raw_timeout)
@@ -959,6 +1018,7 @@ def acquire_project_lease(
         project_namespace=str(lease.get("project_namespace") or project_namespace),
         isolation_policy=str(lease.get("isolation_policy") or isolation_policy),
         workspace_path=str(lease.get("workspace_path") or workspace_path),
+        automation_lock_path=str(lease.get("automation_lock_path") or ""),
         session_key=str(lease.get("session_key") or ""),
         session_process_id=str(lease.get("session_process_id") or ""),
         expected_aedt_version=str(lease.get("expected_aedt_version") or ""),

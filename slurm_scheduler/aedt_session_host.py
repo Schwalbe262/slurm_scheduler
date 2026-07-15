@@ -19,8 +19,15 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
+
+from .aedt_automation_lock import (
+    SessionAutomationLock,
+    automation_lock_path,
+    create_automation_lock_file,
+)
 
 
 # Leave one HTTP-timeout/backoff margin beyond the required five-minute outage.
@@ -78,6 +85,10 @@ DESKTOP_LAUNCH_RETRY_SECONDS = 5.0
 DESKTOP_LAUNCH_RETRY_MAX_SECONDS = 30.0
 NATIVE_PROBE_FAILURES_BEFORE_RECYCLE = 3
 NATIVE_PROBE_FAILURE_WINDOW_SECONDS = 60.0
+NATIVE_PROBE_OK = "ok"
+NATIVE_PROBE_FAILED = "failed"
+NATIVE_PROBE_DEFERRED_BUSY = "deferred_busy"
+NATIVE_PROBE_NOT_RUN = "not_run"
 TRANSIENT_HTTP_STATUSES = {408, 425, 429}
 TERMINAL_REGISTRATION_CONFLICT_MARKERS = (
     "not owned",
@@ -276,7 +287,7 @@ class ControlPlaneClient:
 
 
 class AedtSessionHost:
-    """Own exactly one AEDT process and at most two leased projects.
+    """Own exactly one AEDT process and at most three leased projects.
 
     Project workers may attach through the advertised gRPC endpoint, but they
     never own Desktop lifecycle.  This process alone closes projects and kills
@@ -347,8 +358,12 @@ class AedtSessionHost:
         self.native_probe_first_failure_at = 0.0
         self._native_probe_thread: threading.Thread | None = None
         self._native_probe_errors: list[BaseException] = []
+        self._native_probe_outcome = NATIVE_PROBE_NOT_RUN
+        self.last_native_probe_outcome = NATIVE_PROBE_NOT_RUN
         self.stop_requested = False
         self.artifact_dir = ""
+        self.automation_lock_path = ""
+        self._automation_lock: SessionAutomationLock | None = None
         self.error_log_path = ""
         self.journal_path = ""
         self.native_snapshot_path = ""
@@ -509,9 +524,15 @@ class AedtSessionHost:
         # Persist the intended paths in /start-failed even when mkdir itself is
         # the startup failure (permissions, GPFS outage, quota, and so on).
         self.artifact_dir = str(directory)
+        self.automation_lock_path = automation_lock_path(self.artifact_dir)
         self.error_log_path = str(directory / "pyaedt.log")
         self.journal_path = str(directory / "session-events.jsonl")
         directory.mkdir(parents=True, exist_ok=True)
+        create_automation_lock_file(self.automation_lock_path)
+        self._automation_lock = SessionAutomationLock(
+            self.automation_lock_path,
+            timeout_seconds=max(300.0, self.control_plane_outage_seconds),
+        )
         self._journal(
             "claim_accepted",
             allocation_id=self.allocation_id,
@@ -553,6 +574,7 @@ class AedtSessionHost:
             "session_profile": self.session_profile,
             "dso_profile": self.dso_profile,
             "artifact_dir": self.artifact_dir,
+            "automation_lock_path": self.automation_lock_path,
             "error_log_path": self.error_log_path,
             "journal_path": self.journal_path,
         }
@@ -1035,7 +1057,14 @@ class AedtSessionHost:
                 return str(value)
         return ""
 
+    def _automation_guard(self):
+        return self._automation_lock or nullcontext()
+
     def _close_project(self, project_name: str) -> None:
+        with self._automation_guard():
+            self._close_project_unlocked(project_name)
+
+    def _close_project_unlocked(self, project_name: str) -> None:
         odesktop = getattr(self.desktop, "odesktop", None)
         if odesktop is not None:
             try:
@@ -1056,21 +1085,23 @@ class AedtSessionHost:
 
     def _global_stop(self) -> None:
         """Global by AEDT design; caller must honor the sibling grace gate."""
-        odesktop = getattr(self.desktop, "odesktop", None)
-        if odesktop is None:
-            raise RuntimeError("AEDT Desktop object has no StopSimulations API")
-        odesktop.StopSimulations(False)
+        with self._automation_guard():
+            odesktop = getattr(self.desktop, "odesktop", None)
+            if odesktop is None:
+                raise RuntimeError("AEDT Desktop object has no StopSimulations API")
+            odesktop.StopSimulations(False)
 
     def _close_desktop(self) -> None:
-        if self.desktop is None:
-            return
-        release = getattr(self.desktop, "release_desktop", None)
-        if callable(release):
-            try:
-                release(close_projects=True, close_on_exit=True)
-            except TypeError:
-                release(True, True)
-        self.desktop = None
+        with self._automation_guard():
+            if self.desktop is None:
+                return
+            release = getattr(self.desktop, "release_desktop", None)
+            if callable(release):
+                try:
+                    release(close_projects=True, close_on_exit=True)
+                except TypeError:
+                    release(True, True)
+            self.desktop = None
 
     @staticmethod
     def _process_marker(pid: int) -> str | None:
@@ -1219,41 +1250,92 @@ class AedtSessionHost:
             # unhealthy; never hide the original host failure.
             pass
 
-    def _native_desktop_responds(self, timeout_seconds: float = 5.0) -> bool:
+    def _native_desktop_responds(self, timeout_seconds: float = 5.0) -> str:
+        """Return an explicit native-probe outcome without racing a client.
+
+        A probe is allowed to call ``GetVersion`` only after taking the same
+        cross-process automation lock used by attached clients.  Lock
+        contention is positive evidence that a client owns AEDT automation,
+        not evidence that AEDT is unhealthy, so it is reported separately
+        from a native call failure.
+        """
+
+        def consume_finished_probe() -> str:
+            outcome = self._native_probe_outcome
+            if outcome not in {
+                NATIVE_PROBE_OK,
+                NATIVE_PROBE_FAILED,
+                NATIVE_PROBE_DEFERRED_BUSY,
+            }:
+                outcome = (
+                    NATIVE_PROBE_FAILED
+                    if self._native_probe_errors
+                    else NATIVE_PROBE_OK
+                )
+            self._native_probe_thread = None
+            self._native_probe_errors = []
+            self._native_probe_outcome = NATIVE_PROBE_NOT_RUN
+            return outcome
+
         existing = self._native_probe_thread
         if existing is not None:
             if existing.is_alive():
-                return False
-            succeeded = not self._native_probe_errors
-            self._native_probe_thread = None
-            self._native_probe_errors = []
-            return succeeded
+                # A live worker has already acquired the automation lock and
+                # is blocked in GetVersion.  Never launch a second native call.
+                return NATIVE_PROBE_FAILED
+            return consume_finished_probe()
         odesktop = getattr(self.desktop, "odesktop", None)
         probe = getattr(odesktop, "GetVersion", None)
         if not callable(probe):
-            return False
+            return NATIVE_PROBE_FAILED
         self._native_probe_errors = []
+        self._native_probe_outcome = NATIVE_PROBE_NOT_RUN
 
         def call() -> None:
+            probe_lock: SessionAutomationLock | None = None
+            probe_lock_acquired = False
             try:
+                if self.automation_lock_path:
+                    # A health probe must never wait behind a client and then
+                    # unexpectedly enter AEDT after its caller timed out.  One
+                    # non-blocking filesystem-lock attempt makes a busy client
+                    # an explicit deferred outcome and guarantees GetVersion
+                    # is not invoked in that case.
+                    probe_lock = SessionAutomationLock(
+                        self.automation_lock_path,
+                        timeout_seconds=0.0,
+                    )
+                    try:
+                        probe_lock.acquire()
+                        probe_lock_acquired = True
+                    except TimeoutError:
+                        self._native_probe_outcome = NATIVE_PROBE_DEFERRED_BUSY
+                        return
                 probe()
+                self._native_probe_outcome = NATIVE_PROBE_OK
             except BaseException as exc:
                 self._native_probe_errors.append(exc)
+                self._native_probe_outcome = NATIVE_PROBE_FAILED
+            finally:
+                if probe_lock is not None and probe_lock_acquired:
+                    try:
+                        probe_lock.release()
+                    except BaseException as exc:
+                        self._native_probe_errors.append(exc)
+                        self._native_probe_outcome = NATIVE_PROBE_FAILED
 
         thread = threading.Thread(target=call, name="aedt-native-liveness", daemon=True)
         self._native_probe_thread = thread
         thread.start()
         thread.join(timeout=max(0.1, float(timeout_seconds)))
         if thread.is_alive():
-            return False
-        succeeded = not self._native_probe_errors
-        self._native_probe_thread = None
-        self._native_probe_errors = []
-        return succeeded
+            return NATIVE_PROBE_FAILED
+        return consume_finished_probe()
 
     def _desktop_liveness_proof(self) -> tuple[bool, str]:
         """Require process identity, exact gRPC listener, and native response."""
 
+        self.last_native_probe_outcome = NATIVE_PROBE_NOT_RUN
         if self.desktop is None:
             return False, "Desktop proxy is absent"
         pid_text = self.desktop_process_id or self._desktop_pid(self.desktop)
@@ -1269,7 +1351,21 @@ class AedtSessionHost:
                 port = 0
         if port <= 0 or not self._desktop_port_is_listening(port):
             return False, f"Desktop gRPC port {port or '<unknown>'} is not listening"
-        if not self._native_desktop_responds():
+        native_probe_outcome = self._native_desktop_responds()
+        # Preserve compatibility with narrow test doubles while the production
+        # probe always returns one of the explicit string outcomes above.
+        if native_probe_outcome is True:
+            native_probe_outcome = NATIVE_PROBE_OK
+        elif native_probe_outcome is False:
+            native_probe_outcome = NATIVE_PROBE_FAILED
+        self.last_native_probe_outcome = str(native_probe_outcome)
+        if native_probe_outcome == NATIVE_PROBE_DEFERRED_BUSY:
+            # PID identity and the exact listening port still prove process
+            # liveness.  Do not mutate the failure episode: this was not a
+            # failed AEDT call and a later successful probe must clear any
+            # earlier real failures.
+            return True, ""
+        if native_probe_outcome != NATIVE_PROBE_OK:
             now = time.monotonic()
             if not self.native_probe_failures:
                 self.native_probe_first_failure_at = now
@@ -1421,6 +1517,14 @@ class AedtSessionHost:
                         )
                         time.sleep(self.heartbeat_seconds)
                         continue
+                    if (
+                        self.last_native_probe_outcome
+                        == NATIVE_PROBE_DEFERRED_BUSY
+                    ):
+                        self._journal(
+                            "desktop_native_probe_deferred_busy",
+                            automation_lock_path=self.automation_lock_path,
+                        )
                     self._control_plane_request(
                         "POST",
                         f"/api/aedt-pool/sessions/{self.session_id}/heartbeat",
@@ -1428,7 +1532,12 @@ class AedtSessionHost:
                             "liveness_confirmed": True,
                             "process_id": self.desktop_process_id,
                             "port": self.desktop_port,
-                            "native_probe": "GetVersion",
+                            "native_probe": (
+                                "GetVersion"
+                                if self.last_native_probe_outcome == NATIVE_PROBE_OK
+                                else ""
+                            ),
+                            "native_probe_outcome": self.last_native_probe_outcome,
                         },
                         host_token=self.host_token,
                     )

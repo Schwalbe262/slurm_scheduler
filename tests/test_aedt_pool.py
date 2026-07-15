@@ -24,6 +24,10 @@ from slurm_scheduler.aedt_attach_client import (
     _keepalive_delay,
     acquire_project_lease,
 )
+from slurm_scheduler.aedt_automation_lock import (
+    SessionAutomationLock,
+    create_automation_lock_file,
+)
 from slurm_scheduler.aedt_pool import (
     ALLOCATION_AGE_ROTATION_REASON,
     FAULTED_DESKTOP_ALLOCATION_RECYCLE_REASON,
@@ -39,6 +43,9 @@ from slurm_scheduler.aedt_session_host import (
     ControlPlaneClient,
     EXPECTED_SESSION_PROFILE_JSON,
     LEGACY_DSO_PROFILE,
+    NATIVE_PROBE_DEFERRED_BUSY,
+    NATIVE_PROBE_FAILED,
+    NATIVE_PROBE_OK,
     SUPPORTED_DSO_PROFILE,
     _install_pyaedt_psutil_cmdline_shim,
     _load_pyaedt_dso_template,
@@ -1283,6 +1290,10 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(released["state"], "released")
 
     def test_full_active_batch_gets_one_atomic_solve_permit_generation(self) -> None:
+        # Exercise the production ceiling, not only the historical 1:2 default.
+        self.service.set_enabled(False)
+        self.service.set_operator_limits(projects_per_session=3)
+        self.service.set_enabled(True)
         leases = [
             self.service.request_lease(
                 request_key=f"solve-batch-{index}",
@@ -1294,28 +1305,37 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
                 allocation_id=self.allocation_id,
                 node_name="cpu-01",
             )
-            for index in range(2)
+            for index in range(3)
         ]
         session, _host_token = self.start_one_session(self.allocation_id)
-        first, first_token = leases[0]
-        second, second_token = leases[1]
-        self.service.accept_lease(int(first["id"]), first_token)
-        first_active = self.service.activate_lease(int(first["id"]), first_token)
-        self.assertFalse(first_active["solve_permit_granted"])
-        self.assertFalse(
-            bool(self.service.get_session(int(session["id"]))["solve_batch_sealed_at"])
-        )
+        self.assertEqual(int(session["slots_total"]), 3)
+        active_statuses = []
+        for index, (lease, token) in enumerate(leases):
+            self.service.accept_lease(int(lease["id"]), token)
+            active = self.service.activate_lease(int(lease["id"]), token)
+            active_statuses.append(active)
+            if index < 2:
+                self.assertFalse(active["solve_permit_granted"])
+                self.assertFalse(
+                    bool(
+                        self.service.get_session(int(session["id"]))[
+                            "solve_batch_sealed_at"
+                        ]
+                    )
+                )
 
-        self.service.accept_lease(int(second["id"]), second_token)
-        second_active = self.service.activate_lease(int(second["id"]), second_token)
-        first_permitted = self.service.lease_status(int(first["id"]), first_token)
-        self.assertTrue(second_active["solve_permit_granted"])
-        self.assertTrue(first_permitted["solve_permit_granted"])
-        self.assertGreater(int(first_permitted["solve_permit_generation"]), 0)
-        self.assertEqual(
-            first_permitted["solve_permit_generation"],
-            second_active["solve_permit_generation"],
-        )
+        permitted = [
+            self.service.lease_status(int(lease["id"]), token)
+            for lease, token in leases
+        ]
+        self.assertTrue(all(item["solve_permit_granted"] for item in permitted))
+        generations = {
+            int(item["solve_permit_generation"])
+            for item in permitted
+        }
+        self.assertEqual(len(generations), 1)
+        self.assertGreater(next(iter(generations)), 0)
+        self.assertTrue(active_statuses[-1]["solve_permit_granted"])
         self.assertTrue(
             self.service.get_session(int(session["id"]))["solve_batch_sealed_at"]
         )
@@ -3164,6 +3184,15 @@ class TransientLeaseHeartbeatHttp:
 
 
 class AttachClientTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.lock_tmp = tempfile.TemporaryDirectory()
+        self.automation_lock_path = create_automation_lock_file(
+            str(Path(self.lock_tmp.name) / "desktop-automation.lock")
+        )
+
+    def tearDown(self) -> None:
+        self.lock_tmp.cleanup()
+
     def test_connect_path_forces_pyaedt_multi_desktop_setting(self) -> None:
         ansys_module = ModuleType("ansys")
         aedt_module = ModuleType("ansys.aedt")
@@ -3229,6 +3258,7 @@ class AttachClientTests(unittest.TestCase):
             state="attaching",
             endpoint="cpu-01:50001",
             protocol_version=2,
+            automation_lock_path=self.automation_lock_path,
         )
         desktop_kwargs: list[dict] = []
         attached_desktop = SimpleNamespace(
@@ -3525,6 +3555,7 @@ class AttachClientTests(unittest.TestCase):
                     state="attaching",
                     endpoint="cpu-01:50001",
                     protocol_version=2,
+                    automation_lock_path=self.automation_lock_path,
                 )
                 with self.assertRaisesRegex(AedtLeaseError, expected_error):
                     lease.connect_desktop(
@@ -3620,6 +3651,7 @@ class AttachClientTests(unittest.TestCase):
             state="attaching",
             endpoint="cpu-01:50001",
             protocol_version=2,
+            automation_lock_path=self.automation_lock_path,
         )
         first.start_heartbeat = lambda **_kwargs: None
         first_desktop = first.connect_desktop(
@@ -3636,6 +3668,7 @@ class AttachClientTests(unittest.TestCase):
             state="attaching",
             endpoint="cpu-01:50002",
             protocol_version=2,
+            automation_lock_path=self.automation_lock_path,
         )
         second.start_heartbeat = lambda **_kwargs: None
         second_desktop = second.connect_desktop(
@@ -4155,16 +4188,138 @@ class SessionHostTests(unittest.TestCase):
         host.desktop = SimpleNamespace(
             odesktop=SimpleNamespace(GetVersion=blocked_get_version)
         )
-        self.assertFalse(host._native_desktop_responds(timeout_seconds=0.1))
+        self.assertEqual(
+            host._native_desktop_responds(timeout_seconds=0.1),
+            NATIVE_PROBE_FAILED,
+        )
         self.assertTrue(entered.is_set())
-        self.assertFalse(host._native_desktop_responds(timeout_seconds=0.1))
-        self.assertFalse(host._native_desktop_responds(timeout_seconds=0.1))
+        self.assertEqual(
+            host._native_desktop_responds(timeout_seconds=0.1),
+            NATIVE_PROBE_FAILED,
+        )
+        self.assertEqual(
+            host._native_desktop_responds(timeout_seconds=0.1),
+            NATIVE_PROBE_FAILED,
+        )
         self.assertEqual(calls, 1)
         release.set()
         assert host._native_probe_thread is not None
         host._native_probe_thread.join(timeout=1)
-        self.assertTrue(host._native_desktop_responds(timeout_seconds=0.1))
+        self.assertEqual(
+            host._native_desktop_responds(timeout_seconds=0.1),
+            NATIVE_PROBE_OK,
+        )
         self.assertIsNone(host._native_probe_thread)
+
+    def test_client_automation_lock_defers_probe_without_getversion_or_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            lock_path = create_automation_lock_file(
+                str(Path(root) / "desktop-automation.lock")
+            )
+            get_version_calls = 0
+
+            def get_version():
+                nonlocal get_version_calls
+                get_version_calls += 1
+                return "2025.2"
+
+            host = AedtSessionHost(
+                FakeHostControlPlane([]), allocation_id=1, node_name="cpu-01"
+            )
+            host.automation_lock_path = lock_path
+            host.desktop = SimpleNamespace(
+                odesktop=SimpleNamespace(GetVersion=get_version)
+            )
+            host.desktop_process_id = "3824121"
+            host.desktop_process_marker = "marker"
+            host.desktop_port = 44773
+            host.native_probe_failures = 2
+            host.native_probe_first_failure_at = 91.0
+            client_lock = SessionAutomationLock(lock_path, timeout_seconds=1.0)
+
+            with (
+                client_lock,
+                patch.object(host, "_process_alive", return_value=True),
+                patch.object(
+                    host, "_desktop_port_is_listening", return_value=True
+                ),
+            ):
+                self.assertEqual(
+                    host._native_desktop_responds(timeout_seconds=0.1),
+                    NATIVE_PROBE_DEFERRED_BUSY,
+                )
+                proof = host._desktop_liveness_proof()
+                # Keep the client transaction busy beyond the requested probe
+                # timeout.  A deferred worker must already be gone and must
+                # never call GetVersion later when this lock is released.
+                time.sleep(0.15)
+                self.assertEqual(get_version_calls, 0)
+                self.assertEqual(host._native_probe_errors, [])
+                self.assertIsNone(host._native_probe_thread)
+
+            self.assertEqual(proof, (True, ""))
+            self.assertEqual(
+                host.last_native_probe_outcome, NATIVE_PROBE_DEFERRED_BUSY
+            )
+            self.assertEqual(get_version_calls, 0)
+            self.assertEqual(host.native_probe_failures, 2)
+            self.assertEqual(host.native_probe_first_failure_at, 91.0)
+            self.assertIsNone(host._native_probe_thread)
+
+    def test_deferred_busy_probe_heartbeats_without_suspect_fault(self) -> None:
+        class RecordingControl(FakeHostControlPlane):
+            def __init__(self, events):
+                super().__init__(events)
+                self.paths: list[str] = []
+                self.heartbeats: list[dict] = []
+
+            def request(self, method, path, payload=None, host_token=""):
+                self.paths.append(path)
+                if path.endswith("/heartbeat"):
+                    self.heartbeats.append(dict(payload or {}))
+                return super().request(
+                    method, path, payload, host_token=host_token
+                )
+
+        with tempfile.TemporaryDirectory() as root:
+            events: list[str] = []
+            control = RecordingControl(events)
+            host = AedtSessionHost(
+                control,
+                allocation_id=1,
+                node_name="cpu-01",
+                heartbeat_seconds=0,
+                artifact_root=root,
+            )
+            host._start_desktop = lambda: FakeDesktop(events)
+
+            def deferred_liveness():
+                host.last_native_probe_outcome = NATIVE_PROBE_DEFERRED_BUSY
+                return True, ""
+
+            host._desktop_liveness_proof = deferred_liveness
+            with patch(
+                "slurm_scheduler.aedt_session_host.time.sleep", return_value=None
+            ):
+                self.assertEqual(host.run(), 2)
+
+            journal = Path(host.journal_path).read_text(encoding="utf-8")
+
+        self.assertFalse(any(path.endswith("/fault") for path in control.paths))
+        self.assertGreaterEqual(len(control.heartbeats), 1)
+        self.assertTrue(
+            all(item["native_probe"] == "" for item in control.heartbeats)
+        )
+        self.assertTrue(
+            all(
+                item["native_probe_outcome"] == NATIVE_PROBE_DEFERRED_BUSY
+                for item in control.heartbeats
+            )
+        )
+        self.assertIn("desktop_native_probe_deferred_busy", journal)
+        self.assertNotIn("desktop_native_probe_suspect", journal)
 
     def test_canonical_runtime_attestation_derives_and_checks_aedt_version(
         self,
