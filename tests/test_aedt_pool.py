@@ -1268,6 +1268,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             isolation_policy="family",
             workspace_path="/shared/mft-v2",
             protocol_version=2,
+            task_id=39812,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
             allocation_id=self.allocation_id,
             node_name="cpu-01",
@@ -1292,6 +1293,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(close_command["project_namespace"], "mft-v2")
         self.assertEqual(close_command["workspace_path"], "/shared/mft-v2")
         self.assertEqual(int(close_command["protocol_version"]), 2)
+        self.assertEqual(int(close_command["task_id"]), 39812)
         released = self.service.complete_release(
             int(session["id"]), host_token, int(lease["id"]), success=True
         )
@@ -4142,6 +4144,17 @@ class RemoteDisconnectRegistrationControlPlane(FakeHostControlPlane):
 
 
 class SessionHostTests(unittest.TestCase):
+    @staticmethod
+    def _release_test_host(root: str) -> AedtSessionHost:
+        artifact_root = Path(root) / "aedt_session_logs"
+        artifact_root.mkdir()
+        return AedtSessionHost(
+            FakeHostControlPlane([]),
+            allocation_id=1,
+            node_name="cpu-01",
+            artifact_root=str(artifact_root),
+        )
+
     def test_release_closes_project_before_workspace_preparation(self) -> None:
         events: list[str] = []
         host = AedtSessionHost(
@@ -4172,7 +4185,8 @@ class SessionHostTests(unittest.TestCase):
 
     def test_release_prepares_only_exact_project_directories(self) -> None:
         with tempfile.TemporaryDirectory() as root:
-            workspace = Path(root) / "simulation"
+            host = self._release_test_host(root)
+            workspace = Path(root) / "mft-17009"
             project = workspace / "mft-task-17-lease-9"
             outside = workspace / "unrelated-project"
             foreign_cache = (
@@ -4194,8 +4208,9 @@ class SessionHostTests(unittest.TestCase):
                 "_prepare_plain_directory_for_cross_account_delete",
                 side_effect=record,
             ):
-                result = AedtSessionHost._prepare_released_project_workspace({
+                result = host._prepare_released_project_workspace({
                     "id": 9,
+                    "task_id": 17009,
                     "protocol_version": 2,
                     "project_namespace": "mft",
                     "project_name": "mft-task-17-lease-9",
@@ -4302,35 +4317,146 @@ class SessionHostTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as root:
-            workspace = Path(root) / "simulation"
+            host = self._release_test_host(root)
+            workspace = Path(root) / "mft-10"
             workspace.mkdir()
             with self.assertRaisesRegex(RuntimeError, "lease identity"):
-                AedtSessionHost._prepare_released_project_workspace({
+                host._prepare_released_project_workspace({
                     "protocol_version": 2,
+                    "task_id": 10,
                     "project_namespace": "mft",
                     "project_name": "mft-case-no-lease",
                     "workspace_path": str(workspace),
                 })
             with self.assertRaisesRegex(RuntimeError, "unsafe.*project name"):
-                AedtSessionHost._prepare_released_project_workspace({
+                host._prepare_released_project_workspace({
                     "id": 10,
+                    "task_id": 10,
                     "protocol_version": 2,
                     "project_namespace": "mft",
                     "project_name": "../outside",
                     "workspace_path": str(workspace),
                 })
-            result = AedtSessionHost._prepare_released_project_workspace({
+            motor_workspace = Path(root) / "ipmsm-11-deadbeef"
+            motor_workspace.mkdir()
+            result = host._prepare_released_project_workspace({
                 "id": 11,
+                "task_id": 11,
                 "protocol_version": 2,
                 "project_namespace": "pyaedt_motor",
                 "project_name": "ipmsm-case-1",
-                "workspace_path": str(workspace),
+                "workspace_path": str(motor_workspace),
             })
             self.assertEqual(result["state"], "absent")
 
+    def test_release_workspace_requires_host_root_task_and_direct_child(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            allowed_root = Path(root)
+            host = self._release_test_host(root)
+
+            def prepare(workspace: Path, task_id: int, lease_id: int = 21):
+                workspace.mkdir(parents=True, exist_ok=True)
+                return host._prepare_released_project_workspace({
+                    "id": lease_id,
+                    "task_id": task_id,
+                    "protocol_version": 2,
+                    "project_namespace": "mft",
+                    "project_name": f"mft-project-{lease_id}",
+                    "workspace_path": str(workspace),
+                })
+
+            for lease_id, task_id, leaf in (
+                (21, 40121, "mft-40121"),
+                (22, 40122, "ipmsm-40122"),
+                (23, 40123, "ipmsm-40123-deadbeef"),
+            ):
+                with self.subTest(leaf=leaf):
+                    self.assertEqual(
+                        prepare(
+                            allowed_root / leaf,
+                            task_id,
+                            lease_id=lease_id,
+                        )["state"],
+                        "absent",
+                    )
+
+            with self.assertRaisesRegex(RuntimeError, "exact task id token"):
+                prepare(allowed_root / "mft-140124", 40124, lease_id=24)
+            with self.assertRaisesRegex(RuntimeError, "exact task id token"):
+                prepare(allowed_root / "mft-401250", 40125, lease_id=25)
+            with self.assertRaisesRegex(RuntimeError, "direct child"):
+                prepare(
+                    allowed_root / "nested" / "mft-40126",
+                    40126,
+                    lease_id=26,
+                )
+
+            artifact_root = Path(host.artifact_root)
+            with self.assertRaisesRegex(RuntimeError, "overlaps host artifacts"):
+                host._prepare_released_project_workspace({
+                    "id": 27,
+                    "task_id": 40127,
+                    "protocol_version": 2,
+                    "project_name": "mft-project-27",
+                    "workspace_path": str(artifact_root),
+                })
+            artifact_child = artifact_root / "mft-40128"
+            artifact_child.mkdir()
+            with self.assertRaisesRegex(RuntimeError, "overlaps host artifacts"):
+                host._prepare_released_project_workspace({
+                    "id": 28,
+                    "task_id": 40128,
+                    "protocol_version": 2,
+                    "project_name": "mft-project-28",
+                    "workspace_path": str(artifact_child),
+                })
+
+    def test_release_workspace_fails_without_artifact_or_task_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Path(root) / "mft-40131"
+            workspace.mkdir()
+            no_artifact_host = AedtSessionHost(
+                FakeHostControlPlane([]),
+                allocation_id=1,
+                node_name="cpu-01",
+            )
+            with self.assertRaisesRegex(RuntimeError, "artifact_root"):
+                no_artifact_host._prepare_released_project_workspace({
+                    "id": 31,
+                    "task_id": 40131,
+                    "protocol_version": 2,
+                    "project_name": "mft-project-31",
+                    "workspace_path": str(workspace),
+                })
+            missing_artifact_host = AedtSessionHost(
+                FakeHostControlPlane([]),
+                allocation_id=1,
+                node_name="cpu-01",
+                artifact_root=str(Path(root) / "missing-aedt-session-logs"),
+            )
+            with self.assertRaisesRegex(RuntimeError, "host artifact root"):
+                missing_artifact_host._prepare_released_project_workspace({
+                    "id": 33,
+                    "task_id": 40131,
+                    "protocol_version": 2,
+                    "project_name": "mft-project-33",
+                    "workspace_path": str(workspace),
+                })
+
+            host = self._release_test_host(root)
+            with self.assertRaisesRegex(RuntimeError, "task identity"):
+                host._prepare_released_project_workspace({
+                    "id": 32,
+                    "task_id": 0,
+                    "protocol_version": 2,
+                    "project_name": "mft-project-32",
+                    "workspace_path": str(workspace),
+                })
+
     def test_release_workspace_never_follows_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as root:
-            workspace = Path(root) / "simulation"
+            host = self._release_test_host(root)
+            workspace = Path(root) / "mft-12"
             project = workspace / "mft-case-1"
             outside = Path(root) / "outside"
             project.mkdir(parents=True)
@@ -4342,8 +4468,9 @@ class SessionHostTests(unittest.TestCase):
                 self.skipTest(f"directory symlinks unavailable: {exc}")
 
             with self.assertRaisesRegex(RuntimeError, "contains a symlink"):
-                AedtSessionHost._prepare_released_project_workspace({
+                host._prepare_released_project_workspace({
                     "id": 12,
+                    "task_id": 12,
                     "protocol_version": 2,
                     "project_namespace": "mft",
                     "project_name": "mft-case-1",

@@ -1120,9 +1120,31 @@ class AedtSessionHost:
             )
         return metadata
 
-    @classmethod
+    def _release_allowed_shared_root(self) -> tuple[str, str]:
+        """Derive the only release-mutable root from host-owned artifacts."""
+
+        raw_artifact_root = str(self.artifact_root or "").strip()
+        if not raw_artifact_root or not os.path.isabs(raw_artifact_root):
+            raise RuntimeError(
+                "released AEDT cleanup requires an absolute host artifact_root"
+            )
+        artifact_root = os.path.normpath(raw_artifact_root)
+        if artifact_root != raw_artifact_root.rstrip("/\\"):
+            raise RuntimeError(
+                f"unsafe released AEDT host artifact_root: {raw_artifact_root!r}"
+            )
+        self._plain_directory(artifact_root, "host artifact root")
+        artifact_root_real = os.path.realpath(artifact_root)
+        allowed_root = os.path.dirname(artifact_root_real)
+        if not allowed_root or allowed_root == os.path.abspath(os.path.sep):
+            raise RuntimeError(
+                "released AEDT cleanup allowed root must not be filesystem root"
+            )
+        self._plain_directory(allowed_root, "allowed shared root")
+        return allowed_root, artifact_root_real
+
     def _released_project_paths(
-        cls, lease: dict[str, Any]
+        self, lease: dict[str, Any]
     ) -> tuple[str, str] | None:
         """Resolve the exact direct-child workspace owned by one v2 lease."""
 
@@ -1131,7 +1153,10 @@ class AedtSessionHost:
         lease_id = int(lease.get("id") or 0)
         if lease_id <= 0:
             raise RuntimeError("released AEDT lease identity is unavailable")
-        project_name = cls._released_project_component(
+        task_id = int(lease.get("task_id") or 0)
+        if task_id <= 0:
+            raise RuntimeError("released AEDT task identity is unavailable")
+        project_name = self._released_project_component(
             lease.get("project_name"), "project name"
         )
         namespace_text = str(lease.get("project_namespace") or "").strip()
@@ -1139,9 +1164,10 @@ class AedtSessionHost:
             # Namespace is a logical collision domain, not a required filename
             # prefix (pyaedt_motor deliberately binds ``ipmsm-*`` projects in
             # the ``pyaedt_motor`` namespace).
-            cls._released_project_component(
+            self._released_project_component(
                 namespace_text, "project namespace"
             )
+        allowed_root, artifact_root_real = self._release_allowed_shared_root()
 
         raw_workspace = str(lease.get("workspace_path") or "").strip()
         if not raw_workspace or not os.path.isabs(raw_workspace):
@@ -1155,7 +1181,40 @@ class AedtSessionHost:
             raise RuntimeError(
                 f"unsafe released AEDT lease workspace: {raw_workspace!r}"
             )
-        cls._plain_directory(workspace, "lease workspace")
+        self._plain_directory(workspace, "lease workspace")
+        workspace_real = os.path.realpath(workspace)
+        if workspace_real != workspace:
+            raise RuntimeError(
+                "released AEDT lease workspace must be its canonical real path: "
+                f"workspace={workspace!r}, real={workspace_real!r}"
+            )
+        try:
+            inside_artifacts = (
+                os.path.commonpath((artifact_root_real, workspace_real))
+                == artifact_root_real
+            )
+        except ValueError:
+            inside_artifacts = True
+        if inside_artifacts:
+            raise RuntimeError(
+                "released AEDT lease workspace overlaps host artifacts: "
+                f"workspace={workspace!r}, artifact_root={artifact_root_real!r}"
+            )
+        if os.path.dirname(workspace_real) != allowed_root:
+            raise RuntimeError(
+                "released AEDT lease workspace is not a direct child of the "
+                f"allowed shared root: workspace={workspace!r}, "
+                f"allowed_root={allowed_root!r}"
+            )
+        task_token = re.compile(
+            rf"(?:^|[-_.]){re.escape(str(task_id))}(?:$|[-_.])"
+        )
+        if task_token.search(os.path.basename(workspace_real)) is None:
+            raise RuntimeError(
+                "released AEDT lease workspace does not contain its exact "
+                f"task id token: workspace={workspace!r}, task_id={task_id}"
+            )
+        workspace = workspace_real
 
         project_path = os.path.join(workspace, project_name)
         if (
@@ -1165,7 +1224,6 @@ class AedtSessionHost:
             raise RuntimeError(
                 f"released AEDT project path escaped its workspace: {project_path!r}"
             )
-        workspace_real = os.path.realpath(workspace)
         project_real = os.path.realpath(project_path)
         try:
             contained = (
@@ -1249,9 +1307,8 @@ class AedtSessionHost:
             os.chmod(path, desired_mode)
         return True
 
-    @classmethod
     def _prepare_released_project_workspace(
-        cls, lease: dict[str, Any]
+        self, lease: dict[str, Any]
     ) -> dict[str, Any]:
         """Make one closed lease workspace removable by its client account.
 
@@ -1262,7 +1319,7 @@ class AedtSessionHost:
         data, changes file modes, or follows a symlink.
         """
 
-        resolved = cls._released_project_paths(lease)
+        resolved = self._released_project_paths(lease)
         if resolved is None:
             return {"state": "legacy", "directories_changed": 0}
         workspace, project_path = resolved
@@ -1272,7 +1329,7 @@ class AedtSessionHost:
                 "project_path": project_path,
                 "directories_changed": 0,
             }
-        project_metadata = cls._plain_directory(
+        project_metadata = self._plain_directory(
             project_path, "project workspace"
         )
         workspace_real = os.path.realpath(workspace)
@@ -1295,7 +1352,7 @@ class AedtSessionHost:
             onerror=fail_walk,
             followlinks=False,
         ):
-            root_metadata = cls._plain_directory(root, "project directory")
+            root_metadata = self._plain_directory(root, "project directory")
             if (
                 os.path.commonpath((workspace_real, os.path.realpath(root)))
                 != workspace_real
@@ -1341,7 +1398,7 @@ class AedtSessionHost:
         # Parents first: a host-owned 0700 parent must become traversable before
         # the lease client can reach any already-attested child directory.
         for path, metadata in directories:
-            if cls._prepare_plain_directory_for_cross_account_delete(
+            if self._prepare_plain_directory_for_cross_account_delete(
                 path, metadata, host_uid, lease_owner_uid
             ):
                 changed += 1
