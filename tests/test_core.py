@@ -1269,6 +1269,40 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertEqual({int(row["id"]) for row in rows}, {queued_id, completed_id})
 
+    def test_compact_task_inventory_pages_every_matching_task_by_id(self) -> None:
+        matching_ids = [
+            self.db.create_task(
+                TaskCreate(f"campaign-page-{index}", "~/work", "run", project="motor")
+            )
+            for index in range(5)
+        ]
+        self.db.create_task(
+            TaskCreate("campaign-page-foreign", "~/work", "run", project="other")
+        )
+        self.db.create_task(TaskCreate("unrelated-newer", "~/work", "run", project="motor"))
+
+        first = self.db.list_task_inventory(
+            limit=2, project="motor", name_prefix="campaign-page-"
+        )
+        second = self.db.list_task_inventory(
+            limit=2,
+            project="motor",
+            name_prefix="campaign-page-",
+            before_id=min(int(row["id"]) for row in first),
+        )
+        third = self.db.list_task_inventory(
+            limit=2,
+            project="motor",
+            name_prefix="campaign-page-",
+            before_id=min(int(row["id"]) for row in second),
+        )
+
+        rows = [*first, *second, *third]
+        self.assertEqual(
+            [int(row["id"]) for row in rows], list(reversed(matching_ids))
+        )
+        self.assertTrue(all(set(row) == {"id", "name", "status", "project"} for row in rows))
+
     def test_list_finished_tasks_can_filter_by_name_before_limit(self) -> None:
         for index in range(5):
             task_id = self.db.create_task(TaskCreate(f"other-finished-{index}", "~/work", "run"))
@@ -9201,6 +9235,51 @@ class ProjectApiTests(unittest.TestCase):
 
         self.assertEqual([int(item["id"]) for item in payload], list(reversed(matching_ids[-2:])))
         self.assertEqual({item["project"] for item in payload}, {"motor"})
+
+    def test_task_list_api_compact_pages_avoid_full_task_serialization(self) -> None:
+        matching_ids = [
+            self.app.state.db.create_task(
+                TaskCreate(f"api-compact-{index}", "~/case", "run", project="motor")
+            )
+            for index in range(3)
+        ]
+
+        with mock.patch.object(
+            self.app.state.db,
+            "get_allocation",
+            side_effect=AssertionError("compact inventory resolved allocation metadata"),
+        ):
+            first = self.list_tasks(
+                include_diagnostics=False,
+                compact=True,
+                limit=2,
+                before_id=0,
+                project="motor",
+                name_prefix="api-compact-",
+                status=None,
+            )
+            second = self.list_tasks(
+                include_diagnostics=False,
+                compact=True,
+                limit=2,
+                before_id=min(int(item["id"]) for item in first),
+                project="motor",
+                name_prefix="api-compact-",
+                status=None,
+            )
+
+        payload = [*first, *second]
+        self.assertEqual(
+            [int(item["id"]) for item in payload], list(reversed(matching_ids))
+        )
+        self.assertTrue(
+            all(set(item) == {"id", "name", "status", "project"} for item in payload)
+        )
+        parameters = {
+            item["name"]
+            for item in self.app.openapi()["paths"]["/api/tasks"]["get"]["parameters"]
+        }
+        self.assertTrue({"compact", "before_id"}.issubset(parameters))
 
     def test_task_list_api_accepts_repeated_and_csv_status_filters(self) -> None:
         queued_id = self.app.state.db.create_task(TaskCreate("api-status-queued", "~/case", "run"))

@@ -735,6 +735,50 @@ class Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def list_task_inventory(
+        self,
+        limit: int = 2000,
+        *,
+        project: str = "",
+        name_prefix: str = "",
+        statuses: list[str] | None = None,
+        before_id: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Return a compact, cursor-pageable task inventory.
+
+        Campaign controllers only need identity, ownership, and state when
+        reconciling reserved outputs.  Selecting those columns directly keeps
+        large inventory reads independent of task payload/log-path size.  The
+        descending ``before_id`` cursor lets clients reconcile every matching
+        task without relying on the regular API's 10,000-row response cap.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project:
+            clauses.append("project = ?")
+            params.append(project)
+        if name_prefix:
+            escaped = name_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append("name LIKE ? ESCAPE '\\'")
+            params.append(f"{escaped}%")
+        if statuses is not None:
+            if not statuses:
+                return []
+            placeholders = ",".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        if before_id:
+            clauses.append("id < ?")
+            params.append(max(0, int(before_id)))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, name, status, project "
+                f"FROM tasks{where} ORDER BY id DESC LIMIT ?",
+                (*params, max(0, int(limit))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def list_tasks_with_active(self, limit: int = 200, active_limit: int = 5000) -> list[dict[str, Any]]:
         active_statuses = (TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value)
         placeholders = ",".join("?" for _ in active_statuses)

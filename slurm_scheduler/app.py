@@ -2041,11 +2041,28 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     @app.get("/api/tasks")
     def api_tasks(
         include_diagnostics: bool = False,
+        compact: bool = False,
         limit: int = 0,
+        before_id: int = 0,
         project: str = "",
         name_prefix: str = "",
         status: list[str] | None = Query(default=None),
     ) -> list[dict]:
+        if before_id < 0:
+            raise HTTPException(status_code=422, detail="before_id must be non-negative")
+        statuses = normalize_task_status_filters(status)
+        if compact:
+            # Compact pages deliberately bypass task_json: that serializer
+            # resolves allocation metadata per task, which turns a large
+            # campaign reconciliation into thousands of database lookups.
+            task_limit = max(1, min(int(limit), 10000)) if limit else 2000
+            return db.list_task_inventory(
+                limit=task_limit,
+                project=project,
+                name_prefix=name_prefix,
+                statuses=statuses,
+                before_id=before_id,
+            )
         allocation_rows = None
         allocation_by_id = None
         active_task_allocation_ids = None
@@ -2054,7 +2071,6 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             allocation_rows = db.list_allocations_with_live(limit=500)
             allocation_by_id = {int(allocation["id"]): allocation for allocation in allocation_rows}
             active_task_allocation_ids, active_exclusive_allocation_ids = scheduler.active_task_allocation_sets()
-        statuses = normalize_task_status_filters(status)
         filtered = bool(project or name_prefix or statuses is not None)
         if filtered:
             # A filtered campaign read defaults to the API cap.  The database
