@@ -176,6 +176,7 @@ CREATE TABLE IF NOT EXISTS aedt_exact_session_reservations (
     session_profile TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'reserved',
     lease_id INTEGER,
+    failure_message TEXT NOT NULL DEFAULT '',
     expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     claimed_at TEXT,
@@ -491,6 +492,17 @@ class AedtPoolService:
                     conn.execute(
                         f"ALTER TABLE aedt_project_leases ADD COLUMN {name} {ddl}"
                     )
+            exact_reservation_columns = {
+                str(row["name"])
+                for row in conn.execute(
+                    "PRAGMA table_info(aedt_exact_session_reservations)"
+                ).fetchall()
+            }
+            if "failure_message" not in exact_reservation_columns:
+                conn.execute(
+                    "ALTER TABLE aedt_exact_session_reservations "
+                    "ADD COLUMN failure_message TEXT NOT NULL DEFAULT ''"
+                )
             legacy_leases = conn.execute(
                 """
                 SELECT id, project_name FROM aedt_project_leases
@@ -1242,6 +1254,75 @@ class AedtPoolService:
             return self._exact_session_reservation_from_rows(rows)
 
     @staticmethod
+    def _fail_exact_session_reservation_cohort(
+        conn: Any,
+        *,
+        reservation_key: str,
+        now: str,
+        failure_message: str,
+    ) -> None:
+        """Fail one exact cohort without permitting an unpinned fallback."""
+
+        normalized_reason = str(failure_message or "").strip() or (
+            "exact-session reservation target became unavailable"
+        )
+        conn.execute(
+            """
+            UPDATE aedt_project_leases
+            SET state = 'failed', failure_message = ?, finished_at = ?, updated_at = ?
+            WHERE exact_session_reservation_id IN (
+                SELECT id FROM aedt_exact_session_reservations
+                WHERE reservation_key = ?
+            )
+              AND state IN (
+                  'queued','offered','leased','attaching','active','releasing'
+              )
+            """,
+            (normalized_reason, now, now, reservation_key),
+        )
+        conn.execute(
+            """
+            UPDATE aedt_exact_session_reservations
+            SET state = 'failed', failure_message = ?, finished_at = ?, updated_at = ?
+            WHERE reservation_key = ?
+              AND state IN ('reserved','claimed','consumed')
+            """,
+            (normalized_reason, now, now, reservation_key),
+        )
+
+    @staticmethod
+    def _fail_exact_session_reservations_for_target(
+        conn: Any,
+        *,
+        session_id: int,
+        now: str,
+        failure_message: str,
+    ) -> None:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT r.reservation_key
+            FROM aedt_exact_session_reservations r
+            LEFT JOIN aedt_project_leases l ON l.id = r.lease_id
+            WHERE r.session_id = ?
+              AND (
+                  r.state IN ('reserved','claimed','consumed')
+                  OR l.state IN (
+                      'queued','offered','leased','attaching','active','releasing'
+                  )
+              )
+            ORDER BY r.reservation_key
+            """,
+            (int(session_id),),
+        ).fetchall()
+        for row in rows:
+            AedtPoolService._fail_exact_session_reservation_cohort(
+                conn,
+                reservation_key=str(row["reservation_key"]),
+                now=now,
+                failure_message=failure_message,
+            )
+
+    @staticmethod
     def _refresh_exact_session_reservations(conn: Any, now: str) -> None:
         """Release capacity after task/lease terminal state and expire admissions."""
 
@@ -1274,11 +1355,11 @@ class AedtPoolService:
         )
         invalid_targets = conn.execute(
             """
-            SELECT r.id, r.lease_id
+            SELECT DISTINCT r.reservation_key
             FROM aedt_exact_session_reservations r
             LEFT JOIN aedt_sessions s ON s.id = r.session_id
             LEFT JOIN allocations a ON a.id = s.allocation_id
-            WHERE r.state IN ('reserved','claimed')
+            WHERE r.state IN ('reserved','claimed','consumed')
               AND (
                   s.id IS NULL
                   OR s.generation != r.session_generation
@@ -1288,28 +1369,30 @@ class AedtPoolService:
                   OR s.drain_requested_at IS NOT NULL
                   OR a.state NOT IN ('warm','active')
               )
+              AND EXISTS (
+                  SELECT 1
+                  FROM aedt_exact_session_reservations pending
+                  LEFT JOIN aedt_project_leases pending_lease
+                    ON pending_lease.id = pending.lease_id
+                  WHERE pending.reservation_key = r.reservation_key
+                    AND pending.state IN ('reserved','claimed','consumed')
+                    AND (
+                        pending.state IN ('reserved','claimed')
+                        OR pending_lease.id IS NULL
+                        OR TRIM(COALESCE(pending_lease.solve_permit_at, '')) = ''
+                    )
+              )
             """
         ).fetchall()
         for row in invalid_targets:
-            lease_id = int(row["lease_id"] or 0)
-            if lease_id:
-                conn.execute(
-                    """
-                    UPDATE aedt_project_leases
-                    SET state = 'expired', failure_message =
-                            'exact-session reservation target became unavailable',
-                        finished_at = ?, updated_at = ?
-                    WHERE id = ? AND state = 'queued'
-                    """,
-                    (now, now, lease_id),
-                )
-            conn.execute(
-                """
-                UPDATE aedt_exact_session_reservations
-                SET state = 'expired', finished_at = ?, updated_at = ?
-                WHERE id = ? AND state IN ('reserved','claimed')
-                """,
-                (now, now, int(row["id"])),
+            AedtPoolService._fail_exact_session_reservation_cohort(
+                conn,
+                reservation_key=str(row["reservation_key"]),
+                now=now,
+                failure_message=(
+                    "exact-session reservation target became unavailable "
+                    "before solve permit"
+                ),
             )
         expiring_claims = conn.execute(
             """
@@ -1395,9 +1478,13 @@ class AedtPoolService:
             if str(reservation["state"]) in {"claimed", "consumed"}:
                 raise ValueError("exact-session task reservation is already claimed")
         if str(reservation["state"]) != "reserved":
+            failure_message = str(reservation["failure_message"] or "").strip()
             raise ValueError(
-                "task exact-session reservation is no longer active; "
-                "unpinned fallback is forbidden"
+                failure_message
+                or (
+                    "task exact-session reservation is no longer active; "
+                    "unpinned fallback is forbidden"
+                )
             )
         if str(reservation["expires_at"]) <= now:
             raise ValueError("exact-session reservation expired")
@@ -3825,6 +3912,24 @@ class AedtPoolService:
             ).fetchone()[0]
             if live and success:
                 raise ValueError("session still has live project leases")
+            exact_failure_message = (
+                f"exact-session reservation target {int(session_id)} "
+                + (
+                    f"failed: {failure_message.strip()}"
+                    if failure_message.strip()
+                    else (
+                        "closed before cohort completion"
+                        if success
+                        else "failed before cohort completion"
+                    )
+                )
+            )
+            self._fail_exact_session_reservations_for_target(
+                conn,
+                session_id=int(session_id),
+                now=now,
+                failure_message=exact_failure_message,
+            )
             if live:
                 if not success and requeue_siblings:
                     expires = _sql_time(
@@ -3841,6 +3946,7 @@ class AedtPoolService:
                             failure_message = ?, last_heartbeat_at = ?, expires_at = ?,
                             updated_at = ?
                         WHERE session_id = ? AND state IN ('offered','leased','attaching','active','releasing')
+                          AND exact_session_reservation_id = 0
                         """,
                         (
                             failure_message.strip() or "AEDT session died; lease requeued",

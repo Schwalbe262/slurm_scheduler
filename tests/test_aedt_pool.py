@@ -3853,6 +3853,131 @@ class AedtExactSessionReservationTests(AedtPoolTestCase):
         expired = self.service.get_exact_session_reservation("ttl-cleanup")
         self.assertEqual(expired["slots"][0]["state"], "expired")
 
+    def test_target_failure_fails_entire_exact_cohort_instead_of_stuck_requeue(
+        self,
+    ) -> None:
+        _packing_session, target = self.sessions
+        task_ids = [self.create_pooled_task(f"fault-{index}") for index in range(3)]
+        self.reserve("faulted-target-cohort", target, task_ids)
+        leases = [
+            self.request_v2(f"fault-{index}", task_id=task_id)
+            for index, task_id in enumerate(task_ids[:2])
+        ]
+        self.assertEqual({lease[0]["state"] for lease in leases}, {"offered"})
+
+        with patch.object(self.service, "_authorize_session", return_value={}):
+            self.service.close_session(
+                int(target["id"]),
+                "unused-test-token",
+                success=False,
+                failure_message="native AEDT process exited",
+                requeue_siblings=True,
+            )
+
+        reason = (
+            f"exact-session reservation target {int(target['id'])} failed: "
+            "native AEDT process exited"
+        )
+        for lease, token in leases:
+            current = self.service.get_lease(int(lease["id"]))
+            self.assertEqual(current["state"], "failed")
+            self.assertEqual(current["failure_message"], reason)
+            with self.assertRaisesRegex(ValueError, "lease is failed"):
+                self.service.heartbeat_lease(int(lease["id"]), token)
+        reservation = self.service.get_exact_session_reservation(
+            "faulted-target-cohort"
+        )
+        self.assertEqual({slot["state"] for slot in reservation["slots"]}, {"failed"})
+        self.assertEqual(
+            {slot["failure_message"] for slot in reservation["slots"]}, {reason}
+        )
+        with self.assertRaisesRegex(ValueError, "native AEDT process exited"):
+            self.request_v2("fault-2", task_id=task_ids[2])
+
+    def test_pre_solve_target_drain_fails_consumed_cohort_instead_of_hanging(
+        self,
+    ) -> None:
+        _packing_session, target = self.sessions
+        task_ids = [self.create_pooled_task(f"drift-{index}") for index in range(3)]
+        self.reserve("draining-target-cohort", target, task_ids)
+        leases = [
+            self.request_v2(f"drift-{index}", task_id=task_id)
+            for index, task_id in enumerate(task_ids)
+        ]
+        self.assertEqual(
+            {
+                slot["state"]
+                for slot in self.service.get_exact_session_reservation(
+                    "draining-target-cohort"
+                )["slots"]
+            },
+            {"consumed"},
+        )
+
+        self.service.set_operator_limits(
+            max_sessions=0,
+            min_idle_sessions=0,
+            target_projects=0,
+            projects_per_session=3,
+        )
+        self.service.reconcile(execute=True)
+        self.assertEqual(
+            self.service.get_session(int(target["id"]))["state"], "draining"
+        )
+
+        first_lease, first_token = leases[0]
+        self.service.accept_lease(int(first_lease["id"]), first_token)
+        activated = self.service.activate_lease(int(first_lease["id"]), first_token)
+        self.assertEqual(activated["state"], "failed")
+        self.assertIn("before solve permit", activated["failure_message"])
+        self.assertEqual(
+            {
+                self.service.get_lease(int(lease["id"]))["state"]
+                for lease, _token in leases
+            },
+            {"failed"},
+        )
+        self.assertEqual(
+            {
+                slot["state"]
+                for slot in self.service.get_exact_session_reservation(
+                    "draining-target-cohort"
+                )["slots"]
+            },
+            {"failed"},
+        )
+
+    def test_target_failure_terminates_exact_lease_after_task_cleanup(self) -> None:
+        _packing_session, target = self.sessions
+        task_id = self.create_pooled_task("fault-after-task-cleanup")
+        self.reserve("fault-after-task-cleanup", target, [task_id])
+        lease, token = self.request_v2("fault-after-task-cleanup", task_id=task_id)
+        self.service.accept_lease(int(lease["id"]), token)
+        self.service.activate_lease(int(lease["id"]), token)
+
+        self.db.update_task(task_id, status=TaskStatus.CANCELLED.value)
+        self.service.reconcile(execute=False)
+        self.assertEqual(
+            self.service.get_exact_session_reservation("fault-after-task-cleanup")[
+                "slots"
+            ][0]["state"],
+            "released",
+        )
+        self.assertEqual(self.service.get_lease(int(lease["id"]))["state"], "releasing")
+
+        with patch.object(self.service, "_authorize_session", return_value={}):
+            self.service.close_session(
+                int(target["id"]),
+                "unused-test-token",
+                success=False,
+                failure_message="AEDT exited during cleanup",
+                requeue_siblings=True,
+            )
+
+        current = self.service.get_lease(int(lease["id"]))
+        self.assertEqual(current["state"], "failed")
+        self.assertIn("AEDT exited during cleanup", current["failure_message"])
+
     def test_underfilled_solve_fallback_waits_for_every_exact_reserved_peer(
         self,
     ) -> None:
