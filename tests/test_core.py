@@ -1181,6 +1181,214 @@ class SchedulerTests(unittest.TestCase):
             )
         )
 
+    def test_database_backup_is_async_single_flight_and_rotates(self) -> None:
+        backup_dir = Path(self.tmp.name) / "backups"
+        backup_dir.mkdir()
+        oldest = backup_dir / "slurm_scheduler-20000101-000000.db"
+        previous = backup_dir / "slurm_scheduler-20000102-000000.db"
+        oldest.write_text("oldest", encoding="utf-8")
+        previous.write_text("previous", encoding="utf-8")
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            backup_enabled=True,
+            backup_interval_seconds=3600,
+            backup_keep=2,
+            backup_dir=str(backup_dir),
+        )
+        scheduler._last_backup_at = time.time() - 3601
+        started = threading.Event()
+        release = threading.Event()
+        backup_paths: list[str] = []
+
+        def blocked_backup(path: str) -> None:
+            backup_paths.append(path)
+            started.set()
+            if not release.wait(5):
+                raise AssertionError("backup worker was not released")
+            Path(path).write_text("current", encoding="utf-8")
+
+        try:
+            with mock.patch.object(
+                self.db, "backup_to", side_effect=blocked_backup
+            ):
+                before = time.monotonic()
+                scheduler.backup_database_if_due()
+                self.assertLess(time.monotonic() - before, 1.0)
+                self.assertTrue(started.wait(1))
+                with scheduler._backup_lock:
+                    worker = scheduler._backup_thread
+                self.assertIsNotNone(worker)
+
+                # Even if the cadence appears due again, the active worker is
+                # authoritative and no second backup may be submitted.
+                scheduler._last_backup_at = time.time() - 3601
+                scheduler.backup_database_if_due()
+                self.assertEqual(len(backup_paths), 1)
+
+                release.set()
+                assert worker is not None
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive())
+        finally:
+            release.set()
+            scheduler.stop()
+
+        self.assertFalse(scheduler._backup_inflight)
+        self.assertIsNone(scheduler._backup_thread)
+        self.assertEqual(len(backup_paths), 1)
+        self.assertFalse(oldest.exists())
+        self.assertTrue(previous.exists())
+        self.assertTrue(Path(backup_paths[0]).exists())
+        self.assertEqual(
+            len(list(backup_dir.glob("slurm_scheduler-*.db"))), 2
+        )
+
+    def test_failed_database_backup_clears_single_flight_for_next_cadence(
+        self,
+    ) -> None:
+        backup_dir = Path(self.tmp.name) / "failed-backups"
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            backup_enabled=True,
+            backup_interval_seconds=3600,
+            backup_dir=str(backup_dir),
+        )
+        scheduler._last_backup_at = time.time() - 3601
+        first_started = threading.Event()
+        release_failure = threading.Event()
+        attempts: list[str] = []
+
+        def fail_then_succeed(path: str) -> None:
+            attempts.append(path)
+            if len(attempts) == 1:
+                first_started.set()
+                if not release_failure.wait(5):
+                    raise AssertionError("failed backup was not released")
+                raise RuntimeError("injected backup failure")
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text("recovered", encoding="utf-8")
+
+        try:
+            with mock.patch.object(
+                self.db, "backup_to", side_effect=fail_then_succeed
+            ):
+                scheduler.backup_database_if_due()
+                self.assertTrue(first_started.wait(1))
+                with scheduler._backup_lock:
+                    failed_worker = scheduler._backup_thread
+                self.assertIsNotNone(failed_worker)
+                release_failure.set()
+                assert failed_worker is not None
+                failed_worker.join(timeout=2)
+                self.assertFalse(failed_worker.is_alive())
+                self.assertFalse(scheduler._backup_inflight)
+                self.assertIsNone(scheduler._backup_thread)
+
+                scheduler._last_backup_at = time.time() - 3601
+                scheduler.backup_database_if_due()
+                with scheduler._backup_lock:
+                    recovered_worker = scheduler._backup_thread
+                if recovered_worker is not None:
+                    recovered_worker.join(timeout=2)
+                    self.assertFalse(recovered_worker.is_alive())
+        finally:
+            release_failure.set()
+            scheduler.stop()
+
+        self.assertEqual(len(attempts), 2)
+        self.assertTrue(Path(attempts[1]).exists())
+        self.assertFalse(scheduler._backup_inflight)
+        self.assertIsNone(scheduler._backup_thread)
+
+    def test_database_backup_resumes_cadence_from_newest_completed_file(
+        self,
+    ) -> None:
+        backup_dir = Path(self.tmp.name) / "restart-backups"
+        backup_dir.mkdir()
+        latest = backup_dir / "slurm_scheduler-20990101-000000.db"
+        latest.write_text("complete", encoding="utf-8")
+        now = time.time()
+        os.utime(latest, (now, now))
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            backup_enabled=True,
+            backup_interval_seconds=3600,
+            backup_dir=str(backup_dir),
+        )
+
+        try:
+            with mock.patch.object(self.db, "backup_to") as backup_to:
+                scheduler.backup_database_if_due()
+                backup_to.assert_not_called()
+        finally:
+            scheduler.stop()
+
+        self.assertEqual(scheduler._last_backup_at, now)
+        self.assertFalse(scheduler._backup_inflight)
+
+    def test_scheduler_stop_waits_for_inflight_backup_and_blocks_new_one(
+        self,
+    ) -> None:
+        backup_dir = Path(self.tmp.name) / "stop-backups"
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            backup_enabled=True,
+            backup_interval_seconds=3600,
+            backup_dir=str(backup_dir),
+        )
+        scheduler._last_backup_at = time.time() - 3601
+        started = threading.Event()
+        release = threading.Event()
+        calls: list[str] = []
+
+        def blocked_backup(path: str) -> None:
+            calls.append(path)
+            started.set()
+            if not release.wait(5):
+                raise AssertionError("stop did not release backup test")
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text("complete", encoding="utf-8")
+
+        stopper: threading.Thread | None = None
+        try:
+            with mock.patch.object(
+                self.db, "backup_to", side_effect=blocked_backup
+            ):
+                scheduler.backup_database_if_due()
+                self.assertTrue(started.wait(1))
+                stopper = threading.Thread(target=scheduler.stop, daemon=True)
+                stopper.start()
+                time.sleep(0.05)
+                self.assertTrue(stopper.is_alive())
+
+                scheduler._last_backup_at = time.time() - 3601
+                scheduler.backup_database_if_due()
+                self.assertEqual(len(calls), 1)
+
+                release.set()
+                stopper.join(timeout=2)
+                self.assertFalse(stopper.is_alive())
+        finally:
+            release.set()
+            if stopper is not None:
+                stopper.join(timeout=2)
+
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(scheduler._backup_inflight)
+        self.assertIsNone(scheduler._backup_thread)
+
     def test_list_allocations_with_live_keeps_old_active_allocations_beyond_recent_limit(self) -> None:
         active_id = self.db.create_allocation(
             account_name="a",
