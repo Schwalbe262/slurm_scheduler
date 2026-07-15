@@ -2126,6 +2126,16 @@ class AedtPoolService:
                           AND NOT EXISTS (
                               SELECT 1 FROM aedt_sessions unsafe
                               WHERE unsafe.allocation_id = a.id
+                                -- Only LIVE sessions make the node unsafe.
+                                -- Terminal (failed/closed) siblings keep their
+                                -- historical quarantine_reason forever and must
+                                -- not pin the allocation in draining (observed:
+                                -- 2 healthy ready Desktops idled behind 3
+                                -- failed siblings' history while 249 leases
+                                -- queued).
+                                AND unsafe.state IN (
+                                    'starting','ready','busy','draining','unhealthy'
+                                )
                                 AND (
                                     unsafe.state = 'unhealthy'
                                     OR TRIM(COALESCE(unsafe.quarantine_reason, '')) != ''
