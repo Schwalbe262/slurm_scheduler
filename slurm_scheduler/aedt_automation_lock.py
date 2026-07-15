@@ -6,7 +6,7 @@ import stat
 import threading
 import time
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -19,6 +19,11 @@ def automation_lock_path(artifact_dir: str) -> str:
     normalized = str(artifact_dir or "").strip()
     if not normalized:
         return ""
+    # The control plane runs on Windows while session artifacts live on the
+    # Linux GPFS filesystem.  ``Path('/gpfs/...')`` would otherwise serialize
+    # the lease contract as ``\\gpfs\\...``, which no Linux client can open.
+    if normalized.startswith("/"):
+        return str(PurePosixPath(normalized) / AUTOMATION_LOCK_FILENAME)
     return str(Path(normalized) / AUTOMATION_LOCK_FILENAME)
 
 
