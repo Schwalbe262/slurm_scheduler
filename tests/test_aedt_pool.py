@@ -41,6 +41,8 @@ from slurm_scheduler.aedt_session_host import (
     LEGACY_DSO_PROFILE,
     SUPPORTED_DSO_PROFILE,
     _install_pyaedt_psutil_cmdline_shim,
+    _load_pyaedt_dso_template,
+    _render_dso_configuration,
 )
 from slurm_scheduler.config import AccountConfig
 from slurm_scheduler.db import Database
@@ -69,6 +71,42 @@ PASSING_EVIDENCE = {
     "pooled_artifact": "pooled.json",
     "license_artifact": "lmstat.jsonl",
 }
+
+VALID_PYAEDT_DSO_TEMPLATE = """$begin 'Configs'
+    $begin 'Configs'
+        $begin 'DSOConfig'
+            ConfigName='pyaedt_config'
+            DesignType='HFSS'
+            $begin 'DSOMachineList'
+                $begin 'DSOMachineInfo'
+                    MachineName='localhost'
+                    NumEngines=1
+                    NumCores=4
+                    IsEnabled=true
+                    RAMPercent=90
+                    NumJobCores=0
+                    NumGPUs=0
+                $end 'DSOMachineInfo'
+            $end 'DSOMachineList'
+            UseAutoSettings=true
+            NumVariationsToDistribute=1
+            $begin 'DSOJobDistributionInfo'
+                AllowedDistributionTypes[9: 'Variations', 'Frequencies', 'Mesh Assembly','Mesher', 'Transient Excitations', 'Domain Solver', 'Solver', 'Iterative Solver', 'Direct Solver']
+                Enable2LevelDistribution=false
+                NumL1Engines=1
+                UseDefaultsForDistributionTypes=false
+                Context()
+            $end 'DSOJobDistributionInfo'
+            $begin 'DSOMachineOptionsInfo'
+                MenuValues()
+                IntValues()
+                BoolValues(AllowOffCore=true)
+                DoubleValues()
+            $end 'DSOMachineOptionsInfo'
+        $end 'DSOConfig'
+    $end 'Configs'
+$end 'Configs'
+"""
 
 
 class Clock:
@@ -4317,6 +4355,31 @@ class SessionHostTests(unittest.TestCase):
         )
         self.assertLess(events.index("heartbeat-recovered"), events.index("desktop-close"))
 
+    def test_missing_pyaedt_dso_template_fails_before_registry_load(self) -> None:
+        with patch(
+            "slurm_scheduler.aedt_session_host.importlib.resources.files",
+            side_effect=FileNotFoundError("missing template"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "bundled DSO template is unavailable"):
+                _load_pyaedt_dso_template()
+
+    def test_minimal_pyaedt_dso_template_is_rejected(self) -> None:
+        minimal = """$begin 'DSOConfig'
+ConfigName='pyaedt_config'
+DesignType='HFSS'
+NumEngines=1
+NumCores=4
+NumGPUs=0
+UseAutoSettings=true
+$end 'DSOConfig'
+"""
+        with self.assertRaisesRegex(RuntimeError, "incomplete; missing ACF blocks"):
+            _render_dso_configuration(
+                minimal,
+                design_type="Maxwell 3D",
+                use_auto_settings=True,
+            )
+
     def test_host_initializes_maxwell_and_icepak_dso_profiles_once(self) -> None:
         class RegistryDesktop:
             def __init__(self) -> None:
@@ -4334,7 +4397,10 @@ class SessionHostTests(unittest.TestCase):
             def GetRegistryString(self, key: str):
                 return self.values.get(key, "")
 
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root, patch(
+            "slurm_scheduler.aedt_session_host._load_pyaedt_dso_template",
+            return_value=VALID_PYAEDT_DSO_TEMPLATE,
+        ):
             registry = RegistryDesktop()
             host = AedtSessionHost(
                 FakeHostControlPlane([]),
@@ -4350,6 +4416,24 @@ class SessionHostTests(unittest.TestCase):
             host._initialize_dso_configuration()
 
             self.assertEqual(len(registry.loaded), 3)
+            for text in registry.loaded:
+                self.assertEqual(text.count("$begin 'Configs'"), 2)
+                self.assertEqual(text.count("$end 'Configs'"), 2)
+                self.assertEqual(text.count("$begin 'DSOConfig'"), 1)
+                self.assertIn("$begin 'DSOMachineList'", text)
+                self.assertIn("$begin 'DSOMachineInfo'", text)
+                self.assertIn("$begin 'DSOJobDistributionInfo'", text)
+                self.assertIn("$begin 'DSOMachineOptionsInfo'", text)
+                self.assertIn("AllowedDistributionTypes[9:", text)
+                self.assertIn("BoolValues(AllowOffCore=true)", text)
+                self.assertLess(
+                    text.index("$begin 'DSOMachineList'"),
+                    text.index("$begin 'DSOMachineInfo'"),
+                )
+                self.assertLess(
+                    text.index("$end 'DSOMachineInfo'"),
+                    text.index("$end 'DSOMachineList'"),
+                )
             self.assertTrue(any("DesignType='Maxwell 3D'" in text for text in registry.loaded))
             self.assertTrue(any("DesignType='Maxwell 2D'" in text for text in registry.loaded))
             self.assertTrue(any("DesignType='Icepak'" in text for text in registry.loaded))
@@ -4358,10 +4442,10 @@ class SessionHostTests(unittest.TestCase):
             icepak = next(
                 text for text in registry.loaded if "DesignType='Icepak'" in text
             )
-            self.assertIn("UseAutoSettings=False", icepak)
+            self.assertIn("UseAutoSettings=false", icepak)
             self.assertTrue(
                 all(
-                    "UseAutoSettings=True" in text
+                    "UseAutoSettings=true" in text
                     for text in registry.loaded
                     if "DesignType='Maxwell" in text
                 )
@@ -4388,7 +4472,10 @@ class SessionHostTests(unittest.TestCase):
             registry.values.__setitem__(key, value) or True
         )
         registry.GetRegistryString = lambda key: registry.values.get(key, "")
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root, patch(
+            "slurm_scheduler.aedt_session_host._load_pyaedt_dso_template",
+            return_value=VALID_PYAEDT_DSO_TEMPLATE,
+        ):
             host = AedtSessionHost(
                 FakeHostControlPlane([]),
                 allocation_id=1,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import http.client
+import importlib.resources
 import json
 import math
 import os
@@ -31,6 +32,9 @@ SESSION_PROFILE_ENV = "AEDT_SESSION_HOST_PROFILE"
 SUPPORTED_DSO_PROFILE = "maxwell-2d3d-icepak-4c1e"
 LEGACY_DSO_PROFILE = "maxwell-2d3d-4c1e"
 SUPPORTED_DSO_PROFILES = {SUPPORTED_DSO_PROFILE, LEGACY_DSO_PROFILE}
+DSO_TEMPLATE_PACKAGE = "ansys.aedt.core.misc"
+DSO_TEMPLATE_FILENAME = "pyaedt_local_config.acf"
+DSO_CONFIG_NAME = "pyaedt_config"
 EXPECTED_SESSION_PROFILE = {
     "profile_version": 2,
     "aedt_version": "2025.2",
@@ -150,6 +154,96 @@ def _install_pyaedt_psutil_cmdline_shim(psutil_module: Any | None = None) -> Non
     if hasattr(original, "cache_clear"):
         sanitized_process_iter.cache_clear = original.cache_clear  # type: ignore[attr-defined]
     psutil_module.process_iter = sanitized_process_iter
+
+
+def _validate_pyaedt_dso_template(template: str) -> None:
+    """Reject truncated ACF files before asking AEDT to load them."""
+
+    stack: list[str] = []
+    paths: set[tuple[str, ...]] = set()
+    for line in template.splitlines():
+        stripped = line.strip()
+        begin = re.fullmatch(r"\$begin\s+'([^']+)'", stripped)
+        if begin:
+            stack.append(begin.group(1))
+            paths.add(tuple(stack))
+            continue
+        end = re.fullmatch(r"\$end\s+'([^']+)'", stripped)
+        if end:
+            if not stack or stack[-1] != end.group(1):
+                raise RuntimeError("PyAEDT DSO template has unbalanced ACF blocks")
+            stack.pop()
+            continue
+        if stripped.startswith(("$begin", "$end")):
+            raise RuntimeError("PyAEDT DSO template has malformed ACF blocks")
+    if stack:
+        raise RuntimeError("PyAEDT DSO template has unbalanced ACF blocks")
+
+    dso_root = ("Configs", "Configs", "DSOConfig")
+    required_paths = {
+        ("Configs",),
+        ("Configs", "Configs"),
+        dso_root,
+        dso_root + ("DSOMachineList",),
+        dso_root + ("DSOMachineList", "DSOMachineInfo"),
+        dso_root + ("DSOJobDistributionInfo",),
+        dso_root + ("DSOMachineOptionsInfo",),
+    }
+    missing_blocks = sorted("/".join(path) for path in required_paths - paths)
+    if missing_blocks:
+        raise RuntimeError(
+            "PyAEDT DSO template is incomplete; missing ACF blocks: "
+            + ", ".join(missing_blocks)
+        )
+    for key in (
+        "ConfigName",
+        "DesignType",
+        "NumEngines",
+        "NumCores",
+        "NumGPUs",
+        "UseAutoSettings",
+    ):
+        matches = re.findall(rf"(?m)^[ \t]*{re.escape(key)}[ \t]*=", template)
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"PyAEDT DSO template must contain exactly one {key} setting"
+            )
+
+
+def _load_pyaedt_dso_template() -> str:
+    try:
+        resource = importlib.resources.files(DSO_TEMPLATE_PACKAGE).joinpath(
+            DSO_TEMPLATE_FILENAME
+        )
+        template = resource.read_text(encoding="utf-8")
+    except (ImportError, ModuleNotFoundError, FileNotFoundError, OSError, AttributeError) as exc:
+        raise RuntimeError(
+            f"PyAEDT bundled DSO template is unavailable: {DSO_TEMPLATE_FILENAME}"
+        ) from exc
+    _validate_pyaedt_dso_template(template)
+    return template
+
+
+def _render_dso_configuration(
+    template: str, *, design_type: str, use_auto_settings: bool
+) -> str:
+    _validate_pyaedt_dso_template(template)
+    rendered = template.replace("\r\n", "\n")
+    values = {
+        "ConfigName": f"'{DSO_CONFIG_NAME}'",
+        "DesignType": f"'{design_type}'",
+        "NumEngines": "1",
+        "NumCores": "4",
+        "NumGPUs": "0",
+        "UseAutoSettings": "true" if use_auto_settings else "false",
+    }
+    for key, value in values.items():
+        pattern = re.compile(rf"(?m)^([ \t]*{re.escape(key)}[ \t]*=)[^\r\n]*$")
+        rendered, count = pattern.subn(lambda match: match.group(1) + value, rendered)
+        if count != 1:
+            raise RuntimeError(f"failed to render PyAEDT DSO setting {key}")
+    _validate_pyaedt_dso_template(rendered)
+    return rendered.rstrip("\n") + "\n"
 
 
 class ControlPlaneClient:
@@ -505,6 +599,7 @@ class AedtSessionHost:
             else Path(tempfile.gettempdir()) / f"aedt-session-{self.session_id}"
         )
         base.mkdir(parents=True, exist_ok=True)
+        template = _load_pyaedt_dso_template()
         for design_type, registry_suffix, filename, use_auto_settings in (
             ("Maxwell 3D", "Maxwell 3D", "pyaedt_config_maxwell3d.acf", True),
             ("Maxwell 2D", "Maxwell 2D", "pyaedt_config_maxwell2d.acf", True),
@@ -512,19 +607,10 @@ class AedtSessionHost:
         ):
             acf_path = base / filename
             acf_path.write_text(
-                "\n".join(
-                    (
-                        "$begin 'DSOConfig'",
-                        "ConfigName='pyaedt_config'",
-                        f"DesignType='{design_type}'",
-                        "MachineName='localhost'",
-                        "NumEngines=1",
-                        "NumCores=4",
-                        "NumGPUs=0",
-                        f"UseAutoSettings={str(use_auto_settings)}",
-                        "$end 'DSOConfig'",
-                        "",
-                    )
+                _render_dso_configuration(
+                    template,
+                    design_type=design_type,
+                    use_auto_settings=use_auto_settings,
                 ),
                 encoding="utf-8",
             )
@@ -532,11 +618,11 @@ class AedtSessionHost:
             if loaded is False:
                 raise RuntimeError(f"SetRegistryFromFile failed for {design_type}")
             registry_key = f"Desktop/ActiveDSOConfigurations/{registry_suffix}"
-            selected = odesktop.SetRegistryString(registry_key, "pyaedt_config")
+            selected = odesktop.SetRegistryString(registry_key, DSO_CONFIG_NAME)
             if selected is False:
                 raise RuntimeError(f"SetRegistryString failed for {design_type}")
             actual = str(odesktop.GetRegistryString(registry_key) or "").strip()
-            if actual != "pyaedt_config":
+            if actual != DSO_CONFIG_NAME:
                 raise RuntimeError(
                     f"DSO readback mismatch for {design_type}: {actual!r}"
                 )
