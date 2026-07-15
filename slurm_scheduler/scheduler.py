@@ -2218,6 +2218,23 @@ class Scheduler:
             for allocation in by_account[account_name]:
                 info = outcome.get(str(allocation["slurm_job_id"]))
                 if info is None:
+                    # A CLOSING allocation's scancel was already issued; when
+                    # Slurm no longer reports the job at all (fell out of
+                    # squeue and the sacct window), nothing will ever converge
+                    # it and the row pins the node ledger forever (observed
+                    # 26h+ stuck 'closing' rows). Treat job-vanished as closed.
+                    if allocation["state"] == AllocationStatus.CLOSING.value:
+                        self.db.update_allocation(
+                            allocation["id"],
+                            state=AllocationStatus.CLOSED.value,
+                            closed_at="CURRENT_TIMESTAMP",
+                        )
+                        self.record_event(
+                            "allocation_closed",
+                            f"slurm job {allocation.get('slurm_job_id')} vanished while closing",
+                            entity_type="allocation",
+                            entity_id=allocation["id"],
+                        )
                     continue
                 self._apply_allocation_state(allocation, info)
         self.recalculate_allocation_capacity()

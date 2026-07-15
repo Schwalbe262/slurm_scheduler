@@ -1,3 +1,17 @@
+## 2026-07-15 (Codex A + Claude) - Three-tier lease expiry + closing convergence
+- Lease expiry now has three tiers (Codex, 4cf55bd): QUEUED requests expire
+  after 300s heartbeat silence (dead clients' ghost requests were inflating
+  live-project demand toward the admission cap, observed 739/750); LEASED but
+  never-active leases go to 'releasing' for host-side project cleanup WITHOUT
+  draining/quarantining the session (a client dying at startup used to get a
+  healthy Desktop and its innocent siblings killed); ACTIVE leases keep the
+  conservative quarantine. request_lease seeds last_heartbeat_at/expires_at
+  from the same service clock (no CURRENT_TIMESTAMP mixing).
+- CLOSING allocations whose Slurm job vanished from squeue/sacct now converge
+  to closed in refresh_allocations (Claude): previously the row pinned the
+  node ledger forever (26h+ stuck rows force-closed manually today).
+- Tests: pool suites 90 passed; core 363 passed.
+
 ## 2026-07-15 (Codex, supervised) - Session-host resilience + unhealthy recovery
 - Hosts survive control-plane outages: bounded retry with backoff/jitter for a
   360s budget on all host HTTP calls; terminal 4xx still exits immediately
