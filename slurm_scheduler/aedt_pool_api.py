@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
@@ -42,8 +42,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         return service.summary()
 
     @router.patch("/api/aedt-pool/config", dependencies=[bootstrap_guard])
-    async def set_aedt_pool_limit(request: Request) -> dict[str, Any]:
-        payload = await request.json()
+    def set_aedt_pool_limit(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         allowed = {
             "max_aedt_sessions",
             "min_idle_aedt_sessions",
@@ -102,8 +101,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         }
 
     @router.post("/api/aedt-pool/enable", dependencies=[bootstrap_guard])
-    async def set_aedt_pool_enabled(request: Request) -> dict[str, Any]:
-        payload = await request.json()
+    def set_aedt_pool_enabled(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         if type(payload.get("enabled")) is not bool:
             raise HTTPException(status_code=422, detail="enabled must be a boolean")
         try:
@@ -118,8 +116,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         }
 
     @router.post("/api/aedt-pool/validations", dependencies=[bootstrap_guard])
-    async def record_aedt_pool_validation(request: Request) -> dict[str, Any]:
-        payload = await request.json()
+    def record_aedt_pool_validation(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         try:
             return service.record_validation(payload)
         except (TypeError, ValueError) as exc:
@@ -131,8 +128,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         return service.dry_run() if dry_run else service.reconcile(execute=True)
 
     @router.post("/api/aedt-pool/leases", dependencies=[bootstrap_guard])
-    async def request_aedt_lease(request: Request) -> dict[str, Any]:
-        payload = await request.json()
+    def request_aedt_lease(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         try:
             lease, token = service.request_lease(
                 request_key=str(payload.get("request_key") or ""),
@@ -194,12 +190,11 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         "/api/aedt-pool/leases/{lease_id}/project-name",
         dependencies=[bootstrap_guard],
     )
-    async def bind_aedt_lease_project_name(
+    def bind_aedt_lease_project_name(
         lease_id: int,
-        request: Request,
+        payload: dict[str, Any] = Body(...),
         x_aedt_lease_token: str = Header(""),
     ) -> dict[str, Any]:
-        payload = await request.json()
         try:
             return service.bind_lease_project_name(
                 lease_id,
@@ -217,12 +212,11 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         "/api/aedt-pool/leases/{lease_id}/fault",
         dependencies=[bootstrap_guard],
     )
-    async def report_aedt_lease_fault(
+    def report_aedt_lease_fault(
         lease_id: int,
-        request: Request,
+        payload: dict[str, Any] = Body(...),
         x_aedt_lease_token: str = Header(""),
     ) -> dict[str, Any]:
-        payload = await request.json()
         try:
             return service.report_project_fault(
                 lease_id,
@@ -242,11 +236,10 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         "/api/aedt-pool/hosts/claim-start",
         dependencies=[bootstrap_guard],
     )
-    async def claim_aedt_start(
-        request: Request,
+    def claim_aedt_start(
+        payload: dict[str, Any] = Body(...),
         x_aedt_bootstrap_token: str = Header(""),
     ) -> dict[str, Any]:
-        payload = await request.json()
         try:
             session = service.claim_start(
                 session_id=int(payload.get("session_id") or 0),
@@ -265,13 +258,12 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         "/api/aedt-pool/sessions/{session_id}/register",
         dependencies=[bootstrap_guard],
     )
-    async def register_aedt_session(
+    def register_aedt_session(
         session_id: int,
-        request: Request,
+        payload: dict[str, Any] = Body(...),
         x_aedt_bootstrap_token: str = Header(""),
         x_aedt_host_token: str = Header(""),
     ) -> dict[str, Any]:
-        payload = await request.json()
         try:
             session, token = service.register_session(
                 session_id=session_id,
@@ -293,12 +285,11 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         "/api/aedt-pool/sessions/{session_id}/start-failed",
         dependencies=[bootstrap_guard],
     )
-    async def fail_aedt_session_start(
+    def fail_aedt_session_start(
         session_id: int,
-        request: Request,
+        payload: dict[str, Any] = Body(...),
         x_aedt_bootstrap_token: str = Header(""),
     ) -> dict[str, Any]:
-        payload = await request.json()
         try:
             return service.fail_session_start(
                 session_id=session_id,
@@ -346,13 +337,12 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         "/api/aedt-pool/sessions/{session_id}/leases/{lease_id}/release-complete",
         dependencies=[bootstrap_guard],
     )
-    async def complete_aedt_release(
+    def complete_aedt_release(
         session_id: int,
         lease_id: int,
-        request: Request,
+        payload: dict[str, Any] = Body(...),
         x_aedt_host_token: str = Header(""),
     ) -> dict[str, Any]:
-        payload = await request.json()
         if type(payload.get("success")) is not bool:
             raise HTTPException(status_code=422, detail="success must be a boolean")
         try:
@@ -374,12 +364,11 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         "/api/aedt-pool/sessions/{session_id}/closed",
         dependencies=[bootstrap_guard],
     )
-    async def close_aedt_session(
+    def close_aedt_session(
         session_id: int,
-        request: Request,
+        payload: dict[str, Any] = Body(...),
         x_aedt_host_token: str = Header(""),
     ) -> dict[str, Any]:
-        payload = await request.json()
         if type(payload.get("success")) is not bool:
             raise HTTPException(status_code=422, detail="success must be a boolean")
         if "requeue_siblings" in payload and type(payload["requeue_siblings"]) is not bool:
