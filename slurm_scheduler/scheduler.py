@@ -1750,9 +1750,16 @@ class Scheduler:
         with self._backup_lock:
             if self._stop.is_set() or self._backup_inflight:
                 return
+            now = time.time()
+            if (
+                self._last_backup_at != 0.0
+                and now - self._last_backup_at < self.backup_interval_seconds
+            ):
+                return
             self._backup_inflight = True
             backup_thread = threading.Thread(
                 target=self._backup_database_if_due_worker,
+                args=(now,),
                 name="database-backup",
                 daemon=True,
             )
@@ -1767,9 +1774,8 @@ class Scheduler:
                     self._backup_thread = None
                 LOGGER.warning("failed to start database backup: %s", exc)
 
-    def _backup_database_if_due_worker(self) -> None:
+    def _backup_database_if_due_worker(self, now: float) -> None:
         try:
-            now = time.time()
             if self._last_backup_at == 0.0:
                 # Survive restarts: resume the cadence from the newest backup
                 # file. This scan is intentionally off the scheduler tick

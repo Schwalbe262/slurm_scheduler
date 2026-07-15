@@ -1371,6 +1371,78 @@ class SchedulerTests(unittest.TestCase):
         self.assertFalse(scheduler._backup_inflight)
         self.assertIsNone(scheduler._backup_thread)
 
+    def test_database_backup_interval_ticks_do_not_create_workers(
+        self,
+    ) -> None:
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            backup_enabled=True,
+            backup_interval_seconds=3600,
+            backup_dir=str(Path(self.tmp.name) / "no-worker-backups"),
+        )
+        scheduler._last_backup_at = 10_000.0
+
+        try:
+            with mock.patch(
+                "slurm_scheduler.scheduler.time.time",
+                return_value=10_100.0,
+            ) as clock, mock.patch(
+                "slurm_scheduler.scheduler.threading.Thread"
+            ) as thread_type:
+                for _ in range(100):
+                    scheduler.backup_database_if_due()
+
+            self.assertEqual(clock.call_count, 100)
+            thread_type.assert_not_called()
+            self.assertFalse(scheduler._backup_inflight)
+            self.assertIsNone(scheduler._backup_thread)
+        finally:
+            scheduler.stop()
+
+    def test_database_backup_worker_uses_tick_timestamp_for_cadence(
+        self,
+    ) -> None:
+        backup_dir = Path(self.tmp.name) / "captured-time-backups"
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            backup_enabled=True,
+            backup_interval_seconds=3600,
+            backup_dir=str(backup_dir),
+        )
+        scheduler._last_backup_at = 10_000.0
+        backup_paths: list[str] = []
+
+        def record_backup(path: str) -> None:
+            backup_paths.append(path)
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text("complete", encoding="utf-8")
+
+        try:
+            with mock.patch(
+                "slurm_scheduler.scheduler.time.time",
+                return_value=13_601.0,
+            ) as clock, mock.patch.object(
+                self.db, "backup_to", side_effect=record_backup
+            ):
+                scheduler.backup_database_if_due()
+                with scheduler._backup_lock:
+                    worker = scheduler._backup_thread
+                if worker is not None:
+                    worker.join(timeout=2)
+                    self.assertFalse(worker.is_alive())
+
+            self.assertEqual(clock.call_count, 1)
+            self.assertEqual(scheduler._last_backup_at, 13_601.0)
+            self.assertEqual(len(backup_paths), 1)
+        finally:
+            scheduler.stop()
+
     def test_database_backup_resumes_cadence_from_newest_completed_file(
         self,
     ) -> None:
