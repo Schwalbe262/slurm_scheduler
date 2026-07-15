@@ -7,6 +7,7 @@ import math
 import multiprocessing
 import os
 import random
+import re
 import secrets
 import socket
 import threading
@@ -18,12 +19,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .aedt_session_host import normalize_aedt_version
-
-
 DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS = 360.0
 CONTROL_PLANE_OUTAGE_ENV = "AEDT_POOL_CONTROL_PLANE_OUTAGE_SECONDS"
 TRANSIENT_HTTP_STATUSES = {408, 425, 429}
+
+
+def normalize_aedt_version(value: Any) -> str:
+    """Normalize AEDT's verbose version without importing host-only code."""
+
+    match = re.search(r"(?<!\d)(20\d{2}\.\d)(?!\d)", str(value or ""))
+    return match.group(1) if match else ""
 
 
 def _keepalive_delay(
