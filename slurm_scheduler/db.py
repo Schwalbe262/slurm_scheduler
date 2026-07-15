@@ -272,6 +272,10 @@ CREATE TABLE IF NOT EXISTS projects (
     sim_subdir TEXT NOT NULL DEFAULT 'simulation',
     auto_pull INTEGER NOT NULL DEFAULT 0,
     max_active_tasks INTEGER NOT NULL DEFAULT 0,
+    desired_simulations INTEGER NOT NULL DEFAULT 0,
+    policy_revision INTEGER NOT NULL DEFAULT 1,
+    validated_concurrency_limit INTEGER NOT NULL DEFAULT 0,
+    scale_down_mode TEXT NOT NULL DEFAULT 'drain',
     aedt_backend TEXT NOT NULL DEFAULT 'standalone',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -335,17 +339,28 @@ class Database:
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout = 30000")
-            conn.execute(f"PRAGMA journal_mode = {self.journal_mode}")
-            conn.execute("PRAGMA synchronous = NORMAL")
+            conn.execute("PRAGMA foreign_keys = ON")
             yield conn
             conn.commit()
         finally:
             conn.close()
 
     def init(self) -> None:
-        with self.connect() as conn:
+        # Journal negotiation can acquire an exclusive lock.  Do it once at
+        # process/database initialization, never on each of 500 concurrent
+        # heartbeat connections.
+        conn = sqlite3.connect(self.path, timeout=30)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute(f"PRAGMA journal_mode = {self.journal_mode}")
+            conn.execute("PRAGMA synchronous = NORMAL")
             conn.executescript(SCHEMA)
             self._ensure_columns(conn)
+            conn.commit()
+        finally:
+            conn.close()
 
     def get_setting(self, key: str) -> str | None:
         with self.connect() as conn:
@@ -523,6 +538,10 @@ class Database:
             "projects": {
                 "output_globs": "TEXT NOT NULL DEFAULT ''",
                 "max_active_tasks": "INTEGER NOT NULL DEFAULT 0",
+                "desired_simulations": "INTEGER NOT NULL DEFAULT 0",
+                "policy_revision": "INTEGER NOT NULL DEFAULT 1",
+                "validated_concurrency_limit": "INTEGER NOT NULL DEFAULT 0",
+                "scale_down_mode": "TEXT NOT NULL DEFAULT 'drain'",
                 "aedt_backend": f"TEXT NOT NULL DEFAULT '{AedtBackend.STANDALONE.value}'",
             },
         }
@@ -531,6 +550,45 @@ class Database:
             for name, ddl in columns.items():
                 if name not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+        conn.execute(
+            """
+            UPDATE projects
+            SET desired_simulations = CASE
+                    WHEN LOWER(name) LIKE 'mft%' THEN 1
+                    ELSE max_active_tasks END,
+                validated_concurrency_limit = CASE
+                    WHEN LOWER(name) LIKE 'mft%' THEN 1
+                    ELSE max_active_tasks END,
+                max_active_tasks = CASE
+                    WHEN LOWER(name) LIKE 'mft%' THEN 500
+                    ELSE max_active_tasks END,
+                policy_revision = MAX(1, policy_revision),
+                scale_down_mode = 'drain'
+            WHERE desired_simulations = 0
+              AND validated_concurrency_limit = 0
+              AND max_active_tasks > 0
+            """
+        )
+        conn.execute(
+            """
+            UPDATE projects SET max_active_tasks = 500
+            WHERE LOWER(name) LIKE 'mft%' AND max_active_tasks != 500
+            """
+        )
+        conn.execute(
+            """
+            UPDATE projects
+            SET desired_simulations = MIN(desired_simulations, 500),
+                validated_concurrency_limit = MIN(validated_concurrency_limit, 500),
+                max_active_tasks = MIN(max_active_tasks, 500)
+            WHERE LOWER(name) LIKE 'mft%'
+              AND (
+                  desired_simulations > 500
+                  OR validated_concurrency_limit > 500
+                  OR max_active_tasks > 500
+              )
+            """
+        )
 
     def create_job(self, job: JobCreate) -> int:
         with self.connect() as conn:
@@ -1281,13 +1339,18 @@ class Database:
         max_active_tasks: int = 0,
         aedt_backend: str = AedtBackend.STANDALONE.value,
     ) -> int:
+        requested_limit = max(0, int(max_active_tasks))
+        is_mft = str(name or "").strip().lower().startswith("mft")
+        hard_scheduler_limit = 500 if is_mft else requested_limit
+        initial_policy_limit = 1 if is_mft else requested_limit
         with self.connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO projects (
                     name, repos, setup, entrypoints, cleanup_globs, output_globs, sim_subdir, auto_pull,
-                    max_active_tasks, aedt_backend
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    max_active_tasks, desired_simulations, policy_revision,
+                    validated_concurrency_limit, scale_down_mode, aedt_backend
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'drain', ?)
                 """,
                 (
                     name,
@@ -1298,7 +1361,9 @@ class Database:
                     output_globs,
                     sim_subdir,
                     1 if auto_pull else 0,
-                    max(0, int(max_active_tasks)),
+                    hard_scheduler_limit,
+                    initial_policy_limit,
+                    initial_policy_limit,
                     normalize_aedt_backend(aedt_backend),
                 ),
             )
@@ -1316,6 +1381,95 @@ class Database:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM projects WHERE name = ?", (name,)).fetchone()
             return dict(row) if row else None
+
+    def update_project_simulation_policy(
+        self,
+        name: str,
+        *,
+        desired_simulations: int,
+        expected_revision: int,
+        scale_down_mode: str = "drain",
+    ) -> tuple[str, dict[str, Any] | None]:
+        """CAS-update desired work without changing the hard scheduler guard."""
+
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            project = conn.execute(
+                "SELECT * FROM projects WHERE name = ?", (name,)
+            ).fetchone()
+            if not project:
+                return "not_found", None
+            if int(project["policy_revision"] or 1) != int(expected_revision):
+                return "conflict", dict(project)
+            cursor = conn.execute(
+                """
+                UPDATE projects
+                SET desired_simulations = ?, scale_down_mode = ?,
+                    policy_revision = policy_revision + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND policy_revision = ?
+                """,
+                (
+                    max(0, int(desired_simulations)),
+                    scale_down_mode,
+                    int(project["id"]),
+                    int(expected_revision),
+                ),
+            )
+            if cursor.rowcount != 1:
+                current = conn.execute(
+                    "SELECT * FROM projects WHERE id = ?", (int(project["id"]),)
+                ).fetchone()
+                return "conflict", dict(current) if current else None
+            updated = conn.execute(
+                "SELECT * FROM projects WHERE id = ?", (int(project["id"]),)
+            ).fetchone()
+            return "updated", dict(updated)
+
+    def update_project_validation_limit(
+        self,
+        name: str,
+        *,
+        validated_concurrency_limit: int,
+        expected_revision: int,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """CAS-update the separately controlled rollout/validation ceiling."""
+
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            project = conn.execute(
+                "SELECT * FROM projects WHERE name = ?", (name,)
+            ).fetchone()
+            if not project:
+                return "not_found", None
+            if int(project["policy_revision"] or 1) != int(expected_revision):
+                return "conflict", dict(project)
+            validated = max(0, int(validated_concurrency_limit))
+            desired = min(max(0, int(project["desired_simulations"] or 0)), validated)
+            cursor = conn.execute(
+                """
+                UPDATE projects
+                SET validated_concurrency_limit = ?, desired_simulations = ?,
+                    policy_revision = policy_revision + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND policy_revision = ?
+                """,
+                (
+                    validated,
+                    desired,
+                    int(project["id"]),
+                    int(expected_revision),
+                ),
+            )
+            if cursor.rowcount != 1:
+                current = conn.execute(
+                    "SELECT * FROM projects WHERE id = ?", (int(project["id"]),)
+                ).fetchone()
+                return "conflict", dict(current) if current else None
+            updated = conn.execute(
+                "SELECT * FROM projects WHERE id = ?", (int(project["id"]),)
+            ).fetchone()
+            return "updated", dict(updated)
 
     def count_tasks_by_project(self, project: str, statuses: list[str] | None = None) -> int:
         if not project:

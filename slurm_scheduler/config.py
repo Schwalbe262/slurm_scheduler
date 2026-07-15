@@ -133,11 +133,18 @@ class AppConfig:
     # node-side session-host adapter.  Disabled is the production default.
     aedt_pool_session_host_enabled: bool = False
     aedt_pool_scheduler_url: str = ""
+    # Node-visible file containing only the lease-creation credential.  It is
+    # deliberately distinct from the session-host/admin bootstrap token file.
+    aedt_pool_client_token_file: str = ""
     aedt_pool_host_remote_cwd: str = ""
     aedt_pool_host_python: str = "python"
     aedt_pool_host_env_setup: str = ""
     aedt_pool_host_bootstrap_token_file: str = ""
-    aedt_pool_host_task_memory_mb: int = 4096
+    # Minimum host-task reservation; the pool also enforces 32 GiB per slot.
+    aedt_pool_host_task_memory_mb: int = 65536
+    aedt_pool_host_artifact_root: str = ""
+    aedt_pool_host_dso_profile: str = ""
+    aedt_pool_host_session_profile: str = ""
     # Optional login-node bridge that makes the local HTTP control plane
     # reachable from compute nodes.  It remains inert unless explicitly
     # enabled and supplied with an account and remote deployment path.
@@ -265,11 +272,15 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
         mapping = {
             "session_host_enabled": "aedt_pool_session_host_enabled",
             "scheduler_url": "aedt_pool_scheduler_url",
+            "client_token_file": "aedt_pool_client_token_file",
             "host_remote_cwd": "aedt_pool_host_remote_cwd",
             "host_python": "aedt_pool_host_python",
             "host_env_setup": "aedt_pool_host_env_setup",
             "host_bootstrap_token_file": "aedt_pool_host_bootstrap_token_file",
             "host_task_memory_mb": "aedt_pool_host_task_memory_mb",
+            "host_artifact_root": "aedt_pool_host_artifact_root",
+            "host_dso_profile": "aedt_pool_host_dso_profile",
+            "host_session_profile": "aedt_pool_host_session_profile",
         }
         for source, target in mapping.items():
             if source in aedt_pool:

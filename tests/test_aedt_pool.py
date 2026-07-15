@@ -5,19 +5,23 @@ import http.client
 import io
 import json
 import os
+import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from slurm_scheduler.aedt_attach_client import (
+    AedtLeaseError,
     AedtPoolHttpClient,
     AedtProjectLease,
+    _keepalive_delay,
     acquire_project_lease,
 )
 from slurm_scheduler.aedt_pool import (
@@ -31,7 +35,11 @@ from slurm_scheduler.aedt_pool import (
 from slurm_scheduler.aedt_pool_api import create_aedt_pool_router
 from slurm_scheduler.aedt_session_host import (
     AedtSessionHost,
+    ControlPlaneUnavailable,
     ControlPlaneClient,
+    EXPECTED_SESSION_PROFILE_JSON,
+    LEGACY_DSO_PROFILE,
+    SUPPORTED_DSO_PROFILE,
     _install_pyaedt_psutil_cmdline_shim,
 )
 from slurm_scheduler.config import AccountConfig
@@ -80,7 +88,12 @@ class AedtPoolTestCase(unittest.TestCase):
         self.db = Database(str(Path(self.tmp.name) / "scheduler.db"))
         self.db.init()
         self.clock = Clock()
-        self.service = AedtPoolService(self.db, bootstrap_token="secret", now=self.clock.now)
+        self.service = AedtPoolService(
+            self.db,
+            bootstrap_token="secret",
+            lease_client_token="client-secret",
+            now=self.clock.now,
+        )
         self.service.init()
 
     def tearDown(self) -> None:
@@ -149,6 +162,7 @@ class AedtPoolTestCase(unittest.TestCase):
             host_id="host-1",
             endpoint="cpu-01:50001",
             process_id="123",
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
             bootstrap_token="secret",
         )
 
@@ -477,7 +491,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 self.assertEqual(raised.exception.status_code, 422)
                 self.assertIn("cannot be combined", raised.exception.detail)
 
-    def test_every_mutating_api_route_requires_bootstrap_token(self) -> None:
+    def test_mutating_routes_separate_operator_client_and_lease_authority(self) -> None:
         from fastapi import HTTPException
 
         router = create_aedt_pool_router(self.service)
@@ -486,28 +500,58 @@ class AedtPoolGateTests(AedtPoolTestCase):
             for route in router.routes
             if set(getattr(route, "methods", set())) & {"POST", "PATCH", "PUT", "DELETE"}
         ]
-        self.assertEqual(len(mutating_routes), 15)
-        guards = set()
+        self.assertEqual(len(mutating_routes), 20)
+        bootstrap_routes = []
+        client_routes = []
+        lease_scoped_routes = []
         for route in mutating_routes:
             route_guards = [
                 dependency.call
                 for dependency in route.dependant.dependencies
                 if getattr(dependency.call, "__name__", "") == "require_bootstrap"
             ]
-            self.assertEqual(
-                len(route_guards),
-                1,
-                f"{sorted(route.methods)} {route.path} is missing the bootstrap guard",
-            )
-            guards.update(route_guards)
+            client_guards = [
+                dependency.call
+                for dependency in route.dependant.dependencies
+                if getattr(dependency.call, "__name__", "")
+                == "require_lease_client"
+            ]
+            if route.path == "/api/aedt-pool/leases":
+                self.assertEqual(len(client_guards), 1)
+                self.assertEqual(route_guards, [])
+                client_routes.append(route)
+            elif route.path.startswith("/api/aedt-pool/leases/"):
+                self.assertEqual(route_guards, [])
+                self.assertEqual(client_guards, [])
+                lease_scoped_routes.append(route)
+            else:
+                self.assertEqual(len(route_guards), 1)
+                self.assertEqual(client_guards, [])
+                bootstrap_routes.append(route)
 
-        self.assertEqual(len(guards), 1)
-        guard = guards.pop()
+        self.assertEqual(len(bootstrap_routes), 11)
+        self.assertEqual(len(client_routes), 1)
+        self.assertEqual(len(lease_scoped_routes), 8)
+        guard = next(
+            dependency.call
+            for dependency in bootstrap_routes[0].dependant.dependencies
+            if getattr(dependency.call, "__name__", "") == "require_bootstrap"
+        )
         for token in ("", "wrong"):
             with self.assertRaises(HTTPException) as raised:
                 guard(token)
             self.assertEqual(raised.exception.status_code, 403)
         guard("secret")
+        client_guard = next(
+            dependency.call
+            for dependency in client_routes[0].dependant.dependencies
+            if getattr(dependency.call, "__name__", "") == "require_lease_client"
+        )
+        for token in ("", "secret", "wrong"):
+            with self.assertRaises(HTTPException) as raised:
+                client_guard(token)
+            self.assertEqual(raised.exception.status_code, 403)
+        client_guard("client-secret")
 
     def test_projects_per_aedt_change_requires_disabled_drained_pool(self) -> None:
         self.make_operational()
@@ -681,6 +725,7 @@ class AedtSessionStartRaceTests(AedtPoolTestCase):
                     host_id=host_id,
                     endpoint=endpoint,
                     process_id=process_id,
+                    session_profile=EXPECTED_SESSION_PROFILE_JSON,
                     bootstrap_token="secret",
                     host_token=token,
                 )
@@ -710,6 +755,7 @@ class AedtSessionStartRaceTests(AedtPoolTestCase):
             host_id="host-a",
             endpoint="cpu-01:50001",
             process_id="101",
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
             bootstrap_token="secret",
             host_token="token-a",
         )
@@ -721,6 +767,7 @@ class AedtSessionStartRaceTests(AedtPoolTestCase):
             host_id="host-b",
             endpoint="cpu-01:50002",
             process_id="202",
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
             bootstrap_token="secret",
             host_token="token-b",
         )
@@ -749,11 +796,44 @@ class AedtSessionStartRaceTests(AedtPoolTestCase):
             host_id="slow-owner",
             endpoint="cpu-01:50003",
             process_id="303",
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
             bootstrap_token="secret",
             host_token="slow-token",
         )
         self.assertEqual(token, "slow-token")
         self.assertIn(registered["state"], {"ready", "busy"})
+
+    def test_start_failure_persists_exact_artifact_and_runtime_evidence(self) -> None:
+        session = self._create_starting_sessions(1)[0]
+        session_id = int(session["id"])
+        self.service.claim_start(
+            session_id=session_id,
+            allocation_id=self.allocation_id,
+            node_name="cpu-01",
+            host_id="evidence-owner",
+            bootstrap_token="secret",
+        )
+        failed = self.service.fail_session_start(
+            session_id=session_id,
+            host_id="evidence-owner",
+            bootstrap_token="secret",
+            failure_message="DSO readback mismatch",
+            artifact_dir="/gpfs/aedt/session-1",
+            error_log_path="/gpfs/aedt/session-1/pyaedt.log",
+            journal_path="/gpfs/aedt/session-1/session-events.jsonl",
+            runtime_metadata={
+                "python_executable": "/opt/conda/pyaedt2026v1/bin/python",
+                "aedt_version": "2025.2",
+                "startup_failure": "DSO readback mismatch",
+            },
+        )
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed["artifact_dir"], "/gpfs/aedt/session-1")
+        self.assertTrue(failed["error_log_path"].endswith("pyaedt.log"))
+        self.assertTrue(failed["journal_path"].endswith("session-events.jsonl"))
+        metadata = json.loads(failed["runtime_metadata_json"])
+        self.assertEqual(metadata["aedt_version"], "2025.2")
+        self.assertIn("DSO readback mismatch", failed["failure_message"])
 
     def test_claim_owner_can_register_after_ack_timeout_without_409(self) -> None:
         session = self._create_starting_sessions(1)[0]
@@ -776,6 +856,7 @@ class AedtSessionStartRaceTests(AedtPoolTestCase):
             host_id="late-owner",
             endpoint="cpu-01:50004",
             process_id="404",
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
             bootstrap_token="secret",
             host_token="late-token",
         )
@@ -789,6 +870,7 @@ class AedtSessionStartRaceTests(AedtPoolTestCase):
                 host_id="late-duplicate",
                 endpoint="cpu-01:50005",
                 process_id="405",
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
                 bootstrap_token="secret",
                 host_token="duplicate-token",
             )
@@ -820,6 +902,7 @@ class AedtSessionStartRaceTests(AedtPoolTestCase):
             host_id="draining-owner",
             endpoint="cpu-01:50006",
             process_id="406",
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
             bootstrap_token="secret",
             host_token="draining-token",
         )
@@ -833,6 +916,471 @@ class AedtSessionStartRaceTests(AedtPoolTestCase):
 
 
 class AedtLeaseLifecycleTests(AedtPoolTestCase):
+    def test_protocol_v2_rejects_blank_or_drifted_runtime_contract(self) -> None:
+        with self.assertRaisesRegex(ValueError, "workspace_path"):
+            self.service.request_lease(
+                request_key="v2-blank-workspace",
+                project_name="mft-v2-blank-workspace",
+                workload_family="mft",
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                protocol_version=2,
+            )
+        with self.assertRaisesRegex(ValueError, "workload_family"):
+            self.service.request_lease(
+                request_key="v2-blank-family",
+                project_name="mft-v2-blank-family",
+                workload_family="",
+                workspace_path="/shared/v2",
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                protocol_version=2,
+            )
+        drifted = json.loads(EXPECTED_SESSION_PROFILE_JSON)
+        drifted["aedt_version"] = "2026.1"
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            self.service.request_lease(
+                request_key="v2-profile-drift",
+                project_name="mft-v2-profile-drift",
+                workload_family="mft",
+                workspace_path="/shared/v2",
+                session_profile=drifted,
+                protocol_version=2,
+            )
+
+    def test_shared_mft_ipmsm_admission_requires_dedicated_mixed_validation(
+        self,
+    ) -> None:
+        request = {
+            "request_key": "mixed-gated",
+            "project_name": "mft-ipmsm-mixed",
+            "workload_family": "mft",
+            "workspace_path": "/shared/mixed/mft",
+            "session_profile": EXPECTED_SESSION_PROFILE_JSON,
+            "protocol_version": 2,
+            "isolation_policy": "shared_if_compatible",
+        }
+        with self.assertRaisesRegex(ValueError, "mixed MFT/IPMSM"):
+            self.service.request_lease(**request)
+
+        mixed_validation = self.service.record_validation(
+            {
+                **PASSING_EVIDENCE,
+                "mixed_mft_ipmsm_isolation_passed": True,
+                "mixed_validation_artifact": "mixed-mft-ipmsm.json",
+            }
+        )
+        self.assertEqual(mixed_validation["status"], "passed")
+        self.assertEqual(
+            mixed_validation["mixed_mft_ipmsm_isolation_passed"], 1
+        )
+        lease, _token = self.service.request_lease(**request)
+        self.assertEqual(lease["isolation_policy"], "shared_if_compatible")
+
+    def test_explicit_1800_second_admission_stays_live_past_600_with_heartbeats(
+        self,
+    ) -> None:
+        lease, token = self.service.request_lease(
+            request_key="v2-long-admission",
+            project_name="mft-v2-long-admission",
+            workload_family="mft",
+            workspace_path="/shared/v2-long",
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            protocol_version=2,
+            admission_timeout_seconds=1800,
+        )
+        deadline = datetime.strptime(
+            lease["client_deadline_at"], "%Y-%m-%d %H:%M:%S"
+        ).replace(tzinfo=timezone.utc)
+        self.assertEqual(int((deadline - self.clock.now()).total_seconds()), 1800)
+
+        self.clock.advance(500)
+        self.assertEqual(
+            self.service.heartbeat_lease(int(lease["id"]), token)["state"],
+            "queued",
+        )
+        self.clock.advance(201)
+        self.assertEqual(
+            self.service.heartbeat_lease(int(lease["id"]), token)["state"],
+            "queued",
+        )
+
+    def test_terminal_cancel_cannot_be_resurrected_by_racing_heartbeat(self) -> None:
+        lease, token = self.request("atomic-cancel-heartbeat")
+        barrier = threading.Barrier(2)
+
+        def cancel():
+            barrier.wait()
+            return self.service.cancel_lease(int(lease["id"]), token)
+
+        def heartbeat():
+            barrier.wait()
+            try:
+                return self.service.heartbeat_lease(int(lease["id"]), token)
+            except ValueError as exc:
+                return exc
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            cancelled_future = executor.submit(cancel)
+            heartbeat_future = executor.submit(heartbeat)
+            cancelled_future.result()
+            heartbeat_future.result()
+
+        terminal = self.service.get_lease(int(lease["id"]))
+        self.assertEqual(terminal["state"], "cancelled")
+        with self.assertRaisesRegex(ValueError, "cancelled"):
+            self.service.heartbeat_lease(int(lease["id"]), token)
+        with self.assertRaisesRegex(ValueError, "cancelled"):
+            self.service.bind_lease_project_name(
+                int(lease["id"]), token, "resurrected-project"
+            )
+        self.assertEqual(
+            self.service.cancel_lease(int(lease["id"]), token)["state"],
+            "cancelled",
+        )
+
+    def test_500_concurrent_heartbeats_finish_inside_heartbeat_window(self) -> None:
+        lease, token = self.request("heartbeat-contention")
+        durations: list[float] = []
+        durations_lock = threading.Lock()
+
+        def heartbeat(_index: int) -> str:
+            started = time.monotonic()
+            state = self.service.heartbeat_lease(int(lease["id"]), token)["state"]
+            with durations_lock:
+                durations.append(time.monotonic() - started)
+            return state
+
+        with ThreadPoolExecutor(max_workers=100) as executor:
+            states = list(executor.map(heartbeat, range(500)))
+        self.assertEqual(set(states), {"queued"})
+        p95 = sorted(durations)[int(len(durations) * 0.95) - 1]
+        self.assertLess(p95, 20)
+        self.assertLess(max(durations), 30)
+
+    def test_repeated_native_suspect_freezes_admission_without_recycling(self) -> None:
+        self.request(
+            "native-suspect-owner",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        session_id = int(session["id"])
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE aedt_sessions SET runtime_metadata_json = ? WHERE id = ?",
+                (json.dumps({"runtime_attested": True}), session_id),
+            )
+        for count in range(1, 5):
+            self.clock.advance(300)
+            suspect = self.service.report_session_fault(
+                session_id,
+                host_token,
+                kind="native_probe_suspect",
+                failure_message=f"GetVersion blocked {count}",
+                evidence={"process_id": "123", "port": 50001},
+            )
+            self.assertEqual(suspect["state"], "unhealthy")
+            self.service.reconcile(execute=True)
+            self.assertEqual(self.service.get_session(session_id)["state"], "unhealthy")
+            self.assertEqual(
+                self.db.get_allocation(self.allocation_id)["state"], "active"
+            )
+
+        evidence_session = self.service.get_session(session_id)
+        self.assertEqual(
+            json.loads(evidence_session["runtime_metadata_json"]),
+            {"runtime_attested": True},
+        )
+        self.assertEqual(
+            json.loads(evidence_session["last_fault_evidence_json"])["port"],
+            50001,
+        )
+
+        recovered = self.service.heartbeat_session(
+            session_id,
+            host_token,
+            liveness_confirmed=True,
+            process_id="123",
+            port=50001,
+            native_probe="GetVersion",
+        )
+        self.assertIn(recovered["state"], {"ready", "busy"})
+
+    def test_durable_request_replays_terminal_or_abandoned_intent_with_new_token(self) -> None:
+        first_token = "first-client-token-0001"
+        first, _ = self.service.request_lease(
+            request_key="durable-intent",
+            project_name="mft-durable-intent",
+            workload_family="mft",
+            protocol_version=2,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workspace_path="/shared/test-v2",
+            client_token=first_token,
+        )
+        replay, returned_token = self.service.request_lease(
+            request_key="durable-intent",
+            project_name="mft-durable-intent",
+            workload_family="mft",
+            protocol_version=2,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workspace_path="/shared/test-v2",
+            client_token=first_token,
+        )
+        self.assertEqual(replay["id"], first["id"])
+        self.assertEqual(returned_token, first_token)
+        with self.assertRaisesRegex(ValueError, "owned by a live lease"):
+            self.service.request_lease(
+                request_key="durable-intent",
+                project_name="mft-durable-intent",
+                workload_family="mft",
+                protocol_version=2,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                workspace_path="/shared/test-v2",
+                client_token="second-client-token-0002",
+            )
+
+        self.service.cancel_lease(int(first["id"]), first_token)
+        replacement, replacement_token = self.service.request_lease(
+            request_key="durable-intent",
+            project_name="mft-durable-intent",
+            workload_family="mft",
+            protocol_version=2,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workspace_path="/shared/test-v2",
+            client_token="second-client-token-0002",
+        )
+        self.assertNotEqual(replacement["id"], first["id"])
+        self.assertEqual(replacement["state"], "queued")
+        self.assertEqual(replacement_token, "second-client-token-0002")
+        archived = self.service.get_lease(int(first["id"]))
+        self.assertEqual(archived["state"], "cancelled")
+        self.assertTrue(str(archived["request_key"]).startswith("durable-intent#superseded:"))
+
+        stale, _ = self.service.request_lease(
+            request_key="abandoned-intent",
+            project_name="mft-abandoned-intent",
+            workload_family="mft",
+            protocol_version=2,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workspace_path="/shared/test-v2",
+            client_token="abandoned-token-00001",
+        )
+        self.clock.advance(self.service.config().admission_deadline_seconds + 1)
+        recovered, _ = self.service.request_lease(
+            request_key="abandoned-intent",
+            project_name="mft-abandoned-intent",
+            workload_family="mft",
+            protocol_version=2,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workspace_path="/shared/test-v2",
+            client_token="recovered-token-00002",
+        )
+        self.assertNotEqual(recovered["id"], stale["id"])
+        self.assertEqual(self.service.get_lease(int(stale["id"]))["state"], "expired")
+
+    def test_task_provenance_does_not_pin_central_pool_without_explicit_affinity(self) -> None:
+        task_id = self.db.create_task(
+            TaskCreate(name="motor-worker", remote_cwd="/work", command="true")
+        )
+        self.db.update_task(
+            task_id,
+            allocation_id=self.allocation_id,
+            node_name="worker-01",
+            status=TaskStatus.RUNNING.value,
+        )
+        lease, _ = self.service.request_lease(
+            request_key="central-unpinned",
+            project_name="motor-central-unpinned",
+            workload_family="motor",
+            protocol_version=2,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workspace_path="/shared/motor-test-v2",
+            task_id=task_id,
+        )
+        self.assertEqual(int(lease["requested_allocation_id"]), 0)
+        self.assertEqual(lease["requested_node_name"], "")
+
+        pinned, _ = self.service.request_lease(
+            request_key="explicitly-pinned",
+            project_name="motor-explicitly-pinned",
+            workload_family="motor",
+            protocol_version=2,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workspace_path="/shared/motor-test-v2",
+            task_id=task_id,
+            allocation_id=self.allocation_id,
+            node_name="cpu-01.example",
+        )
+        self.assertEqual(int(pinned["requested_allocation_id"]), self.allocation_id)
+        self.assertEqual(pinned["requested_node_name"], "cpu-01")
+
+    def test_protocol_v2_offer_accept_activate_and_cancel(self) -> None:
+        lease, token = self.service.request_lease(
+            request_key="v2-lifecycle",
+            project_name="mft-v2-unique",
+            workload_family="mft",
+            project_namespace="mft-v2",
+            isolation_policy="family",
+            workspace_path="/shared/mft-v2",
+            protocol_version=2,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            allocation_id=self.allocation_id,
+            node_name="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        lease = self.service.get_lease(int(lease["id"]))
+        self.assertEqual(lease["state"], "offered")
+        accepted = self.service.accept_lease(int(lease["id"]), token)
+        self.assertEqual(accepted["state"], "attaching")
+        self.assertEqual(
+            self.service.heartbeat_lease(int(lease["id"]), token)["state"],
+            "attaching",
+        )
+        active = self.service.activate_lease(int(lease["id"]), token)
+        self.assertEqual(active["state"], "active")
+        releasing = self.service.cancel_lease(int(lease["id"]), token)
+        self.assertEqual(releasing["state"], "releasing")
+        released = self.service.complete_release(
+            int(session["id"]), host_token, int(lease["id"]), success=True
+        )
+        self.assertEqual(released["state"], "released")
+
+    def test_full_active_batch_gets_one_atomic_solve_permit_generation(self) -> None:
+        leases = [
+            self.service.request_lease(
+                request_key=f"solve-batch-{index}",
+                project_name=f"mft-solve-batch-{index}",
+                workload_family="mft",
+                workspace_path=f"/shared/solve-batch/{index}",
+                protocol_version=2,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                allocation_id=self.allocation_id,
+                node_name="cpu-01",
+            )
+            for index in range(2)
+        ]
+        session, _host_token = self.start_one_session(self.allocation_id)
+        first, first_token = leases[0]
+        second, second_token = leases[1]
+        self.service.accept_lease(int(first["id"]), first_token)
+        first_active = self.service.activate_lease(int(first["id"]), first_token)
+        self.assertFalse(first_active["solve_permit_granted"])
+        self.assertFalse(
+            bool(self.service.get_session(int(session["id"]))["solve_batch_sealed_at"])
+        )
+
+        self.service.accept_lease(int(second["id"]), second_token)
+        second_active = self.service.activate_lease(int(second["id"]), second_token)
+        first_permitted = self.service.lease_status(int(first["id"]), first_token)
+        self.assertTrue(second_active["solve_permit_granted"])
+        self.assertTrue(first_permitted["solve_permit_granted"])
+        self.assertGreater(int(first_permitted["solve_permit_generation"]), 0)
+        self.assertEqual(
+            first_permitted["solve_permit_generation"],
+            second_active["solve_permit_generation"],
+        )
+        self.assertTrue(
+            self.service.get_session(int(session["id"]))["solve_batch_sealed_at"]
+        )
+
+    def test_underfilled_solve_permit_seals_session_against_late_attach(self) -> None:
+        first, first_token = self.service.request_lease(
+            request_key="underfilled-first",
+            project_name="mft-underfilled-first",
+            workload_family="mft",
+            workspace_path="/shared/underfilled/first",
+            protocol_version=2,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            allocation_id=self.allocation_id,
+            node_name="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        self.service.accept_lease(int(first["id"]), first_token)
+        active = self.service.activate_lease(int(first["id"]), first_token)
+        self.assertFalse(active["solve_permit_granted"])
+        permitted = self.service.request_solve_permit(
+            int(first["id"]), first_token, seal_underfilled=True
+        )
+        self.assertTrue(permitted["solve_permit_granted"])
+
+        late, _late_token = self.service.request_lease(
+            request_key="underfilled-late",
+            project_name="mft-underfilled-late",
+            workload_family="mft",
+            workspace_path="/shared/underfilled/late",
+            protocol_version=2,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            allocation_id=self.allocation_id,
+            node_name="cpu-01",
+        )
+        self.assertEqual(self.service.get_lease(int(late["id"]))["state"], "queued")
+
+        self.service.cancel_lease(int(first["id"]), first_token)
+        self.service.complete_release(
+            int(session["id"]), host_token, int(first["id"]), success=True
+        )
+        self.assertFalse(
+            bool(self.service.get_session(int(session["id"]))["solve_batch_sealed_at"])
+        )
+        self.service.reconcile(execute=True)
+        self.assertEqual(self.service.get_lease(int(late["id"]))["state"], "offered")
+
+    def test_unaccepted_v2_offer_requeues_through_five_minute_outage(self) -> None:
+        lease, token = self.service.request_lease(
+            request_key="v2-abandoned-offer",
+            project_name="mft-v2-abandoned",
+            workload_family="mft",
+            protocol_version=2,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workspace_path="/shared/test-v2",
+            allocation_id=self.allocation_id,
+            node_name="cpu-01",
+        )
+        session, _host_token = self.start_one_session(self.allocation_id)
+        lease = self.service.get_lease(int(lease["id"]))
+        self.assertEqual(lease["state"], "offered")
+        self.clock.advance(self.service.config().offer_ack_seconds + 1)
+        self.service.reconcile(execute=True)
+        # A fresh client can be re-offered immediately; losing one short offer
+        # ACK is never terminal while the durable admission deadline is live.
+        reoffered = self.service.get_lease(int(lease["id"]))
+        self.assertEqual(reoffered["state"], "offered")
+
+        self.clock.advance(240)
+        self.service.reconcile(execute=True)
+        queued = self.service.get_lease(int(lease["id"]))
+        self.assertEqual(queued["state"], "queued")
+        self.assertIsNone(queued["session_id"])
+        current_session = self.service.get_session(int(session["id"]))
+        self.assertEqual(current_session["state"], "ready")
+        self.assertEqual(current_session["quarantine_reason"], "")
+
+        resumed = self.service.heartbeat_lease(int(lease["id"]), token)
+        self.assertEqual(resumed["state"], "offered")
+
+    def test_terminal_scheduler_task_cancels_unstarted_lease(self) -> None:
+        task_id = self.db.create_task(
+            TaskCreate(name="dead-client", remote_cwd="/work", command="true")
+        )
+        lease, _token = self.service.request_lease(
+            request_key="dead-client-lease",
+            project_name="mft-dead-client",
+            workload_family="mft",
+            protocol_version=2,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workspace_path="/shared/test-v2",
+            task_id=task_id,
+        )
+        self.db.update_task(
+            task_id,
+            status=TaskStatus.FAILED.value,
+            failure_message="client exited",
+            finished_at="CURRENT_TIMESTAMP",
+        )
+        self.service.reconcile(execute=True)
+        cancelled = self.service.get_lease(int(lease["id"]))
+        self.assertEqual(cancelled["state"], "cancelled")
+        self.assertIn("terminal", cancelled["failure_message"])
+
     def setUp(self) -> None:
         super().setUp()
         self.allocation_id = self.add_dedicated_allocation()
@@ -881,6 +1429,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
                 host_id=host_id,
                 endpoint=f"cpu-01:{50001 + index}",
                 process_id=str(100 + index),
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
                 bootstrap_token="secret",
             )
             sessions.append(session)
@@ -1005,6 +1554,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             allocation_id=self.allocation_id,
             node="cpu-01",
         )
+        self.service.reconcile(execute=True)
 
         rotated_allocation = self.db.get_allocation(self.allocation_id)
         self.assertEqual(rotated_allocation["state"], "draining")
@@ -1213,6 +1763,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             allocation_id=self.allocation_id,
             node="cpu-01",
         )
+        self.service.reconcile(execute=True)
 
         self.assertEqual(self.service.get_lease(int(lease["id"]))["session_id"], session["id"])
         self.assertEqual(len(self.service.starting_sessions()), 1)
@@ -1357,6 +1908,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             allocation_id=self.allocation_id,
             node="cpu-01",
         )
+        self.service.reconcile(execute=True)
 
         self.assertEqual(lease["state"], "queued")
         allocation = self.db.get_allocation(self.allocation_id)
@@ -1394,6 +1946,8 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             node="cpu-01",
             project_name="mft-pending-39812-stage",
         )
+        self.service.reconcile(execute=True)
+        lease = self.service.get_lease(int(lease["id"]))
 
         allocation = self.db.get_allocation(self.allocation_id)
         self.assertEqual(allocation["state"], "active")
@@ -2302,6 +2856,25 @@ class FakeHostLaunchScheduler(FakeRuntimeScheduler):
 
 
 class AedtRuntimeTests(AedtPoolTestCase):
+    def test_canonical_host_command_pins_aedt_version_and_profile(self) -> None:
+        runtime = AedtPoolRuntime(
+            self.service,
+            FakeRuntimeScheduler(),
+            scheduler_url="http://relay:18790",
+            host_remote_cwd="/gpfs/scheduler",
+            host_bootstrap_token_file="/gpfs/token",
+            host_artifact_root="/gpfs/aedt-artifacts",
+            host_dso_profile=SUPPORTED_DSO_PROFILE,
+            host_session_profile=EXPECTED_SESSION_PROFILE_JSON,
+        )
+        command = runtime._host_command(
+            {"id": 17, "allocation_id": 9, "node_name": "cpu-09"}
+        )
+        self.assertIn("--aedt-version 2025.2", command)
+        self.assertIn(f"--dso-profile {SUPPORTED_DSO_PROFILE}", command)
+        self.assertIn("--artifact-root /gpfs/aedt-artifacts", command)
+        self.assertIn("--session-profile", command)
+
     def test_control_plane_url_setting_is_normalized_and_durable(self) -> None:
         self.assertEqual(self.service.config().control_plane_url, "")
         configured = self.service.set_control_plane_url(
@@ -2456,6 +3029,38 @@ class AedtRuntimeTests(AedtPoolTestCase):
         self.assertTrue(
             all("control-plane-outage" not in command for command in commands)
         )
+        self.assertTrue(
+            all(int(task["requested_allocation_id"]) > 0 for task in scheduler.host_tasks)
+        )
+        self.assertTrue(all(int(task["cpus"]) == 8 for task in scheduler.host_tasks))
+        self.assertTrue(
+            all(int(task["memory_mb"]) >= 64 * 1024 for task in scheduler.host_tasks)
+        )
+
+    def test_session_capacity_is_bounded_by_free_cpu_and_memory(self) -> None:
+        config = self.service.config()
+        one_by_memory = self.service._allocation_session_capacity(
+            {
+                "total_cpus": 64,
+                "free_cpus": 64,
+                "total_memory_mb": 64 * 1024,
+                "free_memory_mb": 64 * 1024,
+            },
+            config,
+        )
+        self.assertEqual(one_by_memory, 1)
+
+        occupied_plus_free = self.service._allocation_session_capacity(
+            {
+                "total_cpus": 64,
+                "free_cpus": 48,
+                "total_memory_mb": 512 * 1024,
+                "free_memory_mb": 384 * 1024,
+            },
+            config,
+            current_sessions=2,
+        )
+        self.assertEqual(occupied_plus_free, 8)
 
     def test_node_request_uses_full_scheduler_shape_not_eight_cpu_micro_node(self) -> None:
         self.make_operational()
@@ -2521,6 +3126,499 @@ class TransientLeaseHeartbeatHttp:
 
 
 class AttachClientTests(unittest.TestCase):
+    def test_connect_path_forces_pyaedt_multi_desktop_setting(self) -> None:
+        ansys_module = ModuleType("ansys")
+        aedt_module = ModuleType("ansys.aedt")
+        core_module = ModuleType("ansys.aedt.core")
+        core_module.settings = SimpleNamespace(use_multi_desktop=False)
+        ansys_module.aedt = aedt_module
+        aedt_module.core = core_module
+        with patch.dict(
+            sys.modules,
+            {
+                "ansys": ansys_module,
+                "ansys.aedt": aedt_module,
+                "ansys.aedt.core": core_module,
+            },
+        ):
+            AedtProjectLease._enable_pyaedt_multi_desktop(required=True)
+        self.assertIs(core_module.settings.use_multi_desktop, True)
+
+    def test_keepalive_jitter_spreads_500_clients_within_bounded_window(self) -> None:
+        initial = [
+            _keepalive_delay(index, f"token-{index}", 20, 0, initial=True)
+            for index in range(1, 501)
+        ]
+        periodic = [
+            _keepalive_delay(index, f"token-{index}", 20, 1)
+            for index in range(1, 501)
+        ]
+        self.assertEqual(
+            initial,
+            [
+                _keepalive_delay(index, f"token-{index}", 20, 0, initial=True)
+                for index in range(1, 501)
+            ],
+        )
+        self.assertGreater(max(initial) - min(initial), 19)
+        self.assertTrue(all(0 <= item <= 20 for item in initial))
+        self.assertTrue(all(15 <= item <= 25 for item in periodic))
+        self.assertGreater(len({round(item, 3) for item in initial}), 490)
+
+    def test_connect_does_not_activate_until_project_is_bound(self) -> None:
+        calls: list[tuple[str, str, dict | None]] = []
+
+        class Http:
+            def request(self, method, path, payload=None, **_kwargs):
+                calls.append((method, path, payload))
+                if path.endswith("/project-name"):
+                    return {"state": "attaching", "endpoint": "cpu-01:50001"}
+                if path.endswith("/activate"):
+                    return {"state": "active", "endpoint": "cpu-01:50001"}
+                return {
+                    "state": "attaching",
+                    "endpoint": "cpu-01:50001",
+                    "session_key": "session-7",
+                    "session_process_id": "7001",
+                    "expected_aedt_version": "2025.2",
+                }
+
+        lease = AedtProjectLease(
+            Http(),
+            7,
+            "client-token",
+            "pending-name",
+            state="attaching",
+            endpoint="cpu-01:50001",
+            protocol_version=2,
+        )
+        desktop_kwargs: list[dict] = []
+        attached_desktop = SimpleNamespace(
+            port=50001,
+            aedt_process_id="7001",
+            odesktop=SimpleNamespace(GetVersion=lambda: "2025.2.0"),
+        )
+        desktop = lease.connect_desktop(
+            desktop_factory=lambda **kwargs: (
+                desktop_kwargs.append(kwargs) or attached_desktop
+            ),
+            endpoint_probe=lambda _machine, _port: True,
+        )
+        self.assertIsNotNone(desktop)
+        self.assertEqual(desktop_kwargs[0]["version"], "2025.2")
+        self.assertFalse(any(path.endswith("/activate") for _m, path, _p in calls))
+        self.assertEqual(lease.state, "attaching")
+
+        activated = lease.activate("actual-project")
+        self.assertEqual(activated["state"], "active")
+        self.assertTrue(any(path.endswith("/project-name") for _m, path, _p in calls))
+        self.assertTrue(any(path.endswith("/activate") for _m, path, _p in calls))
+        self.assertEqual(lease.project_name, "actual-project")
+        lease.stop_heartbeat()
+
+    def test_connect_rejects_caller_version_override_before_factory(self) -> None:
+        calls: list[tuple[str, str, dict | None]] = []
+
+        class Http:
+            def request(self, method, path, payload=None, **_kwargs):
+                calls.append((method, path, payload))
+                if path.endswith("/fault"):
+                    return {"state": "cancelled", "endpoint": ""}
+                return {
+                    "state": "attaching",
+                    "endpoint": "cpu-01:50001",
+                    "session_key": "session-7",
+                    "session_process_id": "7001",
+                    "expected_aedt_version": "2025.2",
+                }
+
+        lease = AedtProjectLease(
+            Http(),
+            7,
+            "client-token",
+            "pending-name",
+            state="attaching",
+            endpoint="cpu-01:50001",
+            protocol_version=2,
+        )
+        factory_called = False
+
+        def factory(**_kwargs):
+            nonlocal factory_called
+            factory_called = True
+            return object()
+
+        with self.assertRaisesRegex(AedtLeaseError, "does not match authorized"):
+            lease.connect_desktop(
+                version="2026.1",
+                desktop_factory=factory,
+                endpoint_probe=lambda _machine, _port: True,
+            )
+        self.assertFalse(factory_called)
+        self.assertTrue(any(path.endswith("/fault") for _m, path, _p in calls))
+
+    def test_connect_refuses_unreachable_endpoint_before_desktop_factory(self) -> None:
+        calls: list[tuple[str, str, dict | None]] = []
+
+        class Http:
+            def request(self, method, path, payload=None, **_kwargs):
+                calls.append((method, path, payload))
+                if path.endswith("/fault"):
+                    return {"state": "cancelled", "endpoint": ""}
+                return {
+                    "state": "attaching",
+                    "endpoint": "cpu-01:50001",
+                    "session_key": "session-7",
+                    "session_process_id": "7001",
+                    "expected_aedt_version": "2025.2",
+                }
+
+        lease = AedtProjectLease(
+            Http(),
+            7,
+            "client-token",
+            "pending-name",
+            state="attaching",
+            endpoint="cpu-01:50001",
+            protocol_version=2,
+        )
+        factory_called = False
+
+        def factory(**_kwargs):
+            nonlocal factory_called
+            factory_called = True
+            return object()
+
+        with self.assertRaisesRegex(
+            AedtLeaseError, "refusing PyAEDT constructor auto-launch fallback"
+        ):
+            lease.connect_desktop(
+                desktop_factory=factory,
+                endpoint_probe=lambda _machine, _port: False,
+            )
+        self.assertFalse(factory_called)
+        fault = next(
+            payload for _method, path, payload in calls if path.endswith("/fault")
+        )
+        self.assertEqual(fault["fault_kind"], "attach_failed")
+        self.assertEqual(fault["evidence"]["expected_process_id"], "7001")
+
+    def test_activate_waits_for_shared_solve_permit_before_returning(self) -> None:
+        calls: list[tuple[str, str]] = []
+        status_reads = 0
+
+        class Http:
+            def request(self, method, path, payload=None, **_kwargs):
+                nonlocal status_reads
+                calls.append((method, path))
+                base = {
+                    "state": "active",
+                    "endpoint": "cpu-01:50001",
+                    "solve_permit_required": True,
+                    "solve_permit_granted": False,
+                    "session_active_lease_count": 1,
+                    "session_live_lease_count": 2,
+                    "session_slots_total": 2,
+                }
+                if path.endswith("/activate"):
+                    return base
+                if method == "GET":
+                    status_reads += 1
+                    if status_reads == 1:
+                        return {
+                            **base,
+                            "state": "attaching",
+                            "solve_permit_required": False,
+                        }
+                    if status_reads >= 3:
+                        return {
+                            **base,
+                            "solve_permit_required": False,
+                            "solve_permit_granted": True,
+                            "solve_permit_generation": 4,
+                            "session_active_lease_count": 2,
+                        }
+                    return base
+                raise AssertionError((method, path, payload))
+
+        lease = AedtProjectLease(
+            Http(),
+            9,
+            "client-token",
+            "project",
+            state="attaching",
+            endpoint="cpu-01:50001",
+            protocol_version=2,
+        )
+        with patch("slurm_scheduler.aedt_attach_client.time.sleep", return_value=None):
+            activated = lease.activate()
+
+        self.assertTrue(activated["solve_permit_granted"])
+        self.assertEqual(lease.solve_permit_generation, 4)
+        self.assertEqual(status_reads, 3)
+        self.assertEqual(calls[0], ("GET", "/api/aedt-pool/leases/9"))
+        self.assertEqual(calls[1], ("POST", "/api/aedt-pool/leases/9/activate"))
+
+    def test_replayed_active_activation_cannot_bypass_solve_barrier(self) -> None:
+        reads = 0
+
+        class Http:
+            def request(self, method, path, payload=None, **_kwargs):
+                nonlocal reads
+                self.assert_get(method)
+                reads += 1
+                granted = reads >= 2
+                return {
+                    "state": "active",
+                    "endpoint": "cpu-01:50001",
+                    "solve_permit_required": not granted,
+                    "solve_permit_granted": granted,
+                    "solve_permit_generation": 11 if granted else 0,
+                    "session_active_lease_count": 2 if granted else 1,
+                    "session_live_lease_count": 2,
+                    "session_slots_total": 2,
+                }
+
+            @staticmethod
+            def assert_get(method):
+                if method != "GET":
+                    raise AssertionError(method)
+
+        lease = AedtProjectLease(
+            Http(),
+            11,
+            "client-token",
+            "project",
+            state="active",
+            endpoint="cpu-01:50001",
+            protocol_version=2,
+        )
+        with patch("slurm_scheduler.aedt_attach_client.time.sleep", return_value=None):
+            replayed = lease.activate()
+
+        self.assertTrue(replayed["solve_permit_granted"])
+        self.assertEqual(lease.solve_permit_generation, 11)
+        self.assertEqual(reads, 2)
+
+    def test_activate_timeout_atomically_seals_underfilled_batch(self) -> None:
+        calls: list[tuple[str, str, dict | None]] = []
+
+        class Http:
+            def request(self, method, path, payload=None, **_kwargs):
+                calls.append((method, path, payload))
+                base = {
+                    "state": "active",
+                    "endpoint": "cpu-01:50001",
+                    "solve_permit_required": True,
+                    "solve_permit_granted": False,
+                    "session_active_lease_count": 1,
+                    "session_live_lease_count": 1,
+                    "session_slots_total": 2,
+                }
+                if path.endswith("/solve-permit"):
+                    return {
+                        **base,
+                        "solve_permit_required": False,
+                        "solve_permit_granted": True,
+                        "solve_permit_generation": 8,
+                    }
+                return base
+
+        lease = AedtProjectLease(
+            Http(),
+            10,
+            "client-token",
+            "project",
+            state="attaching",
+            endpoint="cpu-01:50001",
+            protocol_version=2,
+        )
+        with patch.dict(
+            os.environ, {"MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS": "0"}, clear=False
+        ):
+            activated = lease.activate()
+
+        self.assertTrue(activated["solve_permit_granted"])
+        seal_call = next(
+            payload for method, path, payload in calls if path.endswith("/solve-permit")
+        )
+        self.assertEqual(seal_call, {"seal_underfilled": True})
+
+    def test_connect_rejects_stale_port_pid_and_version_before_project_work(self) -> None:
+        cases = {
+            "port": SimpleNamespace(
+                port=50002,
+                aedt_process_id="7001",
+                odesktop=SimpleNamespace(GetVersion=lambda: "2025.2.0"),
+            ),
+            "PID": SimpleNamespace(
+                port=50001,
+                aedt_process_id="7999",
+                odesktop=SimpleNamespace(GetVersion=lambda: "2025.2.0"),
+            ),
+            "version": SimpleNamespace(
+                port=50001,
+                aedt_process_id="7001",
+                odesktop=SimpleNamespace(GetVersion=lambda: "2026.1.0"),
+            ),
+        }
+        for expected_error, desktop in cases.items():
+            with self.subTest(expected_error=expected_error):
+                calls: list[tuple[str, str, dict | None]] = []
+
+                class Http:
+                    def request(self, method, path, payload=None, **_kwargs):
+                        calls.append((method, path, payload))
+                        if path.endswith("/fault"):
+                            return {"state": "cancelled", "endpoint": ""}
+                        return {
+                            "state": "attaching",
+                            "endpoint": "cpu-01:50001",
+                            "session_key": "session-7",
+                            "session_process_id": "7001",
+                            "expected_aedt_version": "2025.2",
+                        }
+
+                lease = AedtProjectLease(
+                    Http(),
+                    7,
+                    "client-token",
+                    "pending-name",
+                    state="attaching",
+                    endpoint="cpu-01:50001",
+                    protocol_version=2,
+                )
+                with self.assertRaisesRegex(AedtLeaseError, expected_error):
+                    lease.connect_desktop(
+                        desktop_factory=lambda **_kwargs: desktop,
+                        endpoint_probe=lambda _machine, _port: True,
+                    )
+                fault = next(
+                    payload for _method, path, payload in calls if path.endswith("/fault")
+                )
+                self.assertEqual(fault["fault_kind"], "attach_failed")
+                self.assertEqual(fault["phase"], "attach")
+                self.assertFalse(any(path.endswith("/activate") for _m, path, _p in calls))
+
+    def test_release_detaches_wrapper_only_after_terminal_host_ack(self) -> None:
+        events: list[object] = []
+
+        class Http:
+            def request(self, method, path, payload=None, **_kwargs):
+                if path.endswith("/cancel"):
+                    events.append("cancel-releasing")
+                    return {"state": "releasing", "endpoint": "cpu-01:50001"}
+                if method == "GET":
+                    events.append("host-released")
+                    return {"state": "released", "endpoint": ""}
+                raise AssertionError((method, path, payload))
+
+        class Desktop:
+            def release_desktop(self, **kwargs):
+                events.append(("detach", kwargs))
+
+        lease = AedtProjectLease(
+            Http(), 8, "client-token", "project", state="active"
+        )
+        lease._desktop_proxy = Desktop()
+        with patch("slurm_scheduler.aedt_attach_client.time.sleep", return_value=None):
+            result = lease.release(wait_seconds=5)
+
+        self.assertEqual(result["state"], "released")
+        self.assertEqual(
+            events,
+            [
+                "cancel-releasing",
+                "host-released",
+                (
+                    "detach",
+                    {"close_projects": False, "close_on_exit": False},
+                ),
+            ],
+        )
+        self.assertIsNone(lease._desktop_proxy)
+
+    def test_two_sequential_leases_attach_to_distinct_authorized_endpoints(self) -> None:
+        events: list[object] = []
+        factory_ports: list[int] = []
+
+        class Http:
+            def __init__(self, endpoint: str, process_id: str) -> None:
+                self.endpoint = endpoint
+                self.process_id = process_id
+
+            def request(self, method, path, payload=None, **_kwargs):
+                if path.endswith("/cancel"):
+                    return {"state": "released", "endpoint": ""}
+                return {
+                    "state": "attaching",
+                    "endpoint": self.endpoint,
+                    "session_key": f"session-{self.process_id}",
+                    "session_process_id": self.process_id,
+                    "expected_aedt_version": "2025.2",
+                }
+
+        class Desktop:
+            def __init__(self, port: int, process_id: str) -> None:
+                self.port = port
+                self.aedt_process_id = process_id
+                self.odesktop = SimpleNamespace(GetVersion=lambda: "2025.2.0")
+
+            def release_desktop(self, **kwargs):
+                events.append(("detached", self.port, kwargs))
+
+        process_by_port = {50001: "7001", 50002: "7002"}
+
+        def factory(**kwargs):
+            port = int(kwargs["port"])
+            factory_ports.append(port)
+            return Desktop(port, process_by_port[port])
+
+        first = AedtProjectLease(
+            Http("cpu-01:50001", "7001"),
+            1,
+            "first-token",
+            "project-a",
+            state="attaching",
+            endpoint="cpu-01:50001",
+            protocol_version=2,
+        )
+        first.start_heartbeat = lambda **_kwargs: None
+        first_desktop = first.connect_desktop(
+            desktop_factory=factory,
+            endpoint_probe=lambda _machine, _port: True,
+        )
+        first.release(wait_seconds=0)
+
+        second = AedtProjectLease(
+            Http("cpu-01:50002", "7002"),
+            2,
+            "second-token",
+            "project-b",
+            state="attaching",
+            endpoint="cpu-01:50002",
+            protocol_version=2,
+        )
+        second.start_heartbeat = lambda **_kwargs: None
+        second_desktop = second.connect_desktop(
+            desktop_factory=factory,
+            endpoint_probe=lambda _machine, _port: True,
+        )
+
+        self.assertEqual(factory_ports, [50001, 50002])
+        self.assertEqual(first_desktop.port, 50001)
+        self.assertEqual(second_desktop.port, 50002)
+        self.assertEqual(
+            events,
+            [
+                (
+                    "detached",
+                    50001,
+                    {"close_projects": False, "close_on_exit": False},
+                )
+            ],
+        )
+
     def test_lease_heartbeat_retries_transient_5xx(self) -> None:
         http = TransientLeaseHeartbeatHttp()
         lease = AedtProjectLease(http, 1, "token", "p")
@@ -2544,6 +3642,27 @@ class AttachClientTests(unittest.TestCase):
         self.assertEqual(result["state"], "leased")
         self.assertEqual(http.calls, 3)
         lease.stop_heartbeat()
+
+    def test_wait_polling_uses_get_only_while_process_keepalive_is_alive(self) -> None:
+        methods: list[str] = []
+
+        class Http:
+            def request(self, method, path, payload=None, **_kwargs):
+                methods.append(method)
+                state = "leased" if len(methods) >= 3 else "queued"
+                return {
+                    "id": 1,
+                    "state": state,
+                    "endpoint": "cpu-01:50001" if state == "leased" else "",
+                }
+
+        lease = AedtProjectLease(Http(), 1, "token", "p")
+        lease._keepalive_process = SimpleNamespace(is_alive=lambda: True)
+        with patch("slurm_scheduler.aedt_attach_client.time.sleep", return_value=None):
+            result = lease.wait_until_leased(timeout_seconds=2, heartbeat_seconds=5)
+        self.assertEqual(result["state"], "leased")
+        self.assertEqual(set(methods), {"GET"})
+        lease._keepalive_process = None
 
     def test_mft_pilot_can_request_an_exclusive_session(self) -> None:
         calls = []
@@ -2577,6 +3696,7 @@ class AttachClientTests(unittest.TestCase):
         )
         self.assertTrue(lease.exclusive_session)
         self.assertTrue(calls[0][2]["exclusive_session"])
+        self.assertEqual(calls[0][2]["admission_timeout_seconds"], 1800)
 
 
 class ControlPlaneHttpClientTests(unittest.TestCase):
@@ -2611,7 +3731,7 @@ class ControlPlaneHttpClientTests(unittest.TestCase):
         self.assertEqual(headers["x-aedt-host-token"], "host")
         self.assertEqual(build_opener.call_args.args[0].proxies, {})
 
-    def test_lease_client_sends_bootstrap_and_scoped_lease_tokens(self) -> None:
+    def test_lease_client_never_sends_admin_token_after_lease_creation(self) -> None:
         with patch(
             "slurm_scheduler.aedt_attach_client.urllib.request.build_opener",
         ) as build_opener:
@@ -2628,9 +3748,26 @@ class ControlPlaneHttpClientTests(unittest.TestCase):
 
         request = build_opener.return_value.open.call_args.args[0]
         headers = {key.lower(): value for key, value in request.header_items()}
-        self.assertEqual(headers["x-aedt-bootstrap-token"], "bootstrap")
         self.assertEqual(headers["x-aedt-lease-token"], "lease")
+        self.assertNotIn("x-aedt-bootstrap-token", headers)
+        self.assertNotIn("x-aedt-client-token", headers)
         self.assertEqual(build_opener.call_args.args[0].proxies, {})
+
+    def test_lease_creation_uses_limited_client_credential(self) -> None:
+        with patch(
+            "slurm_scheduler.aedt_attach_client.urllib.request.build_opener",
+        ) as build_opener:
+            build_opener.return_value.open.return_value = self.Response()
+            AedtPoolHttpClient(
+                "http://relay",
+                client_credential="limited-client",
+            ).request("POST", "/api/aedt-pool/leases", {})
+
+        request = build_opener.return_value.open.call_args.args[0]
+        headers = {key.lower(): value for key, value in request.header_items()}
+        self.assertEqual(headers["x-aedt-client-token"], "limited-client")
+        self.assertNotIn("x-aedt-bootstrap-token", headers)
+        self.assertNotIn("x-aedt-lease-token", headers)
 
     def test_read_only_control_plane_requests_do_not_expose_bootstrap_token(self) -> None:
         with patch(
@@ -2646,20 +3783,20 @@ class ControlPlaneHttpClientTests(unittest.TestCase):
         headers = {key.lower(): value for key, value in request.header_items()}
         self.assertNotIn("x-aedt-bootstrap-token", headers)
 
-    def test_lease_client_can_load_bootstrap_from_node_token_file(self) -> None:
+    def test_lease_client_can_load_limited_credential_from_node_token_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             token_file = Path(tmp) / "bootstrap-token"
             token_file.write_text("from-file\n", encoding="utf-8")
             with patch.dict(
                 os.environ,
                 {
-                    "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN": "",
-                    "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN_FILE": str(token_file),
+                    "SLURM_AEDT_POOL_CLIENT_TOKEN": "",
+                    "SLURM_AEDT_POOL_CLIENT_TOKEN_FILE": str(token_file),
                 },
                 clear=False,
             ):
                 client = AedtPoolHttpClient("http://relay")
-        self.assertEqual(client.bootstrap_token, "from-file")
+        self.assertEqual(client.client_credential, "from-file")
 
 
 class PilotPriorityApiTests(unittest.TestCase):
@@ -2753,6 +3890,9 @@ class FakeDesktopApi:
     def StopSimulations(self, _clean: bool) -> None:
         self.events.append("global-stop")
 
+    def GetVersion(self) -> str:
+        return "2025.2.0"
+
 
 class FakeDesktop:
     port = 50001
@@ -2766,6 +3906,10 @@ class FakeDesktop:
 
     def release_desktop(self, close_projects=True, close_desktop=True) -> None:
         self.events.append("desktop-close")
+
+
+def trust_fake_desktop_liveness(host: AedtSessionHost) -> None:
+    host._desktop_liveness_proof = lambda: (True, "")
 
 
 class FakeHostControlPlane:
@@ -2919,6 +4063,368 @@ class RemoteDisconnectRegistrationControlPlane(FakeHostControlPlane):
 
 
 class SessionHostTests(unittest.TestCase):
+    def test_native_liveness_never_declares_death_while_pid_and_port_are_alive(
+        self,
+    ) -> None:
+        host = AedtSessionHost(
+            FakeHostControlPlane([]), allocation_id=1, node_name="cpu-01"
+        )
+        host.desktop = SimpleNamespace(odesktop=object())
+        host.desktop_process_id = "3824121"
+        host.desktop_process_marker = "marker"
+        host.desktop_port = 44773
+        with (
+            patch.object(host, "_process_alive", return_value=True),
+            patch.object(host, "_desktop_port_is_listening", return_value=True),
+            patch.object(
+                host,
+                "_native_desktop_responds",
+                side_effect=[False, False, False, True],
+            ),
+            patch(
+                "slurm_scheduler.aedt_session_host.time.monotonic",
+                side_effect=[100.0, 130.0, 161.0],
+            ),
+        ):
+            first = host._desktop_liveness_proof()
+            second = host._desktop_liveness_proof()
+            third = host._desktop_liveness_proof()
+            recovered = host._desktop_liveness_proof()
+
+        self.assertTrue(first[0])
+        self.assertIn("transiently failed", first[1])
+        self.assertTrue(second[0])
+        self.assertTrue(third[0])
+        self.assertIn("3 consecutive", third[1])
+        self.assertEqual(recovered, (True, ""))
+        self.assertEqual(host.native_probe_failures, 0)
+
+    def test_blocked_native_probe_keeps_only_one_inflight_thread(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        calls = 0
+
+        def blocked_get_version():
+            nonlocal calls
+            calls += 1
+            entered.set()
+            release.wait(2)
+            return "2025.2"
+
+        host = AedtSessionHost(
+            FakeHostControlPlane([]), allocation_id=1, node_name="cpu-01"
+        )
+        host.desktop = SimpleNamespace(
+            odesktop=SimpleNamespace(GetVersion=blocked_get_version)
+        )
+        self.assertFalse(host._native_desktop_responds(timeout_seconds=0.1))
+        self.assertTrue(entered.is_set())
+        self.assertFalse(host._native_desktop_responds(timeout_seconds=0.1))
+        self.assertFalse(host._native_desktop_responds(timeout_seconds=0.1))
+        self.assertEqual(calls, 1)
+        release.set()
+        assert host._native_probe_thread is not None
+        host._native_probe_thread.join(timeout=1)
+        self.assertTrue(host._native_desktop_responds(timeout_seconds=0.1))
+        self.assertIsNone(host._native_probe_thread)
+
+    def test_canonical_runtime_attestation_derives_and_checks_aedt_version(
+        self,
+    ) -> None:
+        ansys_module = ModuleType("ansys")
+        aedt_module = ModuleType("ansys.aedt")
+        core_module = ModuleType("ansys.aedt.core")
+        core_module.__version__ = "0.22.0"
+        ansys_module.aedt = aedt_module
+        aedt_module.core = core_module
+        with tempfile.TemporaryDirectory() as root:
+            host = AedtSessionHost(
+                FakeHostControlPlane([]),
+                allocation_id=1,
+                node_name="cpu-01",
+                artifact_root=root,
+                dso_profile=SUPPORTED_DSO_PROFILE,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            )
+            self.assertEqual(host.aedt_version, "2025.2")
+            host.session_id = 17
+            host._prepare_artifacts({"session_key": "attestation"})
+            host.desktop = SimpleNamespace(
+                odesktop=SimpleNamespace(GetVersion=lambda: "Ansys 2025 R2 (2025.2.0)")
+            )
+            with (
+                patch.dict(
+                    sys.modules,
+                    {
+                        "ansys": ansys_module,
+                        "ansys.aedt": aedt_module,
+                        "ansys.aedt.core": core_module,
+                    },
+                ),
+                patch.dict(
+                    os.environ, {"CONDA_DEFAULT_ENV": "pyaedt2026v1"}, clear=False
+                ),
+            ):
+                metadata = host._attest_runtime_profile()
+
+            self.assertEqual(metadata["aedt_version"], "2025.2")
+            self.assertEqual(metadata["pyaedt_version"], "0.22.0")
+            self.assertEqual(metadata["python_executable"], sys.executable)
+            evidence = Path(host.artifact_dir) / "runtime-attestation.json"
+            self.assertTrue(evidence.is_file())
+
+            with (
+                patch.dict(
+                    sys.modules,
+                    {
+                        "ansys": ansys_module,
+                        "ansys.aedt": aedt_module,
+                        "ansys.aedt.core": core_module,
+                    },
+                ),
+                patch.dict(
+                    os.environ, {"CONDA_DEFAULT_ENV": "wrong-env"}, clear=False
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "environment drift"):
+                    host._attest_runtime_profile()
+
+    def test_artifact_prepare_failure_is_reported_immediately_with_paths(self) -> None:
+        reports: list[dict] = []
+
+        class Control:
+            def request(self, method, path, payload=None, host_token=""):
+                if path.endswith("claim-start"):
+                    return {"session": {"id": 19, "session_key": "mkdir-fail"}}
+                if path.endswith("/start-failed"):
+                    reports.append(dict(payload or {}))
+                    return {}
+                raise AssertionError(path)
+
+        host = AedtSessionHost(
+            Control(),
+            allocation_id=1,
+            node_name="cpu-01",
+            artifact_root="/shared/aedt-artifacts",
+        )
+        with patch.object(Path, "mkdir", side_effect=PermissionError("GPFS denied")):
+            self.assertEqual(host.run(), 1)
+
+        self.assertEqual(len(reports), 1)
+        self.assertIn("GPFS denied", reports[0]["failure_message"])
+        self.assertTrue(reports[0]["artifact_dir"].endswith("19-mkdir-fail"))
+        self.assertTrue(reports[0]["error_log_path"].endswith("pyaedt.log"))
+        self.assertTrue(reports[0]["journal_path"].endswith("session-events.jsonl"))
+        self.assertEqual(
+            reports[0]["runtime_metadata"]["startup_failure"], "GPFS denied"
+        )
+
+    def test_native_diagnostic_snapshot_captures_messages_and_log_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            host = AedtSessionHost(
+                FakeHostControlPlane([]),
+                allocation_id=1,
+                node_name="cpu-01",
+                artifact_root=root,
+            )
+            host.session_id = 23
+            host._prepare_artifacts({"session_key": "native-snapshot"})
+            Path(host.error_log_path).write_text(
+                "old line\nAEDT transport warning\n", encoding="utf-8"
+            )
+            host.desktop_process_id = "23001"
+            host.desktop_port = 50023
+            host.desktop = SimpleNamespace(
+                odesktop=SimpleNamespace(
+                    GetMessages=lambda *_args: ["solver busy", "native timeout"]
+                )
+            )
+            snapshot_path = host._capture_native_diagnostics("GetVersion blocked")
+            snapshot = json.loads(Path(snapshot_path).read_text(encoding="utf-8"))
+
+        self.assertEqual(snapshot["process_id"], "23001")
+        self.assertIn("native timeout", snapshot["messages"])
+        self.assertIn("AEDT transport warning", snapshot["pyaedt_log_tail"])
+
+    def test_native_diagnostic_write_failure_is_best_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            host = AedtSessionHost(
+                FakeHostControlPlane([]),
+                allocation_id=1,
+                node_name="cpu-01",
+                artifact_root=root,
+            )
+            host.session_id = 24
+            host._prepare_artifacts({"session_key": "snapshot-write-failure"})
+            host.desktop_process_id = "24001"
+            host.desktop_port = 50024
+            host.desktop = SimpleNamespace(
+                odesktop=SimpleNamespace(GetMessages=lambda *_args: [])
+            )
+            with patch.object(
+                Path, "write_text", side_effect=PermissionError("GPFS read-only")
+            ):
+                snapshot_path = host._capture_native_diagnostics(
+                    "GetVersion blocked"
+                )
+            with (
+                patch.object(host, "_process_alive", return_value=True),
+                patch.object(host, "_desktop_port_is_listening", return_value=True),
+                patch.object(host, "_native_desktop_responds", return_value=False),
+            ):
+                healthy, reason = host._desktop_liveness_proof()
+
+        self.assertEqual(snapshot_path, "")
+        self.assertTrue(healthy)
+        self.assertIn("native GetVersion", reason)
+
+    def test_exhausted_control_plane_window_preserves_live_desktop(self) -> None:
+        events: list[str] = []
+        host = AedtSessionHost(
+            FakeHostControlPlane(events),
+            allocation_id=1,
+            node_name="cpu-01",
+            heartbeat_seconds=5,
+        )
+        host._start_desktop = lambda: FakeDesktop(events)
+        trust_fake_desktop_liveness(host)
+        heartbeat_count = 0
+
+        def control_request(method, path, payload=None, **_kwargs):
+            nonlocal heartbeat_count
+            if path.endswith("claim-start"):
+                return {"session": {"id": 1, "session_key": "offline-safe"}}
+            if path.endswith("/register"):
+                return {"host_token": "host-token"}
+            if path.endswith("/heartbeat"):
+                heartbeat_count += 1
+                if heartbeat_count == 1:
+                    events.append("control-plane-window-exhausted")
+                    raise ControlPlaneUnavailable("relay remained offline")
+                events.append("heartbeat-recovered")
+                return {}
+            if path.endswith("/commands"):
+                return {"drain": True, "sibling_live_count": 0}
+            return {}
+
+        host._control_plane_request = control_request
+        with patch("slurm_scheduler.aedt_session_host.time.sleep", return_value=None):
+            self.assertEqual(host.run(), 0)
+
+        self.assertLess(
+            events.index("control-plane-window-exhausted"),
+            events.index("heartbeat-recovered"),
+        )
+        self.assertLess(events.index("heartbeat-recovered"), events.index("desktop-close"))
+
+    def test_host_initializes_maxwell_and_icepak_dso_profiles_once(self) -> None:
+        class RegistryDesktop:
+            def __init__(self) -> None:
+                self.loaded: list[str] = []
+                self.values: dict[str, str] = {}
+
+            def SetRegistryFromFile(self, path: str):
+                self.loaded.append(Path(path).read_text(encoding="utf-8"))
+                return True
+
+            def SetRegistryString(self, key: str, value: str):
+                self.values[key] = value
+                return True
+
+            def GetRegistryString(self, key: str):
+                return self.values.get(key, "")
+
+        with tempfile.TemporaryDirectory() as root:
+            registry = RegistryDesktop()
+            host = AedtSessionHost(
+                FakeHostControlPlane([]),
+                allocation_id=1,
+                node_name="cpu-01",
+                artifact_root=root,
+                dso_profile=SUPPORTED_DSO_PROFILE,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            )
+            host.session_id = 7
+            host._prepare_artifacts({"session_key": "dso-test"})
+            host.desktop = SimpleNamespace(odesktop=registry)
+            host._initialize_dso_configuration()
+
+            self.assertEqual(len(registry.loaded), 3)
+            self.assertTrue(any("DesignType='Maxwell 3D'" in text for text in registry.loaded))
+            self.assertTrue(any("DesignType='Maxwell 2D'" in text for text in registry.loaded))
+            self.assertTrue(any("DesignType='Icepak'" in text for text in registry.loaded))
+            self.assertTrue(all("NumCores=4" in text for text in registry.loaded))
+            self.assertTrue(all("NumEngines=1" in text for text in registry.loaded))
+            icepak = next(
+                text for text in registry.loaded if "DesignType='Icepak'" in text
+            )
+            self.assertIn("UseAutoSettings=False", icepak)
+            self.assertTrue(
+                all(
+                    "UseAutoSettings=True" in text
+                    for text in registry.loaded
+                    if "DesignType='Maxwell" in text
+                )
+            )
+            self.assertEqual(
+                registry.values["Desktop/ActiveDSOConfigurations/Maxwell 3D"],
+                "pyaedt_config",
+            )
+            self.assertEqual(
+                registry.values["Desktop/ActiveDSOConfigurations/Maxwell 2D"],
+                "pyaedt_config",
+            )
+            self.assertEqual(
+                registry.values["Desktop/ActiveDSOConfigurations/Icepak"],
+                "pyaedt_config",
+            )
+
+    def test_legacy_maxwell_profile_alias_also_initializes_icepak(self) -> None:
+        registry = SimpleNamespace(
+            values={},
+            SetRegistryFromFile=lambda _path: True,
+        )
+        registry.SetRegistryString = lambda key, value: (
+            registry.values.__setitem__(key, value) or True
+        )
+        registry.GetRegistryString = lambda key: registry.values.get(key, "")
+        with tempfile.TemporaryDirectory() as root:
+            host = AedtSessionHost(
+                FakeHostControlPlane([]),
+                allocation_id=1,
+                node_name="cpu-01",
+                artifact_root=root,
+                dso_profile=LEGACY_DSO_PROFILE,
+            )
+            host.session_id = 8
+            host._prepare_artifacts({"session_key": "legacy-dso-test"})
+            host.desktop = SimpleNamespace(odesktop=registry)
+            host._initialize_dso_configuration()
+
+        self.assertEqual(
+            registry.values["Desktop/ActiveDSOConfigurations/Icepak"],
+            "pyaedt_config",
+        )
+
+    def test_canonical_dso_profile_rejects_missing_or_drifted_session_profile(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exact host session profile"):
+            AedtSessionHost(
+                FakeHostControlPlane([]),
+                allocation_id=1,
+                node_name="cpu-01",
+                dso_profile=SUPPORTED_DSO_PROFILE,
+            )
+        drifted = json.loads(EXPECTED_SESSION_PROFILE_JSON)
+        drifted["desktop_dso"]["designs"]["Icepak"]["use_auto_settings"] = True
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            AedtSessionHost(
+                FakeHostControlPlane([]),
+                allocation_id=1,
+                node_name="cpu-01",
+                dso_profile=SUPPORTED_DSO_PROFILE,
+                session_profile=drifted,
+            )
+
     def test_psutil_shim_sanitizes_none_cmdline_and_is_idempotent(self) -> None:
         calls: list[tuple[tuple, dict]] = []
         processes = [
@@ -2997,6 +4503,11 @@ class SessionHostTests(unittest.TestCase):
         with (
             patch.object(host, "_find_free_desktop_port", return_value=44773),
             patch.object(host, "_desktop_port_is_listening", return_value=True),
+            patch.object(
+                AedtSessionHost,
+                "_owned_desktop_pid_on_port",
+                return_value="3824121",
+            ),
             patch(
                 "slurm_scheduler.aedt_session_host._install_pyaedt_psutil_cmdline_shim"
             ) as shim,
@@ -3037,6 +4548,11 @@ class SessionHostTests(unittest.TestCase):
                 side_effect=[44001, 44002, 44003],
             ),
             patch.object(host, "_desktop_port_is_listening", return_value=False),
+            patch.object(
+                AedtSessionHost,
+                "_owned_desktop_pid_on_port",
+                return_value="3824121",
+            ),
             patch.object(host, "_cleanup_failed_desktop_launch") as cleanup,
             patch(
                 "slurm_scheduler.aedt_session_host._install_pyaedt_psutil_cmdline_shim"
@@ -3059,6 +4575,46 @@ class SessionHostTests(unittest.TestCase):
             [call.args[0] for call in sleep.call_args_list], [2.0, 2.0]
         )
 
+    def test_primary_launch_rejects_wrapper_pid_mismatch(self) -> None:
+        host = AedtSessionHost(
+            FakeHostControlPlane([]), allocation_id=1, node_name="cpu-01"
+        )
+        wrapper = SimpleNamespace(
+            port=44773, aedt_process_id="3824121", odesktop=object()
+        )
+        host._create_desktop = lambda **_kwargs: wrapper
+        with (
+            patch.object(host, "_find_free_desktop_port", return_value=44773),
+            patch.object(
+                AedtSessionHost,
+                "_owned_desktop_pid_on_port",
+                return_value="3824999",
+            ),
+            patch.object(host, "_desktop_port_is_listening", return_value=True),
+            patch.object(host, "_cleanup_failed_desktop_launch"),
+            patch("slurm_scheduler.aedt_session_host.time.sleep"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "reported PID 3824121"):
+                host._start_desktop()
+
+    def test_failed_launch_cleanup_refuses_unattested_wrapper_pid(self) -> None:
+        host = AedtSessionHost(
+            FakeHostControlPlane([]), allocation_id=1, node_name="cpu-01"
+        )
+        wrapper = SimpleNamespace(aedt_process_id="3824121")
+        with (
+            patch.object(
+                AedtSessionHost,
+                "_owned_desktop_pid_on_port",
+                return_value="3824999",
+            ),
+            patch.object(host, "_force_kill_owned_desktop") as force_kill,
+        ):
+            host._cleanup_failed_desktop_launch(
+                wrapper, port=44773, started_after=100.0
+            )
+        force_kill.assert_not_called()
+
     def test_registration_remote_disconnect_retries_without_closing_desktop(
         self,
     ) -> None:
@@ -3066,6 +4622,7 @@ class SessionHostTests(unittest.TestCase):
         control = RemoteDisconnectRegistrationControlPlane(events)
         host = AedtSessionHost(control, allocation_id=1, node_name="cpu-01")
         host._start_desktop = lambda: FakeDesktop(events)
+        trust_fake_desktop_liveness(host)
 
         with (
             patch("slurm_scheduler.aedt_session_host.time.sleep", return_value=None),
@@ -3087,6 +4644,7 @@ class SessionHostTests(unittest.TestCase):
             heartbeat_seconds=5,
         )
         host._start_desktop = lambda: FakeDesktop(events)
+        trust_fake_desktop_liveness(host)
 
         with (
             patch(
@@ -3126,6 +4684,7 @@ class SessionHostTests(unittest.TestCase):
         control = TerminalRegistrationControlPlane(events)
         host = AedtSessionHost(control, allocation_id=1, node_name="cpu-01")
         host._start_desktop = lambda: FakeDesktop(events)
+        trust_fake_desktop_liveness(host)
 
         with patch(
             "slurm_scheduler.aedt_session_host.time.sleep", return_value=None
@@ -3141,6 +4700,7 @@ class SessionHostTests(unittest.TestCase):
         control = TerminalHeartbeatControlPlane(events)
         host = AedtSessionHost(control, allocation_id=1, node_name="cpu-01")
         host._start_desktop = lambda: FakeDesktop(events)
+        trust_fake_desktop_liveness(host)
 
         with patch(
             "slurm_scheduler.aedt_session_host.time.sleep", return_value=None
@@ -3162,6 +4722,7 @@ class SessionHostTests(unittest.TestCase):
         )
         desktop = FakeDesktop(events)
         host._start_desktop = lambda: desktop
+        trust_fake_desktop_liveness(host)
         with patch("slurm_scheduler.aedt_session_host.time.sleep", return_value=None):
             self.assertEqual(host.run(), 2)
         self.assertEqual(events.count("global-stop"), 1)
@@ -3173,6 +4734,7 @@ class SessionHostTests(unittest.TestCase):
         control = FakeHostControlPlane(events)
         host = AedtSessionHost(control, allocation_id=1, node_name="cpu-01", heartbeat_seconds=5)
         host._start_desktop = lambda: FakeDesktop(events)
+        trust_fake_desktop_liveness(host)
         host._bounded_close_desktop = lambda **_kwargs: False
         with patch("slurm_scheduler.aedt_session_host.time.sleep", return_value=None):
             self.assertEqual(host.run(), 3)
@@ -3189,6 +4751,7 @@ class SessionHostTests(unittest.TestCase):
             heartbeat_seconds=5,
         )
         host._start_desktop = lambda: FakeDesktop(events)
+        trust_fake_desktop_liveness(host)
         with patch("slurm_scheduler.aedt_session_host.time.sleep", return_value=None):
             self.assertEqual(host.run(), 2)
 
@@ -3213,6 +4776,7 @@ class SessionHostTests(unittest.TestCase):
             return FakeDesktop(events)
 
         host._start_desktop = start_desktop
+        trust_fake_desktop_liveness(host)
         with patch("slurm_scheduler.aedt_session_host.time.sleep", return_value=None):
             self.assertEqual(host.run(), 2)
 
@@ -3232,6 +4796,7 @@ class SessionHostTests(unittest.TestCase):
             heartbeat_seconds=5,
         )
         host._start_desktop = lambda: FakeDesktop(events)
+        trust_fake_desktop_liveness(host)
         with patch("slurm_scheduler.aedt_session_host.time.sleep", return_value=None):
             self.assertEqual(host.run(), 1)
 

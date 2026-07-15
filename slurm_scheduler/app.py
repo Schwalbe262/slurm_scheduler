@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import shlex
 import threading
 import time
@@ -18,6 +19,11 @@ from fastapi.templating import Jinja2Templates
 from .allocation_metrics import annotate_allocation_fea_pressure, annotate_allocation_node_metrics
 from .aedt_pool import AedtPoolRuntime, AedtPoolService
 from .aedt_pool_api import create_aedt_pool_router
+from .aedt_session_host import (
+    EXPECTED_AEDT_VERSION,
+    SUPPORTED_DSO_PROFILE,
+    is_expected_session_profile,
+)
 from .conda_sync import CondaEnvSyncManager, conda_bootstrap
 from .config import AppConfig, load_accounts, load_app_config
 from .control_plane_relay import ControlPlaneRelay
@@ -39,6 +45,160 @@ def parse_aedt_backend(value: object) -> str:
         return normalize_aedt_backend(str(value or ""))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _literal_shell_assignments(text: str, *, leading_only: bool) -> dict[str, str]:
+    result: dict[str, str] = {}
+    stop = False
+    for raw_line in str(text or "").splitlines():
+        if stop:
+            break
+        try:
+            lexer = shlex.shlex(
+                raw_line,
+                posix=True,
+                punctuation_chars=";",
+            )
+            lexer.whitespace_split = True
+            lexer.commenters = "#"
+            tokens = list(lexer)
+        except ValueError:
+            if leading_only:
+                break
+            continue
+        statements: list[list[str]] = [[]]
+        for token in tokens:
+            if token and set(token) == {";"}:
+                statements.extend([] for _ in token)
+            else:
+                statements[-1].append(token)
+        for statement in statements:
+            if not statement:
+                continue
+            if statement[0] == "export":
+                statement = statement[1:]
+            assignments: dict[str, str] = {}
+            for token in statement:
+                if "=" not in token:
+                    assignments = {}
+                    break
+                key, value = token.split("=", 1)
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                    assignments = {}
+                    break
+                assignments[key] = value
+            if assignments:
+                result.update(assignments)
+                continue
+            if leading_only:
+                stop = True
+                break
+    return result
+
+
+def _literal_task_environment(task: dict) -> dict[str, str]:
+    """Read only literal shell assignments from a task's env_setup.
+
+    Admission must not execute or expand user shell.  Requiring literal values
+    also prevents a superficially valid contract from resolving to a missing
+    credential/profile only after the task reaches a compute node.
+    """
+
+    result = _literal_shell_assignments(
+        str(task.get("env_setup") or ""), leading_only=False
+    )
+    # Unified campaign clients materialize submission_env as a safe leading
+    # series of ``export KEY=literal;`` statements in command.  Parse only that
+    # prefix; never inspect or execute the actual task command body.
+    result.update(
+        _literal_shell_assignments(
+            str(task.get("command") or ""), leading_only=True
+        )
+    )
+    return result
+
+
+def pooled_task_contract_error(
+    task: dict,
+    *,
+    scheduler_url: str,
+    client_token_file: str,
+) -> str:
+    """Return a fail-closed reason for an incomplete pooled worker contract."""
+
+    if normalize_aedt_backend(str(task.get("aedt_backend") or "")) != "pooled":
+        return "pooled task contract is missing the pooled backend marker"
+    values = _literal_task_environment(task)
+    overridden_backend = values.get("MFT_AEDT_BACKEND")
+    if overridden_backend and overridden_backend != "pooled":
+        return "pooled task contract overrides MFT_AEDT_BACKEND"
+
+    expected_scheduler_url = str(scheduler_url or "").strip().rstrip("/")
+    actual_scheduler_url = values.get("MFT_AEDT_SCHEDULER_URL", "").rstrip("/")
+    if not expected_scheduler_url:
+        return "pooled task contract has no configured node-visible scheduler URL"
+    if actual_scheduler_url != expected_scheduler_url:
+        return (
+            "pooled task contract requires literal MFT_AEDT_SCHEDULER_URL="
+            f"{expected_scheduler_url}"
+        )
+
+    expected_token_file = str(client_token_file or "").strip()
+    actual_token_file = values.get("SLURM_AEDT_POOL_CLIENT_TOKEN_FILE", "")
+    if not expected_token_file:
+        return "pooled task contract has no configured limited client token file"
+    if actual_token_file != expected_token_file:
+        return (
+            "pooled task contract requires literal "
+            f"SLURM_AEDT_POOL_CLIENT_TOKEN_FILE={expected_token_file}"
+        )
+    if values.get("SLURM_AEDT_POOL_CLIENT_TOKEN"):
+        return "pooled task contract must not embed the limited client token"
+    if values.get("SLURM_AEDT_POOL_BOOTSTRAP_TOKEN") or values.get(
+        "AEDT_BOOTSTRAP_TOKEN"
+    ):
+        return "pooled task contract must not expose an admin/host bootstrap token"
+
+    session_profile = values.get("MFT_AEDT_SESSION_PROFILE", "")
+    if not session_profile or not is_expected_session_profile(session_profile):
+        return "pooled task contract requires the canonical MFT_AEDT_SESSION_PROFILE"
+    session_version = values.get("MFT_AEDT_SESSION_VERSION", "")
+    if session_version and session_version != EXPECTED_AEDT_VERSION:
+        return (
+            "pooled task contract MFT_AEDT_SESSION_VERSION does not match "
+            f"{EXPECTED_AEDT_VERSION}"
+        )
+
+    isolation = values.get("MFT_AEDT_ISOLATION_POLICY", "")
+    if isolation not in {"family", "shared_if_compatible", "exclusive"}:
+        return (
+            "pooled task contract requires MFT_AEDT_ISOLATION_POLICY="
+            "family, shared_if_compatible, or exclusive"
+        )
+
+    workspace = next(
+        (
+            values[name].strip()
+            for name in (
+                "MFT_AEDT_WORKSPACE_PATH",
+                "MFT_AEDT_POOL_WORKSPACE",
+                "MFT_AEDT_POOL_WORKSPACE_ROOT",
+            )
+            if values.get(name, "").strip()
+        ),
+        "",
+    )
+    normalized_workspace = posixpath.normpath(workspace) if workspace else ""
+    if (
+        not workspace.startswith("/")
+        or normalized_workspace in {"", ".", "/"}
+        or ".." in workspace.split("/")
+    ):
+        return (
+            "pooled task contract requires an absolute, project-scoped "
+            "MFT_AEDT_WORKSPACE_PATH/MFT_AEDT_POOL_WORKSPACE"
+        )
+    return ""
 
 
 def normalize_cleanup_globs(value: object) -> str:
@@ -478,7 +638,14 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     app.state.db = db
     app.state.scheduler = scheduler
     aedt_pool_bootstrap_token = os.environ.get("SLURM_AEDT_POOL_BOOTSTRAP_TOKEN", "").strip()
-    aedt_pool = AedtPoolService(db, bootstrap_token=aedt_pool_bootstrap_token)
+    aedt_pool_client_token = os.environ.get(
+        "SLURM_AEDT_POOL_CLIENT_TOKEN", ""
+    ).strip()
+    aedt_pool = AedtPoolService(
+        db,
+        bootstrap_token=aedt_pool_bootstrap_token,
+        lease_client_token=aedt_pool_client_token,
+    )
     aedt_pool.init()
     aedt_pool.set_warm_spare_admission_checker(
         scheduler.aedt_pool_warm_spare_admission
@@ -491,6 +658,18 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 and not pool_config.control_plane_url
             ):
                 return False, "AEDT pool control-plane relay is unavailable"
+            scheduler_url = (
+                pool_config.control_plane_url
+                if config.control_plane_relay_enabled
+                else config.aedt_pool_scheduler_url
+            )
+            contract_error = pooled_task_contract_error(
+                task,
+                scheduler_url=scheduler_url,
+                client_token_file=config.aedt_pool_client_token_file,
+            )
+            if contract_error:
+                return False, contract_error
             return True, ""
         return False, "AEDT pooled backend is not operational"
 
@@ -531,9 +710,15 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     aedt_adapter_configured = bool(
         config.aedt_pool_session_host_enabled
         and aedt_pool_bootstrap_token
+        and aedt_pool_client_token
+        and config.aedt_pool_client_token_file.strip()
         and control_plane_endpoint_configured
         and config.aedt_pool_host_remote_cwd.strip()
         and config.aedt_pool_host_bootstrap_token_file.strip()
+        and config.aedt_pool_host_artifact_root.strip()
+        and str(config.aedt_pool_host_dso_profile or "").strip().lower()
+        == SUPPORTED_DSO_PROFILE
+        and is_expected_session_profile(config.aedt_pool_host_session_profile)
     )
     # Recompute on every start so a stale DB flag cannot outlive a removed
     # token file/launch configuration.
@@ -548,6 +733,9 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         host_env_setup=config.aedt_pool_host_env_setup,
         host_bootstrap_token_file=config.aedt_pool_host_bootstrap_token_file,
         host_task_memory_mb=config.aedt_pool_host_task_memory_mb,
+        host_artifact_root=config.aedt_pool_host_artifact_root,
+        host_dso_profile=config.aedt_pool_host_dso_profile,
+        host_session_profile=config.aedt_pool_host_session_profile,
         require_published_control_plane_url=config.control_plane_relay_enabled,
     )
     app.state.aedt_pool = aedt_pool
@@ -920,11 +1108,19 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "sim_subdir": project.get("sim_subdir") or "simulation",
             "auto_pull": bool(project.get("auto_pull")),
             "max_active_tasks": max(0, int(project.get("max_active_tasks") or 0)),
+            "desired_simulations": max(
+                0, int(project.get("desired_simulations") or 0)
+            ),
+            "policy_revision": max(1, int(project.get("policy_revision") or 1)),
+            "validated_concurrency_limit": max(
+                0, int(project.get("validated_concurrency_limit") or 0)
+            ),
+            "scale_down_mode": str(project.get("scale_down_mode") or "drain"),
             "aedt_backend": normalize_aedt_backend(project.get("aedt_backend") or ""),
             "queued_count": queued_count,
             "attaching_count": attaching_count,
             "executing_count": executing_count,
-            "logical_active_count": queued_count + attaching_count + executing_count,
+            "logical_active_count": attaching_count + executing_count,
             "running_count": attaching_count + executing_count,
             "total_count": db.count_tasks_by_project(project_name),
             "created_at": project.get("created_at"),
@@ -932,7 +1128,60 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         }
         if include_deployments:
             payload["deployments"] = db.list_project_deployments(int(project["id"]))
+        payload["simulation_policy"] = simulation_policy_json(project)
         return payload
+
+    def simulation_policy_json(project: dict) -> dict:
+        project_name = str(project.get("name") or "")
+        queued = db.count_tasks_by_project(project_name, [TaskStatus.QUEUED.value])
+        attaching = db.count_tasks_by_project(
+            project_name, [TaskStatus.ATTACHING.value]
+        )
+        solving = db.count_tasks_by_project(project_name, [TaskStatus.RUNNING.value])
+        hard_ceiling = (
+            500
+            if project_name.lower().startswith("mft")
+            else int(config.project_max_active_tasks_ceiling)
+        )
+        configured_hard_guard = max(
+            0, int(project.get("max_active_tasks") or 0)
+        )
+        if configured_hard_guard:
+            hard_ceiling = min(hard_ceiling, configured_hard_guard)
+        validated = min(
+            hard_ceiling,
+            max(0, int(project.get("validated_concurrency_limit") or 0)),
+        )
+        maximum = min(hard_ceiling, validated)
+        desired = min(
+            hard_ceiling, max(0, int(project.get("desired_simulations") or 0))
+        )
+        effective = min(desired, maximum)
+        reason = ""
+        if validated <= 0:
+            reason = "concurrency validation has not passed"
+        elif desired > effective:
+            reason = f"desired target is limited to validated ceiling {maximum}"
+        return {
+            "project": project_name,
+            "name": project_name,
+            "desired_simulations": desired,
+            "effective_simulations": effective,
+            "validated_concurrency_limit": validated,
+            "min_desired_simulations": 0,
+            "max_desired_simulations": maximum,
+            "policy_revision": max(1, int(project.get("policy_revision") or 1)),
+            "scale_down_mode": str(project.get("scale_down_mode") or "drain"),
+            "queued_count": queued,
+            "attaching_count": attaching,
+            "active_count": solving,
+            "solving_count": solving,
+            "logical_active_count": attaching + solving,
+            "resource_constraint": reason or None,
+            "reason": reason,
+            "control_enabled": validated > 0,
+            "gate_reason": reason if validated <= 0 else "",
+        }
 
     def parse_repo_lines(text: str) -> list[dict]:
         """One repo per line: ``url[|ref|subdir]``."""
@@ -1003,6 +1252,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             raise ValueError(max_active_tasks_error)
         if not 0 <= max_active_tasks <= config.project_max_active_tasks_ceiling:
             raise ValueError(max_active_tasks_error)
+        if name.lower().startswith("mft"):
+            # MFT's scheduler guard is fixed independently of desired and
+            # validated rollout controls exposed by the simulation-policy UI.
+            max_active_tasks = 500
         if existing:
             db.update_project(
                 int(existing["id"]),
@@ -2371,6 +2624,140 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             raise HTTPException(status_code=404)
         return project_json(project)
 
+    @app.get("/api/projects/{name}/simulation-policy")
+    def api_get_project_simulation_policy(name: str) -> dict:
+        project = db.get_project_by_name(name)
+        if not project:
+            raise HTTPException(status_code=404, detail="project not found")
+        return simulation_policy_json(project)
+
+    @app.patch("/api/projects/{name}/simulation-policy")
+    async def api_set_project_simulation_policy(name: str, request: Request) -> dict:
+        payload = await _json_body(request)
+        if set(payload) != {
+            "desired_simulations",
+            "expected_revision",
+            "scale_down_mode",
+        }:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "request body must contain desired_simulations, "
+                    "expected_revision, and scale_down_mode"
+                ),
+            )
+        desired = payload.get("desired_simulations")
+        if type(desired) is not int:
+            raise HTTPException(
+                status_code=422, detail="desired_simulations must be an integer"
+            )
+        try:
+            expected_revision = int(str(payload.get("expected_revision")).strip())
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422, detail="expected_revision must be an integer"
+            ) from exc
+        if expected_revision < 1:
+            raise HTTPException(
+                status_code=422, detail="expected_revision must be positive"
+            )
+        if payload.get("scale_down_mode") != "drain":
+            raise HTTPException(
+                status_code=422, detail="scale_down_mode must be drain"
+            )
+        project = db.get_project_by_name(name)
+        if not project:
+            raise HTTPException(status_code=404, detail="project not found")
+        policy = simulation_policy_json(project)
+        maximum = int(policy["max_desired_simulations"])
+        if not 0 <= desired <= maximum:
+            raise HTTPException(
+                status_code=422,
+                detail=f"desired_simulations must be between 0 and {maximum}",
+            )
+        status, updated = db.update_project_simulation_policy(
+            name,
+            desired_simulations=desired,
+            expected_revision=expected_revision,
+            scale_down_mode="drain",
+        )
+        if status == "not_found":
+            raise HTTPException(status_code=404, detail="project not found")
+        if status == "conflict":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "simulation policy revision conflict",
+                    "current": simulation_policy_json(updated) if updated else None,
+                },
+            )
+        return simulation_policy_json(updated)
+
+    @app.patch("/api/projects/{name}/simulation-policy/validation")
+    async def api_set_project_simulation_validation(
+        name: str, request: Request
+    ) -> dict:
+        if not aedt_pool_bootstrap_token:
+            raise HTTPException(
+                status_code=503,
+                detail="AEDT bootstrap secret is not configured",
+            )
+        provided_token = str(
+            request.headers.get("x-aedt-bootstrap-token", "")
+        ).strip()
+        if not secrets.compare_digest(provided_token, aedt_pool_bootstrap_token):
+            raise HTTPException(status_code=403, detail="invalid AEDT bootstrap token")
+        payload = await _json_body(request)
+        if set(payload) != {"validated_concurrency_limit", "expected_revision"}:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "request body must contain validated_concurrency_limit "
+                    "and expected_revision"
+                ),
+            )
+        validated = payload.get("validated_concurrency_limit")
+        if type(validated) is not int:
+            raise HTTPException(
+                status_code=422,
+                detail="validated_concurrency_limit must be an integer",
+            )
+        try:
+            expected_revision = int(str(payload.get("expected_revision")).strip())
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422, detail="expected_revision must be an integer"
+            ) from exc
+        hard_ceiling = (
+            500
+            if name.lower().startswith("mft")
+            else int(config.project_max_active_tasks_ceiling)
+        )
+        if not 0 <= validated <= hard_ceiling:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "validated_concurrency_limit must be between 0 and "
+                    f"{hard_ceiling}"
+                ),
+            )
+        status, updated = db.update_project_validation_limit(
+            name,
+            validated_concurrency_limit=validated,
+            expected_revision=expected_revision,
+        )
+        if status == "not_found":
+            raise HTTPException(status_code=404, detail="project not found")
+        if status == "conflict":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "simulation policy revision conflict",
+                    "current": simulation_policy_json(updated) if updated else None,
+                },
+            )
+        return simulation_policy_json(updated)
+
     @app.patch("/api/projects/{name}/max-active-tasks")
     async def api_set_project_max_active_tasks(name: str, request: Request) -> dict:
         payload = await _json_body(request)
@@ -2389,9 +2776,22 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         project = db.get_project_by_name(name)
         if not project:
             raise HTTPException(status_code=404)
+        if name.lower().startswith("mft"):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "MFT max_active_tasks is the fixed 500 hard guard; "
+                    "use simulation-policy to change desired concurrency"
+                ),
+            )
         project_id = int(project["id"])
-        db.update_project(project_id, max_active_tasks=max_active_tasks)
-        return project_json(db.get_project(project_id))
+        db.update_project(
+            project_id,
+            max_active_tasks=max_active_tasks,
+            policy_revision=max(1, int(project.get("policy_revision") or 1)) + 1,
+        )
+        updated = db.get_project(project_id)
+        return project_json(updated)
 
     @app.post("/api/projects")
     async def api_create_project(request: Request) -> JSONResponse:

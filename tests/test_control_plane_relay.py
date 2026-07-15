@@ -18,6 +18,10 @@ import pytest
 
 from slurm_scheduler.config import AccountConfig, load_app_config
 from slurm_scheduler.control_plane_relay import ControlPlaneRelay, relay_script_source
+from slurm_scheduler.aedt_session_host import (
+    EXPECTED_SESSION_PROFILE_JSON,
+    SUPPORTED_DSO_PROFILE,
+)
 
 
 class _DummyHandler(BaseHTTPRequestHandler):
@@ -607,8 +611,12 @@ bind_host: 0.0.0.0
 bind_port: 8123
 aedt_pool:
   session_host_enabled: true
+  client_token_file: /shared/aedt-client-token
   host_remote_cwd: /work/aedt
   host_bootstrap_token_file: /shared/aedt-bootstrap-token
+  host_artifact_root: /shared/aedt-artifacts
+  host_dso_profile: {SUPPORTED_DSO_PROFILE}
+  host_session_profile: '{EXPECTED_SESSION_PROFILE_JSON}'
 control_plane_relay:
   enabled: true
   account: relay-account
@@ -636,6 +644,7 @@ control_plane_relay:
     # construction at this temporary disabled service configuration too.
     monkeypatch.setenv("SLURM_SCHEDULER_CONFIG", str(config_path))
     monkeypatch.setenv("SLURM_AEDT_POOL_BOOTSTRAP_TOKEN", "bootstrap-secret")
+    monkeypatch.setenv("SLURM_AEDT_POOL_CLIENT_TOKEN", "limited-client-secret")
     from slurm_scheduler.app import create_app
 
     app = create_app(str(config_path))

@@ -114,11 +114,19 @@ license_monitor:
 aedt_pool:
   session_host_enabled: false
   scheduler_url: ""
+  # Compute-node-readable file containing the limited lease-creation token.
+  # Never point this at the host/admin bootstrap token file.
+  client_token_file: ""
   host_remote_cwd: ""
   host_python: "python"
   host_env_setup: ""
   host_bootstrap_token_file: ""
-  host_task_memory_mb: 4096
+  # Minimum per-Desktop reservation. At 2 projects/session this is 64 GiB.
+  host_task_memory_mb: 65536
+  # All three are mandatory before the adapter can become ready.
+  host_artifact_root: ""
+  host_dso_profile: "maxwell-2d3d-icepak-4c1e"
+  host_session_profile: '{"profile_version":2,"aedt_version":"2025.2","python_environment":"pyaedt2026v1","pyaedt_version":"0.22.0","filesystem":"gpfs-shared-v1","desktop_dso":{"config_name":"pyaedt_config","designs":{"Icepak":{"cores":4,"tasks":1,"gpus":0,"use_auto_settings":false},"Maxwell 2D":{"cores":4,"tasks":1,"gpus":0,"use_auto_settings":true},"Maxwell 3D":{"cores":4,"tasks":1,"gpus":0,"use_auto_settings":true}}}}'
 # Optional login-node relay for compute nodes that cannot reach this scheduler
 # directly. It is a strict no-op until enabled and fully configured.
 control_plane_relay:

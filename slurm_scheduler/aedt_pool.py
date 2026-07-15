@@ -8,12 +8,19 @@ import os
 import secrets
 import shlex
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from .db import Database
 from .models import SchedulingProfile, TaskCreate, TaskStatus
+from .aedt_session_host import (
+    EXPECTED_AEDT_VERSION,
+    SUPPORTED_DSO_PROFILE,
+    SUPPORTED_DSO_PROFILES,
+    canonical_expected_session_profile,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -22,8 +29,16 @@ SESSION_COUNTED_STATES = ("starting", "ready", "busy", "draining", "unhealthy")
 SESSION_HISTORY_STATES = ("failed", "closed")
 SESSION_HISTORY_LIMIT = 30
 SESSION_ASSIGNABLE_STATES = ("ready", "busy")
-LEASE_LIVE_STATES = ("queued", "leased", "active", "releasing")
-LEASE_SLOT_STATES = ("leased", "active", "releasing")
+LEASE_LIVE_STATES = (
+    "queued",
+    "offered",
+    "leased",  # protocol-v1 compatibility
+    "attaching",
+    "active",
+    "releasing",
+)
+LEASE_SLOT_STATES = ("offered", "leased", "attaching", "active", "releasing")
+LEASE_TERMINAL_STATES = ("released", "failed", "cancelled", "expired")
 SESSION_START_ACK_TIMEOUT_MESSAGE = "session start acknowledgement timed out"
 SESSION_HEARTBEAT_TIMEOUT_MESSAGE = "session heartbeat expired"
 FAULTED_DESKTOP_ALLOCATION_RECYCLE_REASON = (
@@ -45,9 +60,23 @@ CREATE TABLE IF NOT EXISTS aedt_sessions (
     account_name TEXT NOT NULL DEFAULT '',
     node_name TEXT NOT NULL DEFAULT '',
     host_id TEXT NOT NULL DEFAULT '',
+    host_task_id INTEGER NOT NULL DEFAULT 0,
+    host_process_id TEXT NOT NULL DEFAULT '',
+    host_slurm_job_id TEXT NOT NULL DEFAULT '',
+    actual_node_name TEXT NOT NULL DEFAULT '',
     start_claimed_at TEXT,
     endpoint TEXT NOT NULL DEFAULT '',
     process_id TEXT NOT NULL DEFAULT '',
+    session_profile TEXT NOT NULL DEFAULT '',
+    artifact_dir TEXT NOT NULL DEFAULT '',
+    host_stdout_path TEXT NOT NULL DEFAULT '',
+    host_stderr_path TEXT NOT NULL DEFAULT '',
+    error_log_path TEXT NOT NULL DEFAULT '',
+    journal_path TEXT NOT NULL DEFAULT '',
+    native_snapshot_path TEXT NOT NULL DEFAULT '',
+    runtime_metadata_json TEXT NOT NULL DEFAULT '{}',
+    last_fault_evidence_json TEXT NOT NULL DEFAULT '{}',
+    last_fault_at TEXT,
     host_token_hash TEXT NOT NULL DEFAULT '',
     slots_total INTEGER NOT NULL DEFAULT 2,
     state TEXT NOT NULL DEFAULT 'starting',
@@ -60,6 +89,8 @@ CREATE TABLE IF NOT EXISTS aedt_sessions (
     drain_requested_at TEXT,
     quarantine_until TEXT,
     quarantine_reason TEXT NOT NULL DEFAULT '',
+    solve_batch_sealed_at TEXT,
+    solve_batch_generation INTEGER NOT NULL DEFAULT 0,
     closed_at TEXT,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -73,6 +104,12 @@ CREATE TABLE IF NOT EXISTS aedt_project_leases (
     request_key TEXT NOT NULL UNIQUE,
     project_name TEXT NOT NULL,
     placement_group TEXT,
+    workload_family TEXT NOT NULL DEFAULT '',
+    session_profile TEXT NOT NULL DEFAULT '',
+    project_namespace TEXT NOT NULL DEFAULT '',
+    isolation_policy TEXT NOT NULL DEFAULT 'family',
+    workspace_path TEXT NOT NULL DEFAULT '',
+    protocol_version INTEGER NOT NULL DEFAULT 1,
     task_id INTEGER NOT NULL DEFAULT 0,
     requested_allocation_id INTEGER NOT NULL DEFAULT 0,
     requested_node_name TEXT NOT NULL DEFAULT '',
@@ -83,11 +120,21 @@ CREATE TABLE IF NOT EXISTS aedt_project_leases (
     client_token_hash TEXT NOT NULL,
     failure_message TEXT NOT NULL DEFAULT '',
     requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    offered_at TEXT,
+    offer_expires_at TEXT,
+    accepted_at TEXT,
+    activated_at TEXT,
+    solve_permit_at TEXT,
+    solve_permit_generation INTEGER NOT NULL DEFAULT 0,
+    client_deadline_at TEXT,
     acquired_at TEXT,
     last_heartbeat_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     expires_at TEXT NOT NULL,
     release_requested_at TEXT,
     finished_at TEXT,
+    fault_phase TEXT NOT NULL DEFAULT '',
+    fault_kind TEXT NOT NULL DEFAULT '',
+    fault_evidence_json TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -96,7 +143,10 @@ CREATE INDEX IF NOT EXISTS idx_aedt_leases_session ON aedt_project_leases(sessio
 CREATE INDEX IF NOT EXISTS idx_aedt_leases_task ON aedt_project_leases(task_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_aedt_leases_live_slot
 ON aedt_project_leases(session_id, slot_index)
-WHERE session_id IS NOT NULL AND state IN ('leased', 'active', 'releasing');
+WHERE session_id IS NOT NULL
+  AND state IN ('offered', 'leased', 'attaching', 'active', 'releasing');
+CREATE INDEX IF NOT EXISTS idx_aedt_leases_project_name
+ON aedt_project_leases(project_name, state);
 
 CREATE TABLE IF NOT EXISTS aedt_pool_validations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,6 +168,7 @@ CREATE TABLE IF NOT EXISTS aedt_pool_validations (
     sibling_field_solution_passed INTEGER NOT NULL DEFAULT 0,
     fault_checkout_released_after_recycle_passed INTEGER NOT NULL DEFAULT 0,
     faulted_desktop_not_reused_passed INTEGER NOT NULL DEFAULT 0,
+    mixed_mft_ipmsm_isolation_passed INTEGER NOT NULL DEFAULT 0,
     evidence_json TEXT NOT NULL DEFAULT '{}',
     failure_message TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -138,10 +189,16 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "aedt_pool_target_projects": "500",
     "aedt_pool_projects_per_session": "2",
     "aedt_pool_project_cpus": "4",
+    # Maxwell plus Icepak can coexist in one project.  Reserve a conservative
+    # 32 GiB per project (64 GiB for the validated 1:2 host topology).
+    "aedt_pool_project_memory_mb": "32768",
     "aedt_pool_node_cpu_factor": "1.0",
     # Both defaults exceed the node/client six-minute retry budget so a
     # five-minute control-plane outage cannot expire otherwise-live work.
     "aedt_pool_lease_ttl_seconds": "600",
+    "aedt_pool_queued_stale_seconds": "90",
+    "aedt_pool_offer_ack_seconds": "60",
+    "aedt_pool_admission_deadline_seconds": "600",
     "aedt_pool_session_heartbeat_timeout_seconds": "600",
     "aedt_pool_unhealthy_recycle_grace_seconds": "180",
     "aedt_pool_session_start_timeout_seconds": "600",
@@ -167,6 +224,19 @@ def _sql_time(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _parse_utc_time(value: str) -> datetime:
+    normalized = str(value or "").strip()
+    if not normalized:
+        raise ValueError("timestamp is required")
+    try:
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("timestamp must be ISO-8601") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -183,6 +253,27 @@ def _derive_placement_group(project_name: str) -> str:
     return normalized[:token_end] or normalized
 
 
+def _canonical_session_profile(value: Any) -> str:
+    """Return a stable compatibility key for Desktop-global settings."""
+
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if not isinstance(value, str):
+        raise ValueError("session_profile must be a string or object")
+    return value.strip()
+
+
+def _normalized_family(value: str, project_name: str) -> str:
+    family = str(value or "").strip().lower()
+    return family or _derive_placement_group(project_name)
+
+
+def _short_node_name(value: str) -> str:
+    return str(value or "").strip().lower().split(".", 1)[0]
+
+
 def _bool_setting(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -197,8 +288,12 @@ class AedtPoolConfig:
     target_projects: int
     projects_per_session: int
     project_cpus: int
+    project_memory_mb: int
     node_cpu_factor: float
     lease_ttl_seconds: int
+    queued_stale_seconds: int
+    offer_ack_seconds: int
+    admission_deadline_seconds: int
     session_heartbeat_timeout_seconds: int
     unhealthy_recycle_grace_seconds: int
     session_start_timeout_seconds: int
@@ -230,13 +325,17 @@ class AedtPoolService:
         db: Database,
         *,
         bootstrap_token: str = "",
+        lease_client_token: str = "",
         now: Callable[[], datetime] = _utcnow,
     ) -> None:
         self.db = db
         self.bootstrap_token = bootstrap_token
+        self.lease_client_token = str(lease_client_token or "").strip()
         self._now = now
         self._lock = threading.RLock()
         self._warm_spare_admission_checker: Callable[[int], tuple[int, str]] | None = None
+        self._config_cache: AedtPoolConfig | None = None
+        self._config_cache_until = 0.0
 
     def init(self) -> None:
         with self.db.connect() as conn:
@@ -250,6 +349,22 @@ class AedtPoolService:
                 "start_claimed_at": "TEXT",
                 "quarantine_until": "TEXT",
                 "quarantine_reason": "TEXT NOT NULL DEFAULT ''",
+                "host_task_id": "INTEGER NOT NULL DEFAULT 0",
+                "host_process_id": "TEXT NOT NULL DEFAULT ''",
+                "host_slurm_job_id": "TEXT NOT NULL DEFAULT ''",
+                "actual_node_name": "TEXT NOT NULL DEFAULT ''",
+                "session_profile": "TEXT NOT NULL DEFAULT ''",
+                "artifact_dir": "TEXT NOT NULL DEFAULT ''",
+                "host_stdout_path": "TEXT NOT NULL DEFAULT ''",
+                "host_stderr_path": "TEXT NOT NULL DEFAULT ''",
+                "error_log_path": "TEXT NOT NULL DEFAULT ''",
+                "journal_path": "TEXT NOT NULL DEFAULT ''",
+                "native_snapshot_path": "TEXT NOT NULL DEFAULT ''",
+                "runtime_metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+                "last_fault_evidence_json": "TEXT NOT NULL DEFAULT '{}'",
+                "last_fault_at": "TEXT",
+                "solve_batch_sealed_at": "TEXT",
+                "solve_batch_generation": "INTEGER NOT NULL DEFAULT 0",
             }.items():
                 if name not in session_columns:
                     conn.execute(f"ALTER TABLE aedt_sessions ADD COLUMN {name} {ddl}")
@@ -259,15 +374,30 @@ class AedtPoolService:
                     "PRAGMA table_info(aedt_project_leases)"
                 ).fetchall()
             }
-            if "exclusive_session" not in lease_columns:
-                conn.execute(
-                    "ALTER TABLE aedt_project_leases ADD COLUMN "
-                    "exclusive_session INTEGER NOT NULL DEFAULT 0"
-                )
-            if "placement_group" not in lease_columns:
-                conn.execute(
-                    "ALTER TABLE aedt_project_leases ADD COLUMN placement_group TEXT"
-                )
+            for name, ddl in {
+                "exclusive_session": "INTEGER NOT NULL DEFAULT 0",
+                "placement_group": "TEXT",
+                "workload_family": "TEXT NOT NULL DEFAULT ''",
+                "session_profile": "TEXT NOT NULL DEFAULT ''",
+                "project_namespace": "TEXT NOT NULL DEFAULT ''",
+                "isolation_policy": "TEXT NOT NULL DEFAULT 'family'",
+                "workspace_path": "TEXT NOT NULL DEFAULT ''",
+                "protocol_version": "INTEGER NOT NULL DEFAULT 1",
+                "offered_at": "TEXT",
+                "offer_expires_at": "TEXT",
+                "accepted_at": "TEXT",
+                "activated_at": "TEXT",
+                "solve_permit_at": "TEXT",
+                "solve_permit_generation": "INTEGER NOT NULL DEFAULT 0",
+                "client_deadline_at": "TEXT",
+                "fault_phase": "TEXT NOT NULL DEFAULT ''",
+                "fault_kind": "TEXT NOT NULL DEFAULT ''",
+                "fault_evidence_json": "TEXT NOT NULL DEFAULT '{}'",
+            }.items():
+                if name not in lease_columns:
+                    conn.execute(
+                        f"ALTER TABLE aedt_project_leases ADD COLUMN {name} {ddl}"
+                    )
             legacy_leases = conn.execute(
                 """
                 SELECT id, project_name FROM aedt_project_leases
@@ -275,11 +405,36 @@ class AedtPoolService:
                 """
             ).fetchall()
             conn.executemany(
-                "UPDATE aedt_project_leases SET placement_group = ? WHERE id = ?",
+                """
+                UPDATE aedt_project_leases
+                SET placement_group = ?, workload_family = CASE
+                    WHEN TRIM(COALESCE(workload_family, '')) = '' THEN ?
+                    ELSE workload_family END
+                WHERE id = ?
+                """,
                 (
-                    (_derive_placement_group(str(row["project_name"])), int(row["id"]))
+                    (
+                        _derive_placement_group(str(row["project_name"])),
+                        _derive_placement_group(str(row["project_name"])),
+                        int(row["id"]),
+                    )
                     for row in legacy_leases
                 ),
+            )
+            conn.execute("DROP INDEX IF EXISTS idx_aedt_leases_live_slot")
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX idx_aedt_leases_live_slot
+                ON aedt_project_leases(session_id, slot_index)
+                WHERE session_id IS NOT NULL
+                  AND state IN (
+                      'offered','leased','attaching','active','releasing'
+                  )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_aedt_leases_project_name "
+                "ON aedt_project_leases(project_name, state)"
             )
             validation_columns = {
                 str(row["name"])
@@ -293,15 +448,22 @@ class AedtPoolService:
                 "sibling_field_solution_passed",
                 "fault_checkout_released_after_recycle_passed",
                 "faulted_desktop_not_reused_passed",
+                "mixed_mft_ipmsm_isolation_passed",
             ):
                 if name not in validation_columns:
                     conn.execute(
                         f"ALTER TABLE aedt_pool_validations ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
                     )
+        self._invalidate_config()
 
     def _setting(self, key: str) -> str:
         value = self.db.get_setting(key)
         return DEFAULT_SETTINGS[key] if value is None else value
+
+    def _invalidate_config(self) -> None:
+        with self._lock:
+            self._config_cache = None
+            self._config_cache_until = 0.0
 
     def set_warm_spare_admission_checker(
         self,
@@ -325,37 +487,70 @@ class AedtPoolService:
             return item
 
     def config(self) -> AedtPoolConfig:
-        validation = self.latest_validation()
-        return AedtPoolConfig(
-            enabled=_bool_setting(self._setting("aedt_pool_enabled")),
-            adapter_ready=_bool_setting(self._setting("aedt_pool_adapter_ready")),
-            validation_passed=bool(validation and validation.get("status") == "passed"),
-            max_sessions=max(0, int(self._setting("aedt_pool_max_sessions"))),
-            min_idle_sessions=max(0, int(self._setting("aedt_pool_min_idle_sessions"))),
-            target_projects=max(0, int(self._setting("aedt_pool_target_projects"))),
-            projects_per_session=max(1, int(self._setting("aedt_pool_projects_per_session"))),
-            project_cpus=max(1, int(self._setting("aedt_pool_project_cpus"))),
-            node_cpu_factor=max(1.0, min(2.0, float(self._setting("aedt_pool_node_cpu_factor")))),
-            lease_ttl_seconds=max(30, int(self._setting("aedt_pool_lease_ttl_seconds"))),
+        cache_now = time.monotonic()
+        with self._lock:
+            if self._config_cache is not None and cache_now < self._config_cache_until:
+                return self._config_cache
+            with self.db.connect() as conn:
+                settings = dict(DEFAULT_SETTINGS)
+                settings.update(
+                    {
+                        str(row["key"]): str(row["value"])
+                        for row in conn.execute(
+                            "SELECT key, value FROM scheduler_settings WHERE key LIKE 'aedt_pool_%'"
+                        ).fetchall()
+                    }
+                )
+                validation = conn.execute(
+                    "SELECT status FROM aedt_pool_validations ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+
+            def setting(key: str) -> str:
+                return settings[key]
+
+            resolved = AedtPoolConfig(
+            enabled=_bool_setting(setting("aedt_pool_enabled")),
+            adapter_ready=_bool_setting(setting("aedt_pool_adapter_ready")),
+            validation_passed=bool(validation and validation["status"] == "passed"),
+            max_sessions=max(0, int(setting("aedt_pool_max_sessions"))),
+            min_idle_sessions=max(0, int(setting("aedt_pool_min_idle_sessions"))),
+            target_projects=max(0, int(setting("aedt_pool_target_projects"))),
+            projects_per_session=max(1, int(setting("aedt_pool_projects_per_session"))),
+            project_cpus=max(1, int(setting("aedt_pool_project_cpus"))),
+            project_memory_mb=max(1024, int(setting("aedt_pool_project_memory_mb"))),
+            node_cpu_factor=max(1.0, min(2.0, float(setting("aedt_pool_node_cpu_factor")))),
+            lease_ttl_seconds=max(30, int(setting("aedt_pool_lease_ttl_seconds"))),
+            queued_stale_seconds=max(
+                30, int(setting("aedt_pool_queued_stale_seconds"))
+            ),
+            offer_ack_seconds=max(
+                15, int(setting("aedt_pool_offer_ack_seconds"))
+            ),
+            admission_deadline_seconds=max(
+                60, int(setting("aedt_pool_admission_deadline_seconds"))
+            ),
             session_heartbeat_timeout_seconds=max(
-                30, int(self._setting("aedt_pool_session_heartbeat_timeout_seconds"))
+                30, int(setting("aedt_pool_session_heartbeat_timeout_seconds"))
             ),
             unhealthy_recycle_grace_seconds=max(
-                0, int(self._setting("aedt_pool_unhealthy_recycle_grace_seconds"))
+                0, int(setting("aedt_pool_unhealthy_recycle_grace_seconds"))
             ),
             session_start_timeout_seconds=max(
-                60, int(self._setting("aedt_pool_session_start_timeout_seconds"))
+                60, int(setting("aedt_pool_session_start_timeout_seconds"))
             ),
-            idle_ttl_seconds=max(0, int(self._setting("aedt_pool_idle_ttl_seconds"))),
+            idle_ttl_seconds=max(0, int(setting("aedt_pool_idle_ttl_seconds"))),
             allocation_max_age_seconds=max(
-                0, int(self._setting("aedt_pool_allocation_max_age_seconds"))
+                0, int(setting("aedt_pool_allocation_max_age_seconds"))
             ),
-            scale_step_nodes=max(1, int(self._setting("aedt_pool_scale_step_nodes"))),
-            required_capability=self._setting("aedt_pool_required_capability").strip(),
-            env_profile=self._setting("aedt_pool_env_profile").strip(),
-            account_name=self._setting("aedt_pool_account_name").strip(),
-            control_plane_url=self._setting("aedt_pool_control_plane_url").strip().rstrip("/"),
-        )
+            scale_step_nodes=max(1, int(setting("aedt_pool_scale_step_nodes"))),
+            required_capability=setting("aedt_pool_required_capability").strip(),
+            env_profile=setting("aedt_pool_env_profile").strip(),
+            account_name=setting("aedt_pool_account_name").strip(),
+            control_plane_url=setting("aedt_pool_control_plane_url").strip().rstrip("/"),
+            )
+            self._config_cache = resolved
+            self._config_cache_until = cache_now + 1.0
+            return resolved
 
     def set_operator_limit(self, max_sessions: int) -> AedtPoolConfig:
         """Compatibility wrapper for the original one-field operator API."""
@@ -433,6 +628,7 @@ class AedtPoolService:
                         "updated_at = CURRENT_TIMESTAMP",
                         (key, str(value)),
                     )
+        self._invalidate_config()
         return self.config()
 
     def set_operator_timeouts(
@@ -532,14 +728,17 @@ class AedtPoolService:
                     "updated_at = CURRENT_TIMESTAMP",
                     (key, str(value)),
                 )
+        self._invalidate_config()
         return self.config()
 
     def set_adapter_ready(self, ready: bool) -> AedtPoolConfig:
         """Deployment hook, intentionally not exposed as an operator UI toggle."""
         if ready and not self.bootstrap_token:
             raise ValueError("a non-empty session-host bootstrap token is required")
+        was_enabled = self.config().enabled
         self.db.set_setting("aedt_pool_adapter_ready", "1" if ready else "0")
-        if not ready and self.config().enabled:
+        self._invalidate_config()
+        if not ready and was_enabled:
             self._request_all_sessions_drain("session-host adapter disabled")
         return self.config()
 
@@ -553,6 +752,7 @@ class AedtPoolService:
         """
         normalized = str(url or "").strip().rstrip("/")
         self.db.set_setting("aedt_pool_control_plane_url", normalized)
+        self._invalidate_config()
         return self.config()
 
     def set_enabled(self, enabled: bool) -> AedtPoolConfig:
@@ -562,6 +762,7 @@ class AedtPoolService:
         if enabled and not current.adapter_ready:
             raise ValueError("AEDT session-host adapter is not ready")
         self.db.set_setting("aedt_pool_enabled", "1" if enabled else "0")
+        self._invalidate_config()
         if not enabled:
             self._request_all_sessions_drain("operator disabled AEDT pool")
         return self.config()
@@ -633,6 +834,10 @@ class AedtPoolService:
             key: type(evidence.get(key)) is bool and bool(evidence.get(key))
             for key in required_bools
         }
+        mixed_isolation_passed = (
+            type(evidence.get("mixed_mft_ipmsm_isolation_passed")) is bool
+            and bool(evidence.get("mixed_mft_ipmsm_isolation_passed"))
+        )
         failures: list[str] = []
         if (baseline_desktops, baseline_projects) != (2, 2):
             failures.append("baseline must be 2 Desktops running 2 projects")
@@ -670,9 +875,10 @@ class AedtPoolService:
                     sibling_field_solution_passed,
                     fault_checkout_released_after_recycle_passed,
                     faulted_desktop_not_reused_passed,
+                    mixed_mft_ipmsm_isolation_passed,
                     evidence_json, failure_message,
                     finished_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     status,
@@ -696,6 +902,7 @@ class AedtPoolService:
                     int(checks["sibling_field_solution_passed"]),
                     int(checks["fault_checkout_released_after_recycle_passed"]),
                     int(checks["faulted_desktop_not_reused_passed"]),
+                    int(mixed_isolation_passed),
                     json.dumps(evidence, ensure_ascii=False, separators=(",", ":")),
                     "; ".join(failures),
                     now,
@@ -703,6 +910,7 @@ class AedtPoolService:
                 ),
             )
             validation_id = int(cursor.lastrowid)
+        self._invalidate_config()
         return self.get_validation(validation_id)
 
     def get_validation(self, validation_id: int) -> dict[str, Any]:
@@ -722,6 +930,15 @@ class AedtPoolService:
         request_key: str,
         project_name: str,
         placement_group: str | None = None,
+        workload_family: str = "",
+        session_profile: Any = "",
+        project_namespace: str = "",
+        isolation_policy: str = "family",
+        workspace_path: str = "",
+        protocol_version: int = 1,
+        client_deadline_at: str = "",
+        admission_timeout_seconds: int | None = None,
+        client_token: str = "",
         task_id: int = 0,
         allocation_id: int = 0,
         node_name: str = "",
@@ -743,41 +960,238 @@ class AedtPoolService:
                 raise ValueError("placement_group must not be empty")
         if type(exclusive_session) is not bool:
             raise ValueError("exclusive_session must be a boolean")
-        token = secrets.token_urlsafe(32)
+        if type(protocol_version) is not int or protocol_version not in {1, 2}:
+            raise ValueError("protocol_version must be 1 or 2")
+        resolved_family = _normalized_family(workload_family, project_name)
+        resolved_profile = _canonical_session_profile(session_profile)
+        normalized_namespace = str(project_namespace or "").strip()
+        normalized_workspace = str(workspace_path or "").strip()
+        if protocol_version >= 2:
+            if not str(workload_family or "").strip():
+                raise ValueError("protocol-v2 workload_family is required")
+            if not normalized_workspace:
+                raise ValueError("protocol-v2 workspace_path is required")
+            resolved_profile = canonical_expected_session_profile(session_profile)
+        normalized_isolation = str(isolation_policy or "family").strip().lower()
+        if normalized_isolation not in {"family", "shared_if_compatible", "exclusive"}:
+            raise ValueError(
+                "isolation_policy must be family, shared_if_compatible, or exclusive"
+            )
+        if normalized_isolation == "exclusive":
+            exclusive_session = True
+        if normalized_isolation == "shared_if_compatible":
+            mixed_validation = self.latest_validation()
+            if not (
+                mixed_validation
+                and mixed_validation.get("status") == "passed"
+                and bool(
+                    mixed_validation.get("mixed_mft_ipmsm_isolation_passed")
+                )
+            ):
+                raise ValueError(
+                    "shared_if_compatible requires passed mixed MFT/IPMSM "
+                    "isolation validation"
+                )
+        token = str(client_token or "").strip() or secrets.token_urlsafe(32)
+        if len(token) < 16:
+            raise ValueError("client_token must contain at least 16 characters")
         config = self.config()
         now_dt = self._now()
         now = _sql_time(now_dt)
         expires = _sql_time(now_dt + timedelta(seconds=config.lease_ttl_seconds))
+        explicit_deadline = str(client_deadline_at or "").strip()
+        if explicit_deadline and admission_timeout_seconds is not None:
+            raise ValueError(
+                "provide client_deadline_at or admission_timeout_seconds, not both"
+            )
+        if admission_timeout_seconds is None:
+            admission_timeout = config.admission_deadline_seconds
+        else:
+            if (
+                type(admission_timeout_seconds) is not int
+                or not 30 <= admission_timeout_seconds <= 3600
+            ):
+                raise ValueError(
+                    "admission_timeout_seconds must be an integer between 30 and 3600"
+                )
+            admission_timeout = admission_timeout_seconds
+        deadline = (
+            _parse_utc_time(explicit_deadline)
+            if explicit_deadline
+            else now_dt + timedelta(seconds=admission_timeout)
+        )
+        if deadline <= now_dt:
+            raise ValueError("client_deadline_at must be in the future")
+        requested_task_id = max(0, int(task_id))
+        resolved_allocation_id = max(0, int(allocation_id))
+        resolved_node_name = node_name.strip()
+        if not resolved_allocation_id:
+            # node_name is commonly reported as worker provenance.  A node-only
+            # value must never constrain placement in the central AEDT pool.
+            resolved_node_name = ""
         with self.db.connect() as conn:
-            try:
+            conn.execute("BEGIN IMMEDIATE")
+            # task_id is provenance.  Central-pool requests remain unpinned
+            # unless the caller explicitly supplies allocation_id.  When it
+            # does, derive and verify the affinity from the scheduler task.
+            if requested_task_id and resolved_allocation_id:
+                task = conn.execute(
+                    "SELECT allocation_id FROM tasks WHERE id = ?",
+                    (requested_task_id,),
+                ).fetchone()
+                # Public callers are required to provide a real task by the API.
+                # Direct service calls without a matching task are retained for
+                # trusted/internal compatibility (including old control scripts).
+                if task:
+                    task_allocation_id = int(task["allocation_id"] or 0)
+                    if not task_allocation_id:
+                        raise ValueError("task has no active allocation for affinity")
+                    else:
+                        if (
+                            resolved_allocation_id
+                            and resolved_allocation_id != task_allocation_id
+                        ):
+                            raise ValueError(
+                                "requested allocation does not belong to task_id"
+                            )
+                        task_allocation = conn.execute(
+                            "SELECT node_name FROM allocations WHERE id = ?",
+                            (task_allocation_id,),
+                        ).fetchone()
+                        task_node_name = (
+                            str(task_allocation["node_name"] or "")
+                            if task_allocation
+                            else ""
+                        )
+                        if (
+                            resolved_node_name
+                            and _short_node_name(resolved_node_name)
+                            != _short_node_name(task_node_name)
+                        ):
+                            raise ValueError("requested node does not belong to task_id")
+                        resolved_allocation_id = task_allocation_id
+                        resolved_node_name = task_node_name
+            token_hash = _token_hash(token)
+            existing = conn.execute(
+                """
+                SELECT l.*, t.status AS scheduler_task_status
+                FROM aedt_project_leases l
+                LEFT JOIN tasks t ON t.id = l.task_id
+                WHERE l.request_key = ?
+                """,
+                (request_key,),
+            ).fetchone()
+            lease_id = 0
+            if existing and secrets.compare_digest(
+                str(existing["client_token_hash"]), token_hash
+            ):
+                # A create response can be lost.  The original token makes the
+                # retry exactly idempotent, including if the lease has since
+                # reached a terminal state.
+                lease_id = int(existing["id"])
+            elif existing:
+                existing_state = str(existing["state"])
+                task_terminal = str(existing["scheduler_task_status"] or "") in {
+                    TaskStatus.COMPLETED.value,
+                    TaskStatus.FAILED.value,
+                    TaskStatus.CANCELLED.value,
+                }
+                queued_abandoned = existing_state == "queued" and (
+                    str(existing["expires_at"] or "") <= now
+                    or str(existing["client_deadline_at"] or "") <= now
+                    or task_terminal
+                )
+                offered_abandoned = existing_state == "offered" and (
+                    str(existing["offer_expires_at"] or "") <= now or task_terminal
+                )
+                replaceable = (
+                    existing_state in LEASE_TERMINAL_STATES
+                    or queued_abandoned
+                    or offered_abandoned
+                )
+                if not replaceable:
+                    raise ValueError(
+                        "request_key is owned by a live lease; reuse the original "
+                        "client token or wait for terminal cleanup"
+                    )
+                old_lease_id = int(existing["id"])
+                old_session_id = int(existing["session_id"] or 0)
+                archived_key = f"{request_key}#superseded:{old_lease_id}"
+                if existing_state in LEASE_TERMINAL_STATES:
+                    conn.execute(
+                        """
+                        UPDATE aedt_project_leases
+                        SET request_key = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (archived_key, now, old_lease_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE aedt_project_leases
+                        SET request_key = ?, state = 'expired', session_id = NULL,
+                            slot_index = NULL,
+                            failure_message = 'durable request was abandoned and replayed',
+                            finished_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (archived_key, now, now, old_lease_id),
+                    )
+                    if old_session_id:
+                        self._refresh_session_state(conn, old_session_id, now)
+
+            if not lease_id:
+                duplicate_project = conn.execute(
+                    """
+                    SELECT id FROM aedt_project_leases
+                    WHERE project_name = ?
+                      AND state IN (
+                          'queued','offered','leased','attaching','active','releasing'
+                      )
+                    LIMIT 1
+                    """,
+                    (project_name,),
+                ).fetchone()
+                if duplicate_project and protocol_version >= 2:
+                    raise ValueError("project_name is already owned by a live lease")
                 cursor = conn.execute(
                     """
                     INSERT INTO aedt_project_leases (
-                        request_key, project_name, placement_group, task_id,
+                        request_key, project_name, placement_group,
+                        workload_family, session_profile, project_namespace,
+                        isolation_policy, workspace_path, protocol_version, task_id,
                         requested_allocation_id, requested_node_name,
                         exclusive_session, state, client_token_hash,
-                        last_heartbeat_at, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+                        last_heartbeat_at, expires_at, client_deadline_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                              'queued', ?, ?, ?, ?)
                     """,
                     (
                         request_key,
                         project_name,
                         resolved_placement_group,
-                        max(0, int(task_id)),
-                        max(0, int(allocation_id)),
-                        node_name.strip(),
+                        resolved_family,
+                        resolved_profile,
+                        normalized_namespace,
+                        normalized_isolation,
+                        normalized_workspace,
+                        protocol_version,
+                        requested_task_id,
+                        resolved_allocation_id,
+                        resolved_node_name,
                         int(exclusive_session),
-                        _token_hash(token),
+                        token_hash,
                         now,
                         expires,
+                        _sql_time(deadline),
                     ),
                 )
-            except Exception as exc:
-                if "UNIQUE constraint failed" in str(exc):
-                    raise ValueError("request_key already exists; reuse the original client token") from exc
-                raise
-            lease_id = int(cursor.lastrowid)
-        self.reconcile(execute=True)
+                lease_id = int(cursor.lastrowid)
+            if config.operational:
+                self._place_queued_leases(
+                    conn, now, lease_ids=(lease_id,), config=config
+                )
         return self.get_lease(lease_id), token
 
     def _authorize_lease(self, lease_id: int, token: str) -> dict[str, Any]:
@@ -791,7 +1205,18 @@ class AedtPoolService:
             row = conn.execute(
                 """
                 SELECT l.*, s.session_key, s.endpoint, s.node_name AS session_node_name,
-                       s.allocation_id AS session_allocation_id
+                       s.allocation_id AS session_allocation_id,
+                       s.process_id AS session_process_id,
+                       s.slots_total AS session_slots_total,
+                       s.solve_batch_sealed_at,
+                       (SELECT COUNT(*) FROM aedt_project_leases live
+                        WHERE live.session_id = l.session_id
+                          AND live.state IN (
+                              'offered','leased','attaching','active','releasing'
+                          )) AS session_live_lease_count,
+                       (SELECT COUNT(*) FROM aedt_project_leases active
+                        WHERE active.session_id = l.session_id
+                          AND active.state = 'active') AS session_active_lease_count
                 FROM aedt_project_leases l
                 LEFT JOIN aedt_sessions s ON s.id = l.session_id
                 WHERE l.id = ?
@@ -801,86 +1226,406 @@ class AedtPoolService:
             if not row:
                 raise KeyError(lease_id)
             item = dict(row)
+            item["expected_aedt_version"] = (
+                EXPECTED_AEDT_VERSION
+                if str(item.get("session_profile") or "")
+                else ""
+            )
+            item["solve_permit_granted"] = bool(
+                str(item.get("solve_permit_at") or "")
+            )
+            item["solve_permit_required"] = bool(
+                int(item.get("protocol_version") or 1) >= 2
+                and int(item.get("session_id") or 0)
+                and str(item.get("state") or "") == "active"
+                and not item["solve_permit_granted"]
+            )
             if not include_secret_hash:
                 item.pop("client_token_hash", None)
             return item
 
     def lease_status(self, lease_id: int, token: str) -> dict[str, Any]:
         self._authorize_lease(lease_id, token)
-        return self.get_lease(lease_id, include_secret_hash=False)
+        item = self.get_lease(lease_id, include_secret_hash=False)
+        item["legacy_state"] = (
+            "leased" if item.get("state") in {"offered", "attaching"} else item.get("state")
+        )
+        return item
 
-    def heartbeat_lease(self, lease_id: int, token: str) -> dict[str, Any]:
-        lease = self._authorize_lease(lease_id, token)
-        if lease["state"] not in {"queued", "leased", "active", "releasing"}:
-            raise ValueError(f"lease is {lease['state']}")
+    def heartbeat_lease(
+        self, lease_id: int, token: str, *, phase: str = ""
+    ) -> dict[str, Any]:
+        normalized_phase = str(phase or "").strip().lower()
+        if normalized_phase and normalized_phase not in {
+            "waiting",
+            "attaching",
+            "solving",
+            "postprocess",
+            "releasing",
+        }:
+            raise ValueError("invalid lease heartbeat phase")
         config = self.config()
         now = self._now()
-        next_state = "active" if lease["state"] == "leased" else lease["state"]
+        now_sql = _sql_time(now)
+        token_hash = _token_hash(token)
         with self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM aedt_project_leases WHERE id = ?",
+                (int(lease_id),),
+            ).fetchone()
+            if not row:
+                raise KeyError(lease_id)
+            if not secrets.compare_digest(str(row["client_token_hash"]), token_hash):
+                raise PermissionError("invalid lease token")
+            current_state = str(row["state"])
+            if current_state not in LEASE_LIVE_STATES:
+                raise ValueError(f"lease is {current_state}")
+            cursor = conn.execute(
+                """
+                UPDATE aedt_project_leases SET
+                    state = CASE
+                        WHEN protocol_version < 2 AND state = 'leased'
+                        THEN 'active' ELSE state END,
+                    last_heartbeat_at = ?, expires_at = ?,
+                    offer_expires_at = CASE
+                        WHEN protocol_version >= 2 AND state = 'offered'
+                        THEN ? ELSE offer_expires_at END,
+                    fault_phase = CASE WHEN ? = '' THEN fault_phase ELSE ? END,
+                    updated_at = ?
+                WHERE id = ? AND state = ? AND client_token_hash = ?
+                """,
+                (
+                    now_sql,
+                    _sql_time(now + timedelta(seconds=config.lease_ttl_seconds)),
+                    _sql_time(now + timedelta(seconds=config.offer_ack_seconds)),
+                    normalized_phase,
+                    normalized_phase,
+                    now_sql,
+                    int(lease_id),
+                    current_state,
+                    token_hash,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("lease state changed while heartbeating")
+            if current_state == "queued" and config.operational:
+                self._place_queued_leases(
+                    conn, now_sql, lease_ids=(int(lease_id),), config=config
+                )
+        return self.get_lease(lease_id, include_secret_hash=False)
+
+    def accept_lease(self, lease_id: int, token: str) -> dict[str, Any]:
+        lease = self._authorize_lease(lease_id, token)
+        if int(lease.get("protocol_version") or 1) < 2:
+            if lease["state"] in {"leased", "active"}:
+                return self.get_lease(lease_id, include_secret_hash=False)
+            raise ValueError(f"lease is {lease['state']}")
+        if lease["state"] in {"attaching", "active"}:
+            return self.get_lease(lease_id, include_secret_hash=False)
+        if lease["state"] != "offered":
+            raise ValueError(f"lease is {lease['state']}")
+        now_dt = self._now()
+        now = _sql_time(now_dt)
+        if str(lease.get("offer_expires_at") or "") <= now:
+            raise ValueError("lease offer expired")
+        config = self.config()
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE aedt_project_leases
+                SET state = 'attaching', accepted_at = ?,
+                    last_heartbeat_at = ?, expires_at = ?, updated_at = ?
+                WHERE id = ? AND state = 'offered' AND offer_expires_at > ?
+                """,
+                (
+                    now,
+                    now,
+                    _sql_time(now_dt + timedelta(seconds=config.lease_ttl_seconds)),
+                    now,
+                    int(lease_id),
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("lease offer expired or was already claimed")
+        return self.get_lease(lease_id, include_secret_hash=False)
+
+    def activate_lease(self, lease_id: int, token: str) -> dict[str, Any]:
+        lease = self._authorize_lease(lease_id, token)
+        if lease["state"] == "active":
+            return self.get_lease(lease_id, include_secret_hash=False)
+        if int(lease.get("protocol_version") or 1) < 2:
+            if lease["state"] != "leased":
+                raise ValueError(f"lease is {lease['state']}")
+        elif lease["state"] != "attaching":
+            raise ValueError(f"lease is {lease['state']}")
+        now_dt = self._now()
+        now = _sql_time(now_dt)
+        config = self.config()
+        with self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE aedt_project_leases
+                SET state = 'active', activated_at = COALESCE(activated_at, ?),
+                    last_heartbeat_at = ?, expires_at = ?, updated_at = ?
+                WHERE id = ? AND state = ?
+                """,
+                (
+                    now,
+                    now,
+                    _sql_time(now_dt + timedelta(seconds=config.lease_ttl_seconds)),
+                    now,
+                    int(lease_id),
+                    str(lease["state"]),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("lease state changed while activating")
+            self._grant_solve_batch_if_ready(
+                conn,
+                int(lease.get("session_id") or 0),
+                now,
+                allow_underfilled=False,
+            )
+        return self.get_lease(lease_id, include_secret_hash=False)
+
+    def _grant_solve_batch_if_ready(
+        self,
+        conn: Any,
+        session_id: int,
+        now: str,
+        *,
+        allow_underfilled: bool,
+    ) -> bool:
+        """Atomically seal one Desktop batch before any native solve starts."""
+
+        if session_id <= 0:
+            return False
+        session = conn.execute(
+            "SELECT * FROM aedt_sessions WHERE id = ?", (int(session_id),)
+        ).fetchone()
+        if not session or str(session["state"]) not in {"ready", "busy"}:
+            return False
+        occupants = conn.execute(
+            """
+            SELECT id, state, exclusive_session FROM aedt_project_leases
+            WHERE session_id = ?
+              AND state IN ('offered','leased','attaching','active','releasing')
+            ORDER BY id ASC
+            """,
+            (int(session_id),),
+        ).fetchall()
+        if not occupants or any(str(row["state"]) != "active" for row in occupants):
+            return False
+        full = len(occupants) >= int(session["slots_total"] or 1)
+        exclusive = any(bool(row["exclusive_session"]) for row in occupants)
+        if not (full or exclusive or allow_underfilled):
+            return False
+        if not str(session["solve_batch_sealed_at"] or ""):
+            conn.execute(
+                """
+                UPDATE aedt_sessions
+                SET solve_batch_sealed_at = ?,
+                    solve_batch_generation = solve_batch_generation + 1,
+                    updated_at = ?
+                WHERE id = ? AND solve_batch_sealed_at IS NULL
+                """,
+                (now, now, int(session_id)),
+            )
+        generation = int(
+            conn.execute(
+                "SELECT solve_batch_generation FROM aedt_sessions WHERE id = ?",
+                (int(session_id),),
+            ).fetchone()[0]
+        )
+        conn.execute(
+            """
+            UPDATE aedt_project_leases
+            SET solve_permit_at = COALESCE(solve_permit_at, ?),
+                solve_permit_generation = ?, updated_at = ?
+            WHERE session_id = ? AND state = 'active'
+            """,
+            (now, generation, now, int(session_id)),
+        )
+        return True
+
+    def request_solve_permit(
+        self,
+        lease_id: int,
+        token: str,
+        *,
+        seal_underfilled: bool = False,
+    ) -> dict[str, Any]:
+        """Seal an underfilled active batch after the bounded client wait."""
+
+        if type(seal_underfilled) is not bool:
+            raise ValueError("seal_underfilled must be a boolean")
+        token_hash = _token_hash(token)
+        now_dt = self._now()
+        now = _sql_time(now_dt)
+        config = self.config()
+        with self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            lease = conn.execute(
+                "SELECT * FROM aedt_project_leases WHERE id = ?",
+                (int(lease_id),),
+            ).fetchone()
+            if not lease:
+                raise KeyError(lease_id)
+            if not secrets.compare_digest(
+                str(lease["client_token_hash"]), token_hash
+            ):
+                raise PermissionError("invalid lease token")
+            if str(lease["state"]) != "active":
+                raise ValueError(f"lease is {lease['state']}")
             conn.execute(
                 """
                 UPDATE aedt_project_leases
-                SET state = ?, last_heartbeat_at = ?, expires_at = ?, updated_at = ?
-                WHERE id = ?
+                SET last_heartbeat_at = ?, expires_at = ?,
+                    fault_phase = 'waiting', updated_at = ?
+                WHERE id = ? AND state = 'active' AND client_token_hash = ?
                 """,
                 (
-                    next_state,
-                    _sql_time(now),
-                    _sql_time(now + timedelta(seconds=config.lease_ttl_seconds)),
-                    _sql_time(now),
+                    now,
+                    _sql_time(now_dt + timedelta(seconds=config.lease_ttl_seconds)),
+                    now,
                     int(lease_id),
+                    token_hash,
                 ),
+            )
+            self._grant_solve_batch_if_ready(
+                conn,
+                int(lease["session_id"] or 0),
+                now,
+                allow_underfilled=seal_underfilled,
             )
         return self.get_lease(lease_id, include_secret_hash=False)
 
     def bind_lease_project_name(
         self, lease_id: int, token: str, project_name: str
     ) -> dict[str, Any]:
-        lease = self._authorize_lease(lease_id, token)
         project_name = project_name.strip()
         if not project_name:
             raise ValueError("project_name is required")
-        if lease["state"] not in {"queued", "leased", "active"}:
-            raise ValueError(f"lease is {lease['state']}")
+        token_hash = _token_hash(token)
         with self.db.connect() as conn:
-            conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            lease = conn.execute(
+                "SELECT * FROM aedt_project_leases WHERE id = ?",
+                (int(lease_id),),
+            ).fetchone()
+            if not lease:
+                raise KeyError(lease_id)
+            if not secrets.compare_digest(
+                str(lease["client_token_hash"]), token_hash
+            ):
+                raise PermissionError("invalid lease token")
+            current_state = str(lease["state"])
+            if current_state not in {
+                "queued", "offered", "leased", "attaching", "active"
+            }:
+                raise ValueError(f"lease is {current_state}")
+            if int(lease["protocol_version"] or 1) >= 2:
+                duplicate = conn.execute(
+                    """
+                    SELECT 1 FROM aedt_project_leases
+                    WHERE id != ? AND project_name = ?
+                      AND state IN (
+                          'queued','offered','leased','attaching','active','releasing'
+                      )
+                    LIMIT 1
+                    """,
+                    (int(lease_id), project_name),
+                ).fetchone()
+                if duplicate:
+                    raise ValueError("project_name is already owned by a live lease")
+            cursor = conn.execute(
                 """
                 UPDATE aedt_project_leases
                 SET project_name = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
+                WHERE id = ? AND state = ? AND client_token_hash = ?
                 """,
-                (project_name, int(lease_id)),
+                (project_name, int(lease_id), current_state, token_hash),
             )
+            if cursor.rowcount != 1:
+                raise ValueError("lease state changed while binding project name")
+        return self.get_lease(lease_id, include_secret_hash=False)
+
+    def cancel_lease(
+        self,
+        lease_id: int,
+        token: str,
+        *,
+        reason: str = "client cancelled lease",
+    ) -> dict[str, Any]:
+        now = _sql_time(self._now())
+        token_hash = _token_hash(token)
+        with self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            lease = conn.execute(
+                "SELECT * FROM aedt_project_leases WHERE id = ?",
+                (int(lease_id),),
+            ).fetchone()
+            if not lease:
+                raise KeyError(lease_id)
+            if not secrets.compare_digest(
+                str(lease["client_token_hash"]), token_hash
+            ):
+                raise PermissionError("invalid lease token")
+            current_state = str(lease["state"])
+            if current_state not in LEASE_TERMINAL_STATES:
+                owns_project = current_state in {
+                    "attaching", "active", "releasing"
+                }
+                if (
+                    current_state == "leased"
+                    and int(lease["protocol_version"] or 1) < 2
+                ):
+                    owns_project = True
+                if owns_project and lease["session_id"]:
+                    # Two phase release: only the session host can confirm that
+                    # the project is closed and make this slot reusable.
+                    cursor = conn.execute(
+                        """
+                        UPDATE aedt_project_leases
+                        SET state = 'releasing', failure_message = ?,
+                            release_requested_at = ?, updated_at = ?
+                        WHERE id = ? AND state = ? AND client_token_hash = ?
+                        """,
+                        (
+                            reason.strip(), now, now, int(lease_id), current_state,
+                            token_hash,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ValueError("lease state changed while cancelling")
+                else:
+                    cursor = conn.execute(
+                        """
+                        UPDATE aedt_project_leases
+                        SET state = 'cancelled', session_id = NULL, slot_index = NULL,
+                            failure_message = ?, finished_at = ?, updated_at = ?
+                        WHERE id = ? AND state = ? AND client_token_hash = ?
+                        """,
+                        (
+                            reason.strip(), now, now, int(lease_id), current_state,
+                            token_hash,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ValueError("lease state changed while cancelling")
+                    if lease["session_id"]:
+                        self._refresh_session_state(
+                            conn, int(lease["session_id"]), now
+                        )
         return self.get_lease(lease_id, include_secret_hash=False)
 
     def release_lease(self, lease_id: int, token: str) -> dict[str, Any]:
-        lease = self._authorize_lease(lease_id, token)
-        if lease["state"] in {"released", "failed", "cancelled", "expired"}:
-            return self.get_lease(lease_id, include_secret_hash=False)
-        now = _sql_time(self._now())
-        with self.db.connect() as conn:
-            if lease.get("session_id"):
-                # Two phase release: only the session host can confirm that the
-                # project is closed and make this slot reusable.
-                conn.execute(
-                    """
-                    UPDATE aedt_project_leases
-                    SET state = 'releasing', release_requested_at = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (now, now, int(lease_id)),
-                )
-            else:
-                conn.execute(
-                    """
-                    UPDATE aedt_project_leases
-                    SET state = 'cancelled', finished_at = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (now, now, int(lease_id)),
-                )
-        self.reconcile(execute=True)
-        return self.get_lease(lease_id, include_secret_hash=False)
+        """Protocol-v1 compatibility alias for cancel/release."""
+
+        return self.cancel_lease(lease_id, token, reason="client released lease")
 
     def report_project_fault(
         self,
@@ -888,6 +1633,8 @@ class AedtPoolService:
         token: str,
         *,
         fault_kind: str,
+        phase: str = "",
+        evidence: dict[str, Any] | None = None,
         sibling_grace_seconds: int = 900,
         failure_message: str = "",
     ) -> dict[str, Any]:
@@ -901,13 +1648,72 @@ class AedtPoolService:
         """
         lease = self._authorize_lease(lease_id, token)
         normalized = fault_kind.strip().lower()
-        if normalized not in {"pre_solve", "script_error", "solver_timeout", "aedt_death"}:
-            raise ValueError("fault_kind must be pre_solve, script_error, solver_timeout, or aedt_death")
-        if normalized in {"pre_solve", "script_error"}:
-            return self.release_lease(lease_id, token)
+        allowed = {
+            "admission_timeout",
+            "attach_failed",
+            "project_create_failed",
+            "pre_solve",
+            "script_error",
+            "solver_timeout",
+            "aedt_transport_death",
+            "aedt_death",  # protocol-v1 compatibility
+        }
+        if normalized not in allowed:
+            raise ValueError(f"fault_kind must be one of: {', '.join(sorted(allowed))}")
+        normalized_phase = str(phase or "").strip().lower()
+        evidence_json = json.dumps(
+            evidence or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE aedt_project_leases
+                SET fault_phase = ?, fault_kind = ?, fault_evidence_json = ?,
+                    failure_message = CASE WHEN ? = '' THEN failure_message ELSE ? END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    normalized_phase,
+                    normalized,
+                    evidence_json,
+                    failure_message.strip(),
+                    failure_message.strip(),
+                    int(lease_id),
+                ),
+            )
+        if normalized in {
+            "admission_timeout",
+            "attach_failed",
+            "project_create_failed",
+            "pre_solve",
+            "script_error",
+        }:
+            return self.cancel_lease(
+                lease_id,
+                token,
+                reason=failure_message.strip() or normalized.replace("_", " "),
+            )
         session_id = int(lease.get("session_id") or 0)
         if not session_id:
-            return self.release_lease(lease_id, token)
+            return self.cancel_lease(lease_id, token, reason=normalized)
+        if normalized == "aedt_transport_death":
+            # A client cannot authoritatively kill or quarantine a shared
+            # Desktop.  Stop new placement briefly; the next authenticated
+            # host heartbeat proves it is alive and recovers the session.
+            message = failure_message.strip() or "project client lost AEDT transport"
+            now = _sql_time(self._now())
+            with self.db.connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE aedt_sessions
+                    SET state = 'unhealthy', failure_message = ?,
+                        drain_requested_at = NULL, updated_at = ?
+                    WHERE id = ? AND state IN ('ready','busy')
+                    """,
+                    (f"client transport suspect: {message}", now, session_id),
+                )
+            return self.cancel_lease(lease_id, token, reason=message)
         if normalized == "aedt_death":
             session = self.get_session(session_id)
             # Only a host token can normally declare a Desktop dead.  A client
@@ -948,7 +1754,7 @@ class AedtPoolService:
                 UPDATE aedt_project_leases
                 SET state = 'releasing', failure_message = ?,
                     release_requested_at = ?, updated_at = ?
-                WHERE id = ? AND state IN ('leased','active')
+                WHERE id = ? AND state IN ('leased','attaching','active')
                 """,
                 (failure_message.strip() or "solver timeout", now, now, int(lease_id)),
             )
@@ -980,10 +1786,112 @@ class AedtPoolService:
             )
         return self.get_lease(lease_id, include_secret_hash=False)
 
+    def report_session_fault(
+        self,
+        session_id: int,
+        token: str,
+        *,
+        kind: str,
+        failure_message: str = "",
+        evidence: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Record a process-level fault only an authenticated host can confirm."""
+
+        session = self._authorize_session(session_id, token)
+        normalized = str(kind or "").strip().lower()
+        if normalized not in {"confirmed_aedt_death", "native_probe_suspect"}:
+            raise ValueError(
+                "session fault kind must be confirmed_aedt_death or native_probe_suspect"
+            )
+        now = _sql_time(self._now())
+        metadata = json.dumps(
+            evidence or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        native_snapshot_path = str(
+            (evidence or {}).get("native_snapshot_path") or ""
+        ).strip()
+        message = failure_message.strip() or "session host confirmed AEDT process death"
+        with self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if normalized == "native_probe_suspect":
+                conn.execute(
+                    """
+                    UPDATE aedt_sessions
+                    SET state = 'unhealthy', quarantine_reason = '',
+                        failure_message = ?, last_fault_evidence_json = ?,
+                        last_fault_at = ?,
+                        native_snapshot_path = CASE WHEN ? = ''
+                            THEN native_snapshot_path ELSE ? END,
+                        drain_requested_at = NULL, last_heartbeat_at = ?,
+                        updated_at = ?
+                    WHERE id = ? AND state IN ('ready','busy','unhealthy')
+                    """,
+                    (
+                        f"host native liveness suspect: {message}",
+                        metadata,
+                        now,
+                        native_snapshot_path,
+                        native_snapshot_path,
+                        now,
+                        now,
+                        int(session_id),
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE aedt_sessions
+                    SET state = 'unhealthy', quarantine_reason = ?,
+                        failure_message = ?, last_fault_evidence_json = ?,
+                        last_fault_at = ?,
+                        native_snapshot_path = CASE WHEN ? = ''
+                            THEN native_snapshot_path ELSE ? END,
+                        drain_requested_at = COALESCE(drain_requested_at, ?),
+                        updated_at = ?
+                    WHERE id = ? AND state IN ('ready','busy','draining','unhealthy')
+                    """,
+                    (
+                        normalized,
+                        message,
+                        metadata,
+                        now,
+                        native_snapshot_path,
+                        native_snapshot_path,
+                        now,
+                        now,
+                        int(session_id),
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE allocations
+                    SET state = 'draining', drain_reason = ?,
+                        drain_at = COALESCE(drain_at, ?), updated_at = ?
+                    WHERE id = ? AND state IN ('warm','active','draining')
+                    """,
+                    (
+                        FAULTED_DESKTOP_ALLOCATION_RECYCLE_REASON,
+                        now,
+                        now,
+                        int(session.get("allocation_id") or 0),
+                    ),
+                )
+        return self.get_session(session_id, include_secret_hash=False)
+
     def authorize_bootstrap(self, token: str) -> None:
         """Authorize a control-plane mutation with the shared bootstrap secret."""
         if not self.bootstrap_token or not secrets.compare_digest(self.bootstrap_token, token):
             raise PermissionError("invalid session-host bootstrap token")
+
+    def authorize_lease_client(self, token: str) -> None:
+        """Authorize lease creation without operator or host authority."""
+
+        if not self.lease_client_token:
+            raise RuntimeError("AEDT lease client credential is not configured")
+        if not secrets.compare_digest(
+            self.lease_client_token, str(token or "")
+        ):
+            raise PermissionError("invalid AEDT lease client credential")
 
     def _authorize_bootstrap(self, token: str) -> None:
         """Backward-compatible internal alias for bootstrap authorization."""
@@ -995,6 +1903,9 @@ class AedtPoolService:
         allocation_id: int,
         node_name: str,
         host_id: str,
+        actual_node_name: str = "",
+        slurm_job_id: str = "",
+        host_process_id: str = "",
         bootstrap_token: str,
         session_id: int = 0,
     ) -> dict[str, Any] | None:
@@ -1003,6 +1914,9 @@ class AedtPoolService:
         if not normalized_host_id:
             raise ValueError("host_id is required")
         normalized_node_name = node_name.strip()
+        normalized_actual_node = actual_node_name.strip()
+        normalized_slurm_job_id = slurm_job_id.strip()
+        normalized_host_process_id = host_process_id.strip()
         requested_session_id = max(0, int(session_id or 0))
         now = _sql_time(self._now())
         with self.db.connect() as conn:
@@ -1044,10 +1958,52 @@ class AedtPoolService:
                 ).fetchone()
             if not row:
                 return None
+            allocation = conn.execute(
+                "SELECT * FROM allocations WHERE id = ?",
+                (int(row["allocation_id"] or 0),),
+            ).fetchone()
+            if not allocation:
+                raise ValueError("session allocation no longer exists")
+            if int(row["allocation_id"] or 0) != int(allocation_id):
+                raise ValueError("host claimed a different allocation")
+            expected_node = str(row["node_name"] or allocation["node_name"] or "")
+            if (
+                normalized_actual_node
+                and _short_node_name(normalized_actual_node)
+                != _short_node_name(expected_node)
+            ):
+                raise ValueError(
+                    f"host is running on {normalized_actual_node}, expected {expected_node}"
+                )
+            expected_slurm_job = str(allocation["slurm_job_id"] or "").strip()
+            if (
+                normalized_slurm_job_id
+                and expected_slurm_job
+                and normalized_slurm_job_id != expected_slurm_job
+            ):
+                raise ValueError(
+                    f"host Slurm job {normalized_slurm_job_id} does not own allocation "
+                    f"{int(allocation_id)} ({expected_slurm_job})"
+                )
+            host_task_id = int(row["host_task_id"] or 0)
+            if host_task_id:
+                task = conn.execute(
+                    "SELECT * FROM tasks WHERE id = ?", (host_task_id,)
+                ).fetchone()
+                if not task:
+                    raise ValueError("session host task no longer exists")
+                if (
+                    int(task["requested_allocation_id"] or 0) != int(allocation_id)
+                    or int(task["allocation_id"] or 0) != int(allocation_id)
+                    or str(task["status"])
+                    not in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}
+                ):
+                    raise ValueError("session host task is not pinned to its allocation")
             cursor = conn.execute(
                 """
                 UPDATE aedt_sessions
                 SET host_id = ?, start_claimed_at = COALESCE(start_claimed_at, ?),
+                    actual_node_name = ?, host_slurm_job_id = ?, host_process_id = ?,
                     updated_at = ?
                 WHERE id = ? AND state = 'starting'
                   AND (host_id = '' OR host_id = ?)
@@ -1055,6 +2011,9 @@ class AedtPoolService:
                 (
                     normalized_host_id,
                     now,
+                    normalized_actual_node or expected_node,
+                    normalized_slurm_job_id or expected_slurm_job,
+                    normalized_host_process_id,
                     now,
                     int(row["id"]),
                     normalized_host_id,
@@ -1075,6 +2034,11 @@ class AedtPoolService:
         host_id: str,
         endpoint: str,
         process_id: str,
+        artifact_dir: str = "",
+        error_log_path: str = "",
+        journal_path: str = "",
+        runtime_metadata: dict[str, Any] | None = None,
+        session_profile: Any = "",
         bootstrap_token: str,
         host_token: str = "",
     ) -> tuple[dict[str, Any], str]:
@@ -1084,6 +2048,16 @@ class AedtPoolService:
             raise ValueError("host_id is required")
         normalized_endpoint = endpoint.strip()
         normalized_process_id = process_id.strip()
+        normalized_artifact_dir = artifact_dir.strip()
+        normalized_error_log_path = error_log_path.strip()
+        normalized_journal_path = journal_path.strip()
+        runtime_metadata_json = json.dumps(
+            runtime_metadata or {},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        normalized_session_profile = canonical_expected_session_profile(session_profile)
         presented_host_token = host_token.strip()
         issued_host_token = presented_host_token or secrets.token_urlsafe(32)
         now = _sql_time(self._now())
@@ -1093,6 +2067,9 @@ class AedtPoolService:
             row = conn.execute("SELECT * FROM aedt_sessions WHERE id = ?", (int(session_id),)).fetchone()
             if not row:
                 raise KeyError(session_id)
+            existing_profile = str(row["session_profile"] or "")
+            if existing_profile and existing_profile != normalized_session_profile:
+                raise ValueError("session host profile does not match admitted lease profile")
             owns_claim = str(row["host_id"] or "") == normalized_host_id
             same_registration = bool(
                 owns_claim
@@ -1151,6 +2128,10 @@ class AedtPoolService:
                     """
                     UPDATE aedt_sessions
                     SET state = ?, endpoint = ?, process_id = ?,
+                        artifact_dir = ?, error_log_path = ?, journal_path = ?,
+                        runtime_metadata_json = ?,
+                        session_profile = CASE
+                            WHEN ? = '' THEN session_profile ELSE ? END,
                         host_token_hash = ?, started_at = ?, last_heartbeat_at = ?,
                         idle_since = ?, failure_message = '', drain_requested_at = NULL,
                         updated_at = ?
@@ -1160,6 +2141,12 @@ class AedtPoolService:
                         register_state,
                         normalized_endpoint,
                         normalized_process_id,
+                        normalized_artifact_dir,
+                        normalized_error_log_path,
+                        normalized_journal_path,
+                        runtime_metadata_json,
+                        normalized_session_profile,
+                        normalized_session_profile,
                         _token_hash(issued_host_token),
                         now,
                         now,
@@ -1203,6 +2190,10 @@ class AedtPoolService:
         host_id: str,
         bootstrap_token: str,
         failure_message: str,
+        artifact_dir: str = "",
+        error_log_path: str = "",
+        journal_path: str = "",
+        runtime_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self._authorize_bootstrap(bootstrap_token)
         now = _sql_time(self._now())
@@ -1210,14 +2201,66 @@ class AedtPoolService:
             cursor = conn.execute(
                 """
                 UPDATE aedt_sessions
-                SET state = 'failed', failure_message = ?, closed_at = ?, updated_at = ?
+                SET state = 'failed', failure_message = ?, artifact_dir = ?,
+                    error_log_path = ?, journal_path = ?, runtime_metadata_json = ?,
+                    closed_at = ?, updated_at = ?
                 WHERE id = ? AND state = 'starting' AND host_id = ?
                 """,
-                (failure_message.strip() or "AEDT session start failed", now, now, int(session_id), host_id.strip()),
+                (
+                    failure_message.strip() or "AEDT session start failed",
+                    str(artifact_dir or "").strip(),
+                    str(error_log_path or "").strip(),
+                    str(journal_path or "").strip(),
+                    json.dumps(
+                        runtime_metadata or {},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    now,
+                    now,
+                    int(session_id),
+                    host_id.strip(),
+                ),
             )
             if cursor.rowcount != 1:
                 raise ValueError("session start claim is not owned by this host")
         return self.get_session(session_id, include_secret_hash=False)
+
+    def bind_session_host_task(self, session_id: int, task_id: int) -> None:
+        """Bind the sole host task before it can race the global scheduler."""
+
+        with self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            session = conn.execute(
+                "SELECT * FROM aedt_sessions WHERE id = ?", (int(session_id),)
+            ).fetchone()
+            task = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (int(task_id),)
+            ).fetchone()
+            if not session or not task:
+                raise ValueError("session or host task no longer exists")
+            allocation_id = int(session["allocation_id"] or 0)
+            if int(task["requested_allocation_id"] or 0) != allocation_id:
+                raise ValueError("session host task is not allocation-pinned")
+            cursor = conn.execute(
+                """
+                UPDATE aedt_sessions SET host_task_id = ?,
+                    host_stdout_path = ?, host_stderr_path = ?, updated_at = ?
+                WHERE id = ? AND state = 'starting'
+                  AND (host_task_id = 0 OR host_task_id = ?)
+                """,
+                (
+                    int(task_id),
+                    str(task["stdout_path"] or ""),
+                    str(task["stderr_path"] or ""),
+                    _sql_time(self._now()),
+                    int(session_id),
+                    int(task_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("session host task is already owned")
 
     def get_session(self, session_id: int, *, include_secret_hash: bool = True) -> dict[str, Any]:
         with self.db.connect() as conn:
@@ -1237,7 +2280,16 @@ class AedtPoolService:
             raise PermissionError("invalid session token")
         return session
 
-    def heartbeat_session(self, session_id: int, token: str) -> dict[str, Any]:
+    def heartbeat_session(
+        self,
+        session_id: int,
+        token: str,
+        *,
+        liveness_confirmed: bool = True,
+        process_id: str = "",
+        port: int = 0,
+        native_probe: str = "",
+    ) -> dict[str, Any]:
         now = _sql_time(self._now())
         with self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1253,6 +2305,19 @@ class AedtPoolService:
                 raise PermissionError("invalid session token")
             if session["state"] not in {"ready", "busy", "draining", "unhealthy"}:
                 raise ValueError(f"session is {session['state']}")
+            if not liveness_confirmed:
+                raise ValueError("host heartbeat requires fresh Desktop liveness proof")
+            if process_id and str(process_id).strip() != str(session["process_id"] or ""):
+                raise ValueError("heartbeat Desktop process_id does not match registration")
+            if port:
+                try:
+                    registered_port = int(str(session["endpoint"] or "").rsplit(":", 1)[1])
+                except (IndexError, ValueError):
+                    registered_port = 0
+                if int(port) != registered_port:
+                    raise ValueError("heartbeat Desktop port does not match registration")
+            if native_probe and str(native_probe) != "GetVersion":
+                raise ValueError("unsupported Desktop native liveness probe")
             setting_rows = {
                 str(item["key"]): str(item["value"])
                 for item in conn.execute(
@@ -1284,8 +2349,16 @@ class AedtPoolService:
             if (
                 pool_operational
                 and session["state"] == "unhealthy"
-                and str(session.get("failure_message") or "")
-                == SESSION_HEARTBEAT_TIMEOUT_MESSAGE
+                and (
+                    str(session.get("failure_message") or "")
+                    == SESSION_HEARTBEAT_TIMEOUT_MESSAGE
+                    or str(session.get("failure_message") or "").startswith(
+                        "client transport suspect:"
+                    )
+                    or str(session.get("failure_message") or "").startswith(
+                        "host native liveness suspect:"
+                    )
+                )
                 and not str(session.get("quarantine_reason") or "")
             ):
                 allocation = conn.execute(
@@ -1309,7 +2382,7 @@ class AedtPoolService:
                             """
                             SELECT COUNT(*) FROM aedt_project_leases
                             WHERE session_id = ?
-                              AND state IN ('leased','active','releasing')
+                              AND state IN ('offered','leased','attaching','active','releasing')
                             """,
                             (int(session_id),),
                         ).fetchone()[0]
@@ -1320,7 +2393,12 @@ class AedtPoolService:
                         SET state = ?, failure_message = '', drain_requested_at = NULL,
                             last_heartbeat_at = ?, idle_since = ?, updated_at = ?
                         WHERE id = ? AND state = 'unhealthy'
-                          AND failure_message = ? AND quarantine_reason = ''
+                          AND (
+                              failure_message = ?
+                              OR failure_message LIKE 'client transport suspect:%'
+                              OR failure_message LIKE 'host native liveness suspect:%'
+                          )
+                          AND quarantine_reason = ''
                         """,
                         (
                             "busy" if live else "ready",
@@ -1386,7 +2464,7 @@ class AedtPoolService:
                 conn.execute(
                     """
                     SELECT COUNT(*) FROM aedt_project_leases
-                    WHERE session_id = ? AND state IN ('leased','active')
+                    WHERE session_id = ? AND state IN ('offered','leased','attaching','active')
                     """,
                     (int(session_id),),
                 ).fetchone()[0]
@@ -1436,6 +2514,7 @@ class AedtPoolService:
     ) -> dict[str, Any]:
         self._authorize_session(session_id, token)
         now = _sql_time(self._now())
+        config = self.config()
         expected_state = "released" if success else "failed"
         normalized_failure = "" if success else failure_message.strip()
         replayed = False
@@ -1470,8 +2549,8 @@ class AedtPoolService:
                     ),
                 )
                 self._refresh_session_state(conn, int(session_id), now)
-        if not replayed:
-            self.reconcile(execute=True)
+                if config.operational:
+                    self._place_queued_leases(conn, now, config=config)
         return self.get_lease(lease_id, include_secret_hash=False)
 
     def close_session(
@@ -1495,7 +2574,7 @@ class AedtPoolService:
             live = conn.execute(
                 """
                 SELECT COUNT(*) FROM aedt_project_leases
-                WHERE session_id = ? AND state IN ('leased','active','releasing')
+                WHERE session_id = ? AND state IN ('offered','leased','attaching','active','releasing')
                 """,
                 (int(session_id),),
             ).fetchone()[0]
@@ -1512,9 +2591,11 @@ class AedtPoolService:
                         SET state = 'queued', session_id = NULL, slot_index = NULL,
                             requested_allocation_id = 0, requested_node_name = '',
                             acquired_at = NULL, release_requested_at = NULL,
+                            solve_permit_at = NULL,
+                            solve_permit_generation = 0,
                             failure_message = ?, last_heartbeat_at = ?, expires_at = ?,
                             updated_at = ?
-                        WHERE session_id = ? AND state IN ('leased','active','releasing')
+                        WHERE session_id = ? AND state IN ('offered','leased','attaching','active','releasing')
                         """,
                         (
                             failure_message.strip() or "AEDT session died; lease requeued",
@@ -1529,7 +2610,7 @@ class AedtPoolService:
                         """
                         UPDATE aedt_project_leases
                         SET state = 'failed', failure_message = ?, finished_at = ?, updated_at = ?
-                        WHERE session_id = ? AND state IN ('leased','active','releasing')
+                        WHERE session_id = ? AND state IN ('offered','leased','attaching','active','releasing')
                         """,
                         (failure_message.strip() or "AEDT session failed", now, now, int(session_id)),
                     )
@@ -1577,7 +2658,7 @@ class AedtPoolService:
             conn.execute(
                 """
                 SELECT COUNT(*) FROM aedt_project_leases
-                WHERE session_id = ? AND state IN ('leased','active','releasing')
+                WHERE session_id = ? AND state IN ('offered','leased','attaching','active','releasing')
                 """,
                 (session_id,),
             ).fetchone()[0]
@@ -1585,10 +2666,19 @@ class AedtPoolService:
         conn.execute(
             """
             UPDATE aedt_sessions
-            SET state = ?, idle_since = ?, updated_at = ?
+            SET state = ?, idle_since = ?,
+                solve_batch_sealed_at = CASE
+                    WHEN ? = 0 THEN NULL ELSE solve_batch_sealed_at END,
+                updated_at = ?
             WHERE id = ?
             """,
-            ("busy" if live else "ready", None if live else now, now, session_id),
+            (
+                "busy" if live else "ready",
+                None if live else now,
+                live,
+                now,
+                session_id,
+            ),
         )
 
     def _dedicated_allocations(
@@ -1628,13 +2718,50 @@ class AedtPoolService:
         ]
 
     @staticmethod
-    def _allocation_session_capacity(allocation: dict[str, Any], config: AedtPoolConfig) -> int:
-        project_slots = math.floor(
-            max(0, int(allocation.get("total_cpus") or 0))
-            * config.node_cpu_factor
-            / config.project_cpus
+    def _allocation_session_capacity(
+        allocation: dict[str, Any],
+        config: AedtPoolConfig,
+        *,
+        current_sessions: int = 0,
+    ) -> int:
+        """Bound host count by both Slurm CPU and memory reservations.
+
+        `current_sessions + floor(free/resource)` handles both already-reserved
+        hosts and newly planned `starting` rows whose task reservation has not
+        happened yet, without double counting either case.
+        """
+
+        slots = config.projects_per_session
+        session_cpus = max(1, config.project_cpus * slots)
+        session_memory_mb = max(1024, config.project_memory_mb * slots)
+        total_cpus = max(0, int(allocation.get("total_cpus") or 0))
+        total_memory_mb = max(0, int(allocation.get("total_memory_mb") or 0))
+        free_cpus = max(
+            0,
+            int(
+                allocation.get("free_cpus")
+                if allocation.get("free_cpus") is not None
+                else total_cpus
+            ),
         )
-        return max(1, project_slots // config.projects_per_session)
+        free_memory_mb = max(
+            0,
+            int(
+                allocation.get("free_memory_mb")
+                if allocation.get("free_memory_mb") is not None
+                else total_memory_mb
+            ),
+        )
+        current = max(0, int(current_sessions))
+        cpu_capacity = min(
+            total_cpus // session_cpus,
+            current + free_cpus // session_cpus,
+        )
+        memory_capacity = min(
+            total_memory_mb // session_memory_mb,
+            current + free_memory_mb // session_memory_mb,
+        )
+        return max(0, min(cpu_capacity, memory_capacity))
 
     def _plan(self, conn: Any, config: AedtPoolConfig) -> dict[str, Any]:
         state_counts = {
@@ -1663,7 +2790,7 @@ class AedtPoolService:
                 """
                 SELECT COUNT(*) FROM aedt_project_leases
                 WHERE exclusive_session = 1
-                  AND state IN ('queued','leased','active','releasing')
+                  AND state IN ('queued','offered','leased','attaching','active','releasing')
                 """
             ).fetchone()[0]
         )
@@ -1681,7 +2808,7 @@ class AedtPoolService:
                        END AS effective_placement_group
                 FROM aedt_project_leases
                 WHERE exclusive_session = 0
-                  AND state IN ('queued','leased','active','releasing')
+                  AND state IN ('queued','offered','leased','attaching','active','releasing')
                 ORDER BY id ASC
                 LIMIT ?
             )
@@ -1787,8 +2914,11 @@ class AedtPoolService:
             key=lambda row: (current_by_allocation.get(int(row["id"]), 0), int(row["id"])),
         ):
             allocation_id = int(allocation["id"])
-            capacity = self._allocation_session_capacity(allocation, config)
-            free = max(0, capacity - current_by_allocation.get(allocation_id, 0))
+            current_sessions = current_by_allocation.get(allocation_id, 0)
+            capacity = self._allocation_session_capacity(
+                allocation, config, current_sessions=current_sessions
+            )
+            free = max(0, capacity - current_sessions)
             for _ in range(min(free, start_needed - len(placements))):
                 placements.append(
                     {
@@ -1815,10 +2945,24 @@ class AedtPoolService:
             ]
             + [64]
         )
+        shape_memory_mb = max(
+            [
+                int(row.get("total_memory_mb") or 0)
+                for row in [*allocations, *pending_allocations]
+            ]
+            + [512 * 1024]
+        )
         sessions_per_new_node = max(
             1,
-            math.floor(shape_cpus * config.node_cpu_factor / config.project_cpus)
-            // config.projects_per_session,
+            self._allocation_session_capacity(
+                {
+                    "total_cpus": shape_cpus,
+                    "free_cpus": shape_cpus,
+                    "total_memory_mb": shape_memory_mb,
+                    "free_memory_mb": shape_memory_mb,
+                },
+                config,
+            ),
         )
         node_requests = (
             math.ceil(unplaced_after_pending / sessions_per_new_node)
@@ -1870,6 +3014,203 @@ class AedtPoolService:
         config = self.config()
         with self.db.connect() as conn:
             return self._plan(conn, config)
+
+    @staticmethod
+    def _lease_fits_session(
+        lease: Any,
+        session: Any,
+        occupants: list[Any],
+    ) -> bool:
+        if int(session["used_slots"] or 0) >= int(session["slots_total"]):
+            return False
+        if any(bool(item["exclusive_session"]) for item in occupants):
+            return False
+        if bool(lease["exclusive_session"]) and occupants:
+            return False
+
+        requested_profile = str(lease["session_profile"] or "")
+        fixed_profile = str(session["session_profile"] or "")
+        protocol_version = int(lease["protocol_version"] or 1)
+        if protocol_version >= 2:
+            if fixed_profile != requested_profile:
+                return False
+            if any(
+                int(item["protocol_version"] or 1) < 2
+                or str(item["session_profile"] or "") != requested_profile
+                for item in occupants
+            ):
+                return False
+
+        if protocol_version < 2:
+            if any(int(item["protocol_version"] or 1) >= 2 for item in occupants):
+                return False
+            group = str(lease["placement_group"] or "")
+            return all(str(item["placement_group"] or "") == group for item in occupants)
+
+        policy = str(lease["isolation_policy"] or "family")
+        family = str(lease["workload_family"] or "")
+        if policy == "family":
+            return all(str(item["workload_family"] or "") == family for item in occupants)
+        if policy == "shared_if_compatible":
+            return all(
+                int(item["protocol_version"] or 1) >= 2
+                and str(item["isolation_policy"] or "family")
+                == "shared_if_compatible"
+                for item in occupants
+            )
+        return not occupants
+
+    def _place_queued_leases(
+        self,
+        conn: Any,
+        now: str,
+        *,
+        lease_ids: tuple[int, ...] | None = None,
+        config: AedtPoolConfig | None = None,
+    ) -> int:
+        """Place only admission-ready leases in one short existing transaction."""
+
+        config = config or self.config()
+        if not config.operational:
+            return 0
+        ready_cutoff = _sql_time(
+            _parse_utc_time(now) - timedelta(seconds=config.queued_stale_seconds)
+        )
+        params: tuple[Any, ...] = (ready_cutoff,)
+        predicate = ""
+        if lease_ids:
+            placeholders = ",".join("?" for _ in lease_ids)
+            predicate = f" AND id IN ({placeholders})"
+            params = (ready_cutoff, *(int(item) for item in lease_ids))
+        queued = conn.execute(
+            "SELECT * FROM aedt_project_leases "
+            "WHERE state = 'queued' "
+            "AND (protocol_version < 2 OR last_heartbeat_at >= ?) "
+            f"{predicate} ORDER BY id ASC",
+            params,
+        ).fetchall()
+        placed = 0
+        offer_expires = _sql_time(
+            self._now() + timedelta(seconds=config.offer_ack_seconds)
+        )
+        allocation_age_cutoff = (
+            _sql_time(
+                self._now()
+                - timedelta(seconds=config.allocation_max_age_seconds)
+            )
+            if config.allocation_max_age_seconds
+            else ""
+        )
+        for lease in queued:
+            if str(lease["client_deadline_at"] or "") <= now:
+                continue
+            task_id = int(lease["task_id"] or 0)
+            if task_id:
+                task = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                if task and str(task["status"]) in {
+                    TaskStatus.COMPLETED.value,
+                    TaskStatus.FAILED.value,
+                    TaskStatus.CANCELLED.value,
+                }:
+                    continue
+            sessions = conn.execute(
+                """
+                SELECT s.*,
+                       (SELECT COUNT(*) FROM aedt_project_leases l
+                        WHERE l.session_id = s.id
+                          AND l.state IN (
+                              'offered','leased','attaching','active','releasing'
+                          )) AS used_slots
+                FROM aedt_sessions s
+                JOIN allocations a ON a.id = s.allocation_id
+                WHERE s.state IN ('ready','busy')
+                  AND s.solve_batch_sealed_at IS NULL
+                  AND a.state IN ('warm','active')
+                  AND (? = '' OR a.created_at > ?)
+                  AND (? = 0 OR s.allocation_id = ?)
+                  AND (? = '' OR s.node_name = ?)
+                  AND (
+                      ? < 2
+                      OR (? >= 2 AND s.session_profile = ?)
+                  )
+                ORDER BY used_slots DESC, s.id ASC
+                """,
+                (
+                    allocation_age_cutoff,
+                    allocation_age_cutoff,
+                    int(lease["requested_allocation_id"] or 0),
+                    int(lease["requested_allocation_id"] or 0),
+                    str(lease["requested_node_name"] or ""),
+                    str(lease["requested_node_name"] or ""),
+                    int(lease["protocol_version"] or 1),
+                    int(lease["protocol_version"] or 1),
+                    str(lease["session_profile"] or ""),
+                ),
+            ).fetchall()
+            selected = None
+            selected_occupants: list[Any] = []
+            for session in sessions:
+                occupants = conn.execute(
+                    """
+                    SELECT * FROM aedt_project_leases
+                    WHERE session_id = ?
+                      AND state IN (
+                          'offered','leased','attaching','active','releasing'
+                      )
+                    ORDER BY slot_index ASC
+                    """,
+                    (int(session["id"]),),
+                ).fetchall()
+                if self._lease_fits_session(lease, session, occupants):
+                    selected = session
+                    selected_occupants = list(occupants)
+                    break
+            if selected is None:
+                continue
+            occupied = {int(row["slot_index"]) for row in selected_occupants}
+            slot_index = next(
+                index
+                for index in range(int(selected["slots_total"]))
+                if index not in occupied
+            )
+            next_state = (
+                "offered" if int(lease["protocol_version"] or 1) >= 2 else "leased"
+            )
+            cursor = conn.execute(
+                """
+                UPDATE aedt_project_leases
+                SET session_id = ?, slot_index = ?, state = ?,
+                    acquired_at = ?, offered_at = ?, offer_expires_at = ?,
+                    updated_at = ?
+                WHERE id = ? AND state = 'queued'
+                  AND client_deadline_at > ?
+                """,
+                (
+                    int(selected["id"]),
+                    slot_index,
+                    next_state,
+                    now,
+                    now,
+                    offer_expires,
+                    now,
+                    int(lease["id"]),
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                continue
+            profile = str(lease["session_profile"] or "")
+            if profile and not str(selected["session_profile"] or ""):
+                conn.execute(
+                    "UPDATE aedt_sessions SET session_profile = ?, updated_at = ? "
+                    "WHERE id = ? AND session_profile = ''",
+                    (profile, now, int(selected["id"])),
+                )
+            self._refresh_session_state(conn, int(selected["id"]), now)
+            placed += 1
+        return placed
 
     def reconcile(self, *, execute: bool) -> dict[str, Any]:
         """Reap stale ownership, assign leases, and scale only when gated.
@@ -1926,23 +3267,104 @@ class AedtPoolService:
                     allocation_ids=rotating_allocation_ids,
                 )
 
-            queued_cutoff = _sql_time(
+            # A terminal scheduler task cannot still own admission.  Reconcile
+            # this before placement so an abandoned request is never offered
+            # after its client process has already exited.
+            terminal_leases = conn.execute(
+                """
+                SELECT l.id, l.session_id, l.state
+                FROM aedt_project_leases l
+                JOIN tasks t ON t.id = l.task_id
+                WHERE l.state IN (
+                    'queued','offered','leased','attaching','active'
+                )
+                  AND t.status IN ('completed','failed','cancelled')
+                """
+            ).fetchall()
+            for row in terminal_leases:
+                if row["state"] in {"attaching", "active"} and row["session_id"]:
+                    conn.execute(
+                        """
+                        UPDATE aedt_project_leases
+                        SET state = 'releasing',
+                            failure_message = 'scheduler task became terminal',
+                            release_requested_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, now, int(row["id"])),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE aedt_project_leases
+                        SET state = 'cancelled', session_id = NULL,
+                            slot_index = NULL,
+                            failure_message = 'scheduler task became terminal',
+                            finished_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, now, int(row["id"])),
+                    )
+                    if row["session_id"]:
+                        self._refresh_session_state(conn, int(row["session_id"]), now)
+
+            legacy_queued_cutoff = _sql_time(
                 now_dt - timedelta(seconds=min(config.lease_ttl_seconds, 300))
             )
+            # A v2 offer is a revocable reservation, not terminal ownership.
+            # If its short ACK window passes while the relay/client is offline,
+            # return the slot to the queue until the durable admission deadline.
+            stale_offers = conn.execute(
+                """
+                SELECT id, session_id FROM aedt_project_leases
+                WHERE state = 'offered' AND protocol_version >= 2
+                  AND offer_expires_at IS NOT NULL AND offer_expires_at < ?
+                  AND client_deadline_at > ? AND expires_at > ?
+                """,
+                (now, now, now),
+            ).fetchall()
+            for row in stale_offers:
+                conn.execute(
+                    """
+                    UPDATE aedt_project_leases
+                    SET state = 'queued', session_id = NULL, slot_index = NULL,
+                        offered_at = NULL, offer_expires_at = NULL,
+                        acquired_at = NULL, solve_permit_at = NULL,
+                        solve_permit_generation = 0,
+                        failure_message = 'lease offer requeued after ACK window',
+                        updated_at = ?
+                    WHERE id = ? AND state = 'offered'
+                    """,
+                    (now, int(row["id"])),
+                )
+                if row["session_id"]:
+                    self._refresh_session_state(conn, int(row["session_id"]), now)
             expired = conn.execute(
                 """
                 SELECT id, session_id, state FROM aedt_project_leases
-                WHERE state IN ('queued','leased','active')
+                WHERE state IN ('queued','offered','leased','attaching','active')
                   AND (
                       expires_at < ?
                       OR (
+                          state IN ('queued','offered')
+                          AND client_deadline_at < ?
+                      )
+                      OR (
                           state = 'queued'
                           AND last_heartbeat_at IS NOT NULL
-                          AND last_heartbeat_at < ?
+                          AND (
+                              protocol_version < 2 AND last_heartbeat_at < ?
+                          )
+                      )
+                      OR (
+                          state = 'offered'
+                          AND offer_expires_at IS NOT NULL
+                           AND protocol_version < 2
+                           AND offer_expires_at < ?
                       )
                   )
                 """,
-                (now, queued_cutoff),
+                (now, now, legacy_queued_cutoff, now),
             ).fetchall()
             for row in expired:
                 if row["state"] == "queued":
@@ -1954,6 +3376,20 @@ class AedtPoolService:
                         """,
                         (now, now, int(row["id"])),
                     )
+                    continue
+
+                if row["state"] == "offered":
+                    conn.execute(
+                        """
+                        UPDATE aedt_project_leases
+                        SET state = 'expired', session_id = NULL, slot_index = NULL,
+                            failure_message = 'lease offer acknowledgement expired',
+                            finished_at = ?, updated_at = ? WHERE id = ?
+                        """,
+                        (now, now, int(row["id"])),
+                    )
+                    if row["session_id"]:
+                        self._refresh_session_state(conn, int(row["session_id"]), now)
                     continue
 
                 # A lease that never became active cannot own a running solve.
@@ -2091,7 +3527,7 @@ class AedtPoolService:
                     SET state = 'failed',
                         failure_message = 'AEDT session host unreachable; session reaped',
                         finished_at = ?, updated_at = ?
-                    WHERE session_id = ? AND state IN ('leased','active','releasing')
+                    WHERE session_id = ? AND state IN ('offered','leased','attaching','active','releasing')
                     """,
                     (now, now, session_id),
                 )
@@ -2176,82 +3612,11 @@ class AedtPoolService:
                         """,
                         (now, allocation_id),
                     )
-            # Assign oldest requests to a same-allocation/same-node session.
-            # Empty placement constraints allow the controller to choose any
-            # dedicated AEDT allocation; explicit constraints are never relaxed.
+            # Admission placement is deliberately short and shares the same
+            # helper used by POST /leases.  Full expiry/scale reconciliation
+            # stays on this background tick instead of every HTTP request.
             if execute and config.operational:
-                queued = conn.execute(
-                    "SELECT * FROM aedt_project_leases WHERE state = 'queued' ORDER BY id ASC"
-                ).fetchall()
-                for lease in queued:
-                    sessions = conn.execute(
-                        """
-                        SELECT s.*,
-                               (SELECT COUNT(*) FROM aedt_project_leases l
-                                WHERE l.session_id = s.id
-                                  AND l.state IN ('leased','active','releasing')) AS used_slots,
-                               (SELECT COUNT(*) FROM aedt_project_leases l
-                                WHERE l.session_id = s.id
-                                  AND l.state IN ('leased','active','releasing')
-                                  AND l.exclusive_session = 1) AS exclusive_slots,
-                               (SELECT COUNT(*) FROM aedt_project_leases l
-                                WHERE l.session_id = s.id
-                                  AND l.state IN ('leased','active','releasing')
-                                  AND l.placement_group IS NOT ?) AS incompatible_group_slots
-                        FROM aedt_sessions s
-                        JOIN allocations a ON a.id = s.allocation_id
-                        WHERE s.state IN ('ready','busy')
-                          AND a.state IN ('warm','active')
-                          AND (? = 0 OR s.allocation_id = ?)
-                          AND (? = '' OR s.node_name = ?)
-                        ORDER BY incompatible_group_slots ASC, used_slots DESC, s.id ASC
-                        """,
-                        (
-                            str(lease["placement_group"] or ""),
-                            int(lease["requested_allocation_id"] or 0),
-                            int(lease["requested_allocation_id"] or 0),
-                            str(lease["requested_node_name"] or ""),
-                            str(lease["requested_node_name"] or ""),
-                        ),
-                    ).fetchall()
-                    selected = next(
-                        (
-                            row for row in sessions
-                            if int(row["used_slots"] or 0) < int(row["slots_total"])
-                            and int(row["exclusive_slots"] or 0) == 0
-                            and int(row["incompatible_group_slots"] or 0) == 0
-                            and (
-                                not bool(lease["exclusive_session"])
-                                or int(row["used_slots"] or 0) == 0
-                            )
-                        ),
-                        None,
-                    )
-                    if not selected:
-                        continue
-                    occupied = {
-                        int(row[0])
-                        for row in conn.execute(
-                            """
-                            SELECT slot_index FROM aedt_project_leases
-                            WHERE session_id = ? AND state IN ('leased','active','releasing')
-                            """,
-                            (int(selected["id"]),),
-                        ).fetchall()
-                    }
-                    slot_index = next(
-                        index for index in range(int(selected["slots_total"])) if index not in occupied
-                    )
-                    conn.execute(
-                        """
-                        UPDATE aedt_project_leases
-                        SET session_id = ?, slot_index = ?, state = 'leased',
-                            acquired_at = ?, updated_at = ?
-                        WHERE id = ? AND state = 'queued'
-                        """,
-                        (int(selected["id"]), slot_index, now, now, int(lease["id"])),
-                    )
-                    self._refresh_session_state(conn, int(selected["id"]), now)
+                self._place_queued_leases(conn, now, config=config)
 
             plan = self._plan(conn, config)
             if execute and config.operational:
@@ -2264,7 +3629,7 @@ class AedtPoolService:
                         SELECT s.*,
                                (SELECT COUNT(*) FROM aedt_project_leases l
                                 WHERE l.session_id = s.id
-                                  AND l.state IN ('leased','active','releasing')) AS used_slots
+                                  AND l.state IN ('offered','leased','attaching','active','releasing')) AS used_slots
                         FROM aedt_sessions s
                         WHERE s.state IN ('ready','busy')
                         ORDER BY used_slots ASC, COALESCE(s.idle_since, s.created_at) ASC, s.id ASC
@@ -2357,7 +3722,7 @@ class AedtPoolService:
                 SELECT id, session_id, task_id, project_name, slot_index, state
                 FROM aedt_project_leases
                 WHERE session_id IS NOT NULL
-                  AND state IN ('leased', 'active', 'releasing')
+                  AND state IN ('offered', 'leased', 'attaching', 'active', 'releasing')
                 ORDER BY session_id ASC, slot_index ASC, id ASC
                 """
             ).fetchall()
@@ -2420,6 +3785,14 @@ class AedtPoolService:
                 "min_idle_aedt_sessions": config.min_idle_sessions,
                 "target_project_concurrency": config.target_projects,
                 "projects_per_aedt": config.projects_per_session,
+                "project_cpus": config.project_cpus,
+                "project_memory_mb": config.project_memory_mb,
+                "session_reserved_cpus": (
+                    config.project_cpus * config.projects_per_session
+                ),
+                "session_reserved_memory_mb": (
+                    config.project_memory_mb * config.projects_per_session
+                ),
                 "control_plane_url": config.control_plane_url,
                 "hard_counted_states": list(SESSION_COUNTED_STATES),
             },
@@ -2492,7 +3865,10 @@ class AedtPoolRuntime:
         host_python: str = "python",
         host_env_setup: str = "",
         host_bootstrap_token_file: str = "",
-        host_task_memory_mb: int = 4096,
+        host_task_memory_mb: int = 65536,
+        host_artifact_root: str = "",
+        host_dso_profile: str = "",
+        host_session_profile: str = "",
         require_published_control_plane_url: bool = False,
         host_launch_stagger_seconds: int | None = None,
     ) -> None:
@@ -2507,6 +3883,27 @@ class AedtPoolRuntime:
         self.host_env_setup = host_env_setup
         self.host_bootstrap_token_file = host_bootstrap_token_file.strip()
         self.host_task_memory_mb = max(1024, int(host_task_memory_mb))
+        self.host_artifact_root = str(host_artifact_root or "").strip()
+        self.host_dso_profile = str(host_dso_profile or "").strip().lower()
+        if (
+            self.host_dso_profile
+            and self.host_dso_profile not in SUPPORTED_DSO_PROFILES
+        ):
+            raise ValueError(
+                f"unsupported AEDT host DSO profile: {self.host_dso_profile}"
+            )
+        if self.host_dso_profile == SUPPORTED_DSO_PROFILE and not host_session_profile:
+            raise ValueError(
+                "canonical AEDT host DSO profile requires host_session_profile"
+            )
+        self.host_session_profile = (
+            canonical_expected_session_profile(host_session_profile)
+            if host_session_profile
+            else ""
+        )
+        self.host_aedt_version = (
+            EXPECTED_AEDT_VERSION if self.host_session_profile else ""
+        )
         self.require_published_control_plane_url = bool(
             require_published_control_plane_url
         )
@@ -2660,6 +4057,14 @@ class AedtPoolRuntime:
             "--bootstrap-token-file",
             self.host_bootstrap_token_file,
         ]
+        if self.host_artifact_root:
+            parts.extend(["--artifact-root", self.host_artifact_root])
+        if self.host_aedt_version:
+            parts.extend(["--aedt-version", self.host_aedt_version])
+        if self.host_dso_profile:
+            parts.extend(["--dso-profile", self.host_dso_profile])
+        if self.host_session_profile:
+            parts.extend(["--session-profile", self.host_session_profile])
         command = " ".join(shlex.quote(part) for part in parts)
         delay = max(0, int(launch_delay_seconds))
         if delay:
@@ -2703,6 +4108,8 @@ class AedtPoolRuntime:
                 allocation_launch_index * self.host_launch_stagger_seconds
             )
             task_id = self.service.db.create_task(
+                # One task owns the Desktop and every concurrent solver in its
+                # session, so Slurm must reserve the aggregate resources.
                 TaskCreate(
                     name=f"aedt-session-host-{int(session['id'])}",
                     remote_cwd=self.host_remote_cwd,
@@ -2715,8 +4122,14 @@ class AedtPoolRuntime:
                     required_capability=config.required_capability,
                     env_profile=config.env_profile,
                     account_name=str(allocation.get("account_name") or ""),
-                    cpus=1,
-                    memory_mb=self.host_task_memory_mb,
+                    cpus=(
+                        config.project_cpus * max(1, int(session["slots_total"]))
+                    ),
+                    memory_mb=max(
+                        self.host_task_memory_mb,
+                        config.project_memory_mb
+                        * max(1, int(session["slots_total"])),
+                    ),
                     scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                     node_name=str(allocation.get("node_name") or ""),
                     priority=100000,
@@ -2724,8 +4137,20 @@ class AedtPoolRuntime:
                     dedupe_key=dedupe_key,
                     project="_aedt_pool_hosts",
                     entrypoint="slurm_scheduler.aedt_session_host",
+                    requested_allocation_id=allocation_id,
                 )
             )
+            try:
+                self.service.bind_session_host_task(int(session["id"]), task_id)
+            except ValueError as exc:
+                self.service.db.update_task(
+                    task_id,
+                    status=TaskStatus.FAILED.value,
+                    failure_message=str(exc),
+                    finished_at="CURRENT_TIMESTAMP",
+                )
+                self.service.fail_unclaimed_session_start(int(session["id"]), str(exc))
+                continue
             task = self.service.db.get_task(task_id)
             account = self.scheduler.account_by_name(str(allocation.get("account_name") or ""))
             reserved = (
@@ -2734,6 +4159,22 @@ class AedtPoolRuntime:
                 else None
             )
             if not reserved or not account:
+                # The global scheduler may win the race after create_task.
+                # requested_allocation_id makes that safe; recognize the exact
+                # reservation instead of failing a host already being started.
+                current = self.service.db.get_task(task_id)
+                already_exact = bool(
+                    current
+                    and int(current.get("requested_allocation_id") or 0)
+                    == allocation_id
+                    and int(current.get("allocation_id") or 0) == allocation_id
+                    and str(current.get("status") or "")
+                    in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}
+                )
+                if already_exact:
+                    launches_by_allocation[allocation_id] = allocation_launch_index + 1
+                    started += 1
+                    continue
                 license_reason = ""
                 if bool(getattr(self.scheduler, "license_admission_enabled", False)):
                     _allowed, license_reason = self.scheduler.aedt_pool_warm_spare_admission(1)
@@ -2752,6 +4193,7 @@ class AedtPoolRuntime:
                     failure_reason,
                 )
                 continue
+            self.service.bind_session_host_task(int(session["id"]), task_id)
             self.scheduler.start_background_task_attach(reserved, allocation, account)
             launches_by_allocation[allocation_id] = allocation_launch_index + 1
             started += 1

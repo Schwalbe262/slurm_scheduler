@@ -682,6 +682,24 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("export MFT_AEDT_BACKEND=standalone", standalone)
         self.assertIn("export MFT_AEDT_BACKEND=pooled", pooled)
 
+    def test_task_script_reasserts_backend_after_user_environment(self) -> None:
+        script = build_task_script(
+            {
+                "remote_cwd": "~/case",
+                "env_setup": "export MFT_AEDT_BACKEND=standalone",
+                "command": "python run.py",
+                "aedt_backend": "pooled",
+            }
+        )
+        self.assertLess(
+            script.rfind("export MFT_AEDT_BACKEND=standalone"),
+            script.rfind("export MFT_AEDT_BACKEND=pooled"),
+        )
+        self.assertLess(
+            script.rfind("export MFT_AEDT_BACKEND=pooled"),
+            script.rfind("python run.py"),
+        )
+
     def test_task_script_exports_git_ssh_command(self) -> None:
         script = build_task_script(
             {
@@ -8517,13 +8535,27 @@ class ProjectApiTests(unittest.TestCase):
                 os.environ.pop("SLURM_SCHEDULER_CONFIG", None)
             else:
                 os.environ["SLURM_SCHEDULER_CONFIG"] = previous_config
-        self.app = create_app(str(config_path))
+        self.validation_token = "project-validation-bootstrap-token"
+        with mock.patch.dict(
+            os.environ,
+            {"SLURM_AEDT_POOL_BOOTSTRAP_TOKEN": self.validation_token},
+        ):
+            self.app = create_app(str(config_path))
         self.app.router.on_startup.clear()
         self.app.router.on_shutdown.clear()
         self.create_project = self._route_endpoint("/api/projects", "POST")
         self.get_project = self._route_endpoint("/api/projects/{name}", "GET")
         self.patch_project_cap = self._route_endpoint(
             "/api/projects/{name}/max-active-tasks", "PATCH"
+        )
+        self.get_simulation_policy = self._route_endpoint(
+            "/api/projects/{name}/simulation-policy", "GET"
+        )
+        self.patch_simulation_policy = self._route_endpoint(
+            "/api/projects/{name}/simulation-policy", "PATCH"
+        )
+        self.patch_simulation_validation = self._route_endpoint(
+            "/api/projects/{name}/simulation-policy/validation", "PATCH"
         )
         self.list_tasks = self._route_endpoint("/api/tasks", "GET")
         self.get_task = self._route_endpoint("/api/tasks/{task_id}", "GET")
@@ -8541,9 +8573,16 @@ class ProjectApiTests(unittest.TestCase):
             if getattr(route, "path", "") == path and method in getattr(route, "methods", set())
         )
 
-    @staticmethod
-    def _request(payload: dict):
+    def _request(self, payload: dict, *, headers: dict | None = None):
+        request_headers = (
+            {"x-aedt-bootstrap-token": self.validation_token}
+            if headers is None
+            else headers
+        )
+
         class JsonRequest:
+            headers = request_headers
+
             async def json(self) -> dict:
                 return payload
 
@@ -8564,16 +8603,121 @@ class ProjectApiTests(unittest.TestCase):
         ]
         self.assertEqual(len(routes), 1)
 
+    def test_simulation_validation_is_bootstrap_authenticated_and_fail_closed(self) -> None:
+        from fastapi import HTTPException
+        from slurm_scheduler.app import create_app
+
+        created = self._post_project({"name": "MFT-auth", "max_active_tasks": 10})
+        revision = created["simulation_policy"]["policy_revision"]
+        body = {
+            "validated_concurrency_limit": 2,
+            "expected_revision": revision,
+        }
+        for headers in ({}, {"x-aedt-bootstrap-token": "wrong-token"}):
+            with self.assertRaises(HTTPException) as denied:
+                asyncio.run(
+                    self.patch_simulation_validation(
+                        "MFT-auth", self._request(body, headers=headers)
+                    )
+                )
+            self.assertEqual(denied.exception.status_code, 403)
+
+        with mock.patch.dict(
+            os.environ,
+            {"SLURM_AEDT_POOL_BOOTSTRAP_TOKEN": ""},
+        ):
+            unconfigured_app = create_app(str(self.config_path))
+        unconfigured_app.router.on_startup.clear()
+        unconfigured_app.router.on_shutdown.clear()
+        endpoint = self._route_endpoint(
+            "/api/projects/{name}/simulation-policy/validation",
+            "PATCH",
+            app=unconfigured_app,
+        )
+        with self.assertRaises(HTTPException) as unavailable:
+            asyncio.run(
+                endpoint(
+                    "MFT-auth",
+                    self._request(
+                        body,
+                        headers={"x-aedt-bootstrap-token": self.validation_token},
+                    ),
+                )
+            )
+        self.assertEqual(unavailable.exception.status_code, 503)
+
+    def test_simulation_policy_is_cas_guarded_and_validation_is_separate(self) -> None:
+        from fastapi import HTTPException
+
+        created = self._post_project(
+            {"name": "MFT_1MW_2026v1", "max_active_tasks": 300}
+        )
+        self.assertEqual(created["max_active_tasks"], 500)
+        initial = created["simulation_policy"]
+        self.assertEqual(initial["desired_simulations"], 1)
+        self.assertEqual(initial["validated_concurrency_limit"], 1)
+        self.assertEqual(initial["active_count"], 0)
+        self.assertEqual(initial["logical_active_count"], 0)
+
+        validated = asyncio.run(
+            self.patch_simulation_validation(
+                "MFT_1MW_2026v1",
+                self._request(
+                    {
+                        "validated_concurrency_limit": 50,
+                        "expected_revision": initial["policy_revision"],
+                    }
+                ),
+            )
+        )
+        self.assertEqual(validated["validated_concurrency_limit"], 50)
+        self.assertEqual(validated["desired_simulations"], 1)
+        self.assertEqual(
+            self.get_project("MFT_1MW_2026v1")["max_active_tasks"], 500
+        )
+
+        updated = asyncio.run(
+            self.patch_simulation_policy(
+                "MFT_1MW_2026v1",
+                self._request(
+                    {
+                        "desired_simulations": 50,
+                        "expected_revision": validated["policy_revision"],
+                        "scale_down_mode": "drain",
+                    }
+                ),
+            )
+        )
+        self.assertEqual(updated["effective_simulations"], 50)
+        self.assertEqual(updated["max_desired_simulations"], 50)
+        self.assertEqual(
+            self.get_project("MFT_1MW_2026v1")["max_active_tasks"], 500
+        )
+        with self.assertRaises(HTTPException) as conflict:
+            asyncio.run(
+                self.patch_simulation_policy(
+                    "MFT_1MW_2026v1",
+                    self._request(
+                        {
+                            "desired_simulations": 10,
+                            "expected_revision": validated["policy_revision"],
+                            "scale_down_mode": "drain",
+                        }
+                    ),
+                )
+            )
+        self.assertEqual(conflict.exception.status_code, 409)
+
     def test_project_api_round_trips_and_updates_max_active_tasks(self) -> None:
-        created = self._post_project({"name": "motor", "max_active_tasks": 7})
-        self.assertEqual(created["max_active_tasks"], 7)
+        created = self._post_project({"name": "motor", "max_active_tasks": 9})
+        self.assertEqual(created["max_active_tasks"], 9)
 
         preserved = self._post_project({"name": "motor", "setup": "module load ansys"})
-        self.assertEqual(preserved["max_active_tasks"], 7)
+        self.assertEqual(preserved["max_active_tasks"], 9)
 
-        updated = self._post_project({"name": "motor", "max_active_tasks": "9"})
-        self.assertEqual(updated["max_active_tasks"], 9)
-        self.assertEqual(self.get_project("motor")["max_active_tasks"], 9)
+        updated = self._post_project({"name": "motor", "max_active_tasks": "7"})
+        self.assertEqual(updated["max_active_tasks"], 7)
+        self.assertEqual(self.get_project("motor")["max_active_tasks"], 7)
 
     def test_aedt_backend_round_trip_and_retired_exact_pin_submission(self) -> None:
         standalone = asyncio.run(
@@ -8669,6 +8813,99 @@ class ProjectApiTests(unittest.TestCase):
             "AEDT backend: AEDT pooled backend is not operational",
         )
 
+    def test_operational_pool_rejects_incomplete_worker_attach_contract(self) -> None:
+        from types import SimpleNamespace
+        from slurm_scheduler.aedt_session_host import EXPECTED_SESSION_PROFILE_JSON
+
+        scheduler = self.app.state.scheduler
+        config = self.app.state.config
+        object.__setattr__(
+            config, "aedt_pool_scheduler_url", "http://scheduler.internal:18790"
+        )
+        object.__setattr__(
+            config,
+            "aedt_pool_client_token_file",
+            "/work/secrets/aedt-pool-client.token",
+        )
+        required = {
+            "MFT_AEDT_SCHEDULER_URL": "http://scheduler.internal:18790",
+            "SLURM_AEDT_POOL_CLIENT_TOKEN_FILE": (
+                "/work/secrets/aedt-pool-client.token"
+            ),
+            "MFT_AEDT_SESSION_PROFILE": EXPECTED_SESSION_PROFILE_JSON,
+            "MFT_AEDT_ISOLATION_POLICY": "family",
+            "MFT_AEDT_WORKSPACE_PATH": "/work/projects/mft/case-77",
+        }
+
+        def task_with(values: dict[str, str]) -> dict:
+            return {
+                "id": 77,
+                "status": "queued",
+                "aedt_backend": "pooled",
+                "scheduling_profile": "fea_bursty",
+                "command": "python run_simulation.py",
+                "env_setup": "\n".join(
+                    f"export {key}='{value}'" for key, value in values.items()
+                ),
+            }
+
+        expected_fragments = {
+            "MFT_AEDT_SCHEDULER_URL": "MFT_AEDT_SCHEDULER_URL",
+            "SLURM_AEDT_POOL_CLIENT_TOKEN_FILE": (
+                "SLURM_AEDT_POOL_CLIENT_TOKEN_FILE"
+            ),
+            "MFT_AEDT_SESSION_PROFILE": "MFT_AEDT_SESSION_PROFILE",
+            "MFT_AEDT_ISOLATION_POLICY": "MFT_AEDT_ISOLATION_POLICY",
+            "MFT_AEDT_WORKSPACE_PATH": "MFT_AEDT_WORKSPACE_PATH",
+        }
+        operational = SimpleNamespace(operational=True, control_plane_url="")
+        with mock.patch.object(
+            self.app.state.aedt_pool, "config", return_value=operational
+        ):
+            for missing, expected in expected_fragments.items():
+                with self.subTest(missing=missing):
+                    incomplete = dict(required)
+                    incomplete.pop(missing)
+                    reason = scheduler.aedt_backend_block_reason(
+                        task_with(incomplete)
+                    )
+                    self.assertIn(expected, reason)
+            self.assertEqual(
+                scheduler.aedt_backend_block_reason(task_with(required)), ""
+            )
+
+            # Unified feeders preserve submission_env as literal leading
+            # exports in command (not env_setup) and historically use the
+            # POOL_WORKSPACE name.  Admission must validate that real shape.
+            command_contract = dict(required)
+            command_contract.pop("MFT_AEDT_WORKSPACE_PATH")
+            command_contract["MFT_AEDT_POOL_WORKSPACE"] = (
+                "/work/projects/mft/mft-${SLURM_SCHED_TASK_ID}"
+            )
+            command_contract["MFT_AEDT_SESSION_VERSION"] = "2025.2"
+            command_task = task_with({})
+            command_task["command"] = " ".join(
+                f"export {key}='{value}';"
+                for key, value in command_contract.items()
+            ) + " python run_simulation.py"
+            self.assertEqual(
+                scheduler.aedt_backend_block_reason(command_task), ""
+            )
+
+            embedded = dict(required)
+            embedded["SLURM_AEDT_POOL_CLIENT_TOKEN"] = "secret-in-command-env"
+            self.assertIn(
+                "must not embed",
+                scheduler.aedt_backend_block_reason(task_with(embedded)),
+            )
+
+            overridden = dict(required)
+            overridden["MFT_AEDT_BACKEND"] = "standalone"
+            self.assertIn(
+                "overrides MFT_AEDT_BACKEND",
+                scheduler.aedt_backend_block_reason(task_with(overridden)),
+            )
+
     def test_project_api_rejects_invalid_max_active_tasks(self) -> None:
         from fastapi import HTTPException
 
@@ -8695,7 +8932,7 @@ class ProjectApiTests(unittest.TestCase):
                 "output_globs": "*.csv",
                 "sim_subdir": "cases",
                 "auto_pull": True,
-                "max_active_tasks": 7,
+                "max_active_tasks": 300,
             }
         )
         queued_id = self.app.state.db.create_task(
@@ -8735,7 +8972,11 @@ class ProjectApiTests(unittest.TestCase):
             self.app.state.db.update_project = original_update_project
 
         after = self.app.state.db.get_project_by_name("motor")
-        self.assertEqual(updates, [(int(before["id"]), {"max_active_tasks": 275})])
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0][0], int(before["id"]))
+        self.assertEqual(updates[0][1]["max_active_tasks"], 275)
+        self.assertNotIn("desired_simulations", updates[0][1])
+        self.assertNotIn("validated_concurrency_limit", updates[0][1])
         for key in (
             "id",
             "name",
@@ -8754,14 +8995,14 @@ class ProjectApiTests(unittest.TestCase):
         self.assertEqual(result["queued_count"], 1)
         self.assertEqual(result["attaching_count"], 1)
         self.assertEqual(result["executing_count"], 1)
-        self.assertEqual(result["logical_active_count"], 3)
+        self.assertEqual(result["logical_active_count"], 2)
         self.assertEqual(result["running_count"], 2)
         self.assertEqual(result["total_count"], 4)
 
     def test_project_cap_patch_rejects_non_cap_bodies_and_out_of_range_values(self) -> None:
         from fastapi import HTTPException
 
-        self._post_project({"name": "motor", "max_active_tasks": 7})
+        self._post_project({"name": "motor", "max_active_tasks": 300})
         invalid_payloads = (
             {},
             {"max_active_tasks": 8, "setup": "must not change"},
@@ -8779,11 +9020,11 @@ class ProjectApiTests(unittest.TestCase):
                 self.assertEqual(raised.exception.status_code, 422)
                 self.assertEqual(
                     self.app.state.db.get_project_by_name("motor")["max_active_tasks"],
-                    7,
+                    300,
                 )
 
     def test_project_cap_patch_accepts_inclusive_bounds(self) -> None:
-        self._post_project({"name": "motor", "max_active_tasks": 7})
+        self._post_project({"name": "motor", "max_active_tasks": 300})
         for target in (1, 300):
             with self.subTest(target=target):
                 result = asyncio.run(
@@ -8815,7 +9056,11 @@ class ProjectApiTests(unittest.TestCase):
             + "\nproject_max_active_tasks_ceiling: 600\n",
             encoding="utf-8",
         )
-        configured_app = create_app(str(self.config_path))
+        with mock.patch.dict(
+            os.environ,
+            {"SLURM_AEDT_POOL_BOOTSTRAP_TOKEN": self.validation_token},
+        ):
+            configured_app = create_app(str(self.config_path))
         configured_app.router.on_startup.clear()
         configured_app.router.on_shutdown.clear()
         configured_create = self._route_endpoint(
@@ -8825,6 +9070,11 @@ class ProjectApiTests(unittest.TestCase):
         )
         configured_patch = self._route_endpoint(
             "/api/projects/{name}/max-active-tasks",
+            "PATCH",
+            app=configured_app,
+        )
+        configured_validate = self._route_endpoint(
+            "/api/projects/{name}/simulation-policy/validation",
             "PATCH",
             app=configured_app,
         )
@@ -8846,6 +9096,18 @@ class ProjectApiTests(unittest.TestCase):
             "max_active_tasks must be an integer between 0 and 600",
         )
 
+        current_motor = configured_app.state.db.get_project_by_name("motor")
+        asyncio.run(
+            configured_validate(
+                "motor",
+                self._request(
+                    {
+                        "validated_concurrency_limit": 500,
+                        "expected_revision": current_motor["policy_revision"],
+                    }
+                ),
+            )
+        )
         accepted = asyncio.run(
             configured_patch("motor", self._request({"max_active_tasks": 500}))
         )

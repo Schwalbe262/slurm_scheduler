@@ -729,6 +729,12 @@ def build_task_script(task: dict) -> str:
     lines.append(f"cd {shell_path(task['remote_cwd'])}")
     if task.get("env_setup"):
         lines.append(task["env_setup"])
+    # env_setup is user-controlled.  Re-assert the scheduler-selected backend
+    # immediately before the command so it cannot switch a pooled task back to
+    # a standalone ownership path (or vice versa).
+    lines.append(
+        f"export MFT_AEDT_BACKEND={shlex.quote(normalize_aedt_backend(task.get('aedt_backend')))}"
+    )
     lines.append(task["command"])
     return "\n".join(lines) + "\n"
 

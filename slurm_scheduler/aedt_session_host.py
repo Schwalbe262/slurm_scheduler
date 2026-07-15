@@ -6,10 +6,12 @@ import json
 import math
 import os
 import random
+import re
 import secrets
 import signal
 import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -22,8 +24,54 @@ from typing import Any
 # Leave one HTTP-timeout/backoff margin beyond the required five-minute outage.
 DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS = 360.0
 CONTROL_PLANE_OUTAGE_ENV = "AEDT_SESSION_HOST_CONTROL_PLANE_OUTAGE_SECONDS"
+ARTIFACT_ROOT_ENV = "AEDT_SESSION_HOST_ARTIFACT_ROOT"
+DSO_PROFILE_ENV = "AEDT_SESSION_HOST_DSO_PROFILE"
+SESSION_PROFILE_ENV = "AEDT_SESSION_HOST_PROFILE"
+SUPPORTED_DSO_PROFILE = "maxwell-2d3d-icepak-4c1e"
+LEGACY_DSO_PROFILE = "maxwell-2d3d-4c1e"
+SUPPORTED_DSO_PROFILES = {SUPPORTED_DSO_PROFILE, LEGACY_DSO_PROFILE}
+EXPECTED_SESSION_PROFILE = {
+    "profile_version": 2,
+    "aedt_version": "2025.2",
+    "python_environment": "pyaedt2026v1",
+    "pyaedt_version": "0.22.0",
+    "filesystem": "gpfs-shared-v1",
+    "desktop_dso": {
+        "config_name": "pyaedt_config",
+        "designs": {
+            "Icepak": {
+                "cores": 4,
+                "tasks": 1,
+                "gpus": 0,
+                "use_auto_settings": False,
+            },
+            "Maxwell 2D": {
+                "cores": 4,
+                "tasks": 1,
+                "gpus": 0,
+                "use_auto_settings": True,
+            },
+            "Maxwell 3D": {
+                "cores": 4,
+                "tasks": 1,
+                "gpus": 0,
+                "use_auto_settings": True,
+            },
+        },
+    },
+}
+EXPECTED_SESSION_PROFILE_JSON = json.dumps(
+    EXPECTED_SESSION_PROFILE,
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+)
+EXPECTED_AEDT_VERSION = str(EXPECTED_SESSION_PROFILE["aedt_version"])
+EXPECTED_PYAEDT_VERSION = str(EXPECTED_SESSION_PROFILE["pyaedt_version"])
 DESKTOP_LAUNCH_ATTEMPTS = 3
 DESKTOP_LAUNCH_RETRY_SECONDS = 2.0
+NATIVE_PROBE_FAILURES_BEFORE_RECYCLE = 3
+NATIVE_PROBE_FAILURE_WINDOW_SECONDS = 60.0
 TRANSIENT_HTTP_STATUSES = {408, 425, 429}
 TERMINAL_REGISTRATION_CONFLICT_MARKERS = (
     "not owned",
@@ -33,6 +81,45 @@ TERMINAL_REGISTRATION_CONFLICT_MARKERS = (
     "session is cancelled",
     "session is expired",
 )
+
+
+class ControlPlaneUnavailable(RuntimeError):
+    """A retryable control-plane outage exhausted one bounded request window."""
+
+
+def canonical_expected_session_profile(value: Any) -> str:
+    """Validate and canonicalize the one attested Desktop-global profile."""
+
+    candidate = value
+    if isinstance(candidate, str):
+        normalized = candidate.strip()
+        if not normalized:
+            raise ValueError("AEDT host session profile is required")
+        try:
+            candidate = json.loads(normalized)
+        except json.JSONDecodeError as exc:
+            raise ValueError("AEDT host session profile must be valid JSON") from exc
+    if candidate != EXPECTED_SESSION_PROFILE:
+        raise ValueError(
+            "AEDT host session profile does not match the canonical "
+            f"{SUPPORTED_DSO_PROFILE} contract"
+        )
+    return EXPECTED_SESSION_PROFILE_JSON
+
+
+def is_expected_session_profile(value: Any) -> bool:
+    try:
+        canonical_expected_session_profile(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def normalize_aedt_version(value: Any) -> str:
+    """Normalize AEDT's verbose GetVersion result to its year.release pair."""
+
+    match = re.search(r"(?<!\d)(20\d{2}\.\d)(?!\d)", str(value or ""))
+    return match.group(1) if match else ""
 
 
 def _install_pyaedt_psutil_cmdline_shim(psutil_module: Any | None = None) -> None:
@@ -111,6 +198,9 @@ class AedtSessionHost:
         session_id: int = 0,
         heartbeat_seconds: int = 20,
         aedt_version: str = "",
+        artifact_root: str = "",
+        dso_profile: str = "",
+        session_profile: str = "",
         control_plane_outage_seconds: float = DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS,
     ) -> None:
         self.client = client
@@ -118,7 +208,32 @@ class AedtSessionHost:
         self.node_name = node_name
         self.requested_session_id = max(0, int(session_id))
         self.heartbeat_seconds = max(5, int(heartbeat_seconds))
-        self.aedt_version = aedt_version
+        requested_aedt_version = str(aedt_version or "").strip()
+        self.artifact_root = str(artifact_root or "").strip()
+        self.dso_profile = str(dso_profile or "").strip().lower()
+        if self.dso_profile and self.dso_profile not in SUPPORTED_DSO_PROFILES:
+            raise ValueError(f"unsupported AEDT DSO profile: {self.dso_profile}")
+        if self.dso_profile == SUPPORTED_DSO_PROFILE and not session_profile:
+            raise ValueError(
+                "canonical AEDT DSO profile requires the exact host session profile"
+            )
+        self.session_profile = (
+            canonical_expected_session_profile(session_profile)
+            if session_profile
+            else ""
+        )
+        if self.session_profile:
+            normalized_requested_version = normalize_aedt_version(
+                requested_aedt_version
+            )
+            if requested_aedt_version and normalized_requested_version != EXPECTED_AEDT_VERSION:
+                raise ValueError(
+                    f"AEDT version must be {EXPECTED_AEDT_VERSION} for the canonical profile"
+                )
+            # Never let a blank CLI value silently select the installed default.
+            self.aedt_version = EXPECTED_AEDT_VERSION
+        else:
+            self.aedt_version = requested_aedt_version
         outage_seconds = float(control_plane_outage_seconds)
         if not math.isfinite(outage_seconds):
             raise ValueError("control-plane outage budget must be finite")
@@ -129,7 +244,19 @@ class AedtSessionHost:
         self.session_id = 0
         self.host_token = ""
         self.desktop: Any = None
+        self.desktop_process_id = ""
+        self.desktop_process_marker: str | None = None
+        self.desktop_port = 0
+        self.native_probe_failures = 0
+        self.native_probe_first_failure_at = 0.0
+        self._native_probe_thread: threading.Thread | None = None
+        self._native_probe_errors: list[BaseException] = []
         self.stop_requested = False
+        self.artifact_dir = ""
+        self.error_log_path = ""
+        self.journal_path = ""
+        self.native_snapshot_path = ""
+        self.runtime_metadata: dict[str, Any] = {}
 
     def request_stop(self, *_args: Any) -> None:
         self.stop_requested = True
@@ -213,7 +340,9 @@ class AedtSessionHost:
             elapsed = max(0.0, time.monotonic() - outage_started_at)
             remaining = self.control_plane_outage_seconds - elapsed
             if remaining <= 0:
-                raise last_error
+                raise ControlPlaneUnavailable(
+                    f"control plane unavailable for {elapsed:.1f}s: {last_error}"
+                ) from last_error
             base_delay = min(
                 self.retry_max_seconds,
                 self.retry_initial_seconds * (2 ** min(retry_index, 20)),
@@ -235,6 +364,18 @@ class AedtSessionHost:
             from ansys.aedt.core import Desktop
         except ImportError as exc:
             raise RuntimeError("PyAEDT is required on the session-host node") from exc
+        if self.error_log_path:
+            # PyAEDT releases have moved these settings over time; keep this
+            # best-effort and retain the host journal even if a field is absent.
+            try:
+                from ansys.aedt.core.generic.settings import settings
+
+                if hasattr(settings, "enable_file_logs"):
+                    settings.enable_file_logs = True
+                if hasattr(settings, "logger_file_path"):
+                    settings.logger_file_path = self.error_log_path
+            except Exception as exc:
+                self._journal("pyaedt_log_configuration_failed", error=str(exc))
         kwargs: dict[str, Any] = {
             "new_desktop": bool(new_desktop),
             "non_graphical": True,
@@ -244,6 +385,252 @@ class AedtSessionHost:
         if self.aedt_version:
             kwargs["version"] = self.aedt_version
         return Desktop(**kwargs)
+
+    def _prepare_artifacts(self, session: dict[str, Any]) -> None:
+        if not self.artifact_root:
+            return
+        session_key = str(session.get("session_key") or f"session-{self.session_id}")
+        safe_key = "".join(
+            character if character.isalnum() or character in {"-", "_"} else "_"
+            for character in session_key
+        )
+        directory = Path(self.artifact_root) / f"session-{self.session_id}-{safe_key}"
+        # Persist the intended paths in /start-failed even when mkdir itself is
+        # the startup failure (permissions, GPFS outage, quota, and so on).
+        self.artifact_dir = str(directory)
+        self.error_log_path = str(directory / "pyaedt.log")
+        self.journal_path = str(directory / "session-events.jsonl")
+        directory.mkdir(parents=True, exist_ok=True)
+        self._journal(
+            "claim_accepted",
+            allocation_id=self.allocation_id,
+            expected_node=self.node_name,
+            actual_node=socket.gethostname(),
+            slurm_job_id=os.environ.get("SLURM_JOB_ID", ""),
+        )
+
+    def _attest_runtime_profile(self) -> dict[str, Any]:
+        """Fail closed on Desktop/Python environment drift and save evidence."""
+
+        odesktop = getattr(self.desktop, "odesktop", None)
+        get_version = getattr(odesktop, "GetVersion", None)
+        if not callable(get_version):
+            raise RuntimeError("AEDT Desktop has no GetVersion runtime attestation API")
+        raw_aedt_version = str(get_version() or "").strip()
+        actual_aedt_version = normalize_aedt_version(raw_aedt_version)
+        python_environment = str(os.environ.get("CONDA_DEFAULT_ENV", "")).strip()
+        try:
+            import ansys.aedt.core as pyaedt_core
+
+            pyaedt_version = str(getattr(pyaedt_core, "__version__", "") or "")
+        except Exception as exc:
+            if self.session_profile:
+                raise RuntimeError(
+                    "could not attest the PyAEDT runtime version"
+                ) from exc
+            pyaedt_version = f"unavailable: {exc}"
+        metadata = {
+            "hostname": socket.gethostname(),
+            "slurm_job_id": os.environ.get("SLURM_JOB_ID", ""),
+            "host_process_id": os.getpid(),
+            "python_executable": sys.executable,
+            "python_version": sys.version,
+            "python_environment": python_environment,
+            "pyaedt_version": pyaedt_version,
+            "aedt_version_raw": raw_aedt_version,
+            "aedt_version": actual_aedt_version,
+            "session_profile": self.session_profile,
+            "dso_profile": self.dso_profile,
+            "artifact_dir": self.artifact_dir,
+            "error_log_path": self.error_log_path,
+            "journal_path": self.journal_path,
+        }
+        self.runtime_metadata = metadata
+        if self.artifact_dir:
+            evidence_path = Path(self.artifact_dir) / "runtime-attestation.json"
+            evidence_path.write_text(
+                json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2),
+                encoding="utf-8",
+            )
+        self._journal("runtime_profile_attested", **metadata)
+        if self.session_profile:
+            expected_environment = str(
+                EXPECTED_SESSION_PROFILE["python_environment"]
+            )
+            if actual_aedt_version != EXPECTED_AEDT_VERSION:
+                raise RuntimeError(
+                    "AEDT runtime version drift: "
+                    f"expected {EXPECTED_AEDT_VERSION}, got {raw_aedt_version!r}"
+                )
+            if python_environment != expected_environment:
+                raise RuntimeError(
+                    "Python environment drift: "
+                    f"expected {expected_environment!r}, got {python_environment!r}"
+                )
+            if pyaedt_version != EXPECTED_PYAEDT_VERSION:
+                raise RuntimeError(
+                    "PyAEDT runtime version drift: "
+                    f"expected {EXPECTED_PYAEDT_VERSION!r}, got {pyaedt_version!r}"
+                )
+        return metadata
+
+    def _initialize_dso_configuration(self) -> None:
+        """Install Desktop-global 4-core/one-engine profiles exactly once."""
+
+        if not self.dso_profile:
+            return
+        odesktop = getattr(self.desktop, "odesktop", None)
+        if odesktop is None:
+            raise RuntimeError("AEDT Desktop object has no native registry API")
+        base = (
+            Path(self.artifact_dir)
+            if self.artifact_dir
+            else Path(tempfile.gettempdir()) / f"aedt-session-{self.session_id}"
+        )
+        base.mkdir(parents=True, exist_ok=True)
+        for design_type, registry_suffix, filename, use_auto_settings in (
+            ("Maxwell 3D", "Maxwell 3D", "pyaedt_config_maxwell3d.acf", True),
+            ("Maxwell 2D", "Maxwell 2D", "pyaedt_config_maxwell2d.acf", True),
+            ("Icepak", "Icepak", "pyaedt_config_icepak.acf", False),
+        ):
+            acf_path = base / filename
+            acf_path.write_text(
+                "\n".join(
+                    (
+                        "$begin 'DSOConfig'",
+                        "ConfigName='pyaedt_config'",
+                        f"DesignType='{design_type}'",
+                        "MachineName='localhost'",
+                        "NumEngines=1",
+                        "NumCores=4",
+                        "NumGPUs=0",
+                        f"UseAutoSettings={str(use_auto_settings)}",
+                        "$end 'DSOConfig'",
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            loaded = odesktop.SetRegistryFromFile(str(acf_path))
+            if loaded is False:
+                raise RuntimeError(f"SetRegistryFromFile failed for {design_type}")
+            registry_key = f"Desktop/ActiveDSOConfigurations/{registry_suffix}"
+            selected = odesktop.SetRegistryString(registry_key, "pyaedt_config")
+            if selected is False:
+                raise RuntimeError(f"SetRegistryString failed for {design_type}")
+            actual = str(odesktop.GetRegistryString(registry_key) or "").strip()
+            if actual != "pyaedt_config":
+                raise RuntimeError(
+                    f"DSO readback mismatch for {design_type}: {actual!r}"
+                )
+        self._journal("dso_profile_initialized", profile=self.dso_profile)
+
+    def _journal(self, event: str, **fields: Any) -> None:
+        if not self.journal_path:
+            return
+        record = {
+            "timestamp": time.time(),
+            "event": event,
+            "session_id": self.session_id,
+            "host_id": self.host_id,
+            **fields,
+        }
+        try:
+            with Path(self.journal_path).open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        except OSError:
+            pass
+
+    def _capture_native_diagnostics(self, reason: str) -> str:
+        """Save one bounded native-message/log snapshot per suspect episode."""
+
+        if not self.artifact_dir:
+            return ""
+        if self.native_snapshot_path:
+            try:
+                if Path(self.native_snapshot_path).is_file():
+                    return self.native_snapshot_path
+            except OSError:
+                pass
+        messages: list[Any] = []
+        errors: list[str] = []
+        odesktop = getattr(self.desktop, "odesktop", None)
+        get_messages = getattr(odesktop, "GetMessages", None)
+
+        def collect_messages() -> None:
+            if not callable(get_messages):
+                errors.append("GetMessages API unavailable")
+                return
+            try:
+                try:
+                    value = get_messages("", "", 0)
+                except TypeError:
+                    value = get_messages()
+                if isinstance(value, (list, tuple)):
+                    messages.extend(str(item) for item in value[-200:])
+                elif value is not None:
+                    messages.append(str(value))
+            except BaseException as exc:
+                errors.append(str(exc))
+
+        collector = threading.Thread(
+            target=collect_messages,
+            name="aedt-native-diagnostics",
+            daemon=True,
+        )
+        collector.start()
+        collector.join(timeout=2.0)
+        if collector.is_alive():
+            errors.append("GetMessages timed out after 2 seconds")
+        log_tail = ""
+        if self.error_log_path:
+            try:
+                with Path(self.error_log_path).open("rb") as handle:
+                    handle.seek(0, os.SEEK_END)
+                    size = handle.tell()
+                    handle.seek(max(0, size - 65536), os.SEEK_SET)
+                    log_tail = handle.read(65536).decode("utf-8", errors="replace")
+            except OSError as exc:
+                errors.append(f"PyAEDT log tail unavailable: {exc}")
+        snapshot = Path(self.artifact_dir) / (
+            f"native-liveness-{int(time.time() * 1000)}.json"
+        )
+        try:
+            snapshot.write_text(
+                json.dumps(
+                    {
+                        "timestamp": time.time(),
+                        "reason": reason,
+                        "process_id": self.desktop_process_id,
+                        "port": self.desktop_port,
+                        "messages": messages,
+                        "pyaedt_log_tail": log_tail,
+                        "errors": errors,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            snapshots = sorted(
+                Path(self.artifact_dir).glob("native-liveness-*.json"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            for stale in snapshots[10:]:
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+        except OSError as exc:
+            self._journal("native_diagnostics_capture_failed", error=str(exc))
+            return ""
+        self.native_snapshot_path = str(snapshot)
+        self._journal(
+            "native_diagnostics_captured", path=self.native_snapshot_path
+        )
+        return self.native_snapshot_path
 
     @staticmethod
     def _find_free_desktop_port() -> int:
@@ -277,6 +664,37 @@ class AedtSessionHost:
         if pid <= 0:
             raise RuntimeError("PyAEDT returned an invalid AEDT process ID")
         return desktop
+
+    @classmethod
+    def _validate_owned_desktop(
+        cls,
+        desktop: Any,
+        *,
+        expected_port: int,
+        started_after: float,
+    ) -> Any:
+        """Attest that PyAEDT returned the sole Desktop launched for this host.
+
+        An explicit port alone is not an ownership boundary: another same-user
+        AEDT (for example the motor workload's standalone Desktop) may already
+        exist.  Accept the proxy only when its reported PID is exactly the one
+        newly-created current-user ``ansysedt -grpcsrv <port>`` process.
+        """
+
+        validated = cls._validate_desktop(desktop, expected_port=expected_port)
+        reported_pid = str(int(cls._desktop_pid(validated)))
+        owned_pid = cls._owned_desktop_pid_on_port(expected_port, started_after)
+        if not owned_pid:
+            raise RuntimeError(
+                "could not prove sole ownership of newly launched AEDT "
+                f"on gRPC port {expected_port}"
+            )
+        if reported_pid != owned_pid:
+            raise RuntimeError(
+                f"PyAEDT reported PID {reported_pid}, but the sole newly launched "
+                f"AEDT on gRPC port {expected_port} is PID {owned_pid}"
+            )
+        return validated
 
     @staticmethod
     def _desktop_port_is_listening(port: int) -> bool:
@@ -323,19 +741,22 @@ class AedtSessionHost:
     def _cleanup_failed_desktop_launch(
         self, desktop: Any, *, port: int, started_after: float
     ) -> None:
-        pid_text = self._desktop_pid(desktop) if desktop is not None else ""
-        try:
-            pid = int(pid_text)
-        except (TypeError, ValueError):
-            pid = 0
-        if pid <= 0:
-            pid_text = self._owned_desktop_pid_on_port(port, started_after)
-        try:
-            pid = int(pid_text)
-        except (TypeError, ValueError):
+        # Never trust a wrapper-reported PID as authority to signal a process.
+        # First prove exact port, creation-time, executable and current-user
+        # ownership from the OS process table; then require wrapper agreement
+        # when the wrapper did report a PID.
+        owned_pid = self._owned_desktop_pid_on_port(port, started_after)
+        if not owned_pid:
             return
-        marker = self._process_marker(pid)
-        self._force_kill_owned_desktop(pid_text, marker)
+        reported_pid = self._desktop_pid(desktop) if desktop is not None else ""
+        try:
+            reported_value = int(reported_pid)
+        except (TypeError, ValueError):
+            reported_value = 0
+        if reported_value > 0 and str(reported_value) != owned_pid:
+            return
+        marker = self._process_marker(int(owned_pid))
+        self._force_kill_owned_desktop(owned_pid, marker)
 
     def _start_desktop(self) -> Any:
         # Must run before importing/constructing Desktop because PyAEDT's
@@ -350,7 +771,11 @@ class AedtSessionHost:
             desktop: Any = None
             try:
                 desktop = self._create_desktop(new_desktop=True, port=port)
-                return self._validate_desktop(desktop)
+                return self._validate_owned_desktop(
+                    desktop,
+                    expected_port=port,
+                    started_after=launch_started_at,
+                )
             except Exception as launch_error:
                 last_error = launch_error
                 fallback_port = port
@@ -367,8 +792,10 @@ class AedtSessionHost:
                     recovered_desktop = self._create_desktop(
                         new_desktop=False, port=fallback_port
                     )
-                    recovered = self._validate_desktop(
-                        recovered_desktop, expected_port=fallback_port
+                    recovered = self._validate_owned_desktop(
+                        recovered_desktop,
+                        expected_port=fallback_port,
+                        started_after=launch_started_at,
                     )
                     print(
                         f"Recovered AEDT Desktop on explicit gRPC port {fallback_port} "
@@ -606,12 +1033,92 @@ class AedtSessionHost:
             # unhealthy; never hide the original host failure.
             pass
 
+    def _native_desktop_responds(self, timeout_seconds: float = 5.0) -> bool:
+        existing = self._native_probe_thread
+        if existing is not None:
+            if existing.is_alive():
+                return False
+            succeeded = not self._native_probe_errors
+            self._native_probe_thread = None
+            self._native_probe_errors = []
+            return succeeded
+        odesktop = getattr(self.desktop, "odesktop", None)
+        probe = getattr(odesktop, "GetVersion", None)
+        if not callable(probe):
+            return False
+        self._native_probe_errors = []
+
+        def call() -> None:
+            try:
+                probe()
+            except BaseException as exc:
+                self._native_probe_errors.append(exc)
+
+        thread = threading.Thread(target=call, name="aedt-native-liveness", daemon=True)
+        self._native_probe_thread = thread
+        thread.start()
+        thread.join(timeout=max(0.1, float(timeout_seconds)))
+        if thread.is_alive():
+            return False
+        succeeded = not self._native_probe_errors
+        self._native_probe_thread = None
+        self._native_probe_errors = []
+        return succeeded
+
+    def _desktop_liveness_proof(self) -> tuple[bool, str]:
+        """Require process identity, exact gRPC listener, and native response."""
+
+        if self.desktop is None:
+            return False, "Desktop proxy is absent"
+        pid_text = self.desktop_process_id or self._desktop_pid(self.desktop)
+        if not pid_text:
+            return False, "Desktop PID is unavailable"
+        if self._process_alive(pid_text, self.desktop_process_marker) is not True:
+            return False, f"Desktop PID {pid_text} is not alive or identity changed"
+        port = self.desktop_port
+        if port <= 0:
+            try:
+                port = self._desktop_port(self.desktop)
+            except Exception:
+                port = 0
+        if port <= 0 or not self._desktop_port_is_listening(port):
+            return False, f"Desktop gRPC port {port or '<unknown>'} is not listening"
+        if not self._native_desktop_responds():
+            now = time.monotonic()
+            if not self.native_probe_failures:
+                self.native_probe_first_failure_at = now
+            self.native_probe_failures += 1
+            elapsed = max(0.0, now - self.native_probe_first_failure_at)
+            # A solve can serialize AEDT's scripting/native interface for many
+            # minutes.  PID identity plus the exact listening gRPC socket are
+            # authoritative process-liveness proofs; GetVersion timeout alone
+            # only freezes admission and can never authorize a kill/recycle.
+            return (
+                True,
+                "Desktop native GetVersion probe transiently failed "
+                f"({self.native_probe_failures} consecutive, {elapsed:.1f}s)",
+            )
+        self.native_probe_failures = 0
+        self.native_probe_first_failure_at = 0.0
+        # A recovered episode must never cause a later real fault to reuse a
+        # stale diagnostic snapshot.  The persisted path remains in control
+        # plane history while the next episode creates a timestamped file.
+        self.native_snapshot_path = ""
+        return True, ""
+
+    def _desktop_still_alive(self) -> bool:
+        healthy, _reason = self._desktop_liveness_proof()
+        return healthy
+
     def run(self) -> int:
         claim_payload = {
             "allocation_id": self.allocation_id,
             "node_name": self.node_name,
             "host_id": self.host_id,
             "session_id": self.requested_session_id,
+            "actual_node_name": socket.gethostname(),
+            "slurm_job_id": os.environ.get("SLURM_JOB_ID", ""),
+            "host_process_id": str(os.getpid()),
         }
         claimed = self._control_plane_request(
             "POST",
@@ -622,33 +1129,138 @@ class AedtSessionHost:
             return 0
         self.session_id = int(claimed["id"])
         try:
+            self._prepare_artifacts(claimed)
             self.desktop = self._start_desktop()
+            self.desktop_process_id = self._desktop_pid(self.desktop)
+            try:
+                pid_value = int(self.desktop_process_id)
+            except (TypeError, ValueError):
+                pid_value = 0
+            self.desktop_process_marker = (
+                self._process_marker(pid_value) if pid_value > 0 else None
+            )
+            self.desktop_port = self._desktop_port(self.desktop)
+            self._initialize_dso_configuration()
+            self._attest_runtime_profile()
+            self._journal(
+                "desktop_started",
+                process_id=self._desktop_pid(self.desktop),
+                port=self._desktop_port(self.desktop),
+            )
             endpoint = f"{socket.getfqdn()}:{self._desktop_port(self.desktop)}"
             registration_token = secrets.token_urlsafe(32)
-            registered = self._control_plane_request(
-                "POST",
-                f"/api/aedt-pool/sessions/{self.session_id}/register",
-                {
-                    "host_id": self.host_id,
-                    "endpoint": endpoint,
-                    "process_id": self._desktop_pid(self.desktop),
-                },
-                host_token=registration_token,
-                retry_registration_conflict=True,
-            )
+            while True:
+                try:
+                    registered = self._control_plane_request(
+                        "POST",
+                        f"/api/aedt-pool/sessions/{self.session_id}/register",
+                        {
+                            "host_id": self.host_id,
+                            "endpoint": endpoint,
+                            "process_id": self._desktop_pid(self.desktop),
+                            "artifact_dir": self.artifact_dir,
+                            "error_log_path": self.error_log_path,
+                            "journal_path": self.journal_path,
+                            "session_profile": self.session_profile,
+                            "runtime_metadata": self.runtime_metadata,
+                        },
+                        host_token=registration_token,
+                        retry_registration_conflict=True,
+                    )
+                    break
+                except ControlPlaneUnavailable as exc:
+                    if not self._desktop_still_alive():
+                        raise RuntimeError(
+                            "AEDT died while registration control plane was unavailable"
+                        ) from exc
+                    self._journal("registration_deferred", error=str(exc))
+                    time.sleep(min(5, self.heartbeat_seconds))
             self.host_token = str(registered["host_token"])
+            self._journal("session_registered", endpoint=endpoint)
             while not self.stop_requested:
-                self._control_plane_request(
-                    "POST",
-                    f"/api/aedt-pool/sessions/{self.session_id}/heartbeat",
-                    {},
-                    host_token=self.host_token,
-                )
-                commands = self._control_plane_request(
-                    "GET",
-                    f"/api/aedt-pool/sessions/{self.session_id}/commands",
-                    host_token=self.host_token,
-                )
+                try:
+                    healthy, liveness_error = self._desktop_liveness_proof()
+                    if not healthy:
+                        snapshot_path = self._capture_native_diagnostics(
+                            liveness_error
+                        )
+                        self._journal(
+                            "desktop_liveness_failed", error=liveness_error
+                        )
+                        self._control_plane_request(
+                            "POST",
+                            f"/api/aedt-pool/sessions/{self.session_id}/fault",
+                            {
+                                "kind": "confirmed_aedt_death",
+                                "failure_message": liveness_error,
+                                "evidence": {
+                                    "process_id": self.desktop_process_id,
+                                    "port": self.desktop_port,
+                                    "native_probe_failures": self.native_probe_failures,
+                                    "artifact_dir": self.artifact_dir,
+                                    "error_log_path": self.error_log_path,
+                                    "native_snapshot_path": snapshot_path,
+                                },
+                            },
+                            host_token=self.host_token,
+                        )
+                        raise RuntimeError(
+                            f"AEDT Desktop liveness proof failed: {liveness_error}"
+                        )
+                    if liveness_error:
+                        # One serialized native call can miss while two solvers
+                        # are busy.  Freeze admission without claiming health;
+                        # only an empty-error proof sends a recovery heartbeat.
+                        self._journal(
+                            "desktop_native_probe_suspect", error=liveness_error
+                        )
+                        snapshot_path = self._capture_native_diagnostics(
+                            liveness_error
+                        )
+                        self._control_plane_request(
+                            "POST",
+                            f"/api/aedt-pool/sessions/{self.session_id}/fault",
+                            {
+                                "kind": "native_probe_suspect",
+                                "failure_message": liveness_error,
+                                "evidence": {
+                                    "native_probe_failures": self.native_probe_failures,
+                                    "process_id": self.desktop_process_id,
+                                    "port": self.desktop_port,
+                                    "artifact_dir": self.artifact_dir,
+                                    "native_snapshot_path": snapshot_path,
+                                },
+                            },
+                            host_token=self.host_token,
+                        )
+                        time.sleep(self.heartbeat_seconds)
+                        continue
+                    self._control_plane_request(
+                        "POST",
+                        f"/api/aedt-pool/sessions/{self.session_id}/heartbeat",
+                        {
+                            "liveness_confirmed": True,
+                            "process_id": self.desktop_process_id,
+                            "port": self.desktop_port,
+                            "native_probe": "GetVersion",
+                        },
+                        host_token=self.host_token,
+                    )
+                    commands = self._control_plane_request(
+                        "GET",
+                        f"/api/aedt-pool/sessions/{self.session_id}/commands",
+                        host_token=self.host_token,
+                    )
+                except ControlPlaneUnavailable as exc:
+                    if not self._desktop_still_alive():
+                        raise RuntimeError(
+                            "AEDT died while the control plane was unavailable"
+                        ) from exc
+                    # Offline-safe mode: freeze admission/commands locally and
+                    # keep the existing Desktop and solves alive indefinitely.
+                    self._journal("control_plane_offline_safe", error=str(exc))
+                    time.sleep(min(5, self.heartbeat_seconds))
+                    continue
                 for lease in commands.get("close_projects") or []:
                     success = True
                     failure = ""
@@ -657,12 +1269,20 @@ class AedtSessionHost:
                     except Exception as exc:
                         success = False
                         failure = str(exc)
-                    self._control_plane_request(
-                        "POST",
-                        f"/api/aedt-pool/sessions/{self.session_id}/leases/{int(lease['id'])}/release-complete",
-                        {"success": success, "failure_message": failure},
-                        host_token=self.host_token,
-                    )
+                    try:
+                        self._control_plane_request(
+                            "POST",
+                            f"/api/aedt-pool/sessions/{self.session_id}/leases/{int(lease['id'])}/release-complete",
+                            {"success": success, "failure_message": failure},
+                            host_token=self.host_token,
+                        )
+                    except ControlPlaneUnavailable as exc:
+                        self._journal(
+                            "release_ack_deferred",
+                            lease_id=int(lease["id"]),
+                            success=success,
+                            error=str(exc),
+                        )
                 if commands.get("global_stop_allowed"):
                     # Never use this path until the control plane says the
                     # sibling finished or its explicitly bounded grace elapsed.
@@ -691,6 +1311,7 @@ class AedtSessionHost:
                     return 3
                 time.sleep(self.heartbeat_seconds)
         except Exception as exc:
+            self._journal("session_host_failed", error=str(exc))
             try:
                 confirmed = self._bounded_close_desktop(global_stop=False)
             except Exception:
@@ -703,7 +1324,24 @@ class AedtSessionHost:
                         self.client.request(
                             "POST",
                             f"/api/aedt-pool/sessions/{self.session_id}/start-failed",
-                            {"host_id": self.host_id, "failure_message": str(exc)},
+                            {
+                                "host_id": self.host_id,
+                                "failure_message": str(exc),
+                                "artifact_dir": self.artifact_dir,
+                                "error_log_path": self.error_log_path,
+                                "journal_path": self.journal_path,
+                                "runtime_metadata": {
+                                    **self.runtime_metadata,
+                                    "python_executable": sys.executable,
+                                    "python_version": sys.version,
+                                    "python_environment": os.environ.get(
+                                        "CONDA_DEFAULT_ENV", ""
+                                    ),
+                                    "dso_profile": self.dso_profile,
+                                    "session_profile": self.session_profile,
+                                    "startup_failure": str(exc),
+                                },
+                            },
                         )
                     except Exception:
                         pass
@@ -735,6 +1373,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bootstrap-token-file", required=True)
     parser.add_argument("--heartbeat-seconds", type=int, default=20)
     parser.add_argument("--aedt-version", default="")
+    parser.add_argument(
+        "--artifact-root", default=os.environ.get(ARTIFACT_ROOT_ENV, "")
+    )
+    parser.add_argument(
+        "--dso-profile", default=os.environ.get(DSO_PROFILE_ENV, "")
+    )
+    parser.add_argument(
+        "--session-profile", default=os.environ.get(SESSION_PROFILE_ENV, "")
+    )
     return parser
 
 
@@ -768,6 +1415,9 @@ def main(argv: list[str] | None = None) -> int:
         session_id=args.session_id,
         heartbeat_seconds=args.heartbeat_seconds,
         aedt_version=args.aedt_version,
+        artifact_root=args.artifact_root,
+        dso_profile=args.dso_profile,
+        session_profile=args.session_profile,
         control_plane_outage_seconds=_control_plane_outage_seconds_from_env(),
     )
     signal.signal(signal.SIGTERM, host.request_stop)
