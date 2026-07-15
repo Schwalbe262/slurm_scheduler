@@ -13,6 +13,24 @@ from typing import Any
 AUTOMATION_LOCK_FILENAME = "desktop-automation.lock"
 
 
+# POSIX record locks are process-associated: closing *any* descriptor for the
+# inode can release every record lock that process owns on it.  Keep one gate
+# per normalized path so a second SessionAutomationLock in the same process
+# cannot open/close the marker while the first instance owns its record lock.
+_PROCESS_PATH_GATES_GUARD = threading.Lock()
+_PROCESS_PATH_GATES: dict[str, threading.Lock] = {}
+
+
+def _process_path_gate(path: str) -> threading.Lock:
+    key = os.path.normcase(os.path.abspath(os.path.normpath(path)))
+    with _PROCESS_PATH_GATES_GUARD:
+        gate = _PROCESS_PATH_GATES.get(key)
+        if gate is None:
+            gate = threading.Lock()
+            _PROCESS_PATH_GATES[key] = gate
+        return gate
+
+
 def automation_lock_path(artifact_dir: str) -> str:
     """Return the one cross-account lock file owned by a session host."""
 
@@ -60,9 +78,13 @@ def create_automation_lock_file(path: str) -> str:
 class SessionAutomationLock:
     """Re-entrant process lock for Desktop-global AEDT automation calls.
 
-    Linux production uses ``flock``, which GPFS propagates across nodes and
-    accounts.  The small Windows branch exists so the same exclusion contract
-    can be exercised by the scheduler's local unit tests.
+    Linux production takes both a BSD ``flock`` and a POSIX byte-range
+    ``lockf``.  ``flock`` excludes distinct open descriptions on one node;
+    GPFS propagates the POSIX record lock across compute nodes.  A process-wide
+    path gate prevents an unrelated descriptor close from dropping that
+    process's record lock.  All callers take these layers in one order and
+    release them in reverse order.  The Windows branch retains its native
+    one-byte lock for local scheduler tests.
     """
 
     def __init__(
@@ -81,6 +103,8 @@ class SessionAutomationLock:
         self.total_wait_seconds = 0.0
         self.acquire_count = 0
         self._local_lock = threading.RLock()
+        self._process_gate = _process_path_gate(self.path)
+        self._process_gate_held = False
         self._depth = 0
         self._descriptor: int | None = None
         self._owner_thread_id: int | None = None
@@ -92,10 +116,20 @@ class SessionAutomationLock:
             flags |= os.O_NOFOLLOW
         descriptor = os.open(path, flags)
         info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_size < 1
+        ):
             os.close(descriptor)
-            raise RuntimeError("AEDT automation lock must be one regular file")
+            raise RuntimeError(
+                "AEDT automation lock must be one non-empty regular file"
+            )
         return descriptor
+
+    @staticmethod
+    def _lock_would_block(exc: OSError) -> bool:
+        return exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
 
     @staticmethod
     def _try_lock(descriptor: int) -> bool:
@@ -113,10 +147,30 @@ class SessionAutomationLock:
         import fcntl
 
         try:
+            # GPFS propagates POSIX byte-range locks between compute nodes but
+            # does not propagate ``flock`` consistently.  Keep both: flock
+            # excludes distinct descriptors in this process/node, while
+            # lockf is the cluster-wide exclusion primitive.
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if SessionAutomationLock._lock_would_block(exc):
+                return False
+            raise
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            fcntl.lockf(
+                descriptor,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+                1,
+                0,
+                os.SEEK_SET,
+            )
             return True
-        except BlockingIOError:
-            return False
+        except OSError as exc:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            if SessionAutomationLock._lock_would_block(exc):
+                return False
+            raise
 
     @staticmethod
     def _unlock(descriptor: int) -> None:
@@ -128,19 +182,39 @@ class SessionAutomationLock:
             return
         import fcntl
 
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        try:
+            fcntl.lockf(
+                descriptor,
+                fcntl.LOCK_UN,
+                1,
+                0,
+                os.SEEK_SET,
+            )
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
 
     def acquire(self) -> "SessionAutomationLock":
-        self._local_lock.acquire()
+        started = time.monotonic()
+        deadline = started + self.timeout_seconds
+        if not self._local_lock.acquire(timeout=self.timeout_seconds):
+            raise TimeoutError(
+                "timed out waiting for AEDT Desktop automation lock: "
+                f"{self.path}"
+            )
         if self._depth:
             self._depth += 1
             return self
 
         descriptor: int | None = None
-        started = time.monotonic()
         try:
+            remaining = max(0.0, deadline - time.monotonic())
+            if not self._process_gate.acquire(timeout=remaining):
+                raise TimeoutError(
+                    "timed out waiting for AEDT Desktop automation lock: "
+                    f"{self.path}"
+                )
+            self._process_gate_held = True
             descriptor = self._open_existing(self.path)
-            deadline = started + self.timeout_seconds
             while not self._try_lock(descriptor):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -159,25 +233,42 @@ class SessionAutomationLock:
             return self
         except BaseException:
             if descriptor is not None:
-                os.close(descriptor)
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if self._process_gate_held:
+                self._process_gate_held = False
+                self._process_gate.release()
             self._local_lock.release()
             raise
 
     def release(self) -> None:
         if self._depth <= 0:
             raise RuntimeError("AEDT automation lock is not held")
+        if self._owner_thread_id != threading.get_ident():
+            raise RuntimeError(
+                "AEDT automation lock can only be released by its owner"
+            )
         self._depth -= 1
         try:
             if self._depth == 0:
                 descriptor = self._descriptor
                 self._descriptor = None
                 self._owner_thread_id = None
-                if descriptor is None:
-                    raise RuntimeError("AEDT automation lock descriptor is absent")
                 try:
-                    self._unlock(descriptor)
+                    if descriptor is None:
+                        raise RuntimeError(
+                            "AEDT automation lock descriptor is absent"
+                        )
+                    try:
+                        self._unlock(descriptor)
+                    finally:
+                        os.close(descriptor)
                 finally:
-                    os.close(descriptor)
+                    if self._process_gate_held:
+                        self._process_gate_held = False
+                        self._process_gate.release()
         finally:
             self._local_lock.release()
 

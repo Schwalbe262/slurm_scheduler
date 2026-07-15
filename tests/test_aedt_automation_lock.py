@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import errno
 import os
+import sys
 import threading
+import types
 from pathlib import Path
 
 import pytest
 
+import slurm_scheduler.aedt_automation_lock as lock_module
 from slurm_scheduler.aedt_automation_lock import (
     SessionAutomationLock,
     automation_lock_path,
@@ -57,6 +61,55 @@ def test_distinct_clients_are_mutually_exclusive(tmp_path: Path) -> None:
     assert outcome == ["timeout", "acquired"]
 
 
+def test_process_gate_blocks_before_second_instance_opens_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = create_automation_lock_file(automation_lock_path(str(tmp_path)))
+    owner = SessionAutomationLock(path, timeout_seconds=1)
+    contender = SessionAutomationLock(path, timeout_seconds=0)
+
+    def unexpected_open(_path: str) -> int:
+        raise AssertionError("contender opened marker while process gate was held")
+
+    monkeypatch.setattr(contender, "_open_existing", unexpected_open)
+    with owner:
+        with pytest.raises(TimeoutError, match="automation lock"):
+            contender.acquire()
+
+
+def test_non_owner_release_preserves_lock_state(tmp_path: Path) -> None:
+    path = create_automation_lock_file(automation_lock_path(str(tmp_path)))
+    owner = SessionAutomationLock(path, timeout_seconds=1)
+    contender = SessionAutomationLock(path, timeout_seconds=0)
+    errors: list[BaseException] = []
+
+    owner.acquire()
+    thread = threading.Thread(
+        target=lambda: _record_release_error(owner, errors), daemon=True
+    )
+    thread.start()
+    thread.join(timeout=1)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "released by its owner" in str(errors[0])
+    assert owner._depth == 1
+    assert owner._descriptor is not None
+    assert owner._process_gate_held is True
+    with pytest.raises(TimeoutError, match="automation lock"):
+        contender.acquire()
+    owner.release()
+
+
+def _record_release_error(
+    lock: SessionAutomationLock, errors: list[BaseException]
+) -> None:
+    try:
+        lock.release()
+    except BaseException as exc:
+        errors.append(exc)
+
+
 def _record_lock_attempt(lock: SessionAutomationLock, outcome: list[str]) -> None:
     try:
         with lock:
@@ -89,3 +142,160 @@ def test_client_cannot_create_missing_host_lock(tmp_path: Path) -> None:
     )
     with pytest.raises(FileNotFoundError):
         lock.acquire()
+
+
+def test_client_rejects_empty_host_lock_marker(tmp_path: Path) -> None:
+    path = tmp_path / "empty.lock"
+    path.touch()
+    lock = SessionAutomationLock(str(path), timeout_seconds=0.1)
+    with pytest.raises(RuntimeError, match="non-empty regular file"):
+        lock.acquire()
+
+
+def test_process_path_gate_prevents_second_descriptor_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = create_automation_lock_file(automation_lock_path(str(tmp_path)))
+    first = SessionAutomationLock(path, timeout_seconds=1)
+    second = SessionAutomationLock(path, timeout_seconds=0.1, poll_seconds=0.01)
+    opened: list[str] = []
+    original_open = SessionAutomationLock._open_existing
+
+    with first:
+        def tracking_open(candidate: str) -> int:
+            opened.append(candidate)
+            return original_open(candidate)
+
+        monkeypatch.setattr(
+            SessionAutomationLock,
+            "_open_existing",
+            staticmethod(tracking_open),
+        )
+        outcome: list[str] = []
+        thread = threading.Thread(
+            target=lambda: _record_lock_attempt(second, outcome), daemon=True
+        )
+        thread.start()
+        thread.join(timeout=1)
+        assert outcome == ["timeout"]
+        # POSIX closes release all record locks for this process/inode.  The
+        # process gate must therefore stop the losing instance before os.open.
+        assert opened == []
+
+    with second:
+        pass
+    assert opened == [path]
+
+
+def test_wrong_thread_cannot_corrupt_owned_lock(tmp_path: Path) -> None:
+    path = create_automation_lock_file(automation_lock_path(str(tmp_path)))
+    lock = SessionAutomationLock(path, timeout_seconds=1)
+    failures: list[str] = []
+    lock.acquire()
+
+    def wrong_thread_release() -> None:
+        try:
+            lock.release()
+        except RuntimeError as exc:
+            failures.append(str(exc))
+
+    thread = threading.Thread(target=wrong_thread_release, daemon=True)
+    thread.start()
+    thread.join(timeout=1)
+    assert failures == [
+        "AEDT automation lock can only be released by its owner"
+    ]
+    assert lock._depth == 1
+    assert lock._descriptor is not None
+    assert lock._process_gate_held is True
+    lock.release()
+    assert lock._depth == 0
+
+
+def _fake_posix_lock_modules(
+    monkeypatch: pytest.MonkeyPatch, *, busy_layer: str = "",
+) -> tuple[types.ModuleType, list[tuple]]:
+    calls: list[tuple] = []
+    fake_fcntl = types.ModuleType("fcntl")
+    fake_fcntl.LOCK_EX = 1
+    fake_fcntl.LOCK_NB = 2
+    fake_fcntl.LOCK_UN = 8
+
+    def flock(descriptor: int, operation: int) -> None:
+        calls.append(("flock", descriptor, operation))
+        if busy_layer == "flock" and operation != fake_fcntl.LOCK_UN:
+            raise OSError(errno.EACCES, "busy")
+
+    def lockf(
+        descriptor: int,
+        operation: int,
+        length: int,
+        start: int,
+        whence: int,
+    ) -> None:
+        calls.append(
+            ("lockf", descriptor, operation, length, start, whence)
+        )
+        if busy_layer == "lockf" and operation != fake_fcntl.LOCK_UN:
+            raise OSError(errno.EAGAIN, "busy")
+
+    fake_fcntl.flock = flock
+    fake_fcntl.lockf = lockf
+    fake_os = types.SimpleNamespace(
+        name="posix",
+        lseek=os.lseek,
+        SEEK_SET=os.SEEK_SET,
+    )
+    monkeypatch.setitem(sys.modules, "fcntl", fake_fcntl)
+    monkeypatch.setattr(lock_module, "os", fake_os)
+    return fake_fcntl, calls
+
+
+def test_posix_dual_lock_and_reverse_unlock_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_fcntl, calls = _fake_posix_lock_modules(monkeypatch)
+    path = tmp_path / "marker"
+    path.write_bytes(b"\0")
+    descriptor = os.open(path, os.O_RDWR)
+    try:
+        assert SessionAutomationLock._try_lock(descriptor) is True
+        SessionAutomationLock._unlock(descriptor)
+    finally:
+        os.close(descriptor)
+
+    acquire_operation = fake_fcntl.LOCK_EX | fake_fcntl.LOCK_NB
+    assert calls == [
+        ("flock", descriptor, acquire_operation),
+        ("lockf", descriptor, acquire_operation, 1, 0, os.SEEK_SET),
+        ("lockf", descriptor, fake_fcntl.LOCK_UN, 1, 0, os.SEEK_SET),
+        ("flock", descriptor, fake_fcntl.LOCK_UN),
+    ]
+
+
+@pytest.mark.parametrize("busy_layer", ["flock", "lockf"])
+def test_posix_busy_lock_rolls_back_local_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    busy_layer: str,
+) -> None:
+    fake_fcntl, calls = _fake_posix_lock_modules(
+        monkeypatch, busy_layer=busy_layer
+    )
+    path = tmp_path / "marker"
+    path.write_bytes(b"\0")
+    descriptor = os.open(path, os.O_RDWR)
+    try:
+        assert SessionAutomationLock._try_lock(descriptor) is False
+    finally:
+        os.close(descriptor)
+
+    acquire_operation = fake_fcntl.LOCK_EX | fake_fcntl.LOCK_NB
+    if busy_layer == "flock":
+        assert calls == [("flock", descriptor, acquire_operation)]
+    else:
+        assert calls == [
+            ("flock", descriptor, acquire_operation),
+            ("lockf", descriptor, acquire_operation, 1, 0, os.SEEK_SET),
+            ("flock", descriptor, fake_fcntl.LOCK_UN),
+        ]
