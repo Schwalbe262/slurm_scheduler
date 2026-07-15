@@ -370,6 +370,7 @@ class AedtSessionHost:
         self.automation_lock_path = ""
         self._automation_lock: SessionAutomationLock | None = None
         self.error_log_path = ""
+        self.native_batch_log_path = ""
         self.journal_path = ""
         self.native_snapshot_path = ""
         self.runtime_metadata: dict[str, Any] = {}
@@ -535,6 +536,7 @@ class AedtSessionHost:
         self.artifact_dir = str(directory)
         self.automation_lock_path = automation_lock_path(self.artifact_dir)
         self.error_log_path = str(directory / "pyaedt.log")
+        self.native_batch_log_path = str(directory / "batch.log")
         self.journal_path = str(directory / "session-events.jsonl")
         directory.mkdir(parents=True, exist_ok=True)
         create_automation_lock_file(self.automation_lock_path)
@@ -585,6 +587,7 @@ class AedtSessionHost:
             "artifact_dir": self.artifact_dir,
             "automation_lock_path": self.automation_lock_path,
             "error_log_path": self.error_log_path,
+            "native_batch_log_path": self.native_batch_log_path,
             "journal_path": self.journal_path,
         }
         self.runtime_metadata = metadata
@@ -1046,6 +1049,41 @@ class AedtSessionHost:
             f"AEDT Desktop launch failed after {DESKTOP_LAUNCH_ATTEMPTS} attempts: "
             f"{last_error}"
         ) from last_error
+
+    def _start_desktop_with_session_working_directory(self) -> Any:
+        """Launch AEDT where its native ``batch.log`` is session-owned."""
+
+        if not self.artifact_dir:
+            return self._start_desktop()
+        launch_directory = Path(self.artifact_dir)
+        if not launch_directory.is_absolute() or not launch_directory.is_dir():
+            raise RuntimeError(
+                "AEDT session artifact directory must be an existing absolute path"
+            )
+        original_directory = Path.cwd()
+        self.native_batch_log_path = str(launch_directory / "batch.log")
+        self._journal(
+            "desktop_launch_directory_selected",
+            launch_directory=str(launch_directory),
+            native_batch_log_path=self.native_batch_log_path,
+        )
+        try:
+            # AEDT inherits the host cwd at process creation and writes its
+            # native batch.log there. Previously every pooled host launched
+            # from one source checkout, so multiple Desktops corrupted it.
+            os.chdir(launch_directory)
+            return self._start_desktop()
+        finally:
+            try:
+                os.chdir(original_directory)
+            except OSError as exc:
+                # All host runtime paths are absolute after launch. A failed
+                # best-effort restore must not orphan an otherwise owned AEDT.
+                self._journal(
+                    "desktop_launch_directory_restore_failed",
+                    original_directory=str(original_directory),
+                    error=str(exc),
+                )
 
     @staticmethod
     def _desktop_port(desktop: Any) -> int:
@@ -1790,7 +1828,7 @@ class AedtSessionHost:
         self.session_id = int(claimed["id"])
         try:
             self._prepare_artifacts(claimed)
-            self.desktop = self._start_desktop()
+            self.desktop = self._start_desktop_with_session_working_directory()
             self.desktop_process_id = self._desktop_pid(self.desktop)
             try:
                 pid_value = int(self.desktop_process_id)

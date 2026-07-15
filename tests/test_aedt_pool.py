@@ -4212,6 +4212,51 @@ class SessionHostTests(unittest.TestCase):
                 "session-local PyAEDT log\n",
             )
 
+    def test_desktop_launch_uses_session_directory_for_native_batch_log(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            host = AedtSessionHost(
+                FakeHostControlPlane([]),
+                allocation_id=1,
+                node_name="cpu-01",
+                artifact_root=root,
+            )
+            host.session_id = 42
+            host._prepare_artifacts({"session_key": "native-batch-log"})
+            original_directory = Path.cwd()
+            launch_directories: list[Path] = []
+            desktop = object()
+
+            def start_desktop():
+                launch_directories.append(Path.cwd())
+                return desktop
+
+            host._start_desktop = start_desktop
+
+            self.assertIs(
+                host._start_desktop_with_session_working_directory(), desktop
+            )
+            self.assertEqual(launch_directories, [Path(host.artifact_dir)])
+            self.assertEqual(Path.cwd(), original_directory)
+            self.assertEqual(
+                host.native_batch_log_path,
+                str(Path(host.artifact_dir) / "batch.log"),
+            )
+            journal = [
+                json.loads(line)
+                for line in Path(host.journal_path).read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            launch_event = next(
+                item
+                for item in journal
+                if item["event"] == "desktop_launch_directory_selected"
+            )
+            self.assertEqual(
+                launch_event["native_batch_log_path"],
+                host.native_batch_log_path,
+            )
+
     def test_release_closes_project_before_workspace_preparation(self) -> None:
         events: list[str] = []
         host = AedtSessionHost(
