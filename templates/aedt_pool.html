@@ -11,37 +11,58 @@
 
   <section class="panel">
     <h2>Operator limits</h2>
-    <p class="muted">
-      Limits are durable even while the pool is disabled. Starting, ready, busy, draining,
-      and unhealthy sessions consume the AEDT ceiling. The project target must not exceed
-      AEDT sessions × projects per AEDT; changing slot count requires a fully drained pool.
-    </p>
-    <form id="limit-form" class="form-grid">
+    <div class="form-grid">
       <div class="full">
         <label for="aedt-bootstrap-token">Bootstrap token (required for changes)</label>
         <input id="aedt-bootstrap-token" type="password" autocomplete="off" spellcheck="false">
       </div>
+    </div>
+
+    <form id="concurrent-simulations-form" class="form-grid">
       <div>
-        <label for="max-aedt-sessions">Maximum open AEDT sessions</label>
-        <input id="max-aedt-sessions" name="max_aedt_sessions" type="number" min="0" max="550" step="1" required>
+        <label for="concurrent-simulations">동시 시뮬레이션 수</label>
+        <input id="concurrent-simulations" name="concurrent_simulations" type="number" min="0" max="1650" step="1" required>
       </div>
       <div>
-        <label for="min-idle-aedt-sessions">Minimum idle AEDT sessions</label>
-        <input id="min-idle-aedt-sessions" name="min_idle_aedt_sessions" type="number" min="0" max="550" step="1" required>
-      </div>
-      <div>
-        <label for="target-projects">Maximum concurrent projects</label>
-        <input id="target-projects" name="target_project_concurrency" type="number" min="0" max="1650" step="1" required>
-      </div>
-      <div>
-        <label for="projects-per-aedt">Projects per AEDT</label>
-        <input id="projects-per-aedt" name="projects_per_aedt" type="number" min="1" max="3" step="1" required>
+        <label for="derived-aedt-sessions">필요 AEDT 세션</label>
+        <output id="derived-aedt-sessions" class="summary-value" for="concurrent-simulations projects-per-aedt" aria-live="polite"></output>
       </div>
       <div class="full actions">
-        <button type="submit">Save ceiling</button>
-        <span id="save-result" class="muted" role="status"></span>
+        <button type="submit">저장</button>
+        <span id="concurrent-save-result" class="muted" role="status"></span>
       </div>
     </form>
+
+    <details id="advanced-operator-limits" class="section-gap">
+      <summary>고급 설정</summary>
+      <p class="muted">
+        Limits are durable even while the pool is disabled. Starting, ready, busy, draining,
+        and unhealthy sessions consume the AEDT ceiling. The project target must not exceed
+        AEDT sessions × projects per AEDT; changing slot count requires a fully drained pool.
+      </p>
+      <form id="limit-form" class="form-grid">
+        <div>
+          <label for="max-aedt-sessions">Maximum open AEDT sessions</label>
+          <input id="max-aedt-sessions" name="max_aedt_sessions" type="number" min="0" max="550" step="1" required>
+        </div>
+        <div>
+          <label for="min-idle-aedt-sessions">Minimum idle AEDT sessions</label>
+          <input id="min-idle-aedt-sessions" name="min_idle_aedt_sessions" type="number" min="0" max="550" step="1" required>
+        </div>
+        <div>
+          <label for="target-projects">Maximum concurrent projects</label>
+          <input id="target-projects" name="target_project_concurrency" type="number" min="0" max="1650" step="1" required>
+        </div>
+        <div>
+          <label for="projects-per-aedt">Projects per AEDT</label>
+          <input id="projects-per-aedt" name="projects_per_aedt" type="number" min="1" max="3" step="1" required>
+        </div>
+        <div class="full actions">
+          <button type="submit">Save advanced limits</button>
+          <span id="save-result" class="muted" role="status"></span>
+        </div>
+      </form>
+    </details>
   </section>
 
   <section class="panel">
@@ -97,6 +118,7 @@
   const liveSessionStates = new Set(["starting", "ready", "busy", "draining", "unhealthy"]);
   const historySessionStates = new Set(["failed", "closed"]);
   const sessionHistoryLimit = 30;
+  const bootstrapTokenStorageKey = "aedt-pool-bootstrap-token";
 
   function escapeText(value) {
     return String(value ?? "");
@@ -212,13 +234,72 @@
     };
   }
 
+  function restoreBootstrapToken() {
+    try {
+      document.getElementById("aedt-bootstrap-token").value =
+        localStorage.getItem(bootstrapTokenStorageKey) || "";
+    } catch (_) {
+      // Storage may be unavailable in hardened/private browser contexts.
+    }
+  }
+
+  function rememberBootstrapToken() {
+    try {
+      localStorage.setItem(
+        bootstrapTokenStorageKey,
+        document.getElementById("aedt-bootstrap-token").value
+      );
+    } catch (_) {
+      // Saving limits still works when storage is unavailable.
+    }
+  }
+
+  async function responsePayload(response) {
+    const text = await response.text();
+    if (!text) return {};
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      return {detail: text};
+    }
+  }
+
+  function responseError(response, payload) {
+    let message = `HTTP ${response.status}`;
+    if (response.status === 403) message += " · bootstrap token 오류";
+    if (payload?.detail) {
+      const detail = typeof payload.detail === "string"
+        ? payload.detail
+        : JSON.stringify(payload.detail);
+      message += `: ${detail}`;
+    }
+    return new Error(message);
+  }
+
+  function updateDerivedSessions() {
+    const simulations = Number(document.getElementById("concurrent-simulations").value);
+    const projectsPerAedt = Number(document.getElementById("projects-per-aedt").value);
+    const output = document.getElementById("derived-aedt-sessions");
+    if (!Number.isInteger(simulations) || simulations < 0
+        || !Number.isInteger(projectsPerAedt) || projectsPerAedt < 1) {
+      output.className = "summary-value";
+      output.textContent = "—";
+      return;
+    }
+    const sessions = Math.ceil(simulations / projectsPerAedt);
+    output.className = sessions > 550 ? "summary-value error" : "summary-value";
+    output.textContent = `${sessions}개 (${simulations} ÷ ${projectsPerAedt}, 올림)${sessions > 550 ? " · 최대 550 초과" : ""}`;
+  }
+
   function render(summary) {
     const config = summary.config || {};
     const plan = summary.plan || {};
+    document.getElementById("concurrent-simulations").value = config.target_project_concurrency ?? 0;
     document.getElementById("max-aedt-sessions").value = config.max_aedt_sessions ?? 0;
     document.getElementById("min-idle-aedt-sessions").value = config.min_idle_aedt_sessions ?? 0;
     document.getElementById("target-projects").value = config.target_project_concurrency ?? 0;
     document.getElementById("projects-per-aedt").value = config.projects_per_aedt ?? 1;
+    updateDerivedSessions();
 
     const gates = document.getElementById("gates");
     gates.replaceChildren(
@@ -357,6 +438,28 @@
     render(await response.json());
   }
 
+  document.getElementById("concurrent-simulations-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const result = document.getElementById("concurrent-save-result");
+    result.className = "muted";
+    result.textContent = "Saving…";
+    const concurrentSimulations = Number(document.getElementById("concurrent-simulations").value);
+    try {
+      const response = await fetch("/api/aedt-pool/config", {
+        method: "PATCH",
+        headers: mutationHeaders(),
+        body: JSON.stringify({concurrent_simulations: concurrentSimulations})
+      });
+      const payload = await responsePayload(response);
+      if (!response.ok) throw responseError(response, payload);
+      result.textContent = `저장됨: 동시 시뮬레이션 ${payload.target_project_concurrency}, AEDT 세션 ${payload.max_aedt_sessions}`;
+      await refresh();
+    } catch (error) {
+      result.className = "error";
+      result.textContent = error.message;
+    }
+  });
+
   document.getElementById("limit-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const result = document.getElementById("save-result");
@@ -377,8 +480,8 @@
           projects_per_aedt: projectsPerAedt
         })
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+      const payload = await responsePayload(response);
+      if (!response.ok) throw responseError(response, payload);
       result.textContent = `Saved ${payload.max_aedt_sessions} AEDT / ${payload.target_project_concurrency} projects`;
       await refresh();
     } catch (error) {
@@ -397,8 +500,8 @@
         headers: mutationHeaders(),
         body: JSON.stringify({enabled})
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+      const payload = await responsePayload(response);
+      if (!response.ok) throw responseError(response, payload);
       result.textContent = payload.operational ? "Pool operational" : "Pool disabled";
       await refresh();
     } catch (error) {
@@ -409,7 +512,11 @@
 
   document.getElementById("enable-pool").addEventListener("click", () => setEnabled(true));
   document.getElementById("disable-pool").addEventListener("click", () => setEnabled(false));
+  document.getElementById("aedt-bootstrap-token").addEventListener("change", rememberBootstrapToken);
+  document.getElementById("concurrent-simulations").addEventListener("input", updateDerivedSessions);
+  document.getElementById("projects-per-aedt").addEventListener("input", updateDerivedSessions);
 
+  restoreBootstrapToken();
   render(initialSummary);
   setInterval(() => refresh().catch(() => {}), 10000);
 </script>
