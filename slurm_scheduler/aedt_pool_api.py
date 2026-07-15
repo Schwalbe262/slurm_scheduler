@@ -202,6 +202,32 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @router.post(
+        "/api/aedt-pool/mixed-canary-admissions",
+        dependencies=[bootstrap_guard],
+    )
+    def create_mixed_canary_admission(
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        allowed = {"session_id", "mft_projects", "ipmsm_projects", "ttl_seconds"}
+        if not payload or set(payload) - allowed:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "only session_id, mft_projects, ipmsm_projects, and "
+                    "ttl_seconds are accepted"
+                ),
+            )
+        try:
+            return service.create_mixed_canary_admission(
+                session_id=payload.get("session_id"),
+                mft_projects=payload.get("mft_projects", 2),
+                ipmsm_projects=payload.get("ipmsm_projects", 1),
+                ttl_seconds=payload.get("ttl_seconds", 1800),
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @router.post("/api/aedt-pool/reconcile", dependencies=[bootstrap_guard])
     def reconcile_aedt_pool(dry_run: bool = True) -> dict[str, Any]:
         # Live reconciliation is still triple-gated inside the service.

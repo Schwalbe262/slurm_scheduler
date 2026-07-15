@@ -136,6 +136,8 @@ CREATE TABLE IF NOT EXISTS aedt_project_leases (
     fault_phase TEXT NOT NULL DEFAULT '',
     fault_kind TEXT NOT NULL DEFAULT '',
     fault_evidence_json TEXT NOT NULL DEFAULT '{}',
+    mixed_canary_admission_id INTEGER NOT NULL DEFAULT 0,
+    mixed_canary_session_id INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -178,6 +180,43 @@ CREATE TABLE IF NOT EXISTS aedt_pool_validations (
 );
 
 CREATE INDEX IF NOT EXISTS idx_aedt_pool_validations_status ON aedt_pool_validations(status);
+
+CREATE TABLE IF NOT EXISTS aedt_mixed_canary_admissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    placement_group TEXT NOT NULL UNIQUE,
+    session_profile TEXT NOT NULL,
+    expected_mft_projects INTEGER NOT NULL,
+    expected_ipmsm_projects INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'open',
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    filled_at TEXT,
+    finished_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aedt_mixed_canary_live_session
+ON aedt_mixed_canary_admissions(session_id)
+WHERE state IN ('open', 'filled');
+
+CREATE TABLE IF NOT EXISTS aedt_mixed_canary_slots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admission_id INTEGER NOT NULL,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    workload_family TEXT NOT NULL,
+    project_namespace TEXT NOT NULL,
+    lease_id INTEGER,
+    admitted_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_aedt_mixed_canary_slots_admission
+ON aedt_mixed_canary_slots(admission_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_aedt_mixed_canary_slots_lease
+ON aedt_mixed_canary_slots(lease_id)
+WHERE lease_id IS NOT NULL;
 """
 
 
@@ -394,6 +433,8 @@ class AedtPoolService:
                 "fault_phase": "TEXT NOT NULL DEFAULT ''",
                 "fault_kind": "TEXT NOT NULL DEFAULT ''",
                 "fault_evidence_json": "TEXT NOT NULL DEFAULT '{}'",
+                "mixed_canary_admission_id": "INTEGER NOT NULL DEFAULT 0",
+                "mixed_canary_session_id": "INTEGER NOT NULL DEFAULT 0",
             }.items():
                 if name not in lease_columns:
                     conn.execute(
@@ -925,6 +966,273 @@ class AedtPoolService:
             item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
             return item
 
+    def create_mixed_canary_admission(
+        self,
+        *,
+        session_id: int,
+        mft_projects: int = 2,
+        ipmsm_projects: int = 1,
+        ttl_seconds: int = 1800,
+    ) -> dict[str, Any]:
+        """Reserve one empty 3-slot session for one operator-authorized mixed canary.
+
+        The returned dedupe keys are capabilities bound to scheduler task rows.
+        Lease clients receive no bootstrap credential and cannot create another
+        authorized task with an already-live dedupe key.
+        """
+
+        for value, name in (
+            (session_id, "session_id"),
+            (mft_projects, "mft_projects"),
+            (ipmsm_projects, "ipmsm_projects"),
+            (ttl_seconds, "ttl_seconds"),
+        ):
+            if type(value) is not int:
+                raise ValueError(f"{name} must be an integer")
+        if session_id <= 0:
+            raise ValueError("session_id must be positive")
+        if mft_projects < 1 or ipmsm_projects < 1:
+            raise ValueError("mixed canary requires at least one MFT and one IPMSM project")
+        if mft_projects + ipmsm_projects != 3:
+            raise ValueError("mixed canary must reserve exactly three projects")
+        if not 60 <= ttl_seconds <= 3600:
+            raise ValueError("ttl_seconds must be between 60 and 3600")
+        latest = self.latest_validation()
+        if latest and bool(latest.get("mixed_mft_ipmsm_isolation_passed")):
+            raise ValueError("mixed MFT/IPMSM isolation has already passed validation")
+
+        now_dt = self._now()
+        now = _sql_time(now_dt)
+        expires = _sql_time(now_dt + timedelta(seconds=ttl_seconds))
+        with self._lock, self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._refresh_mixed_canary_admissions(conn, now)
+            session = conn.execute(
+                "SELECT * FROM aedt_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if not session:
+                raise ValueError("mixed canary session does not exist")
+            if str(session["state"]) != "ready":
+                raise ValueError("mixed canary session must be ready")
+            if int(session["slots_total"] or 0) != 3:
+                raise ValueError("mixed canary session must have exactly three slots")
+            if session["solve_batch_sealed_at"]:
+                raise ValueError("mixed canary session solve batch is already sealed")
+            if session["drain_requested_at"]:
+                raise ValueError("mixed canary session is draining")
+            session_profile = canonical_expected_session_profile(
+                str(session["session_profile"] or "")
+            )
+            occupant = conn.execute(
+                """
+                SELECT 1 FROM aedt_project_leases
+                WHERE session_id = ?
+                  AND state IN ('offered','leased','attaching','active','releasing')
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if occupant:
+                raise ValueError("mixed canary session must be empty")
+            active = conn.execute(
+                """
+                SELECT 1 FROM aedt_mixed_canary_admissions
+                WHERE session_id = ? AND state IN ('open','filled')
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if active:
+                raise ValueError("mixed canary session already has an active admission")
+            placement_group = f"mixed-canary-{session_id}-{secrets.token_hex(8)}"
+            cursor = conn.execute(
+                """
+                INSERT INTO aedt_mixed_canary_admissions (
+                    session_id, placement_group, session_profile,
+                    expected_mft_projects, expected_ipmsm_projects,
+                    state, expires_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    placement_group,
+                    session_profile,
+                    mft_projects,
+                    ipmsm_projects,
+                    expires,
+                    now,
+                    now,
+                ),
+            )
+            admission_id = int(cursor.lastrowid)
+            slots: list[tuple[str, str, str]] = []
+            for family, namespace, count in (
+                ("mft", "mft", mft_projects),
+                ("ipmsm", "pyaedt_motor", ipmsm_projects),
+            ):
+                for index in range(count):
+                    dedupe_key = (
+                        f"aedt-mixed-canary:{admission_id}:{family}:{index}:"
+                        f"{secrets.token_urlsafe(18)}"
+                    )
+                    slots.append((dedupe_key, family, namespace))
+            conn.executemany(
+                """
+                INSERT INTO aedt_mixed_canary_slots (
+                    admission_id, dedupe_key, workload_family,
+                    project_namespace, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (admission_id, dedupe_key, family, namespace, now, now)
+                    for dedupe_key, family, namespace in slots
+                ),
+            )
+        return self.get_mixed_canary_admission(admission_id)
+
+    def get_mixed_canary_admission(self, admission_id: int) -> dict[str, Any]:
+        with self.db.connect() as conn:
+            admission = conn.execute(
+                "SELECT * FROM aedt_mixed_canary_admissions WHERE id = ?",
+                (int(admission_id),),
+            ).fetchone()
+            if not admission:
+                raise KeyError(admission_id)
+            item = dict(admission)
+            item["slots"] = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT id, dedupe_key, workload_family, project_namespace,
+                           lease_id, admitted_at
+                    FROM aedt_mixed_canary_slots
+                    WHERE admission_id = ? ORDER BY id
+                    """,
+                    (int(admission_id),),
+                ).fetchall()
+            ]
+            return item
+
+    @staticmethod
+    def _refresh_mixed_canary_admissions(conn: Any, now: str) -> None:
+        conn.execute(
+            """
+            UPDATE aedt_mixed_canary_admissions
+            SET state = 'expired', finished_at = ?, updated_at = ?
+            WHERE state = 'open' AND expires_at <= ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM aedt_mixed_canary_slots cs
+                  JOIN aedt_project_leases l ON l.id = cs.lease_id
+                  WHERE cs.admission_id = aedt_mixed_canary_admissions.id
+                    AND l.state IN (
+                        'queued','offered','leased','attaching','active','releasing'
+                    )
+              )
+            """,
+            (now, now, now),
+        )
+        conn.execute(
+            """
+            UPDATE aedt_mixed_canary_admissions
+            SET state = 'closed', finished_at = ?, updated_at = ?
+            WHERE state = 'filled'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM aedt_mixed_canary_slots cs
+                  JOIN aedt_project_leases l ON l.id = cs.lease_id
+                  WHERE cs.admission_id = aedt_mixed_canary_admissions.id
+                    AND l.state IN (
+                        'queued','offered','leased','attaching','active','releasing'
+                    )
+              )
+            """,
+            (now, now),
+        )
+
+    @staticmethod
+    def _authorize_mixed_canary_lease(
+        conn: Any,
+        *,
+        task_id: int,
+        request_key: str,
+        token_hash: str,
+        workload_family: str,
+        project_namespace: str,
+        session_profile: str,
+        now: str,
+    ) -> dict[str, Any]:
+        if task_id <= 0:
+            raise ValueError(
+                "shared_if_compatible requires passed mixed MFT/IPMSM isolation "
+                "validation or a bootstrap-issued canary task"
+            )
+        task = conn.execute(
+            "SELECT id, dedupe_key, status, aedt_backend FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not task or str(task["status"]) in {
+            TaskStatus.COMPLETED.value,
+            TaskStatus.FAILED.value,
+            TaskStatus.CANCELLED.value,
+        }:
+            raise ValueError("mixed canary task is missing or terminal")
+        if str(task["aedt_backend"] or "") != "pooled":
+            raise ValueError("mixed canary task must declare aedt_backend=pooled")
+        slot = conn.execute(
+            """
+            SELECT cs.*, ca.session_id AS canary_session_id,
+                   ca.placement_group, ca.session_profile AS canary_session_profile,
+                   ca.state AS admission_state, ca.expires_at AS admission_expires_at
+            FROM aedt_mixed_canary_slots cs
+            JOIN aedt_mixed_canary_admissions ca ON ca.id = cs.admission_id
+            WHERE cs.dedupe_key = ?
+            """,
+            (str(task["dedupe_key"] or ""),),
+        ).fetchone()
+        if not slot:
+            raise ValueError(
+                "shared_if_compatible requires passed mixed MFT/IPMSM isolation "
+                "validation or a bootstrap-issued canary task"
+            )
+        if str(slot["admission_state"]) not in {"open", "filled"}:
+            raise ValueError("mixed canary admission is no longer active")
+        if str(slot["workload_family"]) != workload_family:
+            raise ValueError("mixed canary workload_family does not match its reserved slot")
+        if str(slot["project_namespace"]) != project_namespace:
+            raise ValueError("mixed canary project_namespace does not match its reserved slot")
+        if str(slot["canary_session_profile"]) != session_profile:
+            raise ValueError("mixed canary session profile does not match its reservation")
+        session = conn.execute(
+            "SELECT * FROM aedt_sessions WHERE id = ?",
+            (int(slot["canary_session_id"]),),
+        ).fetchone()
+        if not session or str(session["state"]) not in {"ready", "busy"}:
+            raise ValueError("mixed canary session is not ready")
+        if int(session["slots_total"] or 0) != 3:
+            raise ValueError("mixed canary session no longer has exactly three slots")
+        if session["solve_batch_sealed_at"] or session["drain_requested_at"]:
+            raise ValueError("mixed canary session is sealed or draining")
+        if str(session["session_profile"] or "") != session_profile:
+            raise ValueError("mixed canary host session profile drifted")
+        existing_lease_id = int(slot["lease_id"] or 0)
+        if existing_lease_id:
+            existing = conn.execute(
+                "SELECT request_key, client_token_hash FROM aedt_project_leases WHERE id = ?",
+                (existing_lease_id,),
+            ).fetchone()
+            if not (
+                existing
+                and str(existing["request_key"]) == request_key
+                and secrets.compare_digest(
+                    str(existing["client_token_hash"]), token_hash
+                )
+            ):
+                raise ValueError("mixed canary task slot has already been consumed")
+        elif str(slot["admission_expires_at"]) <= now:
+            raise ValueError("mixed canary admission expired")
+        return dict(slot)
+
     def request_lease(
         self,
         *,
@@ -980,6 +1288,7 @@ class AedtPoolService:
             )
         if normalized_isolation == "exclusive":
             exclusive_session = True
+        mixed_canary_required = False
         if normalized_isolation == "shared_if_compatible":
             mixed_validation = self.latest_validation()
             if not (
@@ -989,10 +1298,7 @@ class AedtPoolService:
                     mixed_validation.get("mixed_mft_ipmsm_isolation_passed")
                 )
             ):
-                raise ValueError(
-                    "shared_if_compatible requires passed mixed MFT/IPMSM "
-                    "isolation validation"
-                )
+                mixed_canary_required = True
         token = str(client_token or "").strip() or secrets.token_urlsafe(32)
         if len(token) < 16:
             raise ValueError("client_token must contain at least 16 characters")
@@ -1032,6 +1338,7 @@ class AedtPoolService:
             resolved_node_name = ""
         with self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._refresh_mixed_canary_admissions(conn, now)
             # task_id is provenance.  Central-pool requests remain unpinned
             # unless the caller explicitly supplies allocation_id.  When it
             # does, derive and verify the affinity from the scheduler task.
@@ -1073,6 +1380,25 @@ class AedtPoolService:
                         resolved_allocation_id = task_allocation_id
                         resolved_node_name = task_node_name
             token_hash = _token_hash(token)
+            mixed_canary: dict[str, Any] | None = None
+            mixed_canary_admission_id = 0
+            mixed_canary_session_id = 0
+            if mixed_canary_required:
+                mixed_canary = self._authorize_mixed_canary_lease(
+                    conn,
+                    task_id=requested_task_id,
+                    request_key=request_key,
+                    token_hash=token_hash,
+                    workload_family=resolved_family,
+                    project_namespace=normalized_namespace,
+                    session_profile=resolved_profile,
+                    now=now,
+                )
+                mixed_canary_admission_id = int(mixed_canary["admission_id"])
+                mixed_canary_session_id = int(mixed_canary["canary_session_id"])
+                # The operator reservation, not the untrusted lease payload,
+                # owns both the placement group and exact host session.
+                resolved_placement_group = str(mixed_canary["placement_group"])
             existing = conn.execute(
                 """
                 SELECT l.*, t.status AS scheduler_task_status
@@ -1163,9 +1489,10 @@ class AedtPoolService:
                         workload_family, session_profile, project_namespace,
                         isolation_policy, workspace_path, protocol_version, task_id,
                         requested_allocation_id, requested_node_name,
+                        mixed_canary_admission_id, mixed_canary_session_id,
                         exclusive_session, state, client_token_hash,
                         last_heartbeat_at, expires_at, client_deadline_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                               'queued', ?, ?, ?, ?)
                     """,
                     (
@@ -1181,6 +1508,8 @@ class AedtPoolService:
                         requested_task_id,
                         resolved_allocation_id,
                         resolved_node_name,
+                        mixed_canary_admission_id,
+                        mixed_canary_session_id,
                         int(exclusive_session),
                         token_hash,
                         now,
@@ -1189,6 +1518,33 @@ class AedtPoolService:
                     ),
                 )
                 lease_id = int(cursor.lastrowid)
+                if mixed_canary is not None:
+                    claimed = conn.execute(
+                        """
+                        UPDATE aedt_mixed_canary_slots
+                        SET lease_id = ?, admitted_at = ?, updated_at = ?
+                        WHERE id = ? AND lease_id IS NULL
+                        """,
+                        (lease_id, now, now, int(mixed_canary["id"])),
+                    )
+                    if claimed.rowcount != 1:
+                        raise ValueError("mixed canary task slot was consumed concurrently")
+                    remaining = conn.execute(
+                        """
+                        SELECT COUNT(*) AS count FROM aedt_mixed_canary_slots
+                        WHERE admission_id = ? AND lease_id IS NULL
+                        """,
+                        (mixed_canary_admission_id,),
+                    ).fetchone()
+                    if int(remaining["count"] or 0) == 0:
+                        conn.execute(
+                            """
+                            UPDATE aedt_mixed_canary_admissions
+                            SET state = 'filled', filled_at = ?, updated_at = ?
+                            WHERE id = ? AND state = 'open'
+                            """,
+                            (now, now, mixed_canary_admission_id),
+                        )
             if config.operational:
                 self._place_queued_leases(
                     conn, now, lease_ids=(lease_id,), config=config
@@ -3035,6 +3391,22 @@ class AedtPoolService:
         if bool(lease["exclusive_session"]) and occupants:
             return False
 
+        canary_admission_id = int(lease["mixed_canary_admission_id"] or 0)
+        canary_session_id = int(lease["mixed_canary_session_id"] or 0)
+        if canary_session_id and int(session["id"]) != canary_session_id:
+            return False
+        if canary_admission_id:
+            if any(
+                int(item["mixed_canary_admission_id"] or 0)
+                != canary_admission_id
+                for item in occupants
+            ):
+                return False
+        elif any(int(item["mixed_canary_admission_id"] or 0) for item in occupants):
+            # A normal family/shared request cannot steal a slot reserved by a
+            # bootstrap-issued mixed canary.
+            return False
+
         requested_profile = str(lease["session_profile"] or "")
         fixed_profile = str(session["session_profile"] or "")
         protocol_version = int(lease["protocol_version"] or 1)
@@ -3080,6 +3452,7 @@ class AedtPoolService:
         config = config or self.config()
         if not config.operational:
             return 0
+        self._refresh_mixed_canary_admissions(conn, now)
         ready_cutoff = _sql_time(
             _parse_utc_time(now) - timedelta(seconds=config.queued_stale_seconds)
         )
@@ -3138,6 +3511,14 @@ class AedtPoolService:
                   AND (? = '' OR a.created_at > ?)
                   AND (? = 0 OR s.allocation_id = ?)
                   AND (? = '' OR s.node_name = ?)
+                  AND (? = 0 OR s.id = ?)
+                  AND (
+                      ? > 0 OR NOT EXISTS (
+                          SELECT 1 FROM aedt_mixed_canary_admissions ca
+                          WHERE ca.session_id = s.id
+                            AND ca.state IN ('open','filled')
+                      )
+                  )
                   AND (
                       ? < 2
                       OR (? >= 2 AND s.session_profile = ?)
@@ -3151,6 +3532,9 @@ class AedtPoolService:
                     int(lease["requested_allocation_id"] or 0),
                     str(lease["requested_node_name"] or ""),
                     str(lease["requested_node_name"] or ""),
+                    int(lease["mixed_canary_session_id"] or 0),
+                    int(lease["mixed_canary_session_id"] or 0),
+                    int(lease["mixed_canary_session_id"] or 0),
                     int(lease["protocol_version"] or 1),
                     int(lease["protocol_version"] or 1),
                     str(lease["session_profile"] or ""),

@@ -546,7 +546,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
             for route in router.routes
             if set(getattr(route, "methods", set())) & {"POST", "PATCH", "PUT", "DELETE"}
         ]
-        self.assertEqual(len(mutating_routes), 20)
+        self.assertEqual(len(mutating_routes), 21)
         bootstrap_routes = []
         client_routes = []
         lease_scoped_routes = []
@@ -575,7 +575,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 self.assertEqual(client_guards, [])
                 bootstrap_routes.append(route)
 
-        self.assertEqual(len(bootstrap_routes), 11)
+        self.assertEqual(len(bootstrap_routes), 12)
         self.assertEqual(len(client_routes), 1)
         self.assertEqual(len(lease_scoped_routes), 8)
         guard = next(
@@ -959,6 +959,166 @@ class AedtSessionStartRaceTests(AedtPoolTestCase):
         self.assertEqual(allocation["drain_reason"], "age limit")
         self.assertIsNotNone(allocation["drain_at"])
         self.assertTrue(self.service.session_commands(session_id, token)["drain"])
+
+
+class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.allocation_id = self.add_dedicated_allocation()
+        self.service.set_operator_limits(
+            max_sessions=1,
+            min_idle_sessions=1,
+            target_projects=3,
+            projects_per_session=3,
+        )
+        self.make_operational()
+        self.service.reconcile(execute=True)
+        self.session, self.host_token = self.start_one_session(self.allocation_id)
+
+    def create_task_for_slot(self, slot: dict[str, object], suffix: str) -> int:
+        task_id = self.db.create_task(
+            TaskCreate(
+                name=f"mixed-canary-{suffix}",
+                remote_cwd="/work",
+                command="true",
+                dedupe_key=str(slot["dedupe_key"]),
+                aedt_backend="pooled",
+            )
+        )
+        self.db.update_task(task_id, status=TaskStatus.RUNNING.value)
+        return task_id
+
+    def request_slot(
+        self,
+        slot: dict[str, object],
+        *,
+        task_id: int,
+        suffix: str,
+        namespace: str | None = None,
+    ) -> tuple[dict[str, object], str]:
+        family = str(slot["workload_family"])
+        return self.service.request_lease(
+            request_key=f"mixed-canary-request-{suffix}",
+            project_name=f"{family}-mixed-canary-{suffix}",
+            workload_family=family,
+            project_namespace=(
+                str(slot["project_namespace"])
+                if namespace is None
+                else namespace
+            ),
+            isolation_policy="shared_if_compatible",
+            workspace_path=f"/shared/mixed-canary/{suffix}",
+            protocol_version=2,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            task_id=task_id,
+            client_token=f"mixed-canary-client-token-{suffix}",
+        )
+
+    def test_bootstrap_admission_forces_three_mixed_tasks_to_exact_empty_session(self) -> None:
+        admission = self.service.create_mixed_canary_admission(
+            session_id=int(self.session["id"]),
+            mft_projects=2,
+            ipmsm_projects=1,
+        )
+        self.assertEqual(admission["state"], "open")
+        self.assertEqual(len(admission["slots"]), 3)
+        self.assertEqual(
+            {(slot["workload_family"], slot["project_namespace"]) for slot in admission["slots"]},
+            {("mft", "mft"), ("ipmsm", "pyaedt_motor")},
+        )
+
+        leases = []
+        for index, slot in enumerate(admission["slots"]):
+            task_id = self.create_task_for_slot(slot, str(index))
+            lease, _token = self.request_slot(
+                slot,
+                task_id=task_id,
+                suffix=str(index),
+            )
+            leases.append(lease)
+
+        self.assertEqual({int(item["session_id"]) for item in leases}, {int(self.session["id"])})
+        self.assertEqual({item["placement_group"] for item in leases}, {admission["placement_group"]})
+        self.assertEqual({int(item["slot_index"]) for item in leases}, {0, 1, 2})
+        self.assertEqual(
+            {int(item["mixed_canary_admission_id"]) for item in leases},
+            {int(admission["id"])},
+        )
+        filled = self.service.get_mixed_canary_admission(int(admission["id"]))
+        self.assertEqual(filled["state"], "filled")
+        self.assertTrue(all(slot["lease_id"] for slot in filled["slots"]))
+        # Admission authorizes only this experiment; it never forges the
+        # production validation record before full mixed evidence exists.
+        self.assertFalse(
+            bool(self.service.latest_validation()["mixed_mft_ipmsm_isolation_passed"])
+        )
+
+    def test_wrong_namespace_and_unreserved_clients_cannot_consume_canary(self) -> None:
+        admission = self.service.create_mixed_canary_admission(
+            session_id=int(self.session["id"]),
+            mft_projects=1,
+            ipmsm_projects=2,
+        )
+        ipmsm_slot = next(
+            slot for slot in admission["slots"] if slot["workload_family"] == "ipmsm"
+        )
+        task_id = self.create_task_for_slot(ipmsm_slot, "wrong-namespace")
+        with self.assertRaisesRegex(ValueError, "project_namespace"):
+            self.request_slot(
+                ipmsm_slot,
+                task_id=task_id,
+                suffix="wrong-namespace",
+                namespace="mft",
+            )
+
+        unreserved_task_id = self.db.create_task(
+            TaskCreate(
+                name="mixed-canary-unreserved",
+                remote_cwd="/work",
+                command="true",
+                dedupe_key="not-an-operator-reservation",
+                aedt_backend="pooled",
+            )
+        )
+        self.db.update_task(
+            unreserved_task_id, status=TaskStatus.RUNNING.value
+        )
+        with self.assertRaisesRegex(ValueError, "bootstrap-issued canary task"):
+            self.service.request_lease(
+                request_key="unreserved-shared-client",
+                project_name="mft-unreserved-shared-client",
+                workload_family="mft",
+                project_namespace="mft",
+                isolation_policy="shared_if_compatible",
+                workspace_path="/shared/unreserved",
+                protocol_version=2,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                task_id=unreserved_task_id,
+            )
+
+        family_lease, _token = self.service.request_lease(
+            request_key="normal-family-cannot-steal",
+            project_name="mft-normal-family-cannot-steal",
+            workload_family="mft",
+            project_namespace="mft",
+            isolation_policy="family",
+            workspace_path="/shared/normal-family",
+            protocol_version=2,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+        )
+        self.assertEqual(family_lease["state"], "queued")
+        self.assertIsNone(family_lease["session_id"])
+
+    def test_admission_requires_ready_empty_exact_three_slot_session(self) -> None:
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE aedt_sessions SET state = 'busy' WHERE id = ?",
+                (int(self.session["id"]),),
+            )
+        with self.assertRaisesRegex(ValueError, "must be ready"):
+            self.service.create_mixed_canary_admission(
+                session_id=int(self.session["id"]),
+            )
 
 
 class AedtLeaseLifecycleTests(AedtPoolTestCase):
