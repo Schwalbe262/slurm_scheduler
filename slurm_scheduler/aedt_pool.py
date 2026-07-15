@@ -2323,9 +2323,14 @@ class AedtPoolService:
 
         session = self._authorize_session(session_id, token)
         normalized = str(kind or "").strip().lower()
-        if normalized not in {"confirmed_aedt_death", "native_probe_suspect"}:
+        if normalized not in {
+            "automation_lock_timeout",
+            "confirmed_aedt_death",
+            "native_probe_suspect",
+        }:
             raise ValueError(
-                "session fault kind must be confirmed_aedt_death or native_probe_suspect"
+                "session fault kind must be automation_lock_timeout, "
+                "confirmed_aedt_death, or native_probe_suspect"
             )
         now = _sql_time(self._now())
         metadata = json.dumps(
@@ -2334,7 +2339,12 @@ class AedtPoolService:
         native_snapshot_path = str(
             (evidence or {}).get("native_snapshot_path") or ""
         ).strip()
-        message = failure_message.strip() or "session host confirmed AEDT process death"
+        default_message = (
+            "session host confirmed remote automation lock timeout"
+            if normalized == "automation_lock_timeout"
+            else "session host confirmed AEDT process death"
+        )
+        message = failure_message.strip() or default_message
         with self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             if normalized == "native_probe_suspect":

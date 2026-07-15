@@ -40,6 +40,7 @@ from slurm_scheduler.aedt_pool import (
 )
 from slurm_scheduler.aedt_pool_api import create_aedt_pool_router
 from slurm_scheduler.aedt_session_host import (
+    AUTOMATION_LOCK_MAX_HOLD_ENV,
     AedtSessionHost,
     ControlPlaneUnavailable,
     ControlPlaneClient,
@@ -49,6 +50,7 @@ from slurm_scheduler.aedt_session_host import (
     NATIVE_PROBE_FAILED,
     NATIVE_PROBE_OK,
     SUPPORTED_DSO_PROFILE,
+    _automation_lock_max_hold_seconds_from_env,
     _install_pyaedt_psutil_cmdline_shim,
     _load_pyaedt_dso_template,
     _render_dso_configuration,
@@ -1509,6 +1511,65 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             native_probe="GetVersion",
         )
         self.assertIn(recovered["state"], {"ready", "busy"})
+
+    def test_automation_lock_timeout_fault_drains_and_requeues_all_siblings(
+        self,
+    ) -> None:
+        first, _first_token = self.request(
+            "lock-timeout-a", allocation_id=self.allocation_id, node="cpu-01"
+        )
+        second, _second_token = self.request(
+            "lock-timeout-b", allocation_id=self.allocation_id, node="cpu-01"
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        session_id = int(session["id"])
+        evidence = {
+            "actual_lock_busy": True,
+            "same_nonce_continuous": True,
+            "continuous_hold_seconds": 601.25,
+            "maximum_hold_seconds": 600,
+            "owner": {
+                "kind": "client",
+                "task_id": 41720,
+                "host": "n115",
+                "pid": 301234,
+                "nonce": "a" * 32,
+            },
+        }
+
+        faulted = self.service.report_session_fault(
+            session_id,
+            host_token,
+            kind="automation_lock_timeout",
+            failure_message="remote client automation lock timed out",
+            evidence=evidence,
+        )
+
+        self.assertEqual(faulted["state"], "unhealthy")
+        self.assertEqual(
+            faulted["quarantine_reason"], "automation_lock_timeout"
+        )
+        self.assertEqual(
+            json.loads(faulted["last_fault_evidence_json"]), evidence
+        )
+        allocation = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(allocation["state"], "draining")
+        self.assertEqual(
+            allocation["drain_reason"],
+            FAULTED_DESKTOP_ALLOCATION_RECYCLE_REASON,
+        )
+
+        self.service.close_session(
+            session_id,
+            host_token,
+            success=False,
+            failure_message="automation lock watchdog recycled Desktop",
+            requeue_siblings=True,
+        )
+        for original in (first, second):
+            retried = self.service.get_lease(int(original["id"]))
+            self.assertEqual(retried["state"], "queued")
+            self.assertIsNone(retried["session_id"])
 
     def test_native_suspect_heartbeat_requires_unexpired_native_owner(self) -> None:
         lease, _lease_token = self.request(
@@ -3921,6 +3982,27 @@ class AttachClientTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.lock_tmp.cleanup()
 
+    def test_client_automation_lock_carries_scheduler_task_identity(self) -> None:
+        lease = AedtProjectLease(
+            SimpleNamespace(),
+            7,
+            "client-token",
+            "project",
+            protocol_version=2,
+            automation_lock_path=self.automation_lock_path,
+            task_id=41720,
+        )
+
+        lock = lease.automation_lock()
+        self.assertEqual(lock.owner_kind, "client")
+        self.assertEqual(lock.owner_task_id, 41720)
+        self.assertEqual(lock.owner_pid, os.getpid())
+        with lock:
+            owner = lock.owner_record
+            self.assertIsNotNone(owner)
+            self.assertEqual(owner["task_id"], 41720)
+            self.assertEqual(owner["kind"], "client")
+
     def test_connect_path_forces_pyaedt_multi_desktop_setting(self) -> None:
         ansys_module = ModuleType("ansys")
         aedt_module = ModuleType("ansys.aedt")
@@ -4916,6 +4998,237 @@ class SessionHostTests(unittest.TestCase):
             node_name="cpu-01",
             artifact_root=str(artifact_root),
         )
+
+    @staticmethod
+    def _client_lock_inspection(
+        *, nonce: str = "a" * 32, sequence: int = 7
+    ) -> dict[str, object]:
+        return {
+            "busy": True,
+            "local_process": False,
+            "marker_valid": True,
+            "owner": {
+                "kind": "client",
+                "task_id": 41720,
+                "host": "n115",
+                "pid": 301234,
+                "acquired_at": 100.0,
+                "nonce": nonce,
+                "sequence": sequence,
+            },
+        }
+
+    def test_lock_watchdog_requires_same_busy_owner_for_full_monotonic_window(
+        self,
+    ) -> None:
+        host = AedtSessionHost(
+            FakeHostControlPlane([]),
+            allocation_id=1,
+            node_name="cpu-01",
+            automation_lock_max_hold_seconds=300,
+        )
+        host.automation_lock_path = "/shared/desktop-automation.lock"
+        host.desktop_process_id = "400001"
+        clock = [100.0]
+        inspection = self._client_lock_inspection()
+        with (
+            patch.object(
+                SessionAutomationLock, "inspect", return_value=inspection
+            ) as inspect,
+            patch(
+                "slurm_scheduler.aedt_session_host.time.monotonic",
+                side_effect=lambda: clock[0],
+            ),
+        ):
+            self.assertIsNone(host._automation_lock_hold_evidence())
+            clock[0] = 399.999
+            self.assertIsNone(host._automation_lock_hold_evidence())
+            clock[0] = 400.0
+            evidence = host._automation_lock_hold_evidence()
+
+        self.assertIsNotNone(evidence)
+        self.assertEqual(evidence["continuous_hold_seconds"], 300.0)
+        self.assertEqual(evidence["maximum_hold_seconds"], 300.0)
+        self.assertTrue(evidence["actual_lock_busy"])
+        self.assertTrue(evidence["same_nonce_continuous"])
+        self.assertEqual(evidence["owner"]["task_id"], 41720)
+        self.assertEqual(evidence["owner"]["pid"], 301234)
+        self.assertEqual(evidence["session_host"]["pid"], os.getpid())
+        self.assertEqual(inspect.call_count, 3)
+
+    def test_lock_watchdog_resets_on_release_corruption_host_owner_and_handoff(
+        self,
+    ) -> None:
+        client = self._client_lock_inspection()
+        reset_cases = {
+            "solve-window-release": {
+                "busy": False,
+                "local_process": False,
+                "marker_valid": True,
+                "owner": None,
+            },
+            "corrupt-marker": {
+                "busy": True,
+                "local_process": False,
+                "marker_valid": False,
+                "owner": None,
+            },
+            "host-local-gate": {
+                "busy": True,
+                "local_process": True,
+                "marker_valid": False,
+                "owner": None,
+            },
+            "session-host-owner": {
+                "busy": True,
+                "local_process": False,
+                "marker_valid": True,
+                "owner": {
+                    **client["owner"],
+                    "kind": "session_host",
+                },
+            },
+            "owner-handoff": self._client_lock_inspection(
+                nonce="b" * 32, sequence=8
+            ),
+        }
+        for label, reset_inspection in reset_cases.items():
+            with self.subTest(label=label):
+                host = AedtSessionHost(
+                    FakeHostControlPlane([]),
+                    allocation_id=1,
+                    node_name="cpu-01",
+                    automation_lock_max_hold_seconds=300,
+                )
+                host.automation_lock_path = "/shared/desktop-automation.lock"
+                clock = [0.0]
+                current = [client]
+                with (
+                    patch.object(
+                        SessionAutomationLock,
+                        "inspect",
+                        side_effect=lambda _path: current[0],
+                    ),
+                    patch(
+                        "slurm_scheduler.aedt_session_host.time.monotonic",
+                        side_effect=lambda: clock[0],
+                    ),
+                ):
+                    self.assertIsNone(host._automation_lock_hold_evidence())
+                    clock[0] = 301.0
+                    current[0] = reset_inspection
+                    self.assertIsNone(host._automation_lock_hold_evidence())
+                    clock[0] = 602.0
+                    current[0] = client
+                    self.assertIsNone(host._automation_lock_hold_evidence())
+                    clock[0] = 902.0
+                    self.assertIsNotNone(
+                        host._automation_lock_hold_evidence()
+                    )
+
+    def test_lock_watchdog_configuration_is_bounded_and_env_configurable(
+        self,
+    ) -> None:
+        for invalid in (299, 1801, float("inf"), float("nan")):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "between 300 and 1800"):
+                    AedtSessionHost(
+                        FakeHostControlPlane([]),
+                        allocation_id=1,
+                        node_name="cpu-01",
+                        automation_lock_max_hold_seconds=invalid,
+                    )
+        self.assertEqual(
+            AedtSessionHost(
+                FakeHostControlPlane([]),
+                allocation_id=1,
+                node_name="cpu-01",
+                automation_lock_max_hold_seconds=1800,
+            ).automation_lock_max_hold_seconds,
+            1800,
+        )
+        with patch.dict(
+            os.environ, {AUTOMATION_LOCK_MAX_HOLD_ENV: "600"}, clear=False
+        ):
+            self.assertEqual(
+                _automation_lock_max_hold_seconds_from_env(), 600
+            )
+        with patch.dict(
+            os.environ, {AUTOMATION_LOCK_MAX_HOLD_ENV: "299"}, clear=False
+        ):
+            self.assertEqual(
+                _automation_lock_max_hold_seconds_from_env(), 300
+            )
+
+    def test_session_host_reports_lock_timeout_then_closes_with_requeue(
+        self,
+    ) -> None:
+        events: list[str] = []
+        fault_payloads: list[dict] = []
+        closed_payloads: list[dict] = []
+
+        class Control(FakeHostControlPlane):
+            def request(self, method, path, payload=None, host_token=""):
+                if path.endswith("/fault"):
+                    events.append("lock-fault")
+                    fault_payloads.append(dict(payload or {}))
+                    return {"state": "unhealthy"}
+                if path.endswith("/closed"):
+                    events.append("closed-ack")
+                    closed_payloads.append(dict(payload or {}))
+                    return {}
+                return super().request(
+                    method, path, payload, host_token=host_token
+                )
+
+        control = Control(events)
+        host = AedtSessionHost(
+            control,
+            allocation_id=1,
+            node_name="cpu-01",
+            heartbeat_seconds=5,
+            automation_lock_max_hold_seconds=300,
+        )
+
+        def prepare(_session):
+            host.automation_lock_path = "/shared/desktop-automation.lock"
+
+        host._prepare_artifacts = prepare
+        host._start_desktop = lambda: FakeDesktop(events)
+        trust_fake_desktop_liveness(host)
+        clock = [0.0]
+
+        def advance(_seconds: float) -> None:
+            clock[0] += 301.0
+
+        with (
+            patch.object(
+                SessionAutomationLock,
+                "inspect",
+                return_value=self._client_lock_inspection(),
+            ),
+            patch(
+                "slurm_scheduler.aedt_session_host.time.monotonic",
+                side_effect=lambda: clock[0],
+            ),
+            patch(
+                "slurm_scheduler.aedt_session_host.time.sleep",
+                side_effect=advance,
+            ),
+        ):
+            self.assertEqual(host.run(), 1)
+
+        self.assertEqual(len(fault_payloads), 1)
+        self.assertEqual(
+            fault_payloads[0]["kind"], "automation_lock_timeout"
+        )
+        self.assertTrue(
+            fault_payloads[0]["evidence"]["actual_lock_busy"]
+        )
+        self.assertEqual(len(closed_payloads), 1)
+        self.assertFalse(closed_payloads[0]["success"])
+        self.assertTrue(closed_payloads[0]["requeue_siblings"])
+        self.assertLess(events.index("lock-fault"), events.index("desktop-close"))
 
     def test_desktop_launch_enables_session_local_pyaedt_log(self) -> None:
         with tempfile.TemporaryDirectory() as root:

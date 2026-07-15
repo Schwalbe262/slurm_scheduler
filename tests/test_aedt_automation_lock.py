@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import os
+import subprocess
 import sys
 import threading
 import types
@@ -116,6 +117,87 @@ def _record_lock_attempt(lock: SessionAutomationLock, outcome: list[str]) -> Non
             outcome.append("acquired")
     except TimeoutError:
         outcome.append("timeout")
+
+
+def test_owner_marker_records_and_clears_exact_client_identity(
+    tmp_path: Path,
+) -> None:
+    path = create_automation_lock_file(automation_lock_path(str(tmp_path)))
+    lock = SessionAutomationLock(
+        path,
+        timeout_seconds=1,
+        owner_kind="client",
+        owner_task_id=31337,
+        owner_host="worker-a",
+        owner_pid=9001,
+    )
+
+    with lock:
+        owner = lock.owner_record
+        assert owner is not None
+        assert owner["kind"] == "client"
+        assert owner["task_id"] == 31337
+        assert owner["host"] == "worker-a"
+        assert owner["pid"] == 9001
+        assert len(owner["nonce"]) == 32
+        with lock:
+            assert lock.owner_record["nonce"] == owner["nonce"]
+
+    inspection = SessionAutomationLock.inspect(path)
+    assert inspection == {
+        "busy": False,
+        "local_process": False,
+        "marker_valid": True,
+        "owner": None,
+    }
+
+
+def test_inspection_requires_actual_external_lock_and_ignores_crash_stale_owner(
+    tmp_path: Path,
+) -> None:
+    path = create_automation_lock_file(automation_lock_path(str(tmp_path)))
+    child_code = "\n".join(
+        (
+            "import os, sys",
+            "from slurm_scheduler.aedt_automation_lock import SessionAutomationLock",
+            "lock = SessionAutomationLock(sys.argv[1], timeout_seconds=5, "
+            "owner_kind='client', owner_task_id=4242, "
+            "owner_host='remote-client-test', owner_pid=os.getpid())",
+            "lock.acquire()",
+            "print('READY', flush=True)",
+            "sys.stdin.buffer.read(1)",
+        )
+    )
+    process = subprocess.Popen(
+        [getattr(sys, "_base_executable", sys.executable), "-c", child_code, path],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == b"READY"
+        inspection = SessionAutomationLock.inspect(path)
+        assert inspection["busy"] is True
+        assert inspection["local_process"] is False
+        assert inspection["marker_valid"] is True
+        assert inspection["owner"]["task_id"] == 4242
+        assert inspection["owner"]["host"] == "remote-client-test"
+        assert inspection["owner"]["pid"] > 0
+        assert inspection["owner"]["pid"] != os.getpid()
+
+        # Simulate a client process dying after its held frame reached GPFS.
+        # The OS releases the byte lock while the durable frame remains stale.
+        process.terminate()
+        process.wait(timeout=10)
+        stale = SessionAutomationLock.inspect(path)
+        assert stale["busy"] is False
+        assert stale["marker_valid"] is True
+        assert stale["owner"] is None
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=10)
 
 
 def test_native_solve_window_yields_and_restores_all_nesting(

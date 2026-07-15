@@ -240,6 +240,7 @@ class AedtProjectLease:
     session_active_lease_count: int = 0
     session_live_lease_count: int = 0
     session_slots_total: int = 0
+    task_id: int = 0
     control_plane_outage_seconds: float = field(
         default_factory=_control_plane_outage_seconds_from_env
     )
@@ -315,6 +316,7 @@ class AedtProjectLease:
         return status
 
     def _apply_status(self, status: dict[str, Any]) -> None:
+        self.task_id = int(status.get("task_id") or self.task_id or 0)
         self.state = str(status.get("state") or "")
         self.endpoint = str(status.get("endpoint") or "")
         self.automation_lock_path = str(
@@ -641,6 +643,8 @@ class AedtProjectLease:
         if (
             self._automation_lock is None
             or self._automation_lock.path != self.automation_lock_path
+            or self._automation_lock.owner_task_id != self.task_id
+            or self._automation_lock.owner_pid != os.getpid()
         ):
             raw_timeout = os.environ.get(
                 "AEDT_POOL_AUTOMATION_LOCK_TIMEOUT_SECONDS", "1800"
@@ -659,6 +663,10 @@ class AedtProjectLease:
             self._automation_lock = SessionAutomationLock(
                 self.automation_lock_path,
                 timeout_seconds=timeout_seconds,
+                owner_kind="client",
+                owner_task_id=self.task_id,
+                owner_host=socket.gethostname(),
+                owner_pid=os.getpid(),
             )
         return self._automation_lock
 
@@ -1009,6 +1017,7 @@ def acquire_project_lease(
         lease_id=int(lease["id"]),
         client_token=str(payload.get("client_token") or client_token),
         project_name=project_name,
+        task_id=int(lease.get("task_id") or task_id or 0),
         state=str(lease.get("state") or "queued"),
         endpoint=str(lease.get("endpoint") or ""),
         exclusive_session=bool(lease.get("exclusive_session")),

@@ -34,6 +34,12 @@ from .aedt_automation_lock import (
 # Leave one HTTP-timeout/backoff margin beyond the required five-minute outage.
 DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS = 360.0
 CONTROL_PLANE_OUTAGE_ENV = "AEDT_SESSION_HOST_CONTROL_PLANE_OUTAGE_SECONDS"
+DEFAULT_AUTOMATION_LOCK_MAX_HOLD_SECONDS = 300.0
+MIN_AUTOMATION_LOCK_MAX_HOLD_SECONDS = 300.0
+MAX_AUTOMATION_LOCK_MAX_HOLD_SECONDS = 1800.0
+AUTOMATION_LOCK_MAX_HOLD_ENV = (
+    "AEDT_SESSION_HOST_AUTOMATION_LOCK_MAX_HOLD_SECONDS"
+)
 ARTIFACT_ROOT_ENV = "AEDT_SESSION_HOST_ARTIFACT_ROOT"
 DSO_PROFILE_ENV = "AEDT_SESSION_HOST_DSO_PROFILE"
 SESSION_PROFILE_ENV = "AEDT_SESSION_HOST_PROFILE"
@@ -314,6 +320,9 @@ class AedtSessionHost:
         dso_profile: str = "",
         session_profile: str = "",
         control_plane_outage_seconds: float = DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS,
+        automation_lock_max_hold_seconds: float = (
+            DEFAULT_AUTOMATION_LOCK_MAX_HOLD_SECONDS
+        ),
     ) -> None:
         self.client = client
         self.allocation_id = int(allocation_id)
@@ -350,6 +359,19 @@ class AedtSessionHost:
         if not math.isfinite(outage_seconds):
             raise ValueError("control-plane outage budget must be finite")
         self.control_plane_outage_seconds = max(0.0, outage_seconds)
+        lock_hold_seconds = float(automation_lock_max_hold_seconds)
+        if (
+            not math.isfinite(lock_hold_seconds)
+            or not MIN_AUTOMATION_LOCK_MAX_HOLD_SECONDS
+            <= lock_hold_seconds
+            <= MAX_AUTOMATION_LOCK_MAX_HOLD_SECONDS
+        ):
+            raise ValueError(
+                "automation lock maximum hold must be finite and between "
+                f"{MIN_AUTOMATION_LOCK_MAX_HOLD_SECONDS:.0f} and "
+                f"{MAX_AUTOMATION_LOCK_MAX_HOLD_SECONDS:.0f} seconds"
+            )
+        self.automation_lock_max_hold_seconds = lock_hold_seconds
         self.retry_initial_seconds = 1.0
         self.retry_max_seconds = 20.0
         self.host_id = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
@@ -369,6 +391,7 @@ class AedtSessionHost:
         self.artifact_dir = ""
         self.automation_lock_path = ""
         self._automation_lock: SessionAutomationLock | None = None
+        self._automation_lock_hold_observation: dict[str, Any] | None = None
         self.error_log_path = ""
         self.native_batch_log_path = ""
         self.journal_path = ""
@@ -540,8 +563,7 @@ class AedtSessionHost:
         self.journal_path = str(directory / "session-events.jsonl")
         directory.mkdir(parents=True, exist_ok=True)
         create_automation_lock_file(self.automation_lock_path)
-        self._automation_lock = SessionAutomationLock(
-            self.automation_lock_path,
+        self._automation_lock = self._new_session_automation_lock(
             timeout_seconds=max(300.0, self.control_plane_outage_seconds),
         )
         self._journal(
@@ -1107,6 +1129,25 @@ class AedtSessionHost:
     def _automation_guard(self):
         return self._automation_lock or nullcontext()
 
+    @staticmethod
+    def _scheduler_task_id() -> int:
+        try:
+            return max(0, int(os.environ.get("SLURM_SCHED_TASK_ID", "0")))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    def _new_session_automation_lock(
+        self, *, timeout_seconds: float
+    ) -> SessionAutomationLock:
+        return SessionAutomationLock(
+            self.automation_lock_path,
+            timeout_seconds=timeout_seconds,
+            owner_kind="session_host",
+            owner_task_id=self._scheduler_task_id(),
+            owner_host=socket.gethostname(),
+            owner_pid=os.getpid(),
+        )
+
     def _close_project(self, project_name: str) -> None:
         with self._automation_guard():
             self._close_project_unlocked(project_name)
@@ -1468,8 +1509,7 @@ class AedtSessionHost:
             # Once it owns the shared path gate, call the unlocked primitive;
             # nesting through ``_close_project`` would try to reacquire that
             # gate through the long-timeout instance and deadlock this loop.
-            release_lock = SessionAutomationLock(
-                self.automation_lock_path,
+            release_lock = self._new_session_automation_lock(
                 timeout_seconds=PROJECT_RELEASE_LOCK_TIMEOUT_SECONDS,
             )
             try:
@@ -1713,8 +1753,7 @@ class AedtSessionHost:
                     # non-blocking filesystem-lock attempt makes a busy client
                     # an explicit deferred outcome and guarantees GetVersion
                     # is not invoked in that case.
-                    probe_lock = SessionAutomationLock(
-                        self.automation_lock_path,
+                    probe_lock = self._new_session_automation_lock(
                         timeout_seconds=0.0,
                     )
                     try:
@@ -1752,6 +1791,89 @@ class AedtSessionHost:
         if thread.is_alive():
             return NATIVE_PROBE_FAILED
         return consume_finished_probe()
+
+    def _automation_lock_hold_evidence(self) -> dict[str, Any] | None:
+        """Confirm one remote client continuously owns the actual lock.
+
+        Wall-clock marker age is evidence only.  Recycling is authorized from
+        this host's monotonic observations, and only while every observation
+        proves the byte lock remains externally busy with the same complete
+        owner frame.  A free lock, corrupt/stale frame, host-local owner, or
+        owner handoff resets the episode.
+        """
+
+        if not self.automation_lock_path:
+            self._automation_lock_hold_observation = None
+            return None
+        try:
+            inspection = SessionAutomationLock.inspect(
+                self.automation_lock_path
+            )
+        except (OSError, RuntimeError, ValueError):
+            self._automation_lock_hold_observation = None
+            return None
+        owner = inspection.get("owner")
+        if (
+            inspection.get("busy") is not True
+            or inspection.get("local_process") is True
+            or inspection.get("marker_valid") is not True
+            or not isinstance(owner, dict)
+            or owner.get("kind") != "client"
+        ):
+            self._automation_lock_hold_observation = None
+            return None
+        try:
+            identity = (
+                str(owner.get("kind") or ""),
+                int(owner.get("task_id") or 0),
+                str(owner.get("host") or ""),
+                int(owner.get("pid") or 0),
+                float(owner.get("acquired_at") or 0.0),
+                str(owner.get("nonce") or ""),
+                int(owner.get("sequence") or 0),
+            )
+        except (TypeError, ValueError, OverflowError):
+            self._automation_lock_hold_observation = None
+            return None
+        if identity[1] <= 0:
+            self._automation_lock_hold_observation = None
+            return None
+        now = time.monotonic()
+        observation = self._automation_lock_hold_observation
+        if observation is None or observation.get("identity") != identity:
+            self._automation_lock_hold_observation = {
+                "identity": identity,
+                "first_seen_monotonic": now,
+                "last_seen_monotonic": now,
+                "samples": 1,
+            }
+            return None
+        observation["last_seen_monotonic"] = now
+        observation["samples"] = int(observation.get("samples") or 0) + 1
+        continuous_seconds = max(
+            0.0, now - float(observation["first_seen_monotonic"])
+        )
+        if continuous_seconds < self.automation_lock_max_hold_seconds:
+            return None
+        return {
+            "automation_lock_path": self.automation_lock_path,
+            "actual_lock_busy": True,
+            "same_nonce_continuous": True,
+            "continuous_hold_seconds": round(continuous_seconds, 3),
+            "maximum_hold_seconds": self.automation_lock_max_hold_seconds,
+            "observation_samples": int(observation["samples"]),
+            "owner": dict(owner),
+            "session_host": {
+                "task_id": self._scheduler_task_id(),
+                "host": socket.gethostname(),
+                "pid": os.getpid(),
+                "aedt_pid": self.desktop_process_id,
+            },
+            "artifact_dir": self.artifact_dir,
+            "error_log_path": self.error_log_path,
+            "journal_path": self.journal_path,
+            "observed_at": time.time(),
+        }
 
     def _desktop_process_listener_liveness_proof(self) -> tuple[bool, str]:
         """Prove the owned Desktop process and its exact gRPC listener exist.
@@ -1933,6 +2055,34 @@ class AedtSessionHost:
                         f"/api/aedt-pool/sessions/{self.session_id}/commands",
                         host_token=self.host_token,
                     )
+                    lock_hold_evidence = (
+                        self._automation_lock_hold_evidence()
+                    )
+                    if lock_hold_evidence is not None:
+                        owner = lock_hold_evidence["owner"]
+                        liveness_error = (
+                            "remote client held AEDT automation lock for "
+                            f"{lock_hold_evidence['continuous_hold_seconds']:.1f}s "
+                            "without a solve-window release: "
+                            f"task={owner['task_id']} host={owner['host']} "
+                            f"pid={owner['pid']} nonce={owner['nonce']}"
+                        )
+                        self._journal(
+                            "automation_lock_hold_timeout",
+                            error=liveness_error,
+                            evidence=lock_hold_evidence,
+                        )
+                        self._control_plane_request(
+                            "POST",
+                            f"/api/aedt-pool/sessions/{self.session_id}/fault",
+                            {
+                                "kind": "automation_lock_timeout",
+                                "failure_message": liveness_error,
+                                "evidence": lock_hold_evidence,
+                            },
+                            host_token=self.host_token,
+                        )
+                        raise RuntimeError(liveness_error)
                     healthy, liveness_error = (
                         self._desktop_liveness_proof_for_commands(
                             liveness_commands
@@ -2199,6 +2349,29 @@ def _control_plane_outage_seconds_from_env() -> float:
         return DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS
 
 
+def _automation_lock_max_hold_seconds_from_env() -> float:
+    value = os.environ.get(AUTOMATION_LOCK_MAX_HOLD_ENV, "").strip()
+    if not value:
+        return DEFAULT_AUTOMATION_LOCK_MAX_HOLD_SECONDS
+    try:
+        parsed = float(value)
+        if (
+            not math.isfinite(parsed)
+            or not MIN_AUTOMATION_LOCK_MAX_HOLD_SECONDS
+            <= parsed
+            <= MAX_AUTOMATION_LOCK_MAX_HOLD_SECONDS
+        ):
+            raise ValueError
+        return parsed
+    except ValueError:
+        print(
+            f"Ignoring invalid {AUTOMATION_LOCK_MAX_HOLD_ENV}={value!r}; "
+            f"using {DEFAULT_AUTOMATION_LOCK_MAX_HOLD_SECONDS:.0f}s",
+            file=sys.stderr,
+        )
+        return DEFAULT_AUTOMATION_LOCK_MAX_HOLD_SECONDS
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     bootstrap_token = Path(args.bootstrap_token_file).read_text(encoding="utf-8").strip()
@@ -2215,6 +2388,9 @@ def main(argv: list[str] | None = None) -> int:
         dso_profile=args.dso_profile,
         session_profile=args.session_profile,
         control_plane_outage_seconds=_control_plane_outage_seconds_from_env(),
+        automation_lock_max_hold_seconds=(
+            _automation_lock_max_hold_seconds_from_env()
+        ),
     )
     signal.signal(signal.SIGTERM, host.request_stop)
     signal.signal(signal.SIGINT, host.request_stop)
