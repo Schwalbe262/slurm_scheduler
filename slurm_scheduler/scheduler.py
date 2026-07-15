@@ -484,9 +484,11 @@ class Scheduler:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=10)
-        # A completed backup is the restart cadence marker.  Wait for the one
-        # in-flight worker so a graceful scheduler restart cannot overlap it
-        # with a new generation or leave a half-written cadence file behind.
+        # Intentionally use an unbounded join: neither SQLite backup_to() nor
+        # a stalled shared-filesystem scan is safely cancellable. A bounded
+        # join would let a restarted scheduler overlap the old generation and
+        # possibly treat a half-written file as its cadence marker. The trade-
+        # off is that graceful stop can take as long as the in-flight I/O.
         with self._backup_lock:
             backup_thread = self._backup_thread
         if backup_thread and backup_thread is not threading.current_thread():
@@ -1748,10 +1750,30 @@ class Scheduler:
         with self._backup_lock:
             if self._stop.is_set() or self._backup_inflight:
                 return
+            self._backup_inflight = True
+            backup_thread = threading.Thread(
+                target=self._backup_database_if_due_worker,
+                name="database-backup",
+                daemon=True,
+            )
+            self._backup_thread = backup_thread
+            try:
+                # Start while holding the lifecycle lock so stop() can never
+                # observe and join a Thread object that has not started yet.
+                backup_thread.start()
+            except Exception as exc:
+                self._backup_inflight = False
+                if self._backup_thread is backup_thread:
+                    self._backup_thread = None
+                LOGGER.warning("failed to start database backup: %s", exc)
+
+    def _backup_database_if_due_worker(self) -> None:
+        try:
             now = time.time()
             if self._last_backup_at == 0.0:
                 # Survive restarts: resume the cadence from the newest backup
-                # file. Only completed .db files participate in the cadence.
+                # file. This scan is intentionally off the scheduler tick
+                # because backup_dir can be a slow shared filesystem.
                 try:
                     mtimes = [
                         os.path.getmtime(os.path.join(self.backup_dir, entry))
@@ -1772,26 +1794,6 @@ class Scheduler:
             backup_path = os.path.join(
                 self.backup_dir, f"slurm_scheduler-{stamp}.db"
             )
-            self._backup_inflight = True
-            backup_thread = threading.Thread(
-                target=self._backup_database,
-                args=(backup_path,),
-                name="database-backup",
-                daemon=True,
-            )
-            self._backup_thread = backup_thread
-            try:
-                # Start while holding the lifecycle lock so stop() can never
-                # observe and join a Thread object that has not started yet.
-                backup_thread.start()
-            except Exception as exc:
-                self._backup_inflight = False
-                if self._backup_thread is backup_thread:
-                    self._backup_thread = None
-                LOGGER.warning("failed to start database backup: %s", exc)
-
-    def _backup_database(self, backup_path: str) -> None:
-        try:
             try:
                 self.db.backup_to(backup_path)
             except Exception as exc:

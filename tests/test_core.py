@@ -1306,6 +1306,71 @@ class SchedulerTests(unittest.TestCase):
         self.assertFalse(scheduler._backup_inflight)
         self.assertIsNone(scheduler._backup_thread)
 
+    def test_database_backup_tick_does_not_wait_for_bootstrap_scan(
+        self,
+    ) -> None:
+        backup_dir = Path(self.tmp.name) / "slow-scan-backups"
+        backup_dir.mkdir()
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            backup_enabled=True,
+            backup_interval_seconds=3600,
+            backup_dir=str(backup_dir),
+        )
+        scan_started = threading.Event()
+        release_scan = threading.Event()
+        backup_started = threading.Event()
+
+        def slow_listdir(path: str) -> list[str]:
+            self.assertEqual(path, str(backup_dir))
+            scan_started.set()
+            if not release_scan.wait(5):
+                raise AssertionError("bootstrap scan was not released")
+            return []
+
+        def record_backup(path: str) -> None:
+            backup_started.set()
+            Path(path).write_text("complete", encoding="utf-8")
+
+        caller = threading.Thread(
+            target=scheduler.backup_database_if_due,
+            daemon=True,
+        )
+        try:
+            with mock.patch(
+                "slurm_scheduler.scheduler.os.listdir",
+                side_effect=slow_listdir,
+            ), mock.patch.object(
+                self.db, "backup_to", side_effect=record_backup
+            ):
+                caller.start()
+                self.assertTrue(scan_started.wait(1))
+
+                # The scheduler-facing call returned even though its worker
+                # remains blocked on the shared-filesystem bootstrap scan.
+                caller.join(timeout=0.2)
+                self.assertFalse(caller.is_alive())
+                self.assertFalse(backup_started.is_set())
+
+                release_scan.set()
+                with scheduler._backup_lock:
+                    worker = scheduler._backup_thread
+                self.assertIsNotNone(worker)
+                assert worker is not None
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive())
+                self.assertTrue(backup_started.is_set())
+        finally:
+            release_scan.set()
+            caller.join(timeout=2)
+            scheduler.stop()
+
+        self.assertFalse(scheduler._backup_inflight)
+        self.assertIsNone(scheduler._backup_thread)
+
     def test_database_backup_resumes_cadence_from_newest_completed_file(
         self,
     ) -> None:
@@ -1328,6 +1393,11 @@ class SchedulerTests(unittest.TestCase):
         try:
             with mock.patch.object(self.db, "backup_to") as backup_to:
                 scheduler.backup_database_if_due()
+                with scheduler._backup_lock:
+                    worker = scheduler._backup_thread
+                if worker is not None:
+                    worker.join(timeout=2)
+                    self.assertFalse(worker.is_alive())
                 backup_to.assert_not_called()
         finally:
             scheduler.stop()
@@ -1371,6 +1441,9 @@ class SchedulerTests(unittest.TestCase):
                 stopper = threading.Thread(target=scheduler.stop, daemon=True)
                 stopper.start()
                 time.sleep(0.05)
+                # stop() deliberately waits without a timeout because the
+                # backup API cannot be cancelled safely. This can extend a
+                # graceful stop, but prevents overlapping backup generations.
                 self.assertTrue(stopper.is_alive())
 
                 scheduler._last_backup_at = time.time() - 3601
