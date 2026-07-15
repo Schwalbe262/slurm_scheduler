@@ -22,9 +22,11 @@ from slurm_scheduler.aedt_attach_client import (
 )
 from slurm_scheduler.aedt_pool import (
     ALLOCATION_AGE_ROTATION_REASON,
+    FAULTED_DESKTOP_ALLOCATION_RECYCLE_REASON,
     UNHEALTHY_ALLOCATION_RECYCLE_REASON,
     AedtPoolRuntime,
     AedtPoolService,
+    _derive_placement_group,
 )
 from slurm_scheduler.aedt_pool_api import create_aedt_pool_router
 from slurm_scheduler.aedt_session_host import (
@@ -116,6 +118,7 @@ class AedtPoolTestCase(unittest.TestCase):
         allocation_id: int = 0,
         node: str = "",
         exclusive_session: bool = False,
+        placement_group: str | None = None,
         task_id: int = 0,
         project_name: str | None = None,
     ):
@@ -126,6 +129,7 @@ class AedtPoolTestCase(unittest.TestCase):
             allocation_id=allocation_id,
             node_name=node,
             exclusive_session=exclusive_session,
+            placement_group=placement_group,
         )
 
     def start_one_session(self, allocation_id: int, node: str = "cpu-01"):
@@ -150,6 +154,25 @@ class AedtPoolTestCase(unittest.TestCase):
 
 
 class AedtPoolGateTests(AedtPoolTestCase):
+    def test_placement_group_derivation_and_explicit_override(self) -> None:
+        cases = {
+            "mft-pending-39812-stage": "mft",
+            "simulation_745147_2759990": "mft",
+            "IPMSM_v2_stage3_001": "ipmsm",
+            "motor-prototype-ipmsm-stage": "ipmsm",
+            "Alpha42-stage-7": "alpha42",
+        }
+        for project_name, expected in cases.items():
+            with self.subTest(project_name=project_name):
+                self.assertEqual(_derive_placement_group(project_name), expected)
+
+        lease, _token = self.request(
+            "explicit-placement-group",
+            project_name="simulation_745147_2759990",
+            placement_group="motor-team",
+        )
+        self.assertEqual(lease["placement_group"], "motor-team")
+
     def test_requested_250_500_is_staged_but_disabled(self) -> None:
         config = self.service.config()
         self.assertEqual(config.max_sessions, 250)
@@ -829,6 +852,120 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(self.service.get_session(int(session["id"]))["slots_total"], 2)
         self.service.heartbeat_session(int(session["id"]), host_token)
 
+    def test_sessions_pack_one_placement_group_and_keep_groups_separate(self) -> None:
+        self.service.set_enabled(False)
+        self.service.set_operator_limits(
+            max_sessions=2,
+            min_idle_sessions=2,
+            target_projects=6,
+            projects_per_session=3,
+        )
+        self.service.set_enabled(True)
+        self.service.reconcile(execute=True)
+        starts = self.service.starting_sessions()
+        self.assertEqual(len(starts), 2)
+
+        sessions = []
+        for index, start in enumerate(starts):
+            host_id = f"placement-host-{index}"
+            claimed = self.service.claim_start(
+                session_id=int(start["id"]),
+                allocation_id=self.allocation_id,
+                node_name="cpu-01",
+                host_id=host_id,
+                bootstrap_token="secret",
+            )
+            self.assertEqual(int(claimed["id"]), int(start["id"]))
+            session, _host_token = self.service.register_session(
+                session_id=int(start["id"]),
+                host_id=host_id,
+                endpoint=f"cpu-01:{50001 + index}",
+                process_id=str(100 + index),
+                bootstrap_token="secret",
+            )
+            sessions.append(session)
+
+        self.db.update_allocation(
+            self.allocation_id,
+            state="draining",
+            drain_reason="operator maintenance",
+            drain_at=self.clock.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        first_mft, _ = self.request(
+            "placement-mft-first",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+            project_name="mft-pending-39812-stage",
+        )
+        simulation_mft, _ = self.request(
+            "placement-mft-simulation",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+            project_name="simulation_745147_2759990",
+        )
+        ipmsm, _ = self.request(
+            "placement-ipmsm",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+            project_name="ipmsm_v2_stage3_001",
+        )
+        third_mft, _ = self.request(
+            "placement-mft-third",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+            project_name="mft-pending-39813-stage",
+        )
+        for lease in (first_mft, simulation_mft, ipmsm, third_mft):
+            self.assertEqual(lease["state"], "queued")
+
+        self.db.update_allocation(
+            self.allocation_id,
+            state="active",
+            drain_reason="AEDT pool project demand",
+            drain_at=None,
+        )
+        self.service.reconcile(execute=True)
+        first_mft = self.service.get_lease(int(first_mft["id"]))
+        simulation_mft = self.service.get_lease(int(simulation_mft["id"]))
+        ipmsm = self.service.get_lease(int(ipmsm["id"]))
+        third_mft = self.service.get_lease(int(third_mft["id"]))
+
+        first_session_id = int(first_mft["session_id"])
+        second_session_id = int(ipmsm["session_id"])
+        self.assertEqual(first_mft["placement_group"], "mft")
+        self.assertEqual(simulation_mft["placement_group"], "mft")
+        self.assertEqual(ipmsm["placement_group"], "ipmsm")
+        self.assertEqual(int(simulation_mft["session_id"]), first_session_id)
+        self.assertEqual(int(third_mft["session_id"]), first_session_id)
+        self.assertNotEqual(second_session_id, first_session_id)
+        self.assertEqual(
+            {int(session["id"]) for session in sessions},
+            {first_session_id, second_session_id},
+        )
+        with self.db.connect() as conn:
+            occupants = {
+                (
+                    int(row["session_id"]),
+                    str(row["placement_group"]),
+                    int(row["count"]),
+                )
+                for row in conn.execute(
+                    """
+                    SELECT session_id, placement_group, COUNT(*) AS count
+                    FROM aedt_project_leases
+                    WHERE state IN ('leased','active','releasing')
+                    GROUP BY session_id, placement_group
+                    """
+                ).fetchall()
+            }
+        self.assertEqual(
+            occupants,
+            {
+                (first_session_id, "mft", 3),
+                (second_session_id, "ipmsm", 1),
+            },
+        )
+
     def test_allocation_age_rotation_drains_only_old_capacity(self) -> None:
         existing_lease, existing_token = self.request(
             "rotation-existing",
@@ -1227,6 +1364,140 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(self.service.starting_sessions(), [])
         self.assertGreaterEqual(self.service.summary()["plan"]["node_requests"], 1)
 
+    def test_recycle_draining_allocation_with_healthy_session_is_restored(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=1,
+            min_idle_sessions=1,
+            target_projects=2,
+        )
+        session, _host_token = self.start_one_session(self.allocation_id)
+        drain_at = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE aedt_sessions
+                SET drain_requested_at = ?
+                WHERE id = ?
+                """,
+                (drain_at, int(session["id"])),
+            )
+        self.db.update_allocation(
+            self.allocation_id,
+            state="draining",
+            drain_reason=FAULTED_DESKTOP_ALLOCATION_RECYCLE_REASON,
+            drain_at=drain_at,
+        )
+
+        lease, _token = self.request(
+            "recovered-allocation-placement",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+            project_name="mft-pending-39812-stage",
+        )
+
+        allocation = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(allocation["state"], "active")
+        self.assertEqual(allocation["drain_reason"], "AEDT pool project demand")
+        self.assertIsNone(allocation["drain_at"])
+        self.assertEqual(lease["state"], "leased")
+        self.assertEqual(int(lease["session_id"]), int(session["id"]))
+        recovered_session = self.service.get_session(int(session["id"]))
+        self.assertEqual(recovered_session["state"], "busy")
+        self.assertIsNone(recovered_session["drain_requested_at"])
+
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE aedt_sessions SET drain_requested_at = ? WHERE id = ?",
+                (drain_at, int(session["id"])),
+            )
+        self.db.update_allocation(
+            self.allocation_id,
+            state="draining",
+            drain_reason=UNHEALTHY_ALLOCATION_RECYCLE_REASON,
+            drain_at=drain_at,
+        )
+
+        self.service.reconcile(execute=True)
+
+        allocation = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(allocation["state"], "active")
+        self.assertEqual(allocation["drain_reason"], "AEDT pool project demand")
+        self.assertIsNone(allocation["drain_at"])
+        self.assertIsNone(
+            self.service.get_session(int(session["id"]))["drain_requested_at"]
+        )
+
+    def test_age_rotation_draining_allocation_is_not_restored(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=1,
+            min_idle_sessions=1,
+            target_projects=2,
+        )
+        session, _host_token = self.start_one_session(self.allocation_id)
+        drain_at = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE aedt_sessions SET drain_requested_at = ? WHERE id = ?",
+                (drain_at, int(session["id"])),
+            )
+        self.db.update_allocation(
+            self.allocation_id,
+            state="draining",
+            drain_reason=ALLOCATION_AGE_ROTATION_REASON,
+            drain_at=drain_at,
+        )
+
+        self.service.reconcile(execute=True)
+
+        allocation = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(allocation["state"], "draining")
+        self.assertEqual(allocation["drain_reason"], ALLOCATION_AGE_ROTATION_REASON)
+        self.assertIsNotNone(allocation["drain_at"])
+        draining_session = self.service.get_session(int(session["id"]))
+        self.assertEqual(draining_session["state"], "draining")
+        self.assertIsNotNone(draining_session["drain_requested_at"])
+
+    def test_recycle_draining_allocation_with_quarantine_is_not_restored(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=1,
+            min_idle_sessions=1,
+            target_projects=2,
+        )
+        session, _host_token = self.start_one_session(self.allocation_id)
+        drain_at = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE aedt_sessions SET drain_requested_at = ? WHERE id = ?",
+                (drain_at, int(session["id"])),
+            )
+            conn.execute(
+                """
+                INSERT INTO aedt_sessions (
+                    session_key, allocation_id, account_name, node_name,
+                    slots_total, state, quarantine_reason
+                ) VALUES ('closed-quarantine', ?, 'a', 'cpu-01', 2, 'failed',
+                          'solver_timeout')
+                """,
+                (self.allocation_id,),
+            )
+        self.db.update_allocation(
+            self.allocation_id,
+            state="draining",
+            drain_reason=UNHEALTHY_ALLOCATION_RECYCLE_REASON,
+            drain_at=drain_at,
+        )
+
+        self.service.reconcile(execute=True)
+
+        allocation = self.db.get_allocation(self.allocation_id)
+        self.assertEqual(allocation["state"], "draining")
+        self.assertEqual(
+            allocation["drain_reason"], UNHEALTHY_ALLOCATION_RECYCLE_REASON
+        )
+        healthy_session = self.service.get_session(int(session["id"]))
+        self.assertEqual(healthy_session["state"], "ready")
+        self.assertIsNotNone(healthy_session["drain_requested_at"])
+
     def test_exclusive_1to1_lease_never_accepts_a_sibling(self) -> None:
         self.service.set_operator_limit(1)
         exclusive, _ = self.request(
@@ -1259,12 +1530,67 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             ).fetchone()[0]
         self.assertEqual(live_on_session, 1)
 
+    def test_exclusive_lease_requires_an_empty_session(self) -> None:
+        self.service.set_operator_limit(1)
+        shared, _ = self.request(
+            "shared-first",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+            project_name="mft-pending-39812-stage",
+        )
+        session, _host_token = self.start_one_session(self.allocation_id)
+        current_shared = self.service.get_lease(int(shared["id"]))
+        self.assertEqual(int(current_shared["session_id"]), int(session["id"]))
+
+        exclusive, _ = self.request(
+            "exclusive-after-shared",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+            project_name="simulation_745147_2759990",
+            exclusive_session=True,
+        )
+        self.assertEqual(exclusive["placement_group"], "mft")
+        self.assertEqual(exclusive["state"], "queued")
+        with self.db.connect() as conn:
+            live_on_session = conn.execute(
+                """
+                SELECT COUNT(*) FROM aedt_project_leases
+                WHERE session_id = ?
+                  AND state IN ('leased','active','releasing')
+                """,
+                (int(session["id"]),),
+            ).fetchone()[0]
+        self.assertEqual(live_on_session, 1)
+
     def test_exclusive_demand_counts_one_session_per_project(self) -> None:
         self.service.set_operator_limit(2)
         self.request("exclusive-a", exclusive_session=True)
         self.request("exclusive-b", exclusive_session=True)
         plan = self.service.dry_run()
         self.assertEqual(plan["exclusive_projects"], 2)
+        self.assertEqual(plan["desired_sessions"], 2)
+
+    def test_shared_demand_packs_each_placement_group_separately(self) -> None:
+        self.service.set_enabled(False)
+        self.service.set_operator_limits(
+            max_sessions=2,
+            target_projects=6,
+            projects_per_session=3,
+        )
+        self.service.set_enabled(True)
+        self.request(
+            "demand-mft",
+            project_name="mft-pending-39812-stage",
+        )
+        self.request(
+            "demand-ipmsm",
+            project_name="ipmsm_v2_stage3_001",
+        )
+
+        plan = self.service.dry_run()
+        self.assertEqual(plan["live_projects"], 2)
+        self.assertEqual(plan["exclusive_projects"], 0)
+        self.assertEqual(plan["demand_sessions"], 2)
         self.assertEqual(plan["desired_sessions"], 2)
 
     def test_release_is_two_phase_and_slot_is_not_reused_early(self) -> None:
@@ -1697,12 +2023,28 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         )
 
     def test_client_binds_actual_aedt_project_name_after_session_attach(self) -> None:
-        lease, token = self.request("temporary", allocation_id=self.allocation_id, node="cpu-01")
+        lease, token = self.request(
+            "temporary",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+            project_name="mft-pending-39812-stage",
+        )
+        self.assertEqual(lease["placement_group"], "mft")
         self.start_one_session(self.allocation_id)
         updated = self.service.bind_lease_project_name(
-            int(lease["id"]), token, "simulation-pilot-0001"
+            int(lease["id"]), token, "simulation_745147_2759990"
         )
-        self.assertEqual(updated["project_name"], "simulation-pilot-0001")
+        self.assertEqual(updated["project_name"], "simulation_745147_2759990")
+        self.assertEqual(updated["placement_group"], "mft")
+
+        custom, custom_token = self.request(
+            "custom-bind-stability",
+            project_name="custom-pending-001",
+        )
+        rebound = self.service.bind_lease_project_name(
+            int(custom["id"]), custom_token, "simulation_999999_111111"
+        )
+        self.assertEqual(rebound["placement_group"], "custom")
 
     def test_queued_client_heartbeat_survives_slow_node_wait(self) -> None:
         # Disable mutation so this remains a queued request.

@@ -26,6 +26,9 @@ LEASE_LIVE_STATES = ("queued", "leased", "active", "releasing")
 LEASE_SLOT_STATES = ("leased", "active", "releasing")
 SESSION_START_ACK_TIMEOUT_MESSAGE = "session start acknowledgement timed out"
 SESSION_HEARTBEAT_TIMEOUT_MESSAGE = "session heartbeat expired"
+FAULTED_DESKTOP_ALLOCATION_RECYCLE_REASON = (
+    "AEDT pool faulted Desktop allocation recycle"
+)
 UNHEALTHY_ALLOCATION_RECYCLE_REASON = (
     "AEDT pool unhealthy/quarantined session allocation recycle"
 )
@@ -69,6 +72,7 @@ CREATE TABLE IF NOT EXISTS aedt_project_leases (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     request_key TEXT NOT NULL UNIQUE,
     project_name TEXT NOT NULL,
+    placement_group TEXT,
     task_id INTEGER NOT NULL DEFAULT 0,
     requested_allocation_id INTEGER NOT NULL DEFAULT 0,
     requested_node_name TEXT NOT NULL DEFAULT '',
@@ -167,6 +171,18 @@ def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def _derive_placement_group(project_name: str) -> str:
+    normalized = project_name.strip().lower()
+    if "ipmsm" in normalized:
+        return "ipmsm"
+    if normalized.startswith(("mft", "simulation")):
+        return "mft"
+    token_end = 0
+    while token_end < len(normalized) and normalized[token_end].isalnum():
+        token_end += 1
+    return normalized[:token_end] or normalized
+
+
 def _bool_setting(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -248,6 +264,23 @@ class AedtPoolService:
                     "ALTER TABLE aedt_project_leases ADD COLUMN "
                     "exclusive_session INTEGER NOT NULL DEFAULT 0"
                 )
+            if "placement_group" not in lease_columns:
+                conn.execute(
+                    "ALTER TABLE aedt_project_leases ADD COLUMN placement_group TEXT"
+                )
+            legacy_leases = conn.execute(
+                """
+                SELECT id, project_name FROM aedt_project_leases
+                WHERE placement_group IS NULL OR TRIM(placement_group) = ''
+                """
+            ).fetchall()
+            conn.executemany(
+                "UPDATE aedt_project_leases SET placement_group = ? WHERE id = ?",
+                (
+                    (_derive_placement_group(str(row["project_name"])), int(row["id"]))
+                    for row in legacy_leases
+                ),
+            )
             validation_columns = {
                 str(row["name"])
                 for row in conn.execute("PRAGMA table_info(aedt_pool_validations)").fetchall()
@@ -688,6 +721,7 @@ class AedtPoolService:
         *,
         request_key: str,
         project_name: str,
+        placement_group: str | None = None,
         task_id: int = 0,
         allocation_id: int = 0,
         node_name: str = "",
@@ -699,6 +733,14 @@ class AedtPoolService:
             raise ValueError("request_key is required")
         if not project_name:
             raise ValueError("project_name is required")
+        if placement_group is None:
+            resolved_placement_group = _derive_placement_group(project_name)
+        else:
+            if not isinstance(placement_group, str):
+                raise ValueError("placement_group must be a string")
+            resolved_placement_group = placement_group.strip()
+            if not resolved_placement_group:
+                raise ValueError("placement_group must not be empty")
         if type(exclusive_session) is not bool:
             raise ValueError("exclusive_session must be a boolean")
         token = secrets.token_urlsafe(32)
@@ -711,15 +753,16 @@ class AedtPoolService:
                 cursor = conn.execute(
                     """
                     INSERT INTO aedt_project_leases (
-                        request_key, project_name, task_id,
+                        request_key, project_name, placement_group, task_id,
                         requested_allocation_id, requested_node_name,
                         exclusive_session, state, client_token_hash,
                         last_heartbeat_at, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
                     """,
                     (
                         request_key,
                         project_name,
+                        resolved_placement_group,
                         max(0, int(task_id)),
                         max(0, int(allocation_id)),
                         node_name.strip(),
@@ -1513,11 +1556,16 @@ class AedtPoolService:
                     """
                     UPDATE allocations
                     SET state = 'draining',
-                        drain_reason = 'AEDT pool faulted Desktop allocation recycle',
+                        drain_reason = ?,
                         drain_at = COALESCE(drain_at, ?), updated_at = ?
                     WHERE id = ? AND state IN ('warm','active','draining')
                     """,
-                    (now, now, int(session_row["allocation_id"])),
+                    (
+                        FAULTED_DESKTOP_ALLOCATION_RECYCLE_REASON,
+                        now,
+                        now,
+                        int(session_row["allocation_id"]),
+                    ),
                 )
         return self.get_session(session_id, include_secret_hash=False)
 
@@ -1621,12 +1669,33 @@ class AedtPoolService:
         )
         desired_exclusive = min(exclusive_projects, desired_projects)
         desired_shared = max(0, desired_projects - desired_exclusive)
+        shared_group_counts = conn.execute(
+            """
+            SELECT effective_placement_group, COUNT(*) AS count
+            FROM (
+                SELECT CASE
+                           WHEN placement_group IS NULL
+                                OR TRIM(placement_group) = ''
+                           THEN '__legacy_lease_' || id
+                           ELSE placement_group
+                       END AS effective_placement_group
+                FROM aedt_project_leases
+                WHERE exclusive_session = 0
+                  AND state IN ('queued','leased','active','releasing')
+                ORDER BY id ASC
+                LIMIT ?
+            )
+            GROUP BY effective_placement_group
+            """,
+            (desired_shared,),
+        ).fetchall()
+        shared_demand_sessions = sum(
+            math.ceil(int(row["count"]) / config.projects_per_session)
+            for row in shared_group_counts
+        )
         demand_sessions = min(
             config.max_sessions,
-            desired_exclusive + (
-                math.ceil(desired_shared / config.projects_per_session)
-                if desired_shared else 0
-            ),
+            desired_exclusive + shared_demand_sessions,
         )
         # A busy session cannot be consolidated immediately even when its
         # sibling slot is empty.  Preserve every such owner, then add whole
@@ -2040,6 +2109,63 @@ class AedtPoolService:
                     """,
                     (now, now, session_id),
                 )
+            if execute:
+                recoverable_allocation_ids = [
+                    int(row["id"])
+                    for row in conn.execute(
+                        """
+                        SELECT a.id
+                        FROM allocations a
+                        WHERE a.state = 'draining'
+                          AND a.drain_reason IN (?, ?)
+                          AND EXISTS (
+                              SELECT 1 FROM aedt_sessions healthy
+                              WHERE healthy.allocation_id = a.id
+                                AND healthy.state IN ('ready','busy')
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM aedt_sessions unsafe
+                              WHERE unsafe.allocation_id = a.id
+                                AND (
+                                    unsafe.state = 'unhealthy'
+                                    OR TRIM(COALESCE(unsafe.quarantine_reason, '')) != ''
+                                )
+                          )
+                        ORDER BY a.id ASC
+                        """,
+                        (
+                            FAULTED_DESKTOP_ALLOCATION_RECYCLE_REASON,
+                            UNHEALTHY_ALLOCATION_RECYCLE_REASON,
+                        ),
+                    ).fetchall()
+                ]
+                for allocation_id in recoverable_allocation_ids:
+                    restored = conn.execute(
+                        """
+                        UPDATE allocations
+                        SET state = 'active',
+                            drain_reason = 'AEDT pool project demand',
+                            drain_at = NULL, failure_message = '', updated_at = ?
+                        WHERE id = ? AND state = 'draining'
+                          AND drain_reason IN (?, ?)
+                        """,
+                        (
+                            now,
+                            allocation_id,
+                            FAULTED_DESKTOP_ALLOCATION_RECYCLE_REASON,
+                            UNHEALTHY_ALLOCATION_RECYCLE_REASON,
+                        ),
+                    )
+                    if restored.rowcount != 1:
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE aedt_sessions
+                        SET drain_requested_at = NULL, updated_at = ?
+                        WHERE allocation_id = ? AND state IN ('ready','busy')
+                        """,
+                        (now, allocation_id),
+                    )
             # Assign oldest requests to a same-allocation/same-node session.
             # Empty placement constraints allow the controller to choose any
             # dedicated AEDT allocation; explicit constraints are never relaxed.
@@ -2057,16 +2183,21 @@ class AedtPoolService:
                                (SELECT COUNT(*) FROM aedt_project_leases l
                                 WHERE l.session_id = s.id
                                   AND l.state IN ('leased','active','releasing')
-                                  AND l.exclusive_session = 1) AS exclusive_slots
+                                  AND l.exclusive_session = 1) AS exclusive_slots,
+                               (SELECT COUNT(*) FROM aedt_project_leases l
+                                WHERE l.session_id = s.id
+                                  AND l.state IN ('leased','active','releasing')
+                                  AND l.placement_group IS NOT ?) AS incompatible_group_slots
                         FROM aedt_sessions s
                         JOIN allocations a ON a.id = s.allocation_id
                         WHERE s.state IN ('ready','busy')
                           AND a.state IN ('warm','active')
                           AND (? = 0 OR s.allocation_id = ?)
                           AND (? = '' OR s.node_name = ?)
-                        ORDER BY used_slots ASC, s.id ASC
+                        ORDER BY incompatible_group_slots ASC, used_slots DESC, s.id ASC
                         """,
                         (
+                            str(lease["placement_group"] or ""),
                             int(lease["requested_allocation_id"] or 0),
                             int(lease["requested_allocation_id"] or 0),
                             str(lease["requested_node_name"] or ""),
@@ -2078,6 +2209,7 @@ class AedtPoolService:
                             row for row in sessions
                             if int(row["used_slots"] or 0) < int(row["slots_total"])
                             and int(row["exclusive_slots"] or 0) == 0
+                            and int(row["incompatible_group_slots"] or 0) == 0
                             and (
                                 not bool(lease["exclusive_session"])
                                 or int(row["used_slots"] or 0) == 0
