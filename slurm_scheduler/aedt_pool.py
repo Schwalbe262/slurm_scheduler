@@ -1285,6 +1285,7 @@ class AedtPoolService:
         workload_family: str,
         project_namespace: str,
         session_profile: str,
+        protocol_version: int,
         now: str,
     ) -> dict[str, Any]:
         if task_id <= 0:
@@ -1304,6 +1305,8 @@ class AedtPoolService:
             raise ValueError("mixed canary task is missing or terminal")
         if str(task["aedt_backend"] or "") != "pooled":
             raise ValueError("mixed canary task must declare aedt_backend=pooled")
+        if protocol_version != 2:
+            raise ValueError("mixed canary task requires protocol_version=2")
         slot = conn.execute(
             """
             SELECT cs.*, ca.session_id AS canary_session_id,
@@ -1517,6 +1520,7 @@ class AedtPoolService:
                     workload_family=resolved_family,
                     project_namespace=normalized_namespace,
                     session_profile=resolved_profile,
+                    protocol_version=protocol_version,
                     now=now,
                 )
                 mixed_canary_admission_id = int(mixed_canary["admission_id"])

@@ -1265,6 +1265,35 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         self.assertEqual(family_lease["state"], "queued")
         self.assertIsNone(family_lease["session_id"])
 
+    def test_legacy_protocol_cannot_bypass_exact_mixed_solve_barrier(self) -> None:
+        admission = self.service.create_mixed_canary_admission(
+            session_id=int(self.session["id"]),
+        )
+        slot = admission["slots"][0]
+        task_id = self.create_task_for_slot(slot, "legacy-protocol")
+        with self.assertRaisesRegex(ValueError, "protocol_version=2"):
+            self.service.request_lease(
+                request_key="mixed-canary-legacy-protocol",
+                project_name="mft-mixed-canary-legacy-protocol",
+                workload_family=str(slot["workload_family"]),
+                project_namespace=str(slot["project_namespace"]),
+                isolation_policy="shared_if_compatible",
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                protocol_version=1,
+                task_id=task_id,
+                client_token="mixed-canary-legacy-token-0001",
+            )
+        current = self.service.get_mixed_canary_admission(int(admission["id"]))
+        self.assertEqual(current["state"], "open")
+        self.assertTrue(all(slot["lease_id"] is None for slot in current["slots"]))
+
+    def test_normal_family_protocol_v1_session_behavior_is_unchanged(self) -> None:
+        lease, _token = self.request("normal-family-v1")
+        self.assertEqual(lease["protocol_version"], 1)
+        self.assertEqual(lease["state"], "leased")
+        self.assertEqual(int(lease["session_id"]), int(self.session["id"]))
+        self.assertFalse(lease["solve_permit_required"])
+
     def test_admission_requires_ready_empty_exact_three_slot_session(self) -> None:
         with self.db.connect() as conn:
             conn.execute(
