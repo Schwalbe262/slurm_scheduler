@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import json
 import math
@@ -69,7 +70,8 @@ EXPECTED_SESSION_PROFILE_JSON = json.dumps(
 EXPECTED_AEDT_VERSION = str(EXPECTED_SESSION_PROFILE["aedt_version"])
 EXPECTED_PYAEDT_VERSION = str(EXPECTED_SESSION_PROFILE["pyaedt_version"])
 DESKTOP_LAUNCH_ATTEMPTS = 3
-DESKTOP_LAUNCH_RETRY_SECONDS = 2.0
+DESKTOP_LAUNCH_RETRY_SECONDS = 5.0
+DESKTOP_LAUNCH_RETRY_MAX_SECONDS = 30.0
 NATIVE_PROBE_FAILURES_BEFORE_RECYCLE = 3
 NATIVE_PROBE_FAILURE_WINDOW_SECONDS = 60.0
 TRANSIENT_HTTP_STATUSES = {408, 425, 429}
@@ -362,8 +364,23 @@ class AedtSessionHost:
     def _create_desktop(self, *, new_desktop: bool, port: int) -> Any:
         try:
             from ansys.aedt.core import Desktop
+            try:
+                from ansys.aedt.core import settings
+            except ImportError:
+                from ansys.aedt.core.generic.settings import settings
         except ImportError as exc:
             raise RuntimeError("PyAEDT is required on the session-host node") from exc
+        # PyAEDT 0.22 caches the first Desktop wrapper process-wide unless this
+        # flag is set. If ownership validation causes a new-port retry, that
+        # cache otherwise returns the first port forever.
+        try:
+            settings.use_multi_desktop = True
+        except Exception as exc:
+            raise RuntimeError(
+                "failed to enable PyAEDT multi-desktop launch isolation"
+            ) from exc
+        if getattr(settings, "use_multi_desktop", None) is not True:
+            raise RuntimeError("PyAEDT refused multi-desktop launch isolation")
         if self.error_log_path:
             # PyAEDT releases have moved these settings over time; keep this
             # best-effort and retain the host journal even if a field is absent.
@@ -685,9 +702,13 @@ class AedtSessionHost:
         reported_pid = str(int(cls._desktop_pid(validated)))
         owned_pid = cls._owned_desktop_pid_on_port(expected_port, started_after)
         if not owned_pid:
+            if cls._reported_pid_owns_desktop_port(
+                reported_pid, expected_port, started_after
+            ):
+                return validated
             raise RuntimeError(
-                "could not prove sole ownership of newly launched AEDT "
-                f"on gRPC port {expected_port}"
+                "could not prove ownership of newly launched AEDT "
+                f"PID {reported_pid} on gRPC port {expected_port}"
             )
         if reported_pid != owned_pid:
             raise RuntimeError(
@@ -695,6 +716,82 @@ class AedtSessionHost:
                 f"AEDT on gRPC port {expected_port} is PID {owned_pid}"
             )
         return validated
+
+    @staticmethod
+    def _cmdline_has_grpc_port(cmdline: Any, port: int) -> bool:
+        tokens = [str(item or "").strip() for item in (cmdline or [])]
+        for index, token in enumerate(tokens):
+            normalized = token.lower()
+            if normalized == "-grpcsrv" and index + 1 < len(tokens):
+                try:
+                    return int(tokens[index + 1]) == int(port)
+                except (TypeError, ValueError):
+                    return False
+            for separator in ("=", ":"):
+                prefix = f"-grpcsrv{separator}"
+                if normalized.startswith(prefix):
+                    try:
+                        return int(normalized[len(prefix) :]) == int(port)
+                    except ValueError:
+                        return False
+        return False
+
+    @classmethod
+    def _reported_pid_owns_desktop_port(
+        cls, reported_pid: str, port: int, started_after: float
+    ) -> bool:
+        """Attest a wrapper-reported PID without trusting the wrapper alone."""
+
+        try:
+            import psutil
+
+            pid = int(reported_pid)
+            current_process = psutil.Process(os.getpid())
+            current_user = str(current_process.username() or "").lower()
+            process = psutil.Process(pid)
+            if not str(process.name() or "").lower().startswith("ansysedt"):
+                return False
+            executable = os.path.basename(str(process.exe() or "")).lower()
+            if not executable.startswith("ansysedt"):
+                return False
+            try:
+                if int(process.uids().effective) != int(current_process.uids().effective):
+                    return False
+            except (AttributeError, OSError, TypeError, ValueError):
+                if str(process.username() or "").lower() != current_user:
+                    return False
+            if float(process.create_time() or 0) < started_after - 5:
+                return False
+            if cls._cmdline_has_grpc_port(process.cmdline(), port):
+                return True
+            connections = process.net_connections(kind="inet")
+            listen_value = str(getattr(psutil, "CONN_LISTEN", "LISTEN")).upper()
+            for connection in connections:
+                status = str(getattr(connection, "status", "") or "").upper()
+                local = getattr(connection, "laddr", None)
+                local_port = getattr(local, "port", 0)
+                if not local_port and isinstance(local, (tuple, list)) and len(local) > 1:
+                    local_port = local[1]
+                if int(local_port or 0) == int(port) and status in {"LISTEN", listen_value}:
+                    return True
+            # On Linux, AEDT can leave -grpcsrv and the listen socket on a
+            # launcher/child. The wrapper came from this exact endpoint; after
+            # independently proving PID executable, UID and creation time,
+            # endpoint liveness completes the ownership proof.
+            return cls._desktop_port_is_listening(port)
+        except Exception:
+            return False
+
+    def _desktop_launch_retry_delay(self, failed_attempt: int) -> float:
+        base = min(
+            DESKTOP_LAUNCH_RETRY_MAX_SECONDS,
+            DESKTOP_LAUNCH_RETRY_SECONDS * (2 ** max(0, int(failed_attempt) - 1)),
+        )
+        digest = hashlib.sha256(
+            f"{self.host_id}:{int(failed_attempt)}".encode("utf-8")
+        ).digest()
+        fraction = int.from_bytes(digest[:8], "big") / float((1 << 64) - 1)
+        return base * (0.75 + 0.5 * fraction)
 
     @staticmethod
     def _desktop_port_is_listening(port: int) -> bool:
@@ -726,8 +823,7 @@ class AedtSessionHost:
                 cmdline = info.get("cmdline") or []
                 if not name.startswith("ansysedt") or username != current_user:
                     continue
-                flag_index = cmdline.index("-grpcsrv")
-                if int(cmdline[flag_index + 1]) != int(port):
+                if not AedtSessionHost._cmdline_has_grpc_port(cmdline, port):
                     continue
                 # A small tolerance covers process timestamp resolution without
                 # risking an older same-user Desktop that happened to use port.
@@ -746,14 +842,18 @@ class AedtSessionHost:
         # ownership from the OS process table; then require wrapper agreement
         # when the wrapper did report a PID.
         owned_pid = self._owned_desktop_pid_on_port(port, started_after)
-        if not owned_pid:
-            return
         reported_pid = self._desktop_pid(desktop) if desktop is not None else ""
         try:
             reported_value = int(reported_pid)
         except (TypeError, ValueError):
             reported_value = 0
-        if reported_value > 0 and str(reported_value) != owned_pid:
+        if not owned_pid:
+            if reported_value <= 0 or not self._reported_pid_owns_desktop_port(
+                str(reported_value), port, started_after
+            ):
+                return
+            owned_pid = str(reported_value)
+        elif reported_value > 0 and str(reported_value) != owned_pid:
             return
         marker = self._process_marker(int(owned_pid))
         self._force_kill_owned_desktop(owned_pid, marker)
@@ -824,7 +924,7 @@ class AedtSessionHost:
                         file=sys.stderr,
                     )
             if attempt < DESKTOP_LAUNCH_ATTEMPTS:
-                time.sleep(DESKTOP_LAUNCH_RETRY_SECONDS)
+                time.sleep(self._desktop_launch_retry_delay(attempt))
         raise RuntimeError(
             f"AEDT Desktop launch failed after {DESKTOP_LAUNCH_ATTEMPTS} attempts: "
             f"{last_error}"

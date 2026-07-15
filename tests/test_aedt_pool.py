@@ -4484,6 +4484,47 @@ class SessionHostTests(unittest.TestCase):
                 AedtSessionHost._owned_desktop_pid_on_port(44773, 100.0), ""
             )
 
+    def test_wrapper_pid_disambiguates_linux_launcher_child_layout(self) -> None:
+        wrapper = SimpleNamespace(
+            port=46529, aedt_process_id="3824121", odesktop=object()
+        )
+        reported_process = SimpleNamespace(
+            name=lambda: "ansysedt",
+            exe=lambda: "/ansys/v252/Linux64/ansysedt",
+            username=lambda: "cluster-user",
+            uids=lambda: SimpleNamespace(effective=1001),
+            create_time=lambda: 105.0,
+            cmdline=lambda: ["/ansys/v252/Linux64/ansysedt", "-ng"],
+            net_connections=lambda **_kwargs: [],
+        )
+
+        def process(pid):
+            if int(pid) == os.getpid():
+                return SimpleNamespace(
+                    username=lambda: "cluster-user",
+                    uids=lambda: SimpleNamespace(effective=1001),
+                )
+            if int(pid) == 3824121:
+                return reported_process
+            raise AssertionError(pid)
+
+        with (
+            patch.dict(
+                "sys.modules",
+                {"psutil": SimpleNamespace(Process=process, CONN_LISTEN="LISTEN")},
+            ),
+            patch.object(
+                AedtSessionHost, "_owned_desktop_pid_on_port", return_value=""
+            ),
+            patch.object(
+                AedtSessionHost, "_desktop_port_is_listening", return_value=True
+            ),
+        ):
+            validated = AedtSessionHost._validate_owned_desktop(
+                wrapper, expected_port=46529, started_after=100.0
+            )
+        self.assertIs(validated, wrapper)
+
     def test_desktop_launch_failure_recovers_by_explicit_port_attach(self) -> None:
         host = AedtSessionHost(
             FakeHostControlPlane([]), allocation_id=1, node_name="cpu-01"
@@ -4525,6 +4566,79 @@ class SessionHostTests(unittest.TestCase):
         )
         shim.assert_called_once_with()
         sleep.assert_not_called()
+
+    def test_launch_retry_does_not_reuse_first_pyaedt_wrapper_on_new_port(self) -> None:
+        host = AedtSessionHost(
+            FakeHostControlPlane([]), allocation_id=1, node_name="cpu-01"
+        )
+        settings = SimpleNamespace(use_multi_desktop=False)
+        cached: list[SimpleNamespace] = []
+        constructor_calls: list[tuple[bool, int, bool]] = []
+
+        def desktop_factory(**kwargs):
+            new_desktop = bool(kwargs["new_desktop"])
+            port = int(kwargs["port"])
+            constructor_calls.append(
+                (new_desktop, port, bool(settings.use_multi_desktop))
+            )
+            if cached and (not settings.use_multi_desktop or not new_desktop):
+                return cached[0]
+            desktop = SimpleNamespace(
+                port=port,
+                aedt_process_id=str(3800000 + port),
+                odesktop=object(),
+            )
+            cached[:] = [desktop]
+            return desktop
+
+        ansys_module = ModuleType("ansys")
+        aedt_module = ModuleType("ansys.aedt")
+        core_module = ModuleType("ansys.aedt.core")
+        core_module.Desktop = desktop_factory
+        core_module.settings = settings
+        validation_calls = 0
+
+        def validate(desktop, *, expected_port, started_after):
+            nonlocal validation_calls
+            validation_calls += 1
+            if validation_calls <= 2:
+                raise RuntimeError("injected ownership proof race")
+            return AedtSessionHost._validate_desktop(
+                desktop, expected_port=expected_port
+            )
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "ansys": ansys_module,
+                    "ansys.aedt": aedt_module,
+                    "ansys.aedt.core": core_module,
+                },
+            ),
+            patch.object(
+                host, "_find_free_desktop_port", side_effect=[46529, 47981]
+            ),
+            patch.object(host, "_desktop_port_is_listening", return_value=True),
+            patch.object(host, "_validate_owned_desktop", side_effect=validate),
+            patch.object(host, "_cleanup_failed_desktop_launch"),
+            patch(
+                "slurm_scheduler.aedt_session_host._install_pyaedt_psutil_cmdline_shim"
+            ),
+            patch("slurm_scheduler.aedt_session_host.time.sleep"),
+        ):
+            desktop = host._start_desktop()
+
+        self.assertEqual(desktop.port, 47981)
+        self.assertTrue(settings.use_multi_desktop)
+        self.assertEqual(
+            constructor_calls,
+            [
+                (True, 46529, True),
+                (False, 46529, True),
+                (True, 47981, True),
+            ],
+        )
 
     def test_desktop_launch_retries_two_full_cycles_before_success(self) -> None:
         host = AedtSessionHost(
@@ -4572,8 +4686,13 @@ class SessionHostTests(unittest.TestCase):
         )
         self.assertEqual(cleanup.call_count, 2)
         self.assertEqual(
-            [call.args[0] for call in sleep.call_args_list], [2.0, 2.0]
+            [call.args[0] for call in sleep.call_args_list],
+            [
+                host._desktop_launch_retry_delay(1),
+                host._desktop_launch_retry_delay(2),
+            ],
         )
+        self.assertGreater(sleep.call_args_list[1].args[0], sleep.call_args_list[0].args[0])
 
     def test_primary_launch_rejects_wrapper_pid_mismatch(self) -> None:
         host = AedtSessionHost(
