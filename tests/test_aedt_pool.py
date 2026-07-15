@@ -4537,6 +4537,8 @@ class FakeDesktop:
 
 def trust_fake_desktop_liveness(host: AedtSessionHost) -> None:
     host._desktop_liveness_proof = lambda: (True, "")
+    host._desktop_process_listener_liveness_proof = lambda: (True, "")
+    host._desktop_liveness_proof_for_commands = lambda _commands: (True, "")
 
 
 class FakeHostControlPlane:
@@ -4553,7 +4555,7 @@ class FakeHostControlPlane:
             return {}
         if path.endswith("/commands"):
             self.command_count += 1
-            if self.command_count == 1:
+            if self.command_count <= 2:
                 self.events.append("grace-active")
                 return {
                     "close_projects": [],
@@ -4861,7 +4863,7 @@ class SessionHostTests(unittest.TestCase):
                         start_holder.set()
                         if not holder_acquired.wait(2):
                             raise AssertionError("client did not acquire automation lock")
-                    elif self.command_count == 2:
+                    elif self.command_count == 3:
                         if not holder_released.wait(2):
                             raise AssertionError("client did not release automation lock")
                     if not self.released:
@@ -5315,6 +5317,126 @@ class SessionHostTests(unittest.TestCase):
         self.assertEqual(recovered, (True, ""))
         self.assertEqual(host.native_probe_failures, 0)
 
+    def test_live_sibling_count_never_enters_native_desktop_probe(self) -> None:
+        host = AedtSessionHost(
+            FakeHostControlPlane([]), allocation_id=1, node_name="cpu-01"
+        )
+        host.desktop = SimpleNamespace(odesktop=object())
+        host.desktop_process_id = "3824121"
+        host.desktop_process_marker = "marker"
+        host.desktop_port = 44773
+        host.native_probe_failures = 2
+        host.native_probe_first_failure_at = 91.0
+        with (
+            patch.object(host, "_process_alive", return_value=True),
+            patch.object(host, "_desktop_port_is_listening", return_value=True),
+            patch.object(host, "_native_desktop_responds") as native_probe,
+        ):
+            proof = host._desktop_liveness_proof_for_commands(
+                {"sibling_live_count": 3}
+            )
+
+        self.assertEqual(proof, (True, ""))
+        native_probe.assert_not_called()
+        self.assertEqual(
+            host.last_native_probe_outcome, NATIVE_PROBE_DEFERRED_BUSY
+        )
+        self.assertEqual(host.native_probe_failures, 2)
+        self.assertEqual(host.native_probe_first_failure_at, 91.0)
+
+    def test_explicit_empty_session_retains_native_desktop_probe(self) -> None:
+        host = AedtSessionHost(
+            FakeHostControlPlane([]), allocation_id=1, node_name="cpu-01"
+        )
+        host.desktop = SimpleNamespace(odesktop=object())
+        host.desktop_process_id = "3824121"
+        host.desktop_process_marker = "marker"
+        host.desktop_port = 44773
+        with (
+            patch.object(host, "_process_alive", return_value=True),
+            patch.object(host, "_desktop_port_is_listening", return_value=True),
+            patch.object(
+                host, "_native_desktop_responds", return_value=NATIVE_PROBE_OK
+            ) as native_probe,
+        ):
+            proof = host._desktop_liveness_proof_for_commands(
+                {"sibling_live_count": 0}
+            )
+
+        self.assertEqual(proof, (True, ""))
+        native_probe.assert_called_once_with()
+        self.assertEqual(host.last_native_probe_outcome, NATIVE_PROBE_OK)
+
+    def test_commands_precede_probe_and_are_refreshed_after_heartbeat(self) -> None:
+        events: list[str] = []
+
+        class OrderedControl:
+            def __init__(self) -> None:
+                self.command_count = 0
+                self.heartbeats: list[dict] = []
+
+            def request(self, method, path, payload=None, host_token=""):
+                if path.endswith("claim-start"):
+                    return {"session": {"id": 1, "session_key": "ordered"}}
+                if path.endswith("/register"):
+                    return {"host_token": "host-token"}
+                if path.endswith("/commands"):
+                    self.command_count += 1
+                    events.append(f"commands:{self.command_count}")
+                    if self.command_count == 1:
+                        return {
+                            "close_projects": [],
+                            "global_stop_allowed": False,
+                            "drain": False,
+                            "sibling_live_count": 3,
+                        }
+                    return {
+                        "close_projects": [],
+                        "global_stop_allowed": True,
+                        "drain": True,
+                        "sibling_live_count": 0,
+                    }
+                if path.endswith("/heartbeat"):
+                    events.append("heartbeat")
+                    self.heartbeats.append(dict(payload or {}))
+                    return {}
+                if path.endswith("/closed"):
+                    events.append("closed")
+                    return {}
+                raise AssertionError((method, path))
+
+        with tempfile.TemporaryDirectory() as root:
+            control = OrderedControl()
+            host = AedtSessionHost(
+                control,
+                allocation_id=1,
+                node_name="cpu-01",
+                heartbeat_seconds=0,
+                artifact_root=root,
+            )
+            desktop = SimpleNamespace(port=50001, aedt_process_id="3824121")
+            host._start_desktop = lambda: desktop
+            host._initialize_dso_configuration = lambda: None
+            host._attest_runtime_profile = lambda: None
+            host._process_marker = lambda _pid: "marker"
+            host._bounded_close_desktop = lambda **_kwargs: True
+            with (
+                patch.object(host, "_process_alive", return_value=True),
+                patch.object(
+                    host, "_desktop_port_is_listening", return_value=True
+                ),
+                patch.object(host, "_native_desktop_responds") as native_probe,
+            ):
+                self.assertEqual(host.run(), 2)
+
+        native_probe.assert_not_called()
+        self.assertEqual(events[:3], ["commands:1", "heartbeat", "commands:2"])
+        self.assertEqual(control.command_count, 2)
+        self.assertEqual(
+            control.heartbeats[0]["native_probe_outcome"],
+            NATIVE_PROBE_DEFERRED_BUSY,
+        )
+
     def test_blocked_native_probe_keeps_only_one_inflight_thread(self) -> None:
         entered = threading.Event()
         release = threading.Event()
@@ -5498,6 +5620,12 @@ class SessionHostTests(unittest.TestCase):
                 return True, ""
 
             host._desktop_liveness_proof = deferred_liveness
+            host._desktop_liveness_proof_for_commands = (
+                lambda _commands: deferred_liveness()
+            )
+            host._desktop_process_listener_liveness_proof = (
+                lambda: deferred_liveness()
+            )
             with patch(
                 "slurm_scheduler.aedt_session_host.time.sleep", return_value=None
             ):
@@ -6267,7 +6395,7 @@ $end 'DSOConfig'
             self.assertEqual(host.run(), 1)
 
         self.assertEqual(control.heartbeat_attempts, 1)
-        self.assertEqual(control.command_count, 0)
+        self.assertEqual(control.command_count, 1)
         sleep.assert_not_called()
         self.assertIn("desktop-close", events)
 

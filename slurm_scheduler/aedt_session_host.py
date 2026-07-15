@@ -1753,8 +1753,16 @@ class AedtSessionHost:
             return NATIVE_PROBE_FAILED
         return consume_finished_probe()
 
-    def _desktop_liveness_proof(self) -> tuple[bool, str]:
-        """Require process identity, exact gRPC listener, and native response."""
+    def _desktop_process_listener_liveness_proof(self) -> tuple[bool, str]:
+        """Prove the owned Desktop process and its exact gRPC listener exist.
+
+        This proof deliberately never resolves the AEDT native proxy.  Native
+        automation can remain serialized for the full duration of an active
+        solve, including intervals where an attached client has intentionally
+        yielded the filesystem automation lock to AEDT.  Process identity and
+        the exact listening socket therefore form the only safe host-side
+        liveness check while any sibling lease is live.
+        """
 
         self.last_native_probe_outcome = NATIVE_PROBE_NOT_RUN
         if self.desktop is None:
@@ -1772,6 +1780,14 @@ class AedtSessionHost:
                 port = 0
         if port <= 0 or not self._desktop_port_is_listening(port):
             return False, f"Desktop gRPC port {port or '<unknown>'} is not listening"
+        return True, ""
+
+    def _desktop_liveness_proof(self) -> tuple[bool, str]:
+        """Require process identity, exact gRPC listener, and native response."""
+
+        healthy, liveness_error = self._desktop_process_listener_liveness_proof()
+        if not healthy:
+            return healthy, liveness_error
         native_probe_outcome = self._native_desktop_responds()
         # Preserve compatibility with narrow test doubles while the production
         # probe always returns one of the explicit string outcomes above.
@@ -1808,6 +1824,32 @@ class AedtSessionHost:
         # plane history while the next episode creates a timestamped file.
         self.native_snapshot_path = ""
         return True, ""
+
+    def _desktop_liveness_proof_for_commands(
+        self, commands: dict[str, object]
+    ) -> tuple[bool, str]:
+        """Select a solve-safe liveness proof from current lease commands.
+
+        A missing or malformed sibling count is treated conservatively as an
+        active/unknown session.  Only an explicit zero authorizes GetVersion.
+        """
+
+        raw_sibling_count = commands.get("sibling_live_count")
+        try:
+            sibling_live_count = int(raw_sibling_count)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            sibling_live_count = -1
+        if sibling_live_count != 0:
+            healthy, liveness_error = (
+                self._desktop_process_listener_liveness_proof()
+            )
+            if healthy:
+                # Reuse the established non-failure outcome: the native call
+                # was intentionally deferred because clients are live, rather
+                # than attempted and failed.
+                self.last_native_probe_outcome = NATIVE_PROBE_DEFERRED_BUSY
+            return healthy, liveness_error
+        return self._desktop_liveness_proof()
 
     def _desktop_still_alive(self) -> bool:
         healthy, _reason = self._desktop_liveness_proof()
@@ -1882,7 +1924,20 @@ class AedtSessionHost:
             self._journal("session_registered", endpoint=endpoint)
             while not self.stop_requested:
                 try:
-                    healthy, liveness_error = self._desktop_liveness_proof()
+                    # Fetch the current sibling count before any native probe.
+                    # A second command fetch after the heartbeat is required:
+                    # that heartbeat may recover a timed-out session and
+                    # invalidate a previously issued drain/release command.
+                    liveness_commands = self._control_plane_request(
+                        "GET",
+                        f"/api/aedt-pool/sessions/{self.session_id}/commands",
+                        host_token=self.host_token,
+                    )
+                    healthy, liveness_error = (
+                        self._desktop_liveness_proof_for_commands(
+                            liveness_commands
+                        )
+                    )
                     if not healthy:
                         snapshot_path = self._capture_native_diagnostics(
                             liveness_error
@@ -1968,7 +2023,13 @@ class AedtSessionHost:
                         host_token=self.host_token,
                     )
                 except ControlPlaneUnavailable as exc:
-                    if not self._desktop_still_alive():
+                    # With no authoritative current sibling count, never risk
+                    # entering AEDT native automation.  The process/listener
+                    # proof preserves the existing offline-safe semantics.
+                    desktop_alive, _desktop_error = (
+                        self._desktop_process_listener_liveness_proof()
+                    )
+                    if not desktop_alive:
                         raise RuntimeError(
                             "AEDT died while the control plane was unavailable"
                         ) from exc
