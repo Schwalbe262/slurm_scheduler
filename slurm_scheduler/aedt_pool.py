@@ -1720,10 +1720,36 @@ class AedtPoolService:
                 )
                 return None
 
-            reservation_key = (
-                f"aedt-auto:{task_id}:{int(selected['id'])}:"
-                f"{int(selected['generation'])}:{secrets.token_hex(8)}"
-            )
+            # Every automatic slot reserved against one still-unsealed Desktop
+            # generation belongs to the same admission cohort.  A per-task key
+            # made a terminal/expired sibling invisible to leases that had
+            # already become ACTIVE: the remaining lease could later seal an
+            # underfilled batch as if that sibling had never existed.  Reuse a
+            # shared key (and its first authoritative expiry) until the session
+            # seals.  Once all leases release, the session is unsealed and all
+            # old reservation rows are terminal, so the next wave receives a
+            # fresh key.
+            auto_cohort = conn.execute(
+                """
+                SELECT reservation_key, MIN(expires_at) AS expires_at
+                FROM aedt_exact_session_reservations
+                WHERE session_id = ? AND session_generation = ?
+                  AND reservation_key LIKE 'aedt-auto:%'
+                  AND state IN ('reserved','claimed','consumed')
+                GROUP BY reservation_key
+                ORDER BY MIN(id) ASC
+                LIMIT 1
+                """,
+                (int(selected["id"]), int(selected["generation"])),
+            ).fetchone()
+            if auto_cohort:
+                reservation_key = str(auto_cohort["reservation_key"])
+                expires = str(auto_cohort["expires_at"])
+            else:
+                reservation_key = (
+                    f"aedt-auto:{int(selected['id'])}:"
+                    f"{int(selected['generation'])}:{secrets.token_hex(8)}"
+                )
             cursor = conn.execute(
                 """
                 INSERT INTO aedt_exact_session_reservations (
@@ -1810,25 +1836,68 @@ class AedtPoolService:
         reservation_key: str,
         now: str,
         failure_message: str,
+        settle_project_owners: bool = False,
     ) -> None:
         """Fail one exact cohort without permitting an unpinned fallback."""
 
         normalized_reason = str(failure_message or "").strip() or (
             "exact-session reservation target became unavailable"
         )
+        if settle_project_owners:
+            conn.execute(
+                """
+                UPDATE aedt_project_leases
+                SET state = 'releasing', failure_message = ?,
+                    release_requested_at = COALESCE(release_requested_at, ?),
+                    updated_at = ?
+                WHERE exact_session_reservation_id IN (
+                    SELECT id FROM aedt_exact_session_reservations
+                    WHERE reservation_key = ?
+                )
+                  AND state IN ('attaching','active','releasing')
+                """,
+                (normalized_reason, now, now, reservation_key),
+            )
+            conn.execute(
+                """
+                UPDATE aedt_sessions
+                SET reuse_blocked_at = COALESCE(reuse_blocked_at, ?),
+                    updated_at = ?
+                WHERE id IN (
+                    SELECT DISTINCT l.session_id
+                    FROM aedt_project_leases l
+                    JOIN aedt_exact_session_reservations r
+                      ON r.id = l.exact_session_reservation_id
+                    WHERE r.reservation_key = ?
+                      AND l.state = 'releasing'
+                      AND l.session_id IS NOT NULL
+                )
+                  AND state NOT IN ('closed','failed')
+                """,
+                (now, now, reservation_key),
+            )
+            terminal_states = ("queued", "offered", "leased")
+        else:
+            terminal_states = (
+                "queued",
+                "offered",
+                "leased",
+                "attaching",
+                "active",
+                "releasing",
+            )
+        placeholders = ",".join("?" for _ in terminal_states)
         conn.execute(
-            """
+            f"""
             UPDATE aedt_project_leases
             SET state = 'failed', failure_message = ?, finished_at = ?, updated_at = ?
             WHERE exact_session_reservation_id IN (
                 SELECT id FROM aedt_exact_session_reservations
                 WHERE reservation_key = ?
             )
-              AND state IN (
-                  'queued','offered','leased','attaching','active','releasing'
-              )
+              AND state IN ({placeholders})
             """,
-            (normalized_reason, now, now, reservation_key),
+            (normalized_reason, now, now, reservation_key, *terminal_states),
         )
         conn.execute(
             """
@@ -1838,6 +1907,72 @@ class AedtPoolService:
               AND state IN ('reserved','claimed','consumed')
             """,
             (normalized_reason, now, now, reservation_key),
+        )
+
+    @staticmethod
+    def _expire_exact_session_reservation_cohort(
+        conn: Any,
+        *,
+        reservation_key: str,
+        now: str,
+    ) -> None:
+        """Expire every unsealed member at the cohort's shared deadline."""
+
+        reason = "exact-session reservation cohort expired before solve permit"
+        conn.execute(
+            """
+            UPDATE aedt_project_leases
+            SET state = 'releasing', failure_message = ?,
+                release_requested_at = COALESCE(release_requested_at, ?),
+                updated_at = ?
+            WHERE exact_session_reservation_id IN (
+                SELECT id FROM aedt_exact_session_reservations
+                WHERE reservation_key = ?
+            )
+              AND state IN ('attaching','active','releasing')
+              AND TRIM(COALESCE(solve_permit_at, '')) = ''
+            """,
+            (reason, now, now, reservation_key),
+        )
+        conn.execute(
+            """
+            UPDATE aedt_sessions
+            SET reuse_blocked_at = COALESCE(reuse_blocked_at, ?),
+                updated_at = ?
+            WHERE id IN (
+                SELECT DISTINCT l.session_id
+                FROM aedt_project_leases l
+                JOIN aedt_exact_session_reservations r
+                  ON r.id = l.exact_session_reservation_id
+                WHERE r.reservation_key = ?
+                  AND l.state = 'releasing'
+                  AND l.session_id IS NOT NULL
+            )
+              AND state NOT IN ('closed','failed')
+            """,
+            (now, now, reservation_key),
+        )
+        conn.execute(
+            """
+            UPDATE aedt_project_leases
+            SET state = 'expired', failure_message = ?, finished_at = ?, updated_at = ?
+            WHERE exact_session_reservation_id IN (
+                SELECT id FROM aedt_exact_session_reservations
+                WHERE reservation_key = ?
+            )
+              AND state IN ('queued','offered','leased')
+              AND TRIM(COALESCE(solve_permit_at, '')) = ''
+            """,
+            (reason, now, now, reservation_key),
+        )
+        conn.execute(
+            """
+            UPDATE aedt_exact_session_reservations
+            SET state = 'expired', failure_message = ?, finished_at = ?, updated_at = ?
+            WHERE reservation_key = ?
+              AND state IN ('reserved','claimed','consumed')
+            """,
+            (reason, now, now, reservation_key),
         )
 
     @staticmethod
@@ -1875,6 +2010,62 @@ class AedtPoolService:
     @staticmethod
     def _refresh_exact_session_reservations(conn: Any, now: str) -> None:
         """Release capacity after task/lease terminal state and expire admissions."""
+
+        terminal_siblings = conn.execute(
+            """
+            SELECT r.reservation_key, r.task_id, t.status
+            FROM aedt_exact_session_reservations r
+            JOIN tasks t ON t.id = r.task_id
+            LEFT JOIN aedt_sessions s ON s.id = r.session_id
+            WHERE r.state IN ('reserved','claimed','consumed')
+              AND t.status IN ('completed','failed','cancelled')
+              AND (s.id IS NULL OR s.solve_batch_sealed_at IS NULL)
+              AND EXISTS (
+                  SELECT 1
+                  FROM aedt_exact_session_reservations sibling
+                  WHERE sibling.reservation_key = r.reservation_key
+                    AND sibling.id != r.id
+                    AND sibling.state IN ('reserved','claimed','consumed')
+              )
+            ORDER BY r.id
+            """
+        ).fetchall()
+        failed_keys: set[str] = set()
+        for row in terminal_siblings:
+            reservation_key = str(row["reservation_key"])
+            if reservation_key in failed_keys:
+                continue
+            failed_keys.add(reservation_key)
+            AedtPoolService._fail_exact_session_reservation_cohort(
+                conn,
+                reservation_key=reservation_key,
+                now=now,
+                failure_message=(
+                    "exact-session reservation sibling task "
+                    f"{int(row['task_id'])} became {str(row['status'])} "
+                    "before solve permit"
+                ),
+                settle_project_owners=True,
+            )
+
+        expired_cohorts = conn.execute(
+            """
+            SELECT DISTINCT r.reservation_key
+            FROM aedt_exact_session_reservations r
+            LEFT JOIN aedt_sessions s ON s.id = r.session_id
+            WHERE r.state IN ('reserved','claimed','consumed')
+              AND r.expires_at <= ?
+              AND (s.id IS NULL OR s.solve_batch_sealed_at IS NULL)
+            ORDER BY r.reservation_key
+            """,
+            (now,),
+        ).fetchall()
+        for row in expired_cohorts:
+            AedtPoolService._expire_exact_session_reservation_cohort(
+                conn,
+                reservation_key=str(row["reservation_key"]),
+                now=now,
+            )
 
         conn.execute(
             """
@@ -1989,35 +2180,6 @@ class AedtPoolService:
                     "before solve permit"
                 ),
             )
-        expiring_claims = conn.execute(
-            """
-            SELECT id, lease_id FROM aedt_exact_session_reservations
-            WHERE state IN ('reserved','claimed') AND expires_at <= ?
-            """,
-            (now,),
-        ).fetchall()
-        for row in expiring_claims:
-            lease_id = int(row["lease_id"] or 0)
-            if lease_id:
-                conn.execute(
-                    """
-                    UPDATE aedt_project_leases
-                    SET state = 'expired', failure_message =
-                            'exact-session reservation expired before placement',
-                        finished_at = ?, updated_at = ?
-                    WHERE id = ? AND state = 'queued'
-                    """,
-                    (now, now, lease_id),
-                )
-            conn.execute(
-                """
-                UPDATE aedt_exact_session_reservations
-                SET state = 'expired', finished_at = ?, updated_at = ?
-                WHERE id = ? AND state IN ('reserved','claimed')
-                """,
-                (now, now, int(row["id"])),
-            )
-
     @staticmethod
     def _authorize_exact_session_reservation(
         conn: Any,
@@ -2945,6 +3107,7 @@ class AedtPoolService:
                        s.process_id AS session_process_id,
                        s.artifact_dir AS session_artifact_dir,
                        s.slots_total AS session_slots_total,
+                       s.generation AS session_generation,
                        s.solve_batch_sealed_at,
                        (SELECT COUNT(*) FROM aedt_project_leases live
                         WHERE live.session_id = l.session_id
@@ -2980,6 +3143,119 @@ class AedtPoolService:
                 and str(item.get("state") or "") == "active"
                 and not item["solve_permit_granted"]
             )
+            item["exact_session_reservation_key"] = ""
+            item["exact_session_reservation_state"] = ""
+            item["exact_session_reservation_expires_at"] = ""
+            item["exact_session_reservation_failure_message"] = ""
+            item["exact_session_cohort_state"] = ""
+            item["exact_session_cohort_deadline_at"] = ""
+            item["exact_session_cohort_expected_count"] = 0
+            item["exact_session_cohort_active_count"] = 0
+            item["exact_session_cohort_pending_count"] = 0
+            item["exact_session_cohort_failure_message"] = ""
+            reservation_id = int(
+                item.get("exact_session_reservation_id") or 0
+            )
+            if reservation_id:
+                reservation = conn.execute(
+                    """
+                    SELECT * FROM aedt_exact_session_reservations
+                    WHERE id = ?
+                    """,
+                    (reservation_id,),
+                ).fetchone()
+                if reservation:
+                    reservation_key = str(reservation["reservation_key"])
+                    item["exact_session_reservation_key"] = reservation_key
+                    item["exact_session_reservation_state"] = str(
+                        reservation["state"] or ""
+                    )
+                    item["exact_session_reservation_expires_at"] = str(
+                        reservation["expires_at"] or ""
+                    )
+                    item["exact_session_reservation_failure_message"] = str(
+                        reservation["failure_message"] or ""
+                    )
+                    cohort = conn.execute(
+                        """
+                        SELECT r.state, r.expires_at, r.failure_message,
+                               l.state AS lease_state,
+                               l.solve_permit_at AS lease_solve_permit_at
+                        FROM aedt_exact_session_reservations r
+                        LEFT JOIN aedt_project_leases l ON l.id = r.lease_id
+                        WHERE r.reservation_key = ?
+                        ORDER BY r.id
+                        """,
+                        (reservation_key,),
+                    ).fetchall()
+                    active_count = sum(
+                        1
+                        for row in cohort
+                        if str(row["state"] or "") == "consumed"
+                        and str(row["lease_state"] or "") == "active"
+                    )
+                    pending_count = sum(
+                        1
+                        for row in cohort
+                        if str(row["state"] or "")
+                        in {"reserved", "claimed", "consumed"}
+                        and not (
+                            str(row["state"] or "") == "consumed"
+                            and str(row["lease_state"] or "") == "active"
+                        )
+                    )
+                    cohort_states = {
+                        str(row["state"] or "") for row in cohort
+                    }
+                    terminal_state = next(
+                        (
+                            state
+                            for state in ("failed", "expired")
+                            if state in cohort_states
+                        ),
+                        "",
+                    )
+                    if terminal_state:
+                        cohort_state = terminal_state
+                    elif (
+                        "released" in cohort_states
+                        and not str(item.get("solve_batch_sealed_at") or "")
+                        and any(
+                            state in cohort_states
+                            for state in {"reserved", "claimed", "consumed"}
+                        )
+                    ):
+                        cohort_state = "broken"
+                    elif str(item.get("solve_batch_sealed_at") or ""):
+                        cohort_state = "sealed"
+                    elif pending_count:
+                        cohort_state = "waiting"
+                    elif active_count:
+                        cohort_state = "active"
+                    else:
+                        cohort_state = "released"
+                    deadlines = [
+                        str(row["expires_at"] or "")
+                        for row in cohort
+                        if str(row["state"] or "")
+                        in {"reserved", "claimed", "consumed"}
+                        and str(row["expires_at"] or "")
+                    ]
+                    failure_messages = [
+                        str(row["failure_message"] or "").strip()
+                        for row in cohort
+                        if str(row["failure_message"] or "").strip()
+                    ]
+                    item["exact_session_cohort_state"] = cohort_state
+                    item["exact_session_cohort_deadline_at"] = (
+                        min(deadlines) if deadlines else ""
+                    )
+                    item["exact_session_cohort_expected_count"] = len(cohort)
+                    item["exact_session_cohort_active_count"] = active_count
+                    item["exact_session_cohort_pending_count"] = pending_count
+                    item["exact_session_cohort_failure_message"] = (
+                        failure_messages[0] if failure_messages else ""
+                    )
             session_id = int(item.get("session_id") or 0)
             solve_generation = int(item.get("solve_permit_generation") or 0)
             native_completed = bool(

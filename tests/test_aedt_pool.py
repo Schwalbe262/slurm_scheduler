@@ -5019,6 +5019,7 @@ class AedtExactSessionReservationTests(AedtPoolTestCase):
         self.service.reconcile(execute=False)
         expired = self.service.get_exact_session_reservation("ttl-cleanup")
         self.assertEqual(expired["slots"][0]["state"], "expired")
+        self.assertIn("cohort expired", expired["slots"][0]["failure_message"])
 
     def test_target_failure_fails_entire_exact_cohort_instead_of_stuck_requeue(
         self,
@@ -5685,6 +5686,134 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         self.assertIsNotNone(motor)
         self.assertNotEqual(int(motor["session_id"]), mft_sessions[0])
 
+    def test_underfilled_exact_cohort_status_keeps_active_owner_waiting(self) -> None:
+        task_ids = [
+            self.create_pooled_task(f"cohort-wait-{index}")
+            for index in range(3)
+        ]
+        reservations = [
+            self.service.prepare_pooled_task_session(
+                task_id=task_id,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                workload_family="mft",
+                isolation_policy="family",
+            )
+            for task_id in task_ids
+        ]
+        self.assertTrue(all(reservations))
+        self.assertEqual(
+            len({item["reservation_key"] for item in reservations}), 1
+        )
+        first, token = self.request_v2("cohort-wait-0", task_id=task_ids[0])
+        self.service.accept_lease(int(first["id"]), token)
+        self.service.activate_lease(int(first["id"]), token)
+
+        waiting = self.service.request_solve_permit(
+            int(first["id"]), token, seal_underfilled=True
+        )
+
+        self.assertEqual(waiting["state"], "active")
+        self.assertFalse(waiting["solve_permit_granted"])
+        self.assertEqual(waiting["exact_session_cohort_state"], "waiting")
+        self.assertEqual(waiting["exact_session_cohort_expected_count"], 3)
+        self.assertEqual(waiting["exact_session_cohort_active_count"], 1)
+        self.assertEqual(waiting["exact_session_cohort_pending_count"], 2)
+        self.assertEqual(
+            waiting["exact_session_cohort_deadline_at"],
+            reservations[0]["expires_at"],
+        )
+        self.assertEqual(
+            int(waiting["session_generation"]),
+            int(waiting["requested_session_generation"]),
+        )
+
+    def test_terminal_auto_sibling_fails_waiting_exact_cohort_clearly(self) -> None:
+        task_ids = [
+            self.create_pooled_task(f"cohort-terminal-{index}")
+            for index in range(3)
+        ]
+        reservations = [
+            self.service.prepare_pooled_task_session(
+                task_id=task_id,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                workload_family="mft",
+                isolation_policy="family",
+            )
+            for task_id in task_ids
+        ]
+        first, token = self.request_v2(
+            "cohort-terminal-0", task_id=task_ids[0]
+        )
+        self.service.accept_lease(int(first["id"]), token)
+        self.service.activate_lease(int(first["id"]), token)
+        self.db.update_task(task_ids[1], status=TaskStatus.FAILED.value)
+
+        failed = self.service.request_solve_permit(int(first["id"]), token)
+
+        self.assertEqual(failed["state"], "releasing")
+        self.assertEqual(failed["exact_session_cohort_state"], "failed")
+        self.assertEqual(failed["exact_session_reservation_state"], "failed")
+        self.assertIn(
+            f"sibling task {task_ids[1]} became failed",
+            failed["exact_session_cohort_failure_message"],
+        )
+        cohort = self.service.get_exact_session_reservation(
+            str(reservations[0]["reservation_key"])
+        )
+        self.assertEqual({slot["state"] for slot in cohort["slots"]}, {"failed"})
+        session_id = int(first["session_id"])
+        commands = self.service.session_commands(
+            session_id, self.session_tokens[session_id]
+        )
+        self.assertEqual(
+            [int(item["id"]) for item in commands["close_projects"]],
+            [int(first["id"])],
+        )
+
+    def test_expired_auto_sibling_expires_waiting_exact_cohort_clearly(self) -> None:
+        task_ids = [
+            self.create_pooled_task(f"cohort-expired-{index}")
+            for index in range(3)
+        ]
+        reservations = [
+            self.service.prepare_pooled_task_session(
+                task_id=task_id,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                workload_family="mft",
+                isolation_policy="family",
+                ttl_seconds=60,
+            )
+            for task_id in task_ids
+        ]
+        first, token = self.request_v2(
+            "cohort-expired-0", task_id=task_ids[0]
+        )
+        self.service.accept_lease(int(first["id"]), token)
+        self.service.activate_lease(int(first["id"]), token)
+        self.clock.advance(61)
+
+        expired = self.service.request_solve_permit(int(first["id"]), token)
+
+        self.assertEqual(expired["state"], "releasing")
+        self.assertEqual(expired["exact_session_cohort_state"], "expired")
+        self.assertEqual(expired["exact_session_reservation_state"], "expired")
+        self.assertIn(
+            "cohort expired",
+            expired["exact_session_cohort_failure_message"],
+        )
+        cohort = self.service.get_exact_session_reservation(
+            str(reservations[0]["reservation_key"])
+        )
+        self.assertEqual({slot["state"] for slot in cohort["slots"]}, {"expired"})
+        session_id = int(first["session_id"])
+        commands = self.service.session_commands(
+            session_id, self.session_tokens[session_id]
+        )
+        self.assertEqual(
+            [int(item["id"]) for item in commands["close_projects"]],
+            [int(first["id"])],
+        )
+
     def test_auto_preadmitted_serial_siblings_survive_predecessor_release(
         self,
     ) -> None:
@@ -5706,7 +5835,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         self.assertEqual(len(session_ids), 1)
         self.assertEqual(
             len({str(item["reservation_key"]) for item in reservations}),
-            3,
+            1,
         )
 
         leases = []
@@ -5745,8 +5874,8 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
             )
 
         # Polling a sealed serial cohort is normal.  These auto reservations
-        # have distinct keys even though they intentionally target the same
-        # Desktop, so neither waiting lease may be mistaken for a late attach.
+        # share one admission-cohort key, but a successfully permitted/released
+        # predecessor is not a terminal pre-seal sibling.
         # Parent-allocation drain state is an admission gate, not evidence that
         # these ACTIVE project owners or their registered Desktop PID died.
         for index in waiting:
@@ -5758,7 +5887,12 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
             reservation = self.service.get_exact_session_reservation(
                 str(reservations[index]["reservation_key"])
             )
-            self.assertEqual(reservation["slots"][0]["state"], "consumed")
+            own_slot = next(
+                slot
+                for slot in reservation["slots"]
+                if int(slot["task_id"]) == task_ids[index]
+            )
+            self.assertEqual(own_slot["state"], "consumed")
 
         with self.db.connect() as conn:
             conn.execute(
@@ -6611,6 +6745,158 @@ class AttachClientTests(unittest.TestCase):
             payload for method, path, payload in calls if path.endswith("/solve-permit")
         )
         self.assertEqual(seal_call, {"seal_underfilled": True})
+
+    def test_exact_sibling_incomplete_retries_past_local_fill_timeout(self) -> None:
+        calls: list[tuple[str, str, dict | None]] = []
+        status_reads = 0
+        cohort_deadline = (
+            datetime.now(timezone.utc) + timedelta(seconds=120)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+
+        class Http:
+            def request(self, method, path, payload=None, **_kwargs):
+                nonlocal status_reads
+                calls.append((method, path, payload))
+                waiting = {
+                    "state": "active",
+                    "endpoint": "cpu-01:50001",
+                    "session_id": 1179,
+                    "session_generation": 12,
+                    "requested_session_id": 1179,
+                    "requested_session_generation": 12,
+                    "solve_permit_required": True,
+                    "solve_permit_granted": False,
+                    "exact_session_reservation_id": 684,
+                    "exact_session_reservation_key": "aedt-auto:1179:12:cohort",
+                    "exact_session_reservation_state": "consumed",
+                    "exact_session_cohort_state": "waiting",
+                    "exact_session_cohort_deadline_at": cohort_deadline,
+                    "exact_session_cohort_expected_count": 3,
+                    "exact_session_cohort_active_count": 1,
+                    "exact_session_cohort_pending_count": 2,
+                }
+                if method == "GET":
+                    status_reads += 1
+                    if status_reads == 1:
+                        return {
+                            **waiting,
+                            "state": "attaching",
+                            "solve_permit_required": False,
+                        }
+                    if status_reads >= 3:
+                        return {
+                            **waiting,
+                            "solve_permit_required": False,
+                            "solve_permit_granted": True,
+                            "solve_permit_generation": 4,
+                            "exact_session_cohort_state": "sealed",
+                            "exact_session_cohort_active_count": 3,
+                            "exact_session_cohort_pending_count": 0,
+                        }
+                    return waiting
+                if path.endswith("/activate"):
+                    return waiting
+                if path.endswith("/solve-permit"):
+                    return waiting
+                raise AssertionError((method, path, payload))
+
+        lease = AedtProjectLease(
+            Http(),
+            14033,
+            "client-token",
+            "project",
+            state="attaching",
+            endpoint="cpu-01:50001",
+            protocol_version=2,
+        )
+        with patch.dict(
+            os.environ, {"MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS": "0"}, clear=False
+        ), patch("slurm_scheduler.aedt_attach_client.time.sleep", return_value=None):
+            activated = lease.activate()
+
+        self.assertTrue(activated["solve_permit_granted"])
+        self.assertEqual(lease.solve_permit_generation, 4)
+        seal_calls = [
+            payload
+            for method, path, payload in calls
+            if method == "POST" and path.endswith("/solve-permit")
+        ]
+        self.assertEqual(seal_calls, [{"seal_underfilled": True}])
+        self.assertEqual(status_reads, 3)
+
+    def test_exact_sibling_terminal_reason_is_not_retried(self) -> None:
+        reason = "exact-session reservation sibling task 44786 became failed before solve permit"
+
+        class Http:
+            @staticmethod
+            def request(method, path, payload=None, **_kwargs):
+                if method != "GET":
+                    raise AssertionError((method, path, payload))
+                return {
+                    "state": "failed",
+                    "endpoint": "cpu-01:50001",
+                    "session_id": 1179,
+                    "session_generation": 12,
+                    "requested_session_id": 1179,
+                    "requested_session_generation": 12,
+                    "solve_permit_required": False,
+                    "solve_permit_granted": False,
+                    "failure_message": reason,
+                    "exact_session_reservation_id": 684,
+                    "exact_session_reservation_state": "failed",
+                    "exact_session_reservation_failure_message": reason,
+                    "exact_session_cohort_state": "failed",
+                    "exact_session_cohort_failure_message": reason,
+                }
+
+        lease = AedtProjectLease(
+            Http(),
+            14033,
+            "client-token",
+            "project",
+            state="active",
+            endpoint="cpu-01:50001",
+            protocol_version=2,
+            solve_permit_required=True,
+        )
+
+        with self.assertRaisesRegex(AedtLeaseError, "sibling task 44786"):
+            lease.wait_for_solve_permit(fill_timeout_seconds=0)
+
+    def test_exact_session_generation_drift_fails_before_retry(self) -> None:
+        class Http:
+            @staticmethod
+            def request(method, path, payload=None, **_kwargs):
+                if method != "GET":
+                    raise AssertionError((method, path, payload))
+                return {
+                    "state": "active",
+                    "endpoint": "cpu-01:50001",
+                    "session_id": 1179,
+                    "session_generation": 13,
+                    "requested_session_id": 1179,
+                    "requested_session_generation": 12,
+                    "solve_permit_required": True,
+                    "solve_permit_granted": False,
+                    "exact_session_reservation_id": 684,
+                    "exact_session_reservation_state": "consumed",
+                    "exact_session_cohort_state": "waiting",
+                    "exact_session_cohort_deadline_at": "2099-01-01 00:00:00",
+                }
+
+        lease = AedtProjectLease(
+            Http(),
+            14033,
+            "client-token",
+            "project",
+            state="active",
+            endpoint="cpu-01:50001",
+            protocol_version=2,
+            solve_permit_required=True,
+        )
+
+        with self.assertRaisesRegex(AedtLeaseError, "generation drift"):
+            lease.wait_for_solve_permit(fill_timeout_seconds=0)
 
     def test_solve_permit_fill_timeout_accepts_campaign_7200_seconds(self) -> None:
         class Http:

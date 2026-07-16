@@ -17,6 +17,7 @@ import urllib.request
 import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,22 @@ def normalize_aedt_version(value: Any) -> str:
 
     match = re.search(r"(?<!\d)(20\d{2}\.\d)(?!\d)", str(value or ""))
     return match.group(1) if match else ""
+
+
+def _scheduler_deadline_timestamp(value: Any) -> float | None:
+    """Parse scheduler UTC timestamps without depending on local host timezone."""
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _keepalive_delay(
@@ -235,8 +252,24 @@ class AedtProjectLease:
     workspace_path: str = ""
     automation_lock_path: str = ""
     session_key: str = ""
+    session_id: int = 0
+    session_generation: int = 0
+    requested_session_id: int = 0
+    requested_session_generation: int = 0
     session_process_id: str = ""
     expected_aedt_version: str = ""
+    failure_message: str = ""
+    exact_session_reservation_id: int = 0
+    exact_session_reservation_key: str = ""
+    exact_session_reservation_state: str = ""
+    exact_session_reservation_expires_at: str = ""
+    exact_session_reservation_failure_message: str = ""
+    exact_session_cohort_state: str = ""
+    exact_session_cohort_deadline_at: str = ""
+    exact_session_cohort_expected_count: int = 0
+    exact_session_cohort_active_count: int = 0
+    exact_session_cohort_pending_count: int = 0
+    exact_session_cohort_failure_message: str = ""
     solve_permit_required: bool = False
     solve_permit_granted: bool = False
     solve_permit_generation: int = 0
@@ -329,11 +362,60 @@ class AedtProjectLease:
             status.get("automation_lock_path") or self.automation_lock_path
         )
         self.session_key = str(status.get("session_key") or self.session_key)
+        self.session_id = int(status.get("session_id") or self.session_id or 0)
+        self.session_generation = int(
+            status.get("session_generation") or self.session_generation or 0
+        )
+        self.requested_session_id = int(
+            status.get("requested_session_id") or self.requested_session_id or 0
+        )
+        self.requested_session_generation = int(
+            status.get("requested_session_generation")
+            or self.requested_session_generation
+            or 0
+        )
         self.session_process_id = str(
             status.get("session_process_id") or self.session_process_id
         )
         self.expected_aedt_version = str(
             status.get("expected_aedt_version") or self.expected_aedt_version
+        )
+        self.failure_message = str(status.get("failure_message") or "")
+        self.exact_session_reservation_id = int(
+            status.get("exact_session_reservation_id")
+            or self.exact_session_reservation_id
+            or 0
+        )
+        self.exact_session_reservation_key = str(
+            status.get("exact_session_reservation_key")
+            or self.exact_session_reservation_key
+        )
+        self.exact_session_reservation_state = str(
+            status.get("exact_session_reservation_state") or ""
+        )
+        self.exact_session_reservation_expires_at = str(
+            status.get("exact_session_reservation_expires_at") or ""
+        )
+        self.exact_session_reservation_failure_message = str(
+            status.get("exact_session_reservation_failure_message") or ""
+        )
+        self.exact_session_cohort_state = str(
+            status.get("exact_session_cohort_state") or ""
+        )
+        self.exact_session_cohort_deadline_at = str(
+            status.get("exact_session_cohort_deadline_at") or ""
+        )
+        self.exact_session_cohort_expected_count = int(
+            status.get("exact_session_cohort_expected_count") or 0
+        )
+        self.exact_session_cohort_active_count = int(
+            status.get("exact_session_cohort_active_count") or 0
+        )
+        self.exact_session_cohort_pending_count = int(
+            status.get("exact_session_cohort_pending_count") or 0
+        )
+        self.exact_session_cohort_failure_message = str(
+            status.get("exact_session_cohort_failure_message") or ""
         )
         self.solve_permit_required = bool(
             status.get("solve_permit_required", self.solve_permit_required)
@@ -368,6 +450,54 @@ class AedtProjectLease:
         self.native_pipeline_barrier_broken = bool(
             status.get("native_pipeline_barrier_broken", False)
         )
+
+    def _raise_for_exact_session_wait_terminal(self) -> None:
+        if not self.exact_session_reservation_id:
+            return
+        expected_session = int(self.requested_session_id or 0)
+        expected_generation = int(self.requested_session_generation or 0)
+        if expected_session and self.session_id and self.session_id != expected_session:
+            raise AedtLeaseError(
+                "exact-session identity drift while waiting for solve permit: "
+                f"expected session {expected_session}, got {self.session_id}"
+            )
+        if (
+            expected_generation
+            and self.session_generation
+            and self.session_generation != expected_generation
+        ):
+            raise AedtLeaseError(
+                "exact-session generation drift while waiting for solve permit: "
+                f"expected generation {expected_generation}, "
+                f"got {self.session_generation}"
+            )
+        reservation_state = self.exact_session_reservation_state
+        cohort_state = self.exact_session_cohort_state
+        if reservation_state not in {"failed", "expired", "released"} and (
+            cohort_state not in {"failed", "expired", "broken", "released"}
+        ):
+            return
+        reason = (
+            self.exact_session_cohort_failure_message
+            or self.exact_session_reservation_failure_message
+            or self.failure_message
+            or "authoritative exact-session cohort became terminal"
+        )
+        raise AedtLeaseError(
+            "exact-session cohort became terminal while waiting for solve permit: "
+            f"cohort_state={cohort_state!r}, "
+            f"reservation_state={reservation_state!r}, reason={reason}"
+        )
+
+    def _exact_session_cohort_deadline_remaining(self) -> float | None:
+        if self.exact_session_cohort_state != "waiting":
+            return None
+        timestamp = _scheduler_deadline_timestamp(
+            self.exact_session_cohort_deadline_at
+        )
+        if timestamp is None:
+            return None
+        return timestamp - time.time()
 
     def heartbeat(self) -> dict[str, Any]:
         status = self._call_with_retry("POST", "/heartbeat", {})
@@ -841,7 +971,9 @@ class AedtProjectLease:
         # project waits without holding AEDT automation, allowing its sibling
         # to attach/activate.  A full batch receives one atomic generation; an
         # underfilled batch is sealed after a bounded wait so no late lease can
-        # attach after native analyze begins.
+        # attach after native analyze begins.  An exact reserved sibling still
+        # attaching extends that wait only to the server-authoritative cohort
+        # deadline.
         if self.solve_permit_required and not self.solve_permit_granted:
             return self.wait_for_solve_permit()
         return activated
@@ -898,12 +1030,17 @@ class AedtProjectLease:
                 latest = self.status()
             if self.solve_permit_granted:
                 return latest
+            self._raise_for_exact_session_wait_terminal()
             if self.state != "active":
+                reason = f": {self.failure_message}" if self.failure_message else ""
                 raise AedtLeaseError(
                     f"AEDT lease {self.lease_id} became {self.state} while "
-                    "waiting for solve permit"
+                    f"waiting for solve permit{reason}"
                 )
             remaining = deadline - time.monotonic()
+            cohort_remaining = self._exact_session_cohort_deadline_remaining()
+            if cohort_remaining is not None:
+                remaining = min(remaining, max(0.0, cohort_remaining))
             if remaining <= 0:
                 latest = self._call_with_retry(
                     "POST", "/solve-permit", {"seal_underfilled": True}
@@ -911,9 +1048,42 @@ class AedtProjectLease:
                 self._apply_status(latest)
                 if self.solve_permit_granted:
                     return latest
+                self._raise_for_exact_session_wait_terminal()
+                if self.state != "active":
+                    reason = (
+                        f": {self.failure_message}" if self.failure_message else ""
+                    )
+                    raise AedtLeaseError(
+                        f"AEDT lease {self.lease_id} became {self.state} while "
+                        f"waiting for solve permit{reason}"
+                    )
+                cohort_remaining = (
+                    self._exact_session_cohort_deadline_remaining()
+                )
+                if cohort_remaining is not None and cohort_remaining > 0:
+                    # POST /solve-permit is itself an accepted waiting-phase
+                    # heartbeat.  Keep the independent keepalive running and
+                    # retry status/permit until the scheduler's reservation
+                    # deadline, instead of converting a live sibling attach
+                    # into a terminal client error at the local fill timeout.
+                    deadline = time.monotonic() + cohort_remaining
+                    continue
+                if (
+                    self.exact_session_cohort_state == "waiting"
+                    and cohort_remaining is None
+                ):
+                    raise AedtLeaseError(
+                        "waiting exact-session cohort has no valid authoritative "
+                        "deadline; refusing native analyze"
+                    )
+                if self.exact_session_cohort_state == "waiting":
+                    raise AedtLeaseError(
+                        "exact-session cohort deadline expired while a sibling "
+                        "attach was still incomplete; refusing native analyze"
+                    )
                 raise AedtLeaseError(
-                    "AEDT solve permit was refused because a sibling attach "
-                    "is still incomplete; refusing to start native analyze"
+                    "AEDT solve permit remained unavailable after the bounded "
+                    "fill wait; refusing to start native analyze"
                 )
             time.sleep(min(max(0.1, float(poll_seconds)), remaining))
 
