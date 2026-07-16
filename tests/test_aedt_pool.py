@@ -5556,17 +5556,44 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         self.assertEqual(len(permitted), 1)
         self.assertEqual(len(waiting), 2)
 
+        session_id = session_ids.pop()
+        session = self.service.get_session(session_id)
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE allocations
+                SET state = 'draining', drain_reason = 'transient reconcile'
+                WHERE id = ?
+                """,
+                (int(session["allocation_id"]),),
+            )
+
         # Polling a sealed serial cohort is normal.  These auto reservations
         # have distinct keys even though they intentionally target the same
         # Desktop, so neither waiting lease may be mistaken for a late attach.
+        # Parent-allocation drain state is an admission gate, not evidence that
+        # these ACTIVE project owners or their registered Desktop PID died.
         for index in waiting:
             status = self.service.request_solve_permit(
                 int(leases[index]["id"]), tokens[index]
             )
             self.assertEqual(status["state"], "active")
             self.assertFalse(status["solve_permit_granted"])
+            reservation = self.service.get_exact_session_reservation(
+                str(reservations[index]["reservation_key"])
+            )
+            self.assertEqual(reservation["slots"][0]["state"], "consumed")
 
-        session_id = session_ids.pop()
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE allocations
+                SET state = 'active', drain_reason = 'AEDT pool project demand'
+                WHERE id = ?
+                """,
+                (int(session["allocation_id"]),),
+            )
+
         owner_index = permitted[0]
         for next_index in waiting:
             owner = self.service.get_lease(int(leases[owner_index]["id"]))
@@ -5602,6 +5629,108 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         final = self.service.get_lease(int(leases[owner_index]["id"]))
         self.assertEqual(final["state"], "active")
         self.assertTrue(final["solve_permit_granted"])
+
+    def test_unattached_exact_reservations_still_fail_on_parent_drain(self) -> None:
+        _packing_session, target = self.sessions
+        allocation_id = int(target["allocation_id"])
+
+        for reservation_state in ("reserved", "claimed"):
+            with self.subTest(reservation_state=reservation_state):
+                task_id = self.create_pooled_task(
+                    f"parent-drain-{reservation_state}"
+                )
+                key = f"parent-drain-{reservation_state}"
+                self.reserve(key, target, [task_id])
+                with self.db.connect() as conn:
+                    if reservation_state == "claimed":
+                        conn.execute(
+                            """
+                            UPDATE aedt_exact_session_reservations
+                            SET state = 'claimed'
+                            WHERE reservation_key = ?
+                            """,
+                            (key,),
+                        )
+                    conn.execute(
+                        """
+                        UPDATE allocations
+                        SET state = 'draining',
+                            drain_reason = 'transient reconcile'
+                        WHERE id = ?
+                        """,
+                        (allocation_id,),
+                    )
+
+                self.service.reconcile(execute=False)
+
+                reservation = self.service.get_exact_session_reservation(key)
+                self.assertEqual(reservation["slots"][0]["state"], "failed")
+                self.assertIn(
+                    "target became unavailable before solve permit",
+                    reservation["slots"][0]["failure_message"],
+                )
+                with self.db.connect() as conn:
+                    conn.execute(
+                        """
+                        UPDATE allocations
+                        SET state = 'active',
+                            drain_reason = 'AEDT pool project demand'
+                        WHERE id = ?
+                        """,
+                        (allocation_id,),
+                    )
+
+    def test_parent_drain_exemption_requires_registered_desktop_pid(self) -> None:
+        task_ids = [
+            self.create_pooled_task(f"missing-pid-{index}")
+            for index in range(3)
+        ]
+        reservations = [
+            self.service.prepare_pooled_task_session(
+                task_id=task_id,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                workload_family="mft",
+                isolation_policy="family",
+            )
+            for task_id in task_ids
+        ]
+        leases = []
+        tokens = []
+        for index, task_id in enumerate(task_ids):
+            lease, token = self.request_v2(f"missing-pid-{index}", task_id=task_id)
+            self.service.accept_lease(int(lease["id"]), token)
+            self.service.activate_lease(int(lease["id"]), token)
+            leases.append(lease)
+            tokens.append(token)
+
+        current = [
+            self.service.get_lease(int(lease["id"])) for lease in leases
+        ]
+        waiting_index = next(
+            index
+            for index, lease in enumerate(current)
+            if not lease["solve_permit_granted"]
+        )
+        session = self.service.get_session(int(current[waiting_index]["session_id"]))
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE allocations SET state = 'draining' WHERE id = ?",
+                (int(session["allocation_id"]),),
+            )
+            conn.execute(
+                "UPDATE aedt_sessions SET process_id = '' WHERE id = ?",
+                (int(session["id"]),),
+            )
+
+        failed = self.service.request_solve_permit(
+            int(leases[waiting_index]["id"]), tokens[waiting_index]
+        )
+
+        self.assertEqual(failed["state"], "failed")
+        reservation = self.service.get_exact_session_reservation(
+            str(reservations[waiting_index]["reservation_key"])
+        )
+        self.assertEqual(reservation["slots"][0]["state"], "failed")
 
     def test_generic_placement_honors_pending_exact_family_reservation(self) -> None:
         task_id = self.create_pooled_task("pending-family-mft")

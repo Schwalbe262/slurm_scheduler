@@ -1916,7 +1916,30 @@ class AedtPoolService:
                   OR s.session_profile != r.session_profile
                   OR s.state NOT IN ('ready','busy')
                   OR s.drain_requested_at IS NOT NULL
-                  OR a.state NOT IN ('warm','active')
+                  OR (
+                      a.state NOT IN ('warm','active')
+                      AND NOT (
+                          -- A parent allocation can be marked draining by a
+                          -- concurrent scheduler reconciliation even though
+                          -- its Desktop and already-attached projects remain
+                          -- alive.  Allocation state gates new placement; it
+                          -- must not revoke an ACTIVE owner that is waiting
+                          -- for the next serialized solve generation.
+                          s.solve_batch_sealed_at IS NOT NULL
+                          AND r.state = 'consumed'
+                          AND TRIM(COALESCE(s.process_id, '')) != ''
+                          AND TRIM(COALESCE(s.host_id, '')) != ''
+                          AND TRIM(COALESCE(s.host_token_hash, '')) != ''
+                          AND EXISTS (
+                              SELECT 1
+                              FROM aedt_project_leases active_owner
+                              WHERE active_owner.id = r.lease_id
+                                AND active_owner.exact_session_reservation_id = r.id
+                                AND active_owner.session_id = r.session_id
+                                AND active_owner.state = 'active'
+                          )
+                      )
+                  )
                   OR (
                       s.solve_batch_sealed_at IS NOT NULL
                       AND EXISTS (
