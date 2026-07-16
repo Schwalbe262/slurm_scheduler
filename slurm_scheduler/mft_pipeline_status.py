@@ -294,6 +294,12 @@ class MftPipelineStatusReader:
 
     def _build_snapshot(self) -> dict[str, Any]:
         sources: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
+            # The canonical controller re-audits the live parquet every cycle.
+            # Unlike the experimental refresh status below, it keeps reporting
+            # the latest strict row count while no training wave is active.
+            "canonical_surrogate_status": self._read_json(
+                "canonical_surrogate_status", "mft_pipeline/surrogate_status.json"
+            ),
             "surrogate_status": self._read_json(
                 "surrogate_status", "mft_pipeline/experimental_continuous/status.json"
             ),
@@ -342,13 +348,25 @@ class MftPipelineStatusReader:
             if meta.get("message")
         ]
 
+        canonical_status, canonical_meta = sources["canonical_surrogate_status"]
         surrogate_status, surrogate_meta = sources["surrogate_status"]
         pointer, pointer_meta = sources["surrogate_pointer"]
         surrogate_state, surrogate_state_meta = sources["surrogate_state"]
         wave_detail = _mapping(surrogate_status.get("active_wave_detail"))
         strict_snapshot = _mapping(wave_detail.get("strict_snapshot"))
-        raw_rows = _integer(strict_snapshot.get("raw_rows"))
+        raw_rows = max(
+            (
+                value
+                for value in (
+                    _integer(canonical_status.get("raw_rows")),
+                    _integer(strict_snapshot.get("raw_rows")),
+                )
+                if value is not None
+            ),
+            default=None,
+        )
         strict_candidates = [
+            _integer(canonical_status.get("strict_full_rows")),
             _integer(surrogate_status.get("observed_strict_full_rows")),
             _integer(strict_snapshot.get("strict_full_rows")),
             _integer(surrogate_state.get("active_wave_strict_rows")),
@@ -417,20 +435,23 @@ class MftPipelineStatusReader:
             "available": available,
             "data": {
                 "available": bool(
-                    surrogate_meta.get("available")
+                    canonical_meta.get("available")
+                    or surrogate_meta.get("available")
                     or surrogate_state_meta.get("available")
                 ),
-                # strict_rows is the quality-gated population used by the
-                # continuous model loop.  Keep raw_rows as a separate optional
-                # diagnostic because a controller waiting between waves may
-                # intentionally omit it from status.json.
+                # strict_rows is the latest quality-gated population from the
+                # canonical controller.  The experimental wave status is only
+                # a fallback because it can remain pinned to its last attempted
+                # wave while the append-only canonical dataset keeps growing.
+                # raw_rows remains optional until a producer publishes it.
                 "dataset_rows": strict_rows,
                 "raw_rows": raw_rows,
                 "strict_rows": strict_rows,
                 "model_training_rows": model_rows,
                 "strict_delta_since_model": strict_delta,
                 "source_kind": "strict_full_rows",
-                "updated_at": surrogate_status.get("updated_at"),
+                "updated_at": canonical_status.get("updated_at")
+                or surrogate_status.get("updated_at"),
             },
             "surrogate": {
                 "available": bool(

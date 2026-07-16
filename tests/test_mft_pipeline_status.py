@@ -23,6 +23,15 @@ def write_json(root: Path, relative_path: str, payload: dict) -> None:
 def write_complete_runtime(root: Path) -> None:
     write_json(
         root,
+        "mft_pipeline/surrogate_status.json",
+        {
+            "state": "waiting_for_next_dataset_check",
+            "strict_full_rows": 120,
+            "updated_at": "2026-07-17T01:00:01+09:00",
+        },
+    )
+    write_json(
+        root,
         "mft_pipeline/experimental_continuous/status.json",
         {
             "state": "wave_running",
@@ -185,6 +194,38 @@ def write_complete_runtime(root: Path) -> None:
 
 
 class MftPipelineStatusReaderTests(unittest.TestCase):
+    def test_canonical_status_wins_while_experimental_wave_is_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_complete_runtime(root)
+            write_json(
+                root,
+                "mft_pipeline/experimental_continuous/status.json",
+                {
+                    "state": "waiting_for_dataset_growth",
+                    "last_attempted_strict_rows": 120,
+                    "updated_at": "2026-07-17T05:40:00+09:00",
+                },
+            )
+            write_json(
+                root,
+                "mft_pipeline/surrogate_status.json",
+                {
+                    "state": "waiting_for_next_dataset_check",
+                    "strict_full_rows": 137,
+                    "updated_at": "2026-07-16T21:00:00+00:00",
+                },
+            )
+
+            payload = MftPipelineStatusReader(root, cache_seconds=0).snapshot()
+
+        self.assertEqual(payload["data"]["dataset_rows"], 137)
+        self.assertEqual(payload["data"]["strict_rows"], 137)
+        self.assertEqual(payload["data"]["strict_delta_since_model"], 37)
+        self.assertEqual(
+            payload["data"]["updated_at"], "2026-07-16T21:00:00+00:00"
+        )
+
     def test_reader_composes_all_parallel_stages_and_deduplicates_shared_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
