@@ -7341,6 +7341,135 @@ class SchedulerTests(unittest.TestCase):
         self.assertNotIn(allocation_ids[1], reservations)
         self.assertEqual(reservations, {allocation_ids[2]: [task["id"] for task in queued_tasks]})
 
+    def test_maintain_pool_reuses_complete_scale_in_reservation_plan(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=600,
+            total_memory_mb=600000,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="fit-plan",
+        )
+        queued_tasks = [
+            self.db.get_task(
+                self.db.create_task(
+                    TaskCreate(
+                        f"fit-plan-{index}",
+                        "~/case",
+                        "run",
+                        cpus=1,
+                        memory_mb=1,
+                    )
+                )
+            )
+            for index in range(500)
+        ]
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+
+        with mock.patch.object(
+            scheduler,
+            "reserve_inflight_capacity_for_task",
+            wraps=scheduler.reserve_inflight_capacity_for_task,
+        ) as reserve:
+            scheduler.maintain_allocation_pool()
+
+        self.assertEqual(reserve.call_count, 500)
+        self.assertEqual(FakeClient.allocation_submits, [])
+        self.assertEqual(self.db.get_allocation(allocation_id)["state"], AllocationStatus.WARM.value)
+
+    def test_fit_aware_scale_out_discards_plan_after_allocation_change(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=1,
+            total_memory_mb=1024,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="fit-plan-stale",
+        )
+        task_id = self.db.create_task(
+            TaskCreate("fit-plan-stale", "~/case", "run", cpus=1, memory_mb=1)
+        )
+        queued_tasks = [self.db.get_task(task_id)]
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+        plan = scheduler.queued_task_allocation_reservation_plan(queued_tasks)
+        self.db.update_allocation(allocation_id, free_cpus=0)
+
+        with mock.patch.object(
+            scheduler,
+            "reserve_inflight_capacity_for_task",
+            wraps=scheduler.reserve_inflight_capacity_for_task,
+        ) as reserve:
+            opened, blocked = scheduler.open_fit_aware_demand_allocations(
+                queued_tasks,
+                reservation_plan=plan,
+            )
+
+        self.assertGreater(reserve.call_count, 0)
+        self.assertNotEqual((opened, blocked), (0, False))
+
+    def test_fit_aware_scale_out_discards_plan_when_any_task_was_unreserved(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=1,
+            total_memory_mb=1024,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="fit-plan-partial",
+        )
+        queued_tasks = [
+            self.db.get_task(
+                self.db.create_task(
+                    TaskCreate(f"fit-plan-partial-{index}", "~/case", "run", cpus=1, memory_mb=1)
+                )
+            )
+            for index in range(2)
+        ]
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+        plan = scheduler.queued_task_allocation_reservation_plan(queued_tasks)
+
+        with mock.patch.object(
+            scheduler,
+            "reserve_inflight_capacity_for_task",
+            wraps=scheduler.reserve_inflight_capacity_for_task,
+        ) as reserve:
+            opened, blocked = scheduler.open_fit_aware_demand_allocations(
+                queued_tasks,
+                reservation_plan=plan,
+            )
+
+        self.assertGreater(reserve.call_count, 0)
+        self.assertNotEqual((opened, blocked), (0, False))
+
     def test_fea_bursty_ready_attach_respects_physical_node_worker_limit(self) -> None:
         first_id = self.db.create_allocation(
             account_name="a",

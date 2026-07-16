@@ -16,6 +16,7 @@ from bisect import bisect_right
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -65,6 +66,26 @@ def parse_lmstat_features(output: str) -> list[dict]:
 
 class AccountUnavailableThisTick(RuntimeError):
     """The account already failed once this tick; skip it until the next tick."""
+
+
+@dataclass
+class _QueuedTaskAllocationReservationPlan:
+    """Read-only certificate produced by one fit-aware queue scan.
+
+    The scale-in path needs the allocation -> task reservations, while the
+    immediately following scale-out path only needs to know whether every
+    standalone demand task already has in-flight capacity.  Keeping the
+    certificate local to ``maintain_allocation_pool`` avoids a second identical
+    O(queued tasks * allocations) scan without carrying stale scheduling state
+    across ticks.
+    """
+
+    reservations: dict[int, list[int]]
+    reserved_task_ids: frozenset[int]
+    task_signatures_by_id: dict[int, str]
+    allocation_signature: tuple[str, ...]
+    fit_state_signature: tuple[Any, ...]
+    reusable: bool
 
 
 class _TickClientCache:
@@ -6981,8 +7002,13 @@ class Scheduler:
         # Retire stale demand pools before opening replacements. Opening first
         # let a new reservation change the current-fit shape, so scale-in
         # could cancel the pool created a few lines earlier in the same tick.
-        self.scale_in_idle_allocations()
-        self.prewarm_for_demand()
+        queued_tasks = self.queued_tasks_for_allocation_reservations()
+        reservation_plan = self.queued_task_allocation_reservation_plan(queued_tasks)
+        self.scale_in_idle_allocations(
+            reservation_plan=reservation_plan,
+            queued_tasks=queued_tasks,
+        )
+        self.prewarm_for_demand(reservation_plan=reservation_plan)
 
     def prewarm_cpu_for_minimum(self) -> None:
         live_count = sum(
@@ -7078,13 +7104,19 @@ class Scheduler:
         accounts = self.gpu_warm_pool_preferred_accounts or []
         return ",".join(accounts)
 
-    def prewarm_for_demand(self) -> None:
+    def prewarm_for_demand(
+        self,
+        reservation_plan: _QueuedTaskAllocationReservationPlan | None = None,
+    ) -> None:
         if self.prewarm_exclusive_demand():
             return
         if self.scale_out_for_fea_overload():
             return
         queued_tasks = self.queued_demand_tasks()
-        opened, blocked = self.open_fit_aware_demand_allocations(queued_tasks)
+        opened, blocked = self.open_fit_aware_demand_allocations(
+            queued_tasks,
+            reservation_plan=reservation_plan,
+        )
         if opened or blocked:
             return
         self.prewarm_for_high_utilization()
@@ -7102,8 +7134,17 @@ class Scheduler:
             key=lambda item: (-int(item.get("priority") or 0), int(item["id"])),
         )
 
-    def open_fit_aware_demand_allocations(self, queued_tasks: list[dict]) -> tuple[int, bool]:
+    def open_fit_aware_demand_allocations(
+        self,
+        queued_tasks: list[dict],
+        reservation_plan: _QueuedTaskAllocationReservationPlan | None = None,
+    ) -> tuple[int, bool]:
         if not queued_tasks:
+            return 0, False
+        if reservation_plan and self.reservation_plan_covers_tasks(
+            reservation_plan,
+            queued_tasks,
+        ):
             return 0, False
         remaining_allocations = [
             dict(allocation)
@@ -7133,8 +7174,50 @@ class Scheduler:
             self.reserve_inflight_capacity_for_task(remaining_allocations, task)
         return opened, blocked
 
-    def queued_task_allocation_reservations(self, queued_tasks: list[dict] | None = None) -> dict[int, list[int]]:
+    @staticmethod
+    def _reservation_record_signature(record: dict) -> str:
+        return json.dumps(record, sort_keys=True, separators=(",", ":"), default=str)
+
+    def _reservation_allocation_signature(self, allocations: list[dict]) -> tuple[str, ...]:
+        return tuple(
+            self._reservation_record_signature(allocation)
+            for allocation in sorted(allocations, key=lambda item: int(item.get("id") or 0))
+        )
+
+    def _reservation_fit_state_signature(self) -> tuple[Any, ...]:
+        active_tasks = self.db.list_tasks_by_statuses(
+            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value],
+            limit=5000,
+        )
+        active_signature = tuple(
+            self._reservation_record_signature(task)
+            for task in sorted(active_tasks, key=lambda item: int(item.get("id") or 0))
+        )
+        aedt_pressure_signature = self._reservation_record_signature(
+            self.db.aedt_project_pressure_by_allocation()
+        )
+        return (
+            active_signature,
+            aedt_pressure_signature,
+            tuple(sorted(self._tick_attach_workers_by_node.items())),
+        )
+
+    def queued_tasks_for_allocation_reservations(self) -> list[dict]:
+        return sorted(
+            [
+                task
+                for task in self.db.list_tasks(limit=5000)
+                if task["status"] == TaskStatus.QUEUED.value
+            ],
+            key=lambda item: (-int(item.get("priority") or 0), int(item["id"])),
+        )
+
+    def queued_task_allocation_reservation_plan(
+        self,
+        queued_tasks: list[dict] | None = None,
+    ) -> _QueuedTaskAllocationReservationPlan:
         tasks = queued_tasks if queued_tasks is not None else self.queued_demand_tasks()
+        fit_state_before = self._reservation_fit_state_signature()
         remaining_allocations = [
             dict(allocation)
             for allocation in self.db.list_allocations(limit=500)
@@ -7145,6 +7228,7 @@ class Scheduler:
                 AllocationStatus.ACTIVE.value,
             }
         ]
+        allocation_signature = self._reservation_allocation_signature(remaining_allocations)
         self.annotate_fea_node_worker_counts(remaining_allocations)
         reservations: dict[int, list[int]] = {}
         for task in tasks:
@@ -7152,7 +7236,69 @@ class Scheduler:
             if not allocation:
                 continue
             reservations.setdefault(int(allocation["id"]), []).append(int(task["id"]))
-        return reservations
+        current_allocations = [
+            allocation
+            for allocation in self.db.list_allocations(limit=500)
+            if allocation["state"]
+            in {
+                AllocationStatus.PENDING.value,
+                AllocationStatus.WARM.value,
+                AllocationStatus.ACTIVE.value,
+            }
+        ]
+        fit_state_after = self._reservation_fit_state_signature()
+        task_signatures_by_id = {
+            int(task["id"]): self._reservation_record_signature(task)
+            for task in tasks
+        }
+        return _QueuedTaskAllocationReservationPlan(
+            reservations=reservations,
+            reserved_task_ids=frozenset(
+                task_id
+                for task_ids in reservations.values()
+                for task_id in task_ids
+            ),
+            task_signatures_by_id=task_signatures_by_id,
+            allocation_signature=allocation_signature,
+            fit_state_signature=fit_state_before,
+            reusable=(
+                allocation_signature == self._reservation_allocation_signature(current_allocations)
+                and fit_state_before == fit_state_after
+            ),
+        )
+
+    def reservation_plan_covers_tasks(
+        self,
+        plan: _QueuedTaskAllocationReservationPlan,
+        queued_tasks: list[dict],
+    ) -> bool:
+        if not plan.reusable:
+            return False
+        for task in queued_tasks:
+            task_id = int(task["id"])
+            if task_id not in plan.reserved_task_ids:
+                return False
+            if plan.task_signatures_by_id.get(task_id) != self._reservation_record_signature(task):
+                return False
+        current_allocations = [
+            allocation
+            for allocation in self.db.list_allocations(limit=500)
+            if allocation["state"]
+            in {
+                AllocationStatus.PENDING.value,
+                AllocationStatus.WARM.value,
+                AllocationStatus.ACTIVE.value,
+            }
+        ]
+        if plan.allocation_signature != self._reservation_allocation_signature(current_allocations):
+            return False
+        return plan.fit_state_signature == self._reservation_fit_state_signature()
+
+    def queued_task_allocation_reservations(
+        self,
+        queued_tasks: list[dict] | None = None,
+    ) -> dict[int, list[int]]:
+        return self.queued_task_allocation_reservation_plan(queued_tasks).reservations
 
     def prewarm_for_high_utilization(self) -> None:
         allocations = [
@@ -7345,8 +7491,15 @@ class Scheduler:
             require_fea_eligible_node=self.task_is_fea_bursty(task),
         )
 
-    def scale_in_idle_allocations(self) -> None:
-        self.scale_in_unneeded_demand_allocations()
+    def scale_in_idle_allocations(
+        self,
+        reservation_plan: _QueuedTaskAllocationReservationPlan | None = None,
+        queued_tasks: list[dict] | None = None,
+    ) -> None:
+        self.scale_in_unneeded_demand_allocations(
+            reservation_plan=reservation_plan,
+            queued_tasks=queued_tasks,
+        )
         self.enforce_cpu_partition_allocation_limits()
         warm_allocations = [
             item
@@ -7429,14 +7582,23 @@ class Scheduler:
                 for allocation in closable[:excess]:
                     self.close_allocation(allocation, f"{partition} node {node_name} CPU allocation limit {limit}")
 
-    def scale_in_unneeded_demand_allocations(self) -> None:
-        queued_tasks = sorted(
-            [task for task in self.db.list_tasks(limit=5000) if task["status"] == TaskStatus.QUEUED.value],
-            key=lambda item: (-int(item.get("priority") or 0), int(item["id"])),
+    def scale_in_unneeded_demand_allocations(
+        self,
+        reservation_plan: _QueuedTaskAllocationReservationPlan | None = None,
+        queued_tasks: list[dict] | None = None,
+    ) -> None:
+        tasks = (
+            queued_tasks
+            if queued_tasks is not None
+            else self.queued_tasks_for_allocation_reservations()
         )
-        reservations = self.queued_task_allocation_reservations(queued_tasks)
+        reservations = (
+            reservation_plan.reservations
+            if reservation_plan is not None
+            else self.queued_task_allocation_reservations(tasks)
+        )
         reserved_allocation_ids = set(reservations)
-        queued_tasks_by_id = {int(task["id"]): task for task in queued_tasks}
+        queued_tasks_by_id = {int(task["id"]): task for task in tasks}
         desired_cpu_shape = self.choose_allocation_shape(resource_pool="cpu")
         desired_cpu_pool_cpus = int(desired_cpu_shape.get("cpus") or 0) if desired_cpu_shape else 0
         demand_allocations = [
@@ -7502,9 +7664,9 @@ class Scheduler:
                 continue
             if int(allocation["id"]) in reserved_allocation_ids:
                 continue
-            if queued_tasks and self.pending_demand_allocation_in_shape_grace(allocation):
+            if tasks and self.pending_demand_allocation_in_shape_grace(allocation):
                 continue
-            if self.warm_demand_allocation_in_attach_grace(allocation, queued_tasks):
+            if self.warm_demand_allocation_in_attach_grace(allocation, tasks):
                 continue
             self.close_allocation(allocation, "demand allocation no longer needed")
 
