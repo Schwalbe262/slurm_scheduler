@@ -55,7 +55,7 @@ from slurm_scheduler.aedt_session_host import (
 )
 from slurm_scheduler.config import AccountConfig
 from slurm_scheduler.db import Database
-from slurm_scheduler.models import TaskCreate, TaskStatus
+from slurm_scheduler.models import AllocationStatus, SchedulingProfile, TaskCreate, TaskStatus
 from slurm_scheduler.scheduler import Scheduler
 
 
@@ -215,6 +215,101 @@ class AedtPoolTestCase(unittest.TestCase):
 
 
 class AedtPoolGateTests(AedtPoolTestCase):
+    def test_scheduler_pressure_charges_attached_projects_to_session_allocation(self) -> None:
+        host_allocation_id = self.add_dedicated_allocation(node="cpu-host")
+        client_allocation_id = self.add_dedicated_allocation(node="cpu-client")
+        host_task_id = self.db.create_task(
+            TaskCreate(
+                "aedt-session-host",
+                "~/pool",
+                "host",
+                cpus=12,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                project="_aedt_pool_hosts",
+            )
+        )
+        host_client_task_id = self.db.create_task(
+            TaskCreate(
+                "host-local-client",
+                "~/case",
+                "run",
+                cpus=1,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                project="MFT_1MW_2026v1",
+            )
+        )
+        remote_client_task_id = self.db.create_task(
+            TaskCreate(
+                "remote-client",
+                "~/case",
+                "run",
+                cpus=1,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                project="MFT_1MW_2026v1",
+            )
+        )
+        for task_id, allocation_id in (
+            (host_task_id, host_allocation_id),
+            (host_client_task_id, host_allocation_id),
+            (remote_client_task_id, client_allocation_id),
+        ):
+            self.db.update_task(
+                task_id,
+                status=TaskStatus.RUNNING.value,
+                allocation_id=allocation_id,
+                account_name="a",
+            )
+
+        with self.db.connect() as conn:
+            session_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO aedt_sessions (
+                        session_key, allocation_id, node_name, slots_total, state
+                    ) VALUES ('pressure-session', ?, 'cpu-host', 5, 'busy')
+                    """,
+                    (host_allocation_id,),
+                ).lastrowid
+            )
+            for slot, state in enumerate(
+                ("leased", "attaching", "active", "releasing", "offered"), start=1
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO aedt_project_leases (
+                        request_key, project_name, session_id, slot_index, state,
+                        client_token_hash, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, 'token', '2099-01-01 00:00:00')
+                    """,
+                    (f"pressure-{state}", f"project-{state}", session_id, slot, state),
+                )
+
+        scheduler = Scheduler(self.db, [], 30)
+
+        # Four accepted/live leases reserve 4 CPUs each.  The unaccepted offer
+        # contributes zero; the 12-CPU Desktop host task is infrastructure and
+        # is replaced by the lease-derived solver charge.
+        self.assertEqual(
+            self.db.aedt_attached_project_cpus_by_allocation(),
+            {host_allocation_id: 16},
+        )
+        self.assertEqual(
+            scheduler.fea_allocation_pressures()[host_allocation_id],
+            {"workers": 1, "requested_cpus": 17, "owned_cpus": 64},
+        )
+        self.assertEqual(
+            scheduler.fea_allocation_pressures()[client_allocation_id],
+            {"workers": 1, "requested_cpus": 1, "owned_cpus": 64},
+        )
+        self.assertEqual(
+            scheduler.fea_owned_node_pressures()["cpu-host"],
+            {"workers": 1, "requested_cpus": 17, "owned_cpus": 64},
+        )
+        self.assertEqual(
+            scheduler.fea_owned_node_pressures()["cpu-client"],
+            {"workers": 1, "requested_cpus": 1, "owned_cpus": 64},
+        )
+
     def test_placement_group_derivation_and_explicit_override(self) -> None:
         cases = {
             "mft-pending-39812-stage": "mft",

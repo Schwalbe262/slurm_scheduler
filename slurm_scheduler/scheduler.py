@@ -3685,6 +3685,8 @@ class Scheduler:
                 continue
             if not self.task_is_fea_bursty(task):
                 continue
+            if self.task_is_fea_infra(task):
+                continue
             node_name = allocation_node_by_id.get(int(task.get("allocation_id") or 0))
             if not node_name:
                 continue
@@ -4314,6 +4316,13 @@ class Scheduler:
 
     def fit_slots_for_allocation(self, allocation: dict, task: dict, reservation_allocations: list[dict] | None = None) -> int:
         if self.task_is_fea_bursty(task):
+            if self.task_is_fea_infra(task):
+                # The AEDT pool has already pinned this host to an exact
+                # dedicated allocation after _allocation_session_capacity
+                # reserved the aggregate CPU and memory for every session.
+                # Solver load/footprint gates apply to project workers, not to
+                # the control-plane task that starts their Desktop.
+                return 1
             if allocation.get("state") != AllocationStatus.PENDING.value and not self.fea_allocation_accepts_task(allocation):
                 return 0
             slots = self.fea_max_attach_per_loop
@@ -4639,6 +4648,8 @@ class Scheduler:
                 continue
             if not self.task_is_fea_bursty(task):
                 continue
+            if self.task_is_fea_infra(task):
+                continue
             node_name = allocation_node_by_id.get(int(task.get("allocation_id") or 0))
             if not node_name:
                 continue
@@ -4647,10 +4658,26 @@ class Scheduler:
                 task.get("cpus") or 0
             )
 
+        # A pooled AEDT client's task is deliberately thin (normally one CPU),
+        # but its Maxwell/Icepak work executes inside the long-lived Desktop on
+        # the session's allocation.  Charge that host allocation once per
+        # accepted/live project lease instead of charging the 12-CPU session
+        # infrastructure task, which would undercount a full three-project
+        # session and overcount an idle one.
+        for allocation_id, project_cpus in (
+            self.db.aedt_attached_project_cpus_by_allocation().items()
+        ):
+            node_name = allocation_node_by_id.get(int(allocation_id))
+            if not node_name:
+                continue
+            requested_cpus_by_node[node_name] = (
+                requested_cpus_by_node.get(node_name, 0) + int(project_cpus)
+            )
+
         pressures: dict[str, dict[str, int]] = {}
-        for node_name, workers in workers_by_node.items():
+        for node_name in set(workers_by_node) | set(requested_cpus_by_node):
             pressures[node_name] = {
-                "workers": workers,
+                "workers": workers_by_node.get(node_name, 0),
                 "requested_cpus": requested_cpus_by_node.get(node_name, 0),
                 "owned_cpus": owned_cpus_by_node.get(node_name, 0),
             }
@@ -4698,6 +4725,12 @@ class Scheduler:
                 continue
             workers_by_alloc[alloc_id] = workers_by_alloc.get(alloc_id, 0) + 1
             requested_by_alloc[alloc_id] = requested_by_alloc.get(alloc_id, 0) + int(task.get("cpus") or 0)
+        for alloc_id, project_cpus in self.db.aedt_attached_project_cpus_by_allocation().items():
+            if int(alloc_id) not in owned_by_alloc:
+                continue
+            requested_by_alloc[int(alloc_id)] = (
+                requested_by_alloc.get(int(alloc_id), 0) + int(project_cpus)
+            )
         return {
             alloc_id: {
                 "workers": workers_by_alloc.get(alloc_id, 0),
@@ -5424,6 +5457,8 @@ class Scheduler:
         (total_cpus) * fea_node_requested_cpu_factor. Per-allocation, not
         per-node, so several cpu2 allocations sharing a node each stay bounded to
         their own reservation. None = no cap applicable."""
+        if self.task_is_fea_infra(task):
+            return None
         if allocation.get("state") == AllocationStatus.PENDING.value:
             return None
         alloc_id = int(allocation.get("id") or 0)
@@ -5844,6 +5879,11 @@ class Scheduler:
         if self.task_is_fea_bursty(task):
             if not self.allocation_gpu_matches_task(allocation, task):
                 return False
+            if self.task_is_fea_infra(task):
+                # Exact AEDT host placement is capacity-controlled by the
+                # pool.  Do not let transient solver load, stale pestat, or a
+                # full project CPU baseline reject its infrastructure launch.
+                return True
             if include_pending:
                 return True
             return self.fea_allocation_accepts_task(allocation)

@@ -8276,6 +8276,65 @@ class SchedulerTests(unittest.TestCase):
             above_max.fea_effective_worker_limit(allocation, task, current_workers=10, base_limit=32), 24
         )
 
+    def test_exact_aedt_host_bypasses_solver_fit_after_pool_capacity_reservation(self) -> None:
+        allocation_id = self.create_fea_allocation("n-host", total_cpus=64)
+        self.create_running_fea_tasks(allocation_id, count=16, cpus=4)
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n-host cpu1 mix 64 64 64.0 262144 200000 busy\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            fea_node_requested_cpu_factor=1.0,
+        )
+        allocation = self.db.get_allocation(allocation_id)
+        ordinary_solver = {
+            "id": 9001,
+            "cpus": 4,
+            "memory_mb": 32768,
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+            "project": "MFT_1MW_2026v1",
+        }
+        self.assertEqual(scheduler.fea_node_cpu_cap_remaining(allocation, ordinary_solver), 0)
+        self.assertEqual(scheduler.fit_slots_for_allocation(allocation, ordinary_solver), 0)
+
+        host_task_id = self.db.create_task(
+            TaskCreate(
+                "aedt-session-host-pressure-regression",
+                "~/pool",
+                "host",
+                account_name="a",
+                cpus=12,
+                memory_mb=98304,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                project="_aedt_pool_hosts",
+                requested_allocation_id=allocation_id,
+            )
+        )
+        host_task = self.db.get_task(host_task_id)
+        self.assertIsNone(scheduler.fea_node_cpu_cap_remaining(allocation, host_task))
+        self.assertEqual(scheduler.fit_slots_for_allocation(allocation, host_task), 1)
+        self.assertTrue(
+            scheduler.allocation_can_run_task(
+                allocation,
+                host_task,
+                include_pending=False,
+            )
+        )
+        reserved = scheduler.reserve_task_on_allocation(
+            host_task,
+            allocation,
+            self.accounts[0],
+        )
+        self.assertIsNotNone(reserved)
+        self.assertEqual(reserved["status"], TaskStatus.ATTACHING.value)
+        self.assertEqual(int(reserved["allocation_id"]), allocation_id)
+
     def test_gpu_fea_is_included_in_allocation_two_x_cpu_cap_and_rebalance(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",
