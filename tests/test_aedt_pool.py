@@ -599,8 +599,9 @@ class AedtPoolGateTests(AedtPoolTestCase):
         self.assertEqual(validated.native_solve_mode, "validated_parallel")
         self.assertEqual(
             validated._parallel_safe_native_solve_families,
-            frozenset({"mft"}),
+            frozenset({"mft_validated_async"}),
         )
+        self.assertNotIn("mft", validated._parallel_safe_native_solve_families)
         with self.assertRaisesRegex(ValueError, "must be one of"):
             AedtPoolService(self.db, native_solve_mode="unsafe")
 
@@ -5491,6 +5492,100 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         )
         self.assertIsNotNone(motor)
         self.assertNotEqual(int(motor["session_id"]), mft_sessions[0])
+
+    def test_auto_preadmitted_serial_siblings_survive_predecessor_release(
+        self,
+    ) -> None:
+        task_ids = [
+            self.create_pooled_task(f"serial-auto-{index}")
+            for index in range(3)
+        ]
+        reservations = [
+            self.service.prepare_pooled_task_session(
+                task_id=task_id,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                workload_family="mft",
+                isolation_policy="family",
+            )
+            for task_id in task_ids
+        ]
+        self.assertTrue(all(reservations))
+        session_ids = {int(item["session_id"]) for item in reservations}
+        self.assertEqual(len(session_ids), 1)
+        self.assertEqual(
+            len({str(item["reservation_key"]) for item in reservations}),
+            3,
+        )
+
+        leases = []
+        tokens = []
+        for index, task_id in enumerate(task_ids):
+            lease, token = self.request_v2(
+                f"serial-auto-{index}", task_id=task_id
+            )
+            self.service.accept_lease(int(lease["id"]), token)
+            self.service.activate_lease(int(lease["id"]), token)
+            leases.append(lease)
+            tokens.append(token)
+
+        current = [
+            self.service.get_lease(int(lease["id"])) for lease in leases
+        ]
+        permitted = [
+            index
+            for index, lease in enumerate(current)
+            if lease["solve_permit_granted"]
+        ]
+        waiting = [index for index in range(3) if index not in permitted]
+        self.assertEqual(len(permitted), 1)
+        self.assertEqual(len(waiting), 2)
+
+        # Polling a sealed serial cohort is normal.  These auto reservations
+        # have distinct keys even though they intentionally target the same
+        # Desktop, so neither waiting lease may be mistaken for a late attach.
+        for index in waiting:
+            status = self.service.request_solve_permit(
+                int(leases[index]["id"]), tokens[index]
+            )
+            self.assertEqual(status["state"], "active")
+            self.assertFalse(status["solve_permit_granted"])
+
+        session_id = session_ids.pop()
+        owner_index = permitted[0]
+        for next_index in waiting:
+            owner = self.service.get_lease(int(leases[owner_index]["id"]))
+            generation = int(owner["solve_permit_generation"])
+            self.service.complete_native_pipeline(
+                int(owner["id"]),
+                tokens[owner_index],
+                solve_permit_generation=generation,
+            )
+            self.service.cancel_lease(int(owner["id"]), tokens[owner_index])
+            self.service.complete_release(
+                session_id,
+                self.session_tokens[session_id],
+                int(owner["id"]),
+                success=True,
+            )
+
+            for sibling_index in waiting:
+                if sibling_index == owner_index:
+                    continue
+                sibling = self.service.get_lease(
+                    int(leases[sibling_index]["id"])
+                )
+                self.assertEqual(sibling["state"], "active")
+
+            next_owner = self.service.request_solve_permit(
+                int(leases[next_index]["id"]), tokens[next_index]
+            )
+            self.assertEqual(next_owner["state"], "active")
+            self.assertTrue(next_owner["solve_permit_granted"])
+            owner_index = next_index
+
+        final = self.service.get_lease(int(leases[owner_index]["id"]))
+        self.assertEqual(final["state"], "active")
+        self.assertTrue(final["solve_permit_granted"])
 
     def test_generic_placement_honors_pending_exact_family_reservation(self) -> None:
         task_id = self.create_pooled_task("pending-family-mft")

@@ -71,7 +71,7 @@ RECONCILE_PLACEMENT_BATCH_SIZE = 32
 # Families for which a rolling build may enable concurrent native solves.  The
 # emergency ``serial`` mode ignores this allowlist; ``validated_parallel``
 # restores it without requiring another code rollout.
-PARALLEL_SAFE_NATIVE_SOLVE_FAMILIES = frozenset({"mft"})
+PARALLEL_SAFE_NATIVE_SOLVE_FAMILIES = frozenset({"mft_validated_async"})
 NATIVE_SOLVE_MODE_ENV = "SLURM_AEDT_POOL_NATIVE_SOLVE_MODE"
 NATIVE_SOLVE_MODE_SERIAL = "serial"
 NATIVE_SOLVE_MODE_VALIDATED_PARALLEL = "validated_parallel"
@@ -1915,9 +1915,31 @@ class AedtPoolService:
                   OR s.generation != r.session_generation
                   OR s.session_profile != r.session_profile
                   OR s.state NOT IN ('ready','busy')
-                  OR s.solve_batch_sealed_at IS NOT NULL
                   OR s.drain_requested_at IS NOT NULL
                   OR a.state NOT IN ('warm','active')
+                  OR (
+                      s.solve_batch_sealed_at IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM aedt_exact_session_reservations sealed_pending
+                          LEFT JOIN aedt_project_leases sealed_lease
+                            ON sealed_lease.id = sealed_pending.lease_id
+                          WHERE sealed_pending.reservation_key = r.reservation_key
+                            AND sealed_pending.state IN (
+                                'reserved','claimed','consumed'
+                            )
+                            AND (
+                                sealed_pending.state IN ('reserved','claimed')
+                                OR sealed_lease.id IS NULL
+                                OR (
+                                    TRIM(COALESCE(
+                                        sealed_lease.solve_permit_at, ''
+                                    )) = ''
+                                    AND sealed_lease.state != 'active'
+                                )
+                            )
+                      )
+                  )
               )
               AND EXISTS (
                   SELECT 1
