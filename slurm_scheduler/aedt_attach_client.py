@@ -24,6 +24,9 @@ from .aedt_automation_lock import SessionAutomationLock
 
 DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS = 360.0
 CONTROL_PLANE_OUTAGE_ENV = "AEDT_POOL_CONTROL_PLANE_OUTAGE_SECONDS"
+DEFAULT_POOL_FILL_TIMEOUT_SECONDS = 900.0
+MAX_POOL_FILL_TIMEOUT_SECONDS = 7200.0
+POOL_FILL_TIMEOUT_ENV = "MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS"
 TRANSIENT_HTTP_STATUSES = {408, 425, 429}
 
 
@@ -853,18 +856,22 @@ class AedtProjectLease:
             return self.status()
         if fill_timeout_seconds is None:
             raw_timeout = os.environ.get(
-                "MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS", "900"
+                POOL_FILL_TIMEOUT_ENV, f"{DEFAULT_POOL_FILL_TIMEOUT_SECONDS:g}"
             ).strip()
             try:
                 fill_timeout_seconds = float(raw_timeout)
             except ValueError as exc:
                 raise AedtLeaseError(
-                    "MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS must be numeric"
+                    f"{POOL_FILL_TIMEOUT_ENV} must be numeric"
                 ) from exc
         timeout = float(fill_timeout_seconds)
-        if not math.isfinite(timeout) or not 0 <= timeout <= 900:
+        if (
+            not math.isfinite(timeout)
+            or not 0 <= timeout <= MAX_POOL_FILL_TIMEOUT_SECONDS
+        ):
             raise AedtLeaseError(
-                "pooled AEDT fill timeout must be between 0 and 900 seconds"
+                "pooled AEDT fill timeout must be between 0 and "
+                f"{MAX_POOL_FILL_TIMEOUT_SECONDS:g} seconds"
             )
         deadline = time.monotonic() + timeout
         last_inline_heartbeat = time.monotonic()
