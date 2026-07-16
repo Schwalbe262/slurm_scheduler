@@ -559,6 +559,42 @@ Task states:
 - `completed`: command exited with code `0`.
 - `failed`: command exited nonzero or attach failed.
 
+## Project Campaign Demand
+
+`MFT_1MW_2026v1` starts with a durable total demand of `500`. This is an
+absolute campaign budget, not active concurrency. MFT active concurrency is a
+separate simulation-policy value capped at 30 logical clients.
+
+### `GET /api/projects/{name}/campaign-demand`
+
+```bash
+curl -sS "$SCHEDULER_URL/api/projects/MFT_1MW_2026v1/campaign-demand"
+```
+
+The response contains `total_simulations`, monotonic `demand_revision`, audit
+fields `updated_at`/`updated_by`, and an ETag derived from the revision.
+`accepted_simulations` and `remaining_simulations` are `null` because the
+crash-safe feeder manifest owns accepted progress.
+
+### `PATCH /api/projects/{name}/campaign-demand`
+
+The PATCH is an absolute, versioned CAS operation:
+
+```bash
+curl -sS -X PATCH \
+  "$SCHEDULER_URL/api/projects/MFT_1MW_2026v1/campaign-demand" \
+  -H "Content-Type: application/json" \
+  -H "X-Operator-Identity: operator-name" \
+  -d '{"total_simulations":750,"expected_revision":1}'
+```
+
+A stale revision returns `409` with `detail.current`. Repeating the current
+absolute value at the current revision is a no-op and does not consume another
+revision. The update commits under the host-wide MFT campaign mutation lock.
+Increasing the target lets the feeder extend its manifest idempotently;
+decreasing it stops future submissions only. This endpoint never cancels or
+rewrites queued, attaching, or running tasks, which drain naturally.
+
 ## Token Usage
 
 ### `POST /token-usage`

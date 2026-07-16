@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Form, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.gzip import GZipMiddleware
 
 from .allocation_metrics import annotate_allocation_fea_pressure, annotate_allocation_node_metrics
@@ -25,6 +26,7 @@ from .aedt_session_host import (
     SUPPORTED_DSO_PROFILE,
     is_expected_session_profile,
 )
+from .campaign_mutation_lock import campaign_mutation_lock
 from .conda_sync import CondaEnvSyncManager, conda_bootstrap
 from .config import AppConfig, load_accounts, load_app_config
 from .control_plane_relay import ControlPlaneRelay
@@ -41,6 +43,8 @@ from .web_read_guard import WebReadGuardMiddleware
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+MFT_ACTIVE_CONCURRENCY_CEILING = 30
+MAX_CAMPAIGN_TOTAL_SIMULATIONS = 1_000_000
 
 def parse_aedt_backend(value: object) -> str:
     try:
@@ -1131,6 +1135,12 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 0, int(project.get("validated_concurrency_limit") or 0)
             ),
             "scale_down_mode": str(project.get("scale_down_mode") or "drain"),
+            "campaign_total_simulations": max(
+                0, int(project.get("campaign_total_simulations") or 0)
+            ),
+            "campaign_demand_revision": max(
+                1, int(project.get("campaign_demand_revision") or 1)
+            ),
             "aedt_backend": normalize_aedt_backend(project.get("aedt_backend") or ""),
             "queued_count": queued_count,
             "attaching_count": attaching_count,
@@ -1144,7 +1154,33 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         if include_deployments:
             payload["deployments"] = db.list_project_deployments(int(project["id"]))
         payload["simulation_policy"] = simulation_policy_json(project)
+        payload["campaign_demand"] = campaign_demand_json(project)
         return payload
+
+    def campaign_demand_json(project: dict) -> dict:
+        """Serialize the durable feeder budget, never inferred task progress."""
+
+        return {
+            "project": str(project.get("name") or ""),
+            "total_simulations": max(
+                0, int(project.get("campaign_total_simulations") or 0)
+            ),
+            "demand_revision": max(
+                1, int(project.get("campaign_demand_revision") or 1)
+            ),
+            "updated_at": str(project.get("campaign_demand_updated_at") or ""),
+            "updated_by": str(project.get("campaign_demand_updated_by") or "system"),
+            "scale_down_mode": "drain",
+            "active_tasks_cancelled_on_decrease": False,
+            # Accepted progress is a feeder-manifest invariant.  Publishing a
+            # made-up count from scheduler task rows would break crash/retry
+            # idempotence, so consumers must reconcile it under the common
+            # campaign mutation lock.
+            "accepted_simulations": None,
+            "remaining_simulations": None,
+            "progress_source": "feeder_manifest",
+            "mutation_serialization": "host-wide-mft-campaign-lock",
+        }
 
     def simulation_policy_json(project: dict) -> dict:
         project_name = str(project.get("name") or "")
@@ -1154,7 +1190,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         )
         solving = db.count_tasks_by_project(project_name, [TaskStatus.RUNNING.value])
         hard_ceiling = (
-            500
+            MFT_ACTIVE_CONCURRENCY_CEILING
             if project_name.lower().startswith("mft")
             else int(config.project_max_active_tasks_ceiling)
         )
@@ -2683,6 +2719,84 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             raise HTTPException(status_code=404, detail="project not found")
         return simulation_policy_json(project)
 
+    @app.get("/api/projects/{name}/campaign-demand")
+    def api_get_project_campaign_demand(name: str, response: Response) -> dict:
+        project = db.get_project_by_name(name)
+        if not project:
+            raise HTTPException(status_code=404, detail="project not found")
+        demand = campaign_demand_json(project)
+        response.headers["ETag"] = f'W/"campaign-demand-{demand["demand_revision"]}"'
+        response.headers["Cache-Control"] = "no-store"
+        return demand
+
+    @app.patch("/api/projects/{name}/campaign-demand")
+    async def api_set_project_campaign_demand(
+        name: str, request: Request, response: Response
+    ) -> dict:
+        payload = await _json_body(request)
+        if set(payload) != {"total_simulations", "expected_revision"}:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "request body must contain only total_simulations and "
+                    "expected_revision"
+                ),
+            )
+        total = payload.get("total_simulations")
+        revision = payload.get("expected_revision")
+        if type(total) is not int or not 0 <= total <= MAX_CAMPAIGN_TOTAL_SIMULATIONS:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "total_simulations must be an integer between 0 and "
+                    f"{MAX_CAMPAIGN_TOTAL_SIMULATIONS}"
+                ),
+            )
+        if type(revision) is not int or revision < 1:
+            raise HTTPException(
+                status_code=422, detail="expected_revision must be a positive integer"
+            )
+        if not db.get_project_by_name(name):
+            raise HTTPException(status_code=404, detail="project not found")
+
+        raw_actor = str(request.headers.get("x-operator-identity", "") or "").strip()
+        actor = re.sub(r"[^A-Za-z0-9_.:@/-]+", "_", raw_actor)[:256] or "api"
+        lock_path = str(config.mft_campaign_mutation_lock_path or "").strip() or None
+
+        def update_under_campaign_lock():
+            with campaign_mutation_lock(
+                lock_path,
+                timeout_seconds=config.mft_campaign_mutation_lock_timeout_seconds,
+            ):
+                return db.update_project_campaign_demand(
+                    name,
+                    total_simulations=total,
+                    expected_revision=revision,
+                    updated_by=actor,
+                )
+
+        try:
+            status, updated = await run_in_threadpool(update_under_campaign_lock)
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="campaign mutation lock is busy; demand was not changed",
+            ) from exc
+        if status == "not_found":
+            raise HTTPException(status_code=404, detail="project not found")
+        if status == "conflict":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "campaign demand revision conflict",
+                    "current": campaign_demand_json(updated) if updated else None,
+                },
+            )
+        demand = campaign_demand_json(updated)
+        response.headers["ETag"] = f'W/"campaign-demand-{demand["demand_revision"]}"'
+        response.headers["Cache-Control"] = "no-store"
+        return demand
+
     @app.patch("/api/projects/{name}/simulation-policy")
     async def api_set_project_simulation_policy(name: str, request: Request) -> dict:
         payload = await _json_body(request)
@@ -2781,7 +2895,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 status_code=422, detail="expected_revision must be an integer"
             ) from exc
         hard_ceiling = (
-            500
+            MFT_ACTIVE_CONCURRENCY_CEILING
             if name.lower().startswith("mft")
             else int(config.project_max_active_tasks_ceiling)
         )
