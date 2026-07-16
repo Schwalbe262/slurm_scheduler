@@ -6470,6 +6470,123 @@ class AedtRuntimeCapacityTests(AedtPoolTestCase):
         self.assertEqual(runtime.tick()["node_allocations_opened"], 0)
         self.assertEqual(len(fake.open_calls), 1)
 
+    def _pending_pool_allocation(
+        self,
+        *,
+        cpus: int = 39,
+        memory_mb: int = 3 * 96 * 1024,
+        submitted_at: str,
+    ) -> int:
+        self.service.set_operator_limits(projects_per_session=3)
+        allocation_id = self.db.create_allocation(
+            "a", "cpu", "", cpus, memory_mb
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state="pending",
+            slurm_job_id=f"pending-{allocation_id}",
+            drain_reason="AEDT pool project demand",
+            submitted_at=submitted_at,
+        )
+        return allocation_id
+
+    def _pending_cleanup_runtime(self):
+        class ExactCloseScheduler(FakeRuntimeScheduler):
+            def __init__(self, db: Database) -> None:
+                super().__init__()
+                self.db = db
+                self.close_calls: list[int] = []
+
+            def close_empty_aedt_pool_allocation(self, allocation_id: int) -> bool:
+                self.close_calls.append(allocation_id)
+                self.db.update_allocation(
+                    allocation_id,
+                    state="closed",
+                    closed_at="CURRENT_TIMESTAMP",
+                    drain_reason="AEDT pool empty",
+                )
+                return True
+
+        scheduler = ExactCloseScheduler(self.db)
+        return AedtPoolRuntime(self.service, scheduler), scheduler
+
+    def test_pending_downscale_keeps_oldest_whole_capacity_per_account(self) -> None:
+        oldest = self._pending_pool_allocation(
+            submitted_at="2026-01-01 00:00:01"
+        )
+        middle = self._pending_pool_allocation(
+            submitted_at="2026-01-01 00:00:02"
+        )
+        newest = self._pending_pool_allocation(
+            submitted_at="2026-01-01 00:00:03"
+        )
+        runtime, scheduler = self._pending_cleanup_runtime()
+
+        closed = runtime._close_excess_pending_dedicated_allocations(
+            {"unplaced_sessions_by_account": {"a": 2}},
+            self.service.config(),
+        )
+
+        # Each request fits three sessions.  Keep the indivisible oldest one
+        # even though only two sessions are needed and retire newest first.
+        self.assertEqual(closed, 2)
+        self.assertEqual(scheduler.close_calls, [newest, middle])
+        self.assertEqual(self.db.get_allocation(oldest)["state"], "pending")
+
+    def test_pending_downscale_preserves_enough_partially_used_requests(self) -> None:
+        oldest = self._pending_pool_allocation(
+            submitted_at="2026-01-01 00:00:01"
+        )
+        partially_used = self._pending_pool_allocation(
+            submitted_at="2026-01-01 00:00:02"
+        )
+        newest = self._pending_pool_allocation(
+            submitted_at="2026-01-01 00:00:03"
+        )
+        runtime, scheduler = self._pending_cleanup_runtime()
+
+        closed = runtime._close_excess_pending_dedicated_allocations(
+            {"unplaced_sessions_by_account": {"a": 4}},
+            self.service.config(),
+        )
+
+        # Two whole three-session requests provide six slots for demand four;
+        # the second request is partially needed and therefore cannot close.
+        self.assertEqual(closed, 1)
+        self.assertEqual(scheduler.close_calls, [newest])
+        self.assertEqual(self.db.get_allocation(oldest)["state"], "pending")
+        self.assertEqual(
+            self.db.get_allocation(partially_used)["state"], "pending"
+        )
+
+    def test_pending_downscale_zero_demand_closes_every_request_newest_first(self) -> None:
+        oldest = self._pending_pool_allocation(
+            submitted_at="2026-01-01 00:00:01"
+        )
+        newest = self._pending_pool_allocation(
+            submitted_at="2026-01-01 00:00:02"
+        )
+        runtime, scheduler = self._pending_cleanup_runtime()
+
+        closed = runtime._close_excess_pending_dedicated_allocations(
+            {"unplaced_sessions_by_account": {}},
+            self.service.config(),
+        )
+
+        self.assertEqual(closed, 2)
+        self.assertEqual(scheduler.close_calls, [newest, oldest])
+
+    def test_pending_cleanup_fails_closed_without_demand_proof(self) -> None:
+        self._pending_pool_allocation(submitted_at="2026-01-01 00:00:01")
+        runtime, scheduler = self._pending_cleanup_runtime()
+
+        closed = runtime._close_excess_pending_dedicated_allocations(
+            {}, self.service.config()
+        )
+
+        self.assertEqual(closed, 0)
+        self.assertEqual(scheduler.close_calls, [])
+
 
 class FakeLeaseHttp:
     def __init__(self) -> None:

@@ -8320,6 +8320,9 @@ class AedtPoolRuntime:
                 control_plane_url=control_plane_url,
                 blocked_start_accounts=blocked_start_accounts,
             )
+        plan["excess_pending_allocations_closed"] = (
+            self._close_excess_pending_dedicated_allocations(plan, config)
+        )
         plan["empty_allocations_closed"] = self._close_empty_dedicated_allocations()
         return plan
 
@@ -8589,5 +8592,92 @@ class AedtPoolRuntime:
             ):
                 continue
             if self.scheduler.close_empty_aedt_pool_allocation(allocation_id):
+                closed += 1
+        return closed
+
+    def _close_excess_pending_dedicated_allocations(
+        self,
+        plan: dict[str, Any],
+        config: AedtPoolConfig,
+    ) -> int:
+        """Retire only pending pool requests beyond current account demand.
+
+        A pool downscale can leave many old dedicated allocations pending in
+        Slurm.  They have no sessions or task claims yet, so the normal empty
+        allocation reaper (which intentionally covers only started
+        allocations) never sees them.  Besides wasting per-account submit
+        slots, their aggregate future capacity suppresses a right-sized node
+        request forever.
+
+        Preserve the oldest requests until each account still has at least its
+        full unplaced session demand.  An allocation is indivisible: when one
+        retained request takes capacity above the exact demand, keep the whole
+        request.  Only newer, wholly excess requests are offered to the
+        scheduler's existing exact-owner close path.
+        """
+
+        raw_needed = plan.get("unplaced_sessions_by_account")
+        if not isinstance(raw_needed, dict):
+            # A synthetic/older reconciliation plan has not proved how much
+            # pending capacity must survive.  Fail closed without mutation.
+            return 0
+        close_pending = getattr(
+            self.scheduler, "close_empty_aedt_pool_allocation", None
+        )
+        if not callable(close_pending):
+            # Test/minimal scheduler adapters that cannot perform the exact
+            # owner close must never fall back to a generic mutation.
+            return 0
+        needed_by_account = {
+            str(account or ""): max(0, int(count or 0))
+            for account, count in raw_needed.items()
+            if str(account or "")
+        }
+        pending = [
+            allocation
+            for allocation in self.service._dedicated_allocations({"pending"})
+            if str(allocation.get("drain_reason") or "")
+            == "AEDT pool project demand"
+        ]
+        pending_by_account: dict[str, list[dict[str, Any]]] = {}
+        for allocation in pending:
+            account = str(allocation.get("account_name") or "")
+            if not account:
+                continue
+            pending_by_account.setdefault(account, []).append(allocation)
+
+        excess: list[dict[str, Any]] = []
+        for account, allocations in pending_by_account.items():
+            needed = needed_by_account.get(account, 0)
+            retained_capacity = 0
+            ordered = sorted(
+                allocations,
+                key=lambda row: (
+                    str(row.get("submitted_at") or row.get("created_at") or ""),
+                    int(row["id"]),
+                ),
+            )
+            for allocation in ordered:
+                if retained_capacity < needed:
+                    retained_capacity += self.service._allocation_session_capacity(
+                        allocation,
+                        config,
+                    )
+                else:
+                    excess.append(allocation)
+
+        closed = 0
+        # Newest excess requests have the least Slurm queue age, so close them
+        # first.  Every close remains an exact allocation-id CAS through the
+        # pool-owner path and can independently refuse if a live claim appears.
+        for allocation in sorted(
+            excess,
+            key=lambda row: (
+                str(row.get("submitted_at") or row.get("created_at") or ""),
+                int(row["id"]),
+            ),
+            reverse=True,
+        ):
+            if close_pending(int(allocation["id"])):
                 closed += 1
         return closed
