@@ -8335,6 +8335,74 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.db.get_task(standard)["status"], TaskStatus.RUNNING.value)
         self.assertEqual(FakeClient.cancelled_tasks, [new_fea])
 
+    def test_fea_hard_memory_pressure_reclaims_only_once_per_shared_node(self) -> None:
+        allocation_a = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=32,
+            total_memory_mb=100000,
+        )
+        allocation_b = self.db.create_allocation(
+            account_name="b",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=32,
+            total_memory_mb=100000,
+        )
+        for allocation_id, job_id in [(allocation_a, "alloc-a"), (allocation_b, "alloc-b")]:
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.ACTIVE.value,
+                slurm_job_id=job_id,
+            )
+        older = self.db.create_task(
+            TaskCreate(
+                "fea-older-shared-node",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=8192,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        newer = self.db.create_task(
+            TaskCreate(
+                "fea-newer-shared-node",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=8192,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        for task_id, allocation_id, account_name, attached_at in [
+            (older, allocation_a, "a", "2026-01-01 00:00:00"),
+            (newer, allocation_b, "b", "2026-01-01 00:01:00"),
+        ]:
+            self.db.update_task(
+                task_id,
+                status=TaskStatus.RUNNING.value,
+                account_name=account_name,
+                allocation_id=allocation_id,
+                wrapper_pid=str(1000 + task_id),
+                attached_at=attached_at,
+                started_at=attached_at,
+            )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 12.0 100000 35000 some_job\n"
+            )
+        )
+
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        scheduler.handle_fea_memory_pressure()
+
+        self.assertEqual(self.db.get_task(older)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(self.db.get_task(newer)["status"], TaskStatus.QUEUED.value)
+        self.assertEqual(FakeClient.cancelled_tasks, [newer])
+
     def test_fea_hard_memory_pressure_fails_task_at_attempt_cap(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",

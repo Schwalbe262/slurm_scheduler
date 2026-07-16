@@ -6499,6 +6499,7 @@ class Scheduler:
 
     def handle_fea_memory_pressure(self) -> None:
         reclaimed = False
+        pressured_allocations_by_node: dict[str, list[dict]] = {}
         for allocation in self.db.list_allocations(limit=500):
             if allocation["state"] not in {
                 AllocationStatus.WARM.value,
@@ -6508,9 +6509,38 @@ class Scheduler:
                 continue
             if self.fea_memory_pressure_state(allocation) != "hard_pressure":
                 continue
-            task = self.newest_running_fea_task(int(allocation["id"]))
-            if not task:
+            node_name = str(allocation.get("node_name") or "")
+            if not node_name:
                 continue
+            pressured_allocations_by_node.setdefault(node_name, []).append(allocation)
+
+        # Memory pressure is measured by pestat for the whole node.  Several
+        # scheduler allocations can share that node, so reclaiming once per
+        # allocation would kill a burst of otherwise recoverable simulations
+        # from a single pressure sample.  Reclaim only the newest standalone
+        # FEA worker on each pressured node during this tick.
+        for allocations in pressured_allocations_by_node.values():
+            allocation_by_id = {
+                int(allocation["id"]): allocation for allocation in allocations
+            }
+            candidates = [
+                task
+                for allocation_id in allocation_by_id
+                if (task := self.newest_running_fea_task(allocation_id)) is not None
+            ]
+            if not candidates:
+                continue
+            task = max(
+                candidates,
+                key=lambda candidate: (
+                    candidate.get("attached_at")
+                    or candidate.get("started_at")
+                    or candidate.get("created_at")
+                    or "",
+                    int(candidate.get("id") or 0),
+                ),
+            )
+            allocation = allocation_by_id[int(task.get("allocation_id") or 0)]
             account = self.account_by_name(str(task.get("account_name") or allocation.get("account_name") or ""))
             if account:
                 try:
