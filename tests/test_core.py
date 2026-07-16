@@ -4803,13 +4803,15 @@ class SchedulerTests(unittest.TestCase):
         shape = scheduler.choose_allocation_shape(
             resource_pool="cpu",
             requested_cpus=13,
+            requested_memory_mb=98304,
             require_fea_eligible_node=True,
             cpu_only_nodes=True,
             aedt_pool_node_sharing=True,
         )
 
         self.assertEqual(shape["node_name"], "cpu2-a")
-        self.assertEqual(shape["cpus"], 64)
+        self.assertEqual(shape["cpus"], 52)
+        self.assertEqual(shape["memory_mb"], 393216)
 
         for index in range(2, 4):
             allocation_id = self.db.create_allocation(
@@ -4828,19 +4830,21 @@ class SchedulerTests(unittest.TestCase):
             )
             allocation_ids.append(allocation_id)
 
-        # Four 64-CPU allocations consume all 256 CPUs.  Current-fit placement
-        # is impossible, so the AEDT policy submits an unpinned 64-CPU request
-        # to wait in Slurm instead of violating aggregate capacity.
+        # Four legacy 64-CPU allocations consume all 256 CPUs. Current-fit
+        # placement is impossible, so the AEDT policy submits an unpinned exact
+        # four-session request to wait in Slurm.
         queued_shape = scheduler.choose_allocation_shape(
             resource_pool="cpu",
             requested_cpus=13,
+            requested_memory_mb=98304,
             require_fea_eligible_node=True,
             cpu_only_nodes=True,
             aedt_pool_node_sharing=True,
         )
         self.assertEqual(queued_shape["partition"], "cpu2")
         self.assertEqual(queued_shape["node_name"], "")
-        self.assertEqual(queued_shape["cpus"], 64)
+        self.assertEqual(queued_shape["cpus"], 52)
+        self.assertEqual(queued_shape["memory_mb"], 393216)
 
         scheduler.enforce_cpu_partition_allocation_limits()
         self.assertTrue(
@@ -4882,13 +4886,15 @@ class SchedulerTests(unittest.TestCase):
         aedt_shape = scheduler.choose_allocation_shape(
             resource_pool="cpu",
             requested_cpus=13,
+            requested_memory_mb=98304,
             require_fea_eligible_node=True,
             cpu_only_nodes=True,
             aedt_pool_node_sharing=True,
         )
         self.assertEqual(aedt_shape["partition"], "cpu2")
         self.assertEqual(aedt_shape["node_name"], "cpu2-a")
-        self.assertEqual(aedt_shape["cpus"], 64)
+        self.assertEqual(aedt_shape["cpus"], 52)
+        self.assertEqual(aedt_shape["memory_mb"], 393216)
 
     def test_aedt_pool_downshifts_to_complete_session_cpu_multiple(self) -> None:
         self.db.replace_pestat_nodes(
@@ -4911,6 +4917,7 @@ class SchedulerTests(unittest.TestCase):
         shape = scheduler.choose_allocation_shape(
             resource_pool="cpu",
             requested_cpus=13,
+            requested_memory_mb=98304,
             require_fea_eligible_node=True,
             cpu_only_nodes=True,
             aedt_pool_node_sharing=True,
@@ -4918,13 +4925,14 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertEqual(shape["node_name"], "cpu2-fragment")
         self.assertEqual(shape["cpus"], 26)
+        self.assertEqual(shape["memory_mb"], 196608)
 
         pending_id = self.db.create_allocation(
             account_name="a",
             partition="cpu2",
             node_name="cpu2-fragment",
             total_cpus=26,
-            total_memory_mb=98304,
+            total_memory_mb=196608,
             resource_pool="cpu",
         )
         self.db.update_allocation(
@@ -4936,12 +4944,160 @@ class SchedulerTests(unittest.TestCase):
         next_shape = scheduler.choose_allocation_shape(
             resource_pool="cpu",
             requested_cpus=13,
+            requested_memory_mb=98304,
             require_fea_eligible_node=True,
             cpu_only_nodes=True,
             aedt_pool_node_sharing=True,
         )
         self.assertEqual(next_shape["node_name"], "")
-        self.assertEqual(next_shape["cpus"], 64)
+        self.assertEqual(next_shape["cpus"], 52)
+        self.assertEqual(next_shape["memory_mb"], 393216)
+
+    def test_aedt_pool_shape_is_an_exact_whole_session_multiple(self) -> None:
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            allocation_partition="cpu2",
+            allocation_cpus=64,
+            allocation_memory="768G",
+            fea_soft_memory_free_percent=0,
+            fea_hard_memory_free_percent=0,
+        )
+
+        for free_cpus, expected_sessions in ((13, 1), (26, 2), (39, 3), (64, 4)):
+            with self.subTest(free_cpus=free_cpus):
+                used_cpus = 64 - free_cpus
+                state = "idle" if used_cpus == 0 else "mix"
+                self.db.replace_pestat_nodes(
+                    parse_pestat(
+                        "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                        f"cpu2-shape cpu2 {state} {used_cpus} 64 1.0 1031519 900000 jobs\n"
+                    )
+                )
+
+                shape = scheduler.choose_allocation_shape(
+                    resource_pool="cpu",
+                    requested_cpus=13,
+                    requested_memory_mb=98304,
+                    require_fea_eligible_node=True,
+                    cpu_only_nodes=True,
+                    aedt_pool_node_sharing=True,
+                )
+
+                self.assertEqual(shape["cpus"], expected_sessions * 13)
+                self.assertEqual(
+                    shape["memory_mb"], expected_sessions * 98304
+                )
+
+    def test_aedt_pool_shape_downshifts_when_memory_limits_sessions(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "cpu2-memory cpu2 idle 0 256 0.0 1031519 250000\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            allocation_partition="cpu2",
+            allocation_cpus=64,
+            allocation_memory="768G",
+            fea_soft_memory_free_percent=0,
+            fea_hard_memory_free_percent=0,
+        )
+
+        shape = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            requested_cpus=13,
+            requested_memory_mb=98304,
+            require_fea_eligible_node=True,
+            cpu_only_nodes=True,
+            aedt_pool_node_sharing=True,
+        )
+
+        self.assertEqual(shape["node_name"], "cpu2-memory")
+        self.assertEqual(shape["cpus"], 26)
+        self.assertEqual(shape["memory_mb"], 196608)
+
+    def test_aedt_pool_shape_accounts_for_pinned_pending_memory(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "cpu2-pending cpu2 idle 0 256 0.0 1031519 450000\n"
+            )
+        )
+        pending_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu2",
+            node_name="cpu2-pending",
+            total_cpus=13,
+            total_memory_mb=98304,
+            resource_pool="cpu",
+        )
+        self.db.update_allocation(
+            pending_id,
+            state=AllocationStatus.PENDING.value,
+            slurm_job_id="aedt-pending-memory",
+            drain_reason="AEDT pool project demand",
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            allocation_partition="cpu2",
+            allocation_cpus=64,
+            allocation_memory="768G",
+            fea_soft_memory_free_percent=0,
+            fea_hard_memory_free_percent=0,
+        )
+
+        shape = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            requested_cpus=13,
+            requested_memory_mb=98304,
+            require_fea_eligible_node=True,
+            cpu_only_nodes=True,
+            aedt_pool_node_sharing=True,
+        )
+
+        # pestat cannot see pinned pending reservations yet. Discounting the
+        # pending 96 GiB leaves room for exactly three additional sessions.
+        self.assertEqual(shape["node_name"], "cpu2-pending")
+        self.assertEqual(shape["cpus"], 39)
+        self.assertEqual(shape["memory_mb"], 294912)
+
+    def test_generic_cpu_pool_request_keeps_floor_memory_semantics(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "cpu2-generic cpu2 idle 0 256 0.0 1031519 900000\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            allocation_partition="cpu2",
+            allocation_cpus=64,
+            allocation_memory="768G",
+        )
+
+        shape = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            requested_cpus=13,
+            requested_memory_mb=98304,
+            require_fea_eligible_node=True,
+            cpu_only_nodes=True,
+        )
+
+        self.assertEqual(shape["cpus"], 64)
+        self.assertEqual(shape["memory_mb"], 98304)
 
     def test_cpu_pool_can_use_gpu_partition_when_no_cpu_candidate_exists(self) -> None:
         inventory = parse_scontrol_nodes(

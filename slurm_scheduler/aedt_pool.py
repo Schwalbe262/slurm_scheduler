@@ -7957,20 +7957,22 @@ class AedtPoolRuntime:
                 required_capability=config.required_capability,
                 env_profile=config.env_profile,
                 account_name=account_name,
-                # This is a floor, not the final pool shape.  The scheduler
-                # expands a shared CPU pool to its configured target, capped by
-                # the physical node size.  Keeping the floor at one complete
-                # session lets 48-core CPU nodes grant a 48-core pool while
-                # 64+-core nodes retain the normal 64-core pool. Per-allocation
-                # session capacity limits those shapes to 3 and 4 hosts,
-                # respectively, for the 1 host + 3 projects x 4 CPUs topology.
+                # In AEDT node-sharing mode this is one complete session's CPU
+                # footprint.  The scheduler expands it only in whole-session
+                # multiples up to its configured allocation target.
                 requested_cpus=(
                     1 + config.project_cpus * config.projects_per_session
                 ),
-                # cpu2 nodes expose 256 CPUs while each scheduler allocation
-                # owns 64. Allow four exact 64-CPU AEDT allocations to share
-                # such a physical node; aggregate Slurm/DB CPU reservations
-                # remain the hard capacity boundary.
+                # In AEDT node-sharing mode these are per-session footprints.
+                # The scheduler requests an exact whole-session multiple, so a
+                # three-project session reserves 3 x project memory alongside
+                # its one host CPU plus three project CPU reservations.
+                requested_memory_mb=(
+                    config.project_memory_mb * config.projects_per_session
+                ),
+                # cpu2 nodes may host multiple AEDT allocations; aggregate
+                # Slurm/DB CPU and memory reservations remain the hard node
+                # capacity boundary.
                 aedt_pool_node_sharing=True,
                 require_fea_eligible_node=True,
                 # Desktop hosts are CPU-pool infrastructure.  Generic CPU work

@@ -6128,6 +6128,10 @@ class AedtRuntimeCapacityTests(AedtPoolTestCase):
             fake.open_calls[0]["requested_cpus"],
             1 + config.project_cpus * config.projects_per_session,
         )
+        self.assertEqual(
+            fake.open_calls[0]["requested_memory_mb"],
+            config.project_memory_mb * config.projects_per_session,
+        )
         self.assertTrue(fake.open_calls[0]["aedt_pool_node_sharing"])
         self.assertFalse(fake.open_calls[0].get("exclusive_node", False))
         self.assertTrue(fake.open_calls[0]["cpu_only_nodes"])

@@ -7181,8 +7181,20 @@ class Scheduler:
         candidates = []
         wants_gpu = resource_pool.startswith("gpu:") or int(gpus or 0) > 0
         wants_shared_cpu_pool = not wants_gpu and not exclusive_node
+        # For shared AEDT pools these two request fields describe one complete
+        # Desktop session, not merely generic allocation floors.  Keeping both
+        # footprints explicit prevents a 13-CPU session floor from expanding
+        # into a 64-CPU/768-GiB allocation that can only host four sessions.
+        aedt_session_cpus = int(requested_cpus or 0)
+        aedt_session_memory_mb = int(requested_memory_mb or 0)
+        if aedt_pool_node_sharing and (
+            aedt_session_cpus <= 0 or aedt_session_memory_mb <= 0
+        ):
+            return None
         aedt_reserved_cpus_by_node: dict[str, int] = {}
         aedt_pending_cpus_by_node: dict[str, int] = {}
+        aedt_reserved_memory_by_node: dict[str, int] = {}
+        aedt_pending_memory_by_node: dict[str, int] = {}
         if aedt_pool_node_sharing:
             live_states = {
                 AllocationStatus.PENDING.value,
@@ -7203,10 +7215,18 @@ class Scheduler:
                     aedt_reserved_cpus_by_node.get(node_name, 0)
                     + max(0, int(allocation.get("total_cpus") or 0))
                 )
+                aedt_reserved_memory_by_node[node_name] = (
+                    aedt_reserved_memory_by_node.get(node_name, 0)
+                    + max(0, int(allocation.get("total_memory_mb") or 0))
+                )
                 if allocation.get("state") == AllocationStatus.PENDING.value:
                     aedt_pending_cpus_by_node[node_name] = (
                         aedt_pending_cpus_by_node.get(node_name, 0)
                         + max(0, int(allocation.get("total_cpus") or 0))
+                    )
+                    aedt_pending_memory_by_node[node_name] = (
+                        aedt_pending_memory_by_node.get(node_name, 0)
+                        + max(0, int(allocation.get("total_memory_mb") or 0))
                     )
         dynamic_warm_gpu_count = wants_gpu and resource_pool.startswith("gpu:") and int(gpus or 0) <= 0
         target_gpu_count = max(1, int(gpus or self.gpu_prewarm_gpus_per_allocation))
@@ -7228,6 +7248,7 @@ class Scheduler:
         reserved_nodes = self.reserved_allocation_nodes()
         for node in nodes:
             node_free_cpus_for_shape = node.sched_free_cpus if wants_gpu else node.effective_free_cpus
+            node_free_memory_for_shape = max(0, int(node.free_memory_mb))
             if aedt_pool_node_sharing:
                 # pestat already reflects running Slurm jobs, while the DB also
                 # includes pinned pending allocations not visible there yet.
@@ -7245,6 +7266,23 @@ class Scheduler:
                         - aedt_pending_cpus_by_node.get(node.hostname, 0),
                     ),
                     aggregate_free,
+                )
+                # Running jobs are already reflected in pestat's free memory,
+                # while pinned pending jobs are not.  The aggregate reservation
+                # bound also protects against actual free memory lagging behind
+                # Slurm's committed memory accounting.
+                aggregate_free_memory = max(
+                    0,
+                    int(node.memory_mb)
+                    - aedt_reserved_memory_by_node.get(node.hostname, 0),
+                )
+                node_free_memory_for_shape = min(
+                    max(
+                        0,
+                        node_free_memory_for_shape
+                        - aedt_pending_memory_by_node.get(node.hostname, 0),
+                    ),
+                    aggregate_free_memory,
                 )
             if node.state not in {"idle", "mix"} or node_free_cpus_for_shape <= 0:
                 continue
@@ -7327,40 +7365,46 @@ class Scheduler:
                 requested_cpu_floor = int(requested_cpus or 0)
                 if requested_cpu_floor and cpu_capacity < requested_cpu_floor:
                     continue
-                if node_is_gpu_partition:
+                if aedt_pool_node_sharing:
+                    target_cpu_budget = min(
+                        cpu_capacity,
+                        max(
+                            aedt_session_cpus,
+                            int(self.allocation_cpus or cpu_capacity),
+                        ),
+                    )
+                    session_count = min(
+                        target_cpu_budget // aedt_session_cpus,
+                        available_cpus // aedt_session_cpus,
+                        node_free_memory_for_shape // aedt_session_memory_mb,
+                    )
+                    if session_count <= 0:
+                        continue
+                    cpus = session_count * aedt_session_cpus
+                    memory_mb = session_count * aedt_session_memory_mb
+                elif node_is_gpu_partition:
                     minimum_pool_cpus = max(1, requested_cpu_floor)
                     if available_cpus < minimum_pool_cpus:
                         continue
                     cpus = available_cpus
                 else:
                     target_pool_cpus = min(max(1, int(self.allocation_cpus or cpu_capacity)), cpu_capacity)
-                    if aedt_pool_node_sharing and requested_cpu_floor > 0:
-                        # Prefer the normal 64-CPU pool, but use the largest
-                        # complete session multiple that fits a fragmented
-                        # node (52/39/26/13 for the current 13-CPU footprint).
-                        cpus = target_pool_cpus
-                        if available_cpus < target_pool_cpus:
-                            cpus = (
-                                available_cpus // requested_cpu_floor
-                            ) * requested_cpu_floor
-                        if cpus < requested_cpu_floor:
-                            continue
-                    else:
-                        minimum_pool_cpus = max(
-                            requested_cpu_floor, target_pool_cpus
-                        )
-                        if available_cpus < minimum_pool_cpus:
-                            continue
-                        cpus = minimum_pool_cpus
+                    minimum_pool_cpus = max(
+                        requested_cpu_floor, target_pool_cpus
+                    )
+                    if available_cpus < minimum_pool_cpus:
+                        continue
+                    cpus = minimum_pool_cpus
             elif wants_gpu or exclusive_node:
                 cpus = minimum_cpus or self.allocation_cpus or available_cpus
             else:
                 cpus = self.allocation_cpus or available_cpus
             cpus = max(1, min(cpus, available_cpus))
-            if requested_memory_mb and node.free_memory_mb < requested_memory_mb:
-                continue
-            memory_mb = requested_memory_mb or self._memory_mb(self.allocation_memory) or node.free_memory_mb
-            memory_mb = max(1024, min(memory_mb, node.free_memory_mb))
+            if not aedt_pool_node_sharing:
+                if requested_memory_mb and node.free_memory_mb < requested_memory_mb:
+                    continue
+                memory_mb = requested_memory_mb or self._memory_mb(self.allocation_memory) or node.free_memory_mb
+                memory_mb = max(1024, min(memory_mb, node.free_memory_mb))
             if cpus > 0 and memory_mb > 0:
                 cpu_profile = CPU_PROFILES_BY_PARTITION.get(node.partition, {})
                 cpu_score = int(inventory.get("cpu_score") or cpu_profile.get("cpu_score") or 0)
@@ -7532,7 +7576,24 @@ class Scheduler:
             int(requested_cpus or 0),
             fallback_gpu_cpu_floor,
         )
-        if wants_shared_cpu_pool and fallback_cpu_capacity:
+        if aedt_pool_node_sharing:
+            target_cpu_budget = max(
+                aedt_session_cpus,
+                int(self.allocation_cpus or fallback_cpu_capacity or aedt_session_cpus),
+            )
+            if fallback_cpu_capacity:
+                target_cpu_budget = min(target_cpu_budget, fallback_cpu_capacity)
+            session_count = target_cpu_budget // aedt_session_cpus
+            if fallback_memory_capacity:
+                session_count = min(
+                    session_count,
+                    fallback_memory_capacity // aedt_session_memory_mb,
+                )
+            if session_count <= 0:
+                return None
+            fallback_cpus = session_count * aedt_session_cpus
+            fallback_memory_mb = session_count * aedt_session_memory_mb
+        elif wants_shared_cpu_pool and fallback_cpu_capacity:
             fallback_target_cpus = min(
                 fallback_cpu_capacity,
                 max(1, int(self.allocation_cpus or fallback_cpu_capacity)),
@@ -7551,7 +7612,14 @@ class Scheduler:
             "partition": partition,
             "node_name": "",
             "cpus": fallback_cpus,
-            "memory_mb": requested_memory_mb or self._memory_mb(self.allocation_memory) or fallback_memory_capacity or 16384,
+            "memory_mb": (
+                fallback_memory_mb
+                if aedt_pool_node_sharing
+                else requested_memory_mb
+                or self._memory_mb(self.allocation_memory)
+                or fallback_memory_capacity
+                or 16384
+            ),
             "gpus": target_gpu_count if wants_gpu else 0,
             "gpu_model": (target_models[0] if target_models else "") if wants_gpu else "",
             "exclusive_node": exclusive_node,
