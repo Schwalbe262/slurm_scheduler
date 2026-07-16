@@ -31,8 +31,9 @@ from .aedt_automation_lock import (
 )
 
 
-# Leave one HTTP-timeout/backoff margin beyond the required five-minute outage.
-DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS = 360.0
+# Cover a full 15-minute relay outage plus one in-flight 30-second HTTP
+# timeout and bounded retry jitter after the relay becomes reachable again.
+DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS = 1200.0
 CONTROL_PLANE_OUTAGE_ENV = "AEDT_SESSION_HOST_CONTROL_PLANE_OUTAGE_SECONDS"
 ARTIFACT_ROOT_ENV = "AEDT_SESSION_HOST_ARTIFACT_ROOT"
 DSO_PROFILE_ENV = "AEDT_SESSION_HOST_DSO_PROFILE"
