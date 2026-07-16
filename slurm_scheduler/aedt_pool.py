@@ -5321,9 +5321,13 @@ class AedtPoolService:
                     WHERE state = 'unhealthy'
                       AND (
                           (
-                              failure_message LIKE 'host native liveness suspect:%'
+                              (
+                                  failure_message LIKE 'host native liveness suspect:%'
+                                  OR quarantine_reason = 'confirmed_aedt_death'
+                              )
                               AND COALESCE(
-                                  drain_requested_at, last_heartbeat_at,
+                                  drain_requested_at, last_fault_at,
+                                  last_heartbeat_at,
                                   started_at, created_at
                               ) < ?
                               AND NOT EXISTS (

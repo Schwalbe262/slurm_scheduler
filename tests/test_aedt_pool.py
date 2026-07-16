@@ -1836,6 +1836,69 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             allocation["drain_reason"], UNHEALTHY_ALLOCATION_RECYCLE_REASON
         )
 
+    def test_confirmed_dead_idle_session_reaps_after_unhealthy_grace(self) -> None:
+        lease, lease_token = self.request(
+            "confirmed-dead-idle",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        session_id = int(session["id"])
+        self.service.release_lease(int(lease["id"]), lease_token)
+        released = self.service.complete_release(
+            session_id,
+            host_token,
+            int(lease["id"]),
+            success=True,
+        )
+        self.assertEqual(released["state"], "released")
+
+        dead = self.service.report_session_fault(
+            session_id,
+            host_token,
+            kind="confirmed_aedt_death",
+            failure_message="Desktop process identity is gone",
+        )
+        self.assertEqual(dead["state"], "unhealthy")
+        self.assertEqual(dead["quarantine_reason"], "confirmed_aedt_death")
+        self.assertIsNotNone(dead["drain_requested_at"])
+
+        self.clock.advance(
+            self.service.config().unhealthy_recycle_grace_seconds - 1
+        )
+        self.service.reconcile(execute=True)
+        self.assertEqual(self.service.get_session(session_id)["state"], "unhealthy")
+
+        self.clock.advance(2)
+        self.service.reconcile(execute=True)
+        self.assertEqual(self.service.get_session(session_id)["state"], "failed")
+
+    def test_confirmed_dead_session_keeps_live_owner_until_it_settles(self) -> None:
+        lease, _lease_token = self.request(
+            "confirmed-dead-live-owner",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        session_id = int(session["id"])
+        self.assertIn(
+            self.service.get_lease(int(lease["id"]))["state"],
+            {"leased", "attaching", "active", "releasing"},
+        )
+
+        self.service.report_session_fault(
+            session_id,
+            host_token,
+            kind="confirmed_aedt_death",
+            failure_message="Desktop process identity is gone",
+        )
+        self.clock.advance(
+            self.service.config().unhealthy_recycle_grace_seconds + 1
+        )
+        self.service.reconcile(execute=True)
+
+        self.assertEqual(self.service.get_session(session_id)["state"], "unhealthy")
+
     def test_durable_request_replays_terminal_or_abandoned_intent_with_new_token(self) -> None:
         first_token = "first-client-token-0001"
         first, _ = self.service.request_lease(
