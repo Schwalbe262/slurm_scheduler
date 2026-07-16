@@ -14,7 +14,7 @@ import traceback
 import uuid
 from bisect import bisect_right
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -620,6 +620,17 @@ class Scheduler:
         self._ssh_executor = ThreadPoolExecutor(
             max_workers=self.ssh_parallelism, thread_name_prefix="ssh-fanout"
         )
+        # A timed-out task can spend up to a minute in the best-effort
+        # node-side reap after its login-side wrapper is killed.  Do not hold
+        # the scheduler tick on that remote cleanup.  The task deliberately
+        # remains RUNNING (and therefore keeps its allocation capacity
+        # reserved) until its future completes, so a replacement cannot be
+        # admitted on top of a solver that has not been reaped yet.
+        self._timed_out_task_cancel_executor = ThreadPoolExecutor(
+            max_workers=self.ssh_parallelism,
+            thread_name_prefix="timed-out-task-cancel",
+        )
+        self._timed_out_task_cancellations: dict[int, tuple[dict, Any]] = {}
         self._terminal_aedt_workspace_cleanup_executor = ThreadPoolExecutor(
             max_workers=max(1, min(4, len(self.accounts))),
             thread_name_prefix="aedt-workspace-cleanup",
@@ -664,6 +675,9 @@ class Scheduler:
         if backup_thread and backup_thread is not threading.current_thread():
             backup_thread.join()
         self._ssh_executor.shutdown(wait=False, cancel_futures=True)
+        self._timed_out_task_cancel_executor.shutdown(
+            wait=False, cancel_futures=True
+        )
         self._terminal_aedt_workspace_cleanup_executor.shutdown(
             wait=False, cancel_futures=True
         )
@@ -2628,6 +2642,7 @@ class Scheduler:
             )
 
     def refresh_tasks(self, max_tasks: int | None = None) -> None:
+        self._drain_timed_out_task_cancellations()
         accounts_by_name = {account.name: account for account in self.accounts}
         candidates = [
             task
@@ -2639,7 +2654,7 @@ class Scheduler:
         by_account: dict[str, list[dict]] = {}
         for task in self.tasks_to_refresh(candidates, max_tasks=max_tasks):
             if self.task_timed_out(task):
-                self.cancel_timed_out_task(task)
+                self._schedule_timed_out_task_cancellation(task)
                 continue
             if task["status"] == TaskStatus.ATTACHING.value and not task.get("exit_code_path"):
                 continue
@@ -2668,6 +2683,10 @@ class Scheduler:
                 if probe is None:
                     continue
                 self._apply_task_probe(task, probe, client)
+        # Fake/fast clients commonly finish before the probe fan-out returns;
+        # a single bounded wait preserves prompt terminalization without ever
+        # making a real remote reap part of the tick's critical path.
+        self._drain_timed_out_task_cancellations(wait_seconds=0.1)
         self.recalculate_allocation_capacity()
 
     def _apply_task_probe(self, task: dict, probe: TaskProbe, client) -> None:
@@ -2759,23 +2778,78 @@ class Scheduler:
             return False
         return (self._now() - started).total_seconds() >= timeout
 
-    def cancel_timed_out_task(self, task: dict) -> None:
+    def _cancel_timed_out_task_remote(
+        self,
+        account: AccountConfig,
+        task: dict,
+        allocation_job_id: str,
+    ) -> None:
+        self.client_factory(account).cancel_task(task, allocation_job_id)
+
+    def _schedule_timed_out_task_cancellation(self, task: dict) -> bool:
+        task_id = int(task.get("id") or 0)
+        if task_id <= 0 or task_id in self._timed_out_task_cancellations:
+            return False
         account = self.account_by_name(str(task.get("account_name") or ""))
-        if account:
+        if not account:
+            self._finalize_timed_out_task(task)
+            return True
+        allocation_job_id = self._task_allocation_job_id(task)
+        future = self._timed_out_task_cancel_executor.submit(
+            self._cancel_timed_out_task_remote,
+            account,
+            dict(task),
+            allocation_job_id,
+        )
+        self._timed_out_task_cancellations[task_id] = (dict(task), future)
+        return True
+
+    def _drain_timed_out_task_cancellations(
+        self, wait_seconds: float = 0.0
+    ) -> int:
+        if wait_seconds > 0 and self._timed_out_task_cancellations:
+            wait_futures(
+                [item[1] for item in self._timed_out_task_cancellations.values()],
+                timeout=max(0.0, float(wait_seconds)),
+            )
+        finalized = 0
+        for task_id, (task, future) in list(
+            self._timed_out_task_cancellations.items()
+        ):
+            if not future.done():
+                continue
+            self._timed_out_task_cancellations.pop(task_id, None)
             try:
-                self._client(account).cancel_task(task, self._task_allocation_job_id(task))
+                future.result()
             except Exception as exc:
-                LOGGER.warning("failed to cancel timed out task %s remotely: %s", task["id"], exc)
-        self.db.update_task(
-            task["id"],
+                LOGGER.warning(
+                    "failed to cancel timed out task %s remotely: %s",
+                    task_id,
+                    exc,
+                )
+            if self._finalize_timed_out_task(task):
+                finalized += 1
+        return finalized
+
+    def _finalize_timed_out_task(self, task: dict) -> bool:
+        updated = self.db.update_task_if_status(
+            int(task["id"]),
+            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value],
             status=TaskStatus.FAILED.value,
             failure_message=f"task timed out after {int(task.get('timeout_seconds') or 0)}s",
             exit_code=124,
             finished_at="CURRENT_TIMESTAMP",
         )
+        if not updated:
+            return False
         self.on_task_terminal(task, "timed out")
         self.close_allocation_after_exclusive_task(task)
-        self.recalculate_allocation_capacity()
+        return True
+
+    def cancel_timed_out_task(self, task: dict) -> None:
+        """Compatibility entry point; remote cleanup is intentionally async."""
+        self._schedule_timed_out_task_cancellation(task)
+        self._drain_timed_out_task_cancellations(wait_seconds=0.1)
 
     def close_allocation_after_exclusive_task(self, task: dict) -> None:
         if not int(task.get("exclusive_node") or 0):
@@ -5894,6 +5968,18 @@ class Scheduler:
         )
         live_states = {AllocationStatus.WARM.value, AllocationStatus.ACTIVE.value, AllocationStatus.DRAINING.value}
         command = self._orphan_process_sweep_shell(patterns, live_ids, self.orphan_process_min_age_seconds)
+        # The sweep scans every process owned by one Unix account on one node,
+        # regardless of which Slurm allocation supplied the overlapping srun.
+        # Running it once per allocation repeated the exact same scan whenever
+        # an account had co-located allocations.  Group those allocations and
+        # use the remaining jobs only as fallbacks if the preferred job has
+        # already vanished.
+        grouped: dict[tuple[str, str], list[dict]] = {}
+        state_rank = {
+            AllocationStatus.ACTIVE.value: 0,
+            AllocationStatus.WARM.value: 1,
+            AllocationStatus.DRAINING.value: 2,
+        }
         for allocation in self.db.list_allocations(limit=500):
             if allocation["state"] not in live_states:
                 continue
@@ -5902,16 +5988,78 @@ class Scheduler:
             account = self.account_by_name(str(allocation.get("account_name") or ""))
             if not node or not job_id or not account:
                 continue
-            srun = f"srun --jobid={shlex.quote(job_id)} --overlap bash -lc {shlex.quote(command)}"
+            grouped.setdefault((account.name, node), []).append(allocation)
+
+        for allocations in grouped.values():
+            allocations.sort(
+                key=lambda item: (
+                    state_rank.get(str(item.get("state") or ""), 99),
+                    -int(item.get("id") or 0),
+                )
+            )
+
+        futures = {
+            key: self._ssh_executor.submit(
+                self._sweep_orphan_process_group,
+                self.account_by_name(key[0]),
+                key[1],
+                allocations,
+                command,
+            )
+            for key, allocations in grouped.items()
+        }
+        for (account_name, node), future in futures.items():
+            try:
+                result = future.result()
+            except Exception as exc:
+                LOGGER.warning(
+                    "orphan process sweep failed on %s/%s: %s",
+                    account_name,
+                    node,
+                    exc,
+                )
+                continue
+            last = (result.stdout or "").strip().splitlines()[-1:] or [""]
+            if last[0].startswith("orphan_killed=") and last[0] != "orphan_killed=0":
+                LOGGER.info(
+                    "orphan process sweep on %s/%s: %s",
+                    account_name,
+                    node,
+                    last[0],
+                )
+
+    @staticmethod
+    def _sweep_orphan_process_group(
+        account: AccountConfig | None,
+        node: str,
+        allocations: list[dict],
+        command: str,
+    ) -> Any:
+        if not account:
+            raise RuntimeError("orphan sweep account is not configured")
+        errors: list[str] = []
+        for allocation in allocations:
+            job_id = str(allocation.get("slurm_job_id") or "").strip()
+            if not job_id:
+                continue
+            srun = (
+                f"srun --jobid={shlex.quote(job_id)} --overlap "
+                f"bash -lc {shlex.quote(command)}"
+            )
             try:
                 with SSHSession(account, default_timeout=90) as ssh:
                     result = ssh.run(srun, timeout=80)
             except Exception as exc:
-                LOGGER.warning("orphan process sweep failed on %s/%s: %s", account.name, node, exc)
+                errors.append(f"job {job_id}: {exc}")
                 continue
-            last = (result.stdout or "").strip().splitlines()[-1:] or [""]
-            if last[0].startswith("orphan_killed=") and last[0] != "orphan_killed=0":
-                LOGGER.info("orphan process sweep on %s/%s: %s", account.name, node, last[0])
+            if result.exit_code == 0:
+                return result
+            detail = result.stderr.strip() or result.stdout.strip() or "remote exit"
+            errors.append(f"job {job_id}: exit {result.exit_code}: {detail[:200]}")
+        raise RuntimeError(
+            "; ".join(errors)
+            or f"no usable live allocation for {account.name}/{node}"
+        )
 
     def enforce_fea_node_cpu_cap(self) -> None:
         """Retroactive side of the per-allocation FEA CPU cap: allocations that

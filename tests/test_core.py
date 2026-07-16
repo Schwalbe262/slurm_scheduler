@@ -4824,6 +4824,163 @@ class SchedulerTests(unittest.TestCase):
         self.assertIn("timed out", task["failure_message"])
         self.assertEqual(FakeClient.cancelled_tasks, [task_id])
 
+    def test_slow_timed_out_task_cancel_does_not_block_refresh_or_release_capacity(self) -> None:
+        release = threading.Event()
+        cancel_started = threading.Event()
+
+        class SlowCancelClient(FakeClient):
+            def cancel_task(self, task: dict, allocation_job_id: str = "") -> None:
+                cancel_started.set()
+                release.wait(timeout=5)
+                super().cancel_task(task, allocation_job_id)
+
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=4,
+            total_memory_mb=8192,
+            resource_pool="cpu",
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="slow-timeout-allocation",
+        )
+        task_id = self.db.create_task(
+            TaskCreate(
+                "slow-timeout",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=1024,
+                timeout_seconds=1,
+            )
+        )
+        self.db.update_task(
+            task_id,
+            status=TaskStatus.RUNNING.value,
+            allocation_id=allocation_id,
+            account_name="a",
+            wrapper_pid="1234",
+            started_at="2000-01-01 00:00:00",
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=SlowCancelClient,
+            ssh_parallelism=2,
+        )
+        try:
+            started = time.monotonic()
+            scheduler.refresh_tasks()
+            elapsed = time.monotonic() - started
+
+            self.assertTrue(cancel_started.wait(timeout=1))
+            self.assertLess(elapsed, 1.0)
+            self.assertEqual(
+                self.db.get_task(task_id)["status"], TaskStatus.RUNNING.value
+            )
+            allocation = self.db.get_allocation(allocation_id)
+            self.assertEqual(allocation["state"], AllocationStatus.ACTIVE.value)
+            self.assertEqual(allocation["free_cpus"], 0)
+
+            release.set()
+            deadline = time.monotonic() + 2
+            while scheduler._timed_out_task_cancellations and time.monotonic() < deadline:
+                time.sleep(0.01)
+                scheduler._drain_timed_out_task_cancellations()
+            scheduler.recalculate_allocation_capacity()
+            self.assertEqual(
+                self.db.get_task(task_id)["status"], TaskStatus.FAILED.value
+            )
+            self.assertEqual(self.db.get_task(task_id)["exit_code"], 124)
+            allocation = self.db.get_allocation(allocation_id)
+            self.assertEqual(allocation["state"], AllocationStatus.WARM.value)
+            self.assertEqual(allocation["free_cpus"], 4)
+        finally:
+            release.set()
+            scheduler.stop()
+
+    def test_orphan_process_sweep_deduplicates_account_node_and_runs_groups_concurrently(self) -> None:
+        allocations = [
+            ("a", "n001", AllocationStatus.ACTIVE.value, "job-active-fails"),
+            ("a", "n001", AllocationStatus.WARM.value, "job-warm-fallback"),
+            ("a", "n001", AllocationStatus.DRAINING.value, "job-unused-fallback"),
+            ("a", "n002", AllocationStatus.ACTIVE.value, "job-a-n002"),
+            ("b", "n001", AllocationStatus.ACTIVE.value, "job-b-n001"),
+        ]
+        for account_name, node_name, state, job_id in allocations:
+            allocation_id = self.db.create_allocation(
+                account_name=account_name,
+                partition="cpu1",
+                node_name=node_name,
+                total_cpus=4,
+                total_memory_mb=8192,
+            )
+            self.db.update_allocation(
+                allocation_id,
+                state=state,
+                slurm_job_id=job_id,
+            )
+
+        class SweepSession:
+            commands: list[str] = []
+            active = 0
+            max_active = 0
+            lock = threading.Lock()
+
+            def __init__(self, account, default_timeout=None):
+                self.account = account
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def run(self, command, timeout=None):
+                with type(self).lock:
+                    type(self).commands.append(command)
+                    type(self).active += 1
+                    type(self).max_active = max(
+                        type(self).max_active, type(self).active
+                    )
+                try:
+                    time.sleep(0.05)
+                    if "--jobid=job-active-fails" in command:
+                        return CommandResult("", "job vanished", 1)
+                    return CommandResult("orphan_killed=0\n", "", 0)
+                finally:
+                    with type(self).lock:
+                        type(self).active -= 1
+
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            orphan_process_sweep_enabled=True,
+            orphan_process_sweep_interval_seconds=600,
+            orphan_process_name_patterns=["ansysedt"],
+            ssh_parallelism=4,
+        )
+        try:
+            with mock.patch("slurm_scheduler.scheduler.SSHSession", SweepSession):
+                scheduler.sweep_orphan_processes_if_due()
+            commands = SweepSession.commands
+            self.assertEqual(len(commands), 4)
+            self.assertTrue(
+                any("--jobid=job-warm-fallback" in command for command in commands)
+            )
+            self.assertFalse(
+                any("--jobid=job-unused-fallback" in command for command in commands)
+            )
+            self.assertGreaterEqual(SweepSession.max_active, 2)
+        finally:
+            scheduler.stop()
+
     def test_refresh_tasks_caps_large_fea_set_and_rotates(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",
