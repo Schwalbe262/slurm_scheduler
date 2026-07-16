@@ -8991,6 +8991,158 @@ class SchedulerTests(unittest.TestCase):
             above_max.fea_effective_worker_limit(allocation, task, current_workers=10, base_limit=32), 24
         )
 
+    def test_multi_account_allocations_share_one_node_memory_shadow(self) -> None:
+        allocation_ids = []
+        for account_name in ("a", "b"):
+            allocation_id = self.db.create_allocation(
+                account_name=account_name,
+                partition="cpu1",
+                node_name="n-shared",
+                total_cpus=64,
+                total_memory_mb=700000,
+            )
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.ACTIVE.value,
+                slurm_job_id=f"alloc-{account_name}",
+            )
+            allocation_ids.append(allocation_id)
+            for index in range(8):
+                task_id = self.db.create_task(
+                    TaskCreate(
+                        f"fea-{account_name}-{index}",
+                        "~/case",
+                        "run",
+                        cpus=4,
+                        memory_mb=65536,
+                        scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                    )
+                )
+                self.db.update_task(
+                    task_id,
+                    status=TaskStatus.RUNNING.value,
+                    account_name=account_name,
+                    allocation_id=allocation_id,
+                    attached_at=days_ago(1),
+                    started_at=days_ago(1),
+                )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n-shared cpu1 mix 8 64 0.0 1000000 900000 busy\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            fea_node_requested_cpu_factor=2.0,
+        )
+        queued_shape = {
+            "id": 999,
+            "cpus": 4,
+            "memory_mb": 65536,
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+        }
+
+        pressure = scheduler.fea_node_resource_pressures()["n-shared"]
+        self.assertEqual(pressure["allocation_count"], 2)
+        self.assertEqual(pressure["requested_cpus"], 64)
+        self.assertEqual(pressure["requested_memory_mb"], 16 * 65536)
+        # Each allocation still has local baseline room, but their combined
+        # peak declaration already exceeds the one physical 1,000,000-MB node.
+        for allocation_id in allocation_ids:
+            allocation = self.db.get_allocation(allocation_id)
+            self.assertGreater(
+                scheduler.fea_node_cpu_cap_remaining(allocation, queued_shape),
+                0,
+            )
+            self.assertEqual(
+                scheduler.fea_node_shadow_cap_remaining(
+                    allocation, queued_shape
+                ),
+                0,
+            )
+            self.assertEqual(
+                scheduler.fit_slots_for_allocation(allocation, queued_shape),
+                0,
+            )
+
+    def test_multi_account_allocations_share_one_node_cpu_shadow(self) -> None:
+        allocation_ids = []
+        for account_name in ("a", "b"):
+            allocation_id = self.db.create_allocation(
+                account_name=account_name,
+                partition="cpu1",
+                node_name="n-shared-cpu",
+                total_cpus=64,
+                total_memory_mb=700000,
+            )
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.ACTIVE.value,
+                slurm_job_id=f"alloc-{account_name}",
+            )
+            allocation_ids.append(allocation_id)
+            for index in range(8):
+                task_id = self.db.create_task(
+                    TaskCreate(
+                        f"cpu-fea-{account_name}-{index}",
+                        "~/case",
+                        "run",
+                        cpus=4,
+                        memory_mb=4096,
+                        scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                    )
+                )
+                self.db.update_task(
+                    task_id,
+                    status=TaskStatus.RUNNING.value,
+                    account_name=account_name,
+                    allocation_id=allocation_id,
+                    attached_at=days_ago(1),
+                    started_at=days_ago(1),
+                )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n-shared-cpu cpu1 mix 8 64 0.0 1000000 900000 busy\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            fea_node_requested_cpu_factor=1.0,
+        )
+        queued_shape = {
+            "id": 999,
+            "cpus": 4,
+            "memory_mb": 4096,
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+        }
+
+        for allocation_id in allocation_ids:
+            allocation = self.db.get_allocation(allocation_id)
+            # Local accounting sees 32/64 requested on each allocation; the
+            # node shadow correctly sees 64/64 across both accounts.
+            self.assertEqual(
+                scheduler.fea_node_cpu_cap_remaining(allocation, queued_shape),
+                8,
+            )
+            self.assertEqual(
+                scheduler.fea_node_shadow_cap_remaining(
+                    allocation, queued_shape
+                ),
+                0,
+            )
+            self.assertEqual(
+                scheduler.fit_slots_for_allocation(allocation, queued_shape),
+                0,
+            )
+
     def test_exact_aedt_host_bypasses_solver_fit_after_pool_capacity_reservation(self) -> None:
         allocation_id = self.create_fea_allocation("n-host", total_cpus=64)
         self.create_running_fea_tasks(allocation_id, count=16, cpus=4)

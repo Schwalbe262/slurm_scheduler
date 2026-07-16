@@ -361,6 +361,7 @@ class Scheduler:
         self._tick_attach_workers_by_node: dict[str, int] = {}
         self._fea_pressures_cache: tuple[int, dict[str, dict[str, int]]] | None = None
         self._fea_alloc_pressures_cache: tuple[int, dict[int, dict[str, int]]] | None = None
+        self._fea_node_resources_cache: tuple[int, dict[str, dict[str, int]]] | None = None
         self._pestat_nodes_cache: tuple[int, dict[str, dict]] | None = None
         self._fea_overload_since_by_node: dict[str, float] = {}
         self._fea_overload_scaled_nodes: set[str] = set()
@@ -4716,6 +4717,13 @@ class Scheduler:
                     allocation.get("_reserved_pooled_aedt_client_slots") or 0
                 )
                 slots = min(slots, max(0, density_cap - active - reserved))
+            node_shadow_slots = self.fea_node_shadow_cap_remaining(
+                allocation,
+                task,
+                reservation_allocations=reservation_allocations,
+            )
+            if node_shadow_slots is not None:
+                slots = min(slots, node_shadow_slots)
             return max(0, slots - reserved_slots)
         memory_slots = int(allocation.get("free_memory_mb") or 0) // max(1, int(task.get("memory_mb") or 1))
         if self.task_requires_gpu(task):
@@ -4960,6 +4968,7 @@ class Scheduler:
         # New ATTACHING rows change both the pressure and young-footprint views.
         self._fea_pressures_cache = None
         self._fea_alloc_pressures_cache = None
+        self._fea_node_resources_cache = None
         self._fea_footprint_cache = None
 
     def fea_stale_node_recently_ok(self, allocation: dict) -> bool:
@@ -6171,6 +6180,7 @@ class Scheduler:
         policy the scheduler has since corrected, not by its own failure."""
         self._fea_pressures_cache = None
         self._fea_alloc_pressures_cache = None
+        self._fea_node_resources_cache = None
         self._fea_footprint_cache = None
         self._active_profile_sets_cache = None
         self.record_event(
@@ -6247,6 +6257,160 @@ class Scheduler:
         budget = owned * self.fea_node_requested_cpu_factor - requested
         return max(0, int(budget // max(1, int(task.get("cpus") or 1))))
 
+    def fea_node_resource_pressures(self) -> dict[str, dict[str, int]]:
+        """Full declared FEA resources grouped by physical hostname.
+
+        Allocation-local ``free_cpus`` and ``free_memory_mb`` intentionally do
+        not debit bursty FEA workers because measured load and memory govern
+        their overcommit. When multiple account allocations land on one host,
+        however, each allocation must not treat the same physical CPU/RAM as a
+        private pool. This node-global shadow supplies that safety bound.
+        """
+        cached = self._fea_node_resources_cache
+        if cached is not None and cached[0] == self._tick_seq:
+            return cached[1]
+
+        live_states = {
+            AllocationStatus.WARM.value,
+            AllocationStatus.ACTIVE.value,
+            AllocationStatus.DRAINING.value,
+        }
+        allocation_node_by_id: dict[int, str] = {}
+        resources: dict[str, dict[str, int]] = {}
+        for live_allocation in self.db.list_allocations(limit=500):
+            if live_allocation["state"] not in live_states:
+                continue
+            node_name = str(live_allocation.get("node_name") or "").strip()
+            if not node_name:
+                continue
+            allocation_node_by_id[int(live_allocation["id"])] = node_name
+            entry = resources.setdefault(
+                node_name,
+                {
+                    "allocation_count": 0,
+                    "owned_cpus": 0,
+                    "owned_memory_mb": 0,
+                    "requested_cpus": 0,
+                    "requested_memory_mb": 0,
+                },
+            )
+            entry["allocation_count"] += 1
+            entry["owned_cpus"] += max(
+                0, int(live_allocation.get("total_cpus") or 0)
+            )
+            entry["owned_memory_mb"] += max(
+                0, int(live_allocation.get("total_memory_mb") or 0)
+            )
+
+        project_cpus = self.db.aedt_pool_project_cpus()
+        for active_task in self.db.list_tasks_by_statuses(
+            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
+        ):
+            if active_task["status"] not in {
+                TaskStatus.ATTACHING.value,
+                TaskStatus.RUNNING.value,
+            }:
+                continue
+            if not self.task_is_fea_bursty(active_task):
+                continue
+            if self.task_is_fea_infra(active_task):
+                continue
+            # Thin pooled clients consume the capacity already reserved by
+            # their exact AEDT session shape, so charging the client row again
+            # would double count it. Ordinary standalone FEA is charged fully.
+            if (
+                self.task_aedt_backend(active_task) == AedtBackend.POOLED.value
+                and int(active_task.get("cpus") or 0) < project_cpus
+            ):
+                continue
+            node_name = allocation_node_by_id.get(
+                int(active_task.get("allocation_id") or 0)
+            )
+            if not node_name:
+                continue
+            entry = resources[node_name]
+            entry["requested_cpus"] += max(
+                0, int(active_task.get("cpus") or 0)
+            )
+            entry["requested_memory_mb"] += max(
+                0, int(active_task.get("memory_mb") or 0)
+            )
+
+        self._fea_node_resources_cache = (self._tick_seq, resources)
+        return resources
+
+    def _node_memory_total(self, node_name: str) -> int:
+        if not node_name:
+            return 0
+        row = self.pestat_node_for_allocation(
+            {"node_name": node_name}, max_age_seconds=float("inf")
+        )
+        if row and int(row.get("memory_mb") or 0) > 0:
+            return int(row.get("memory_mb") or 0)
+        for inventory_row in self.db.list_node_inventory():
+            if str(inventory_row.get("node_name") or "") == node_name:
+                return int(inventory_row.get("memory_mb") or 0)
+        return 0
+
+    def fea_node_shadow_cap_remaining(
+        self,
+        allocation: dict,
+        task: dict,
+        reservation_allocations: list[dict] | None = None,
+    ) -> int | None:
+        """Slots remaining under the physical-node declared CPU/RAM shadow.
+
+        The additional cap applies only to co-located allocations. A single
+        allocation retains the existing measured bursty policy, while two or
+        more account allocations cannot each claim the same physical resource
+        as if it were private.
+        """
+        if self.task_is_fea_infra(task) or self.task_uses_reserved_aedt_pool_capacity(
+            allocation, task
+        ):
+            return None
+        if allocation.get("state") == AllocationStatus.PENDING.value:
+            return None
+        node_name = str(allocation.get("node_name") or "").strip()
+        if not node_name:
+            return None
+        pressure = self.fea_node_resource_pressures().get(node_name)
+        if not pressure or int(pressure.get("allocation_count") or 0) < 2:
+            return None
+
+        reserved_slots = self.reserved_fea_slots_for_node(
+            reservation_allocations, node_name
+        )
+        task_cpus = max(1, int(task.get("cpus") or 1))
+        task_memory_mb = max(1, int(task.get("memory_mb") or 1))
+        requested_cpus = int(pressure.get("requested_cpus") or 0) + (
+            reserved_slots * task_cpus
+        )
+        requested_memory_mb = int(
+            pressure.get("requested_memory_mb") or 0
+        ) + (reserved_slots * task_memory_mb)
+
+        owned_cpus = max(0, int(pressure.get("owned_cpus") or 0))
+        physical_cpus = self._node_cpu_total(node_name)
+        if physical_cpus > 0:
+            owned_cpus = min(owned_cpus, physical_cpus)
+        cpu_capacity = int(owned_cpus * self.fea_node_requested_cpu_factor)
+
+        owned_memory_mb = max(
+            0, int(pressure.get("owned_memory_mb") or 0)
+        )
+        physical_memory_mb = self._node_memory_total(node_name)
+        if physical_memory_mb > 0:
+            owned_memory_mb = min(owned_memory_mb, physical_memory_mb)
+
+        if cpu_capacity <= 0 or owned_memory_mb <= 0:
+            return 0
+        cpu_slots = max(0, (cpu_capacity - requested_cpus) // task_cpus)
+        memory_slots = max(
+            0, (owned_memory_mb - requested_memory_mb) // task_memory_mb
+        )
+        return min(cpu_slots, memory_slots)
+
     def handle_fea_memory_pressure(self) -> None:
         reclaimed = False
         for allocation in self.db.list_allocations(limit=500):
@@ -6294,6 +6458,7 @@ class Scheduler:
         )
         self._fea_pressures_cache = None
         self._fea_alloc_pressures_cache = None
+        self._fea_node_resources_cache = None
         self.record_event(
             "task_requeued",
             f"task {task.get('name') or task['id']} requeued after memory-pressure kill (attempt {attempts}/{self.fea_pressure_max_attempts})",
