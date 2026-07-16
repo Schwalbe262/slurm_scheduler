@@ -13,6 +13,7 @@ from starlette.requests import Request
 from slurm_scheduler.aedt_pool import AedtPoolService
 from slurm_scheduler.db import Database, TASK_COUNT_SAMPLE_RETENTION_SECONDS
 from slurm_scheduler.models import TaskCreate, TaskStatus
+from slurm_scheduler.pestat import PestatNode
 from slurm_scheduler.scheduler import Scheduler
 
 
@@ -431,6 +432,40 @@ class TaskCountHistoryRouteTests(unittest.TestCase):
         self.assertEqual(live["tasks"]["aedt_pool_sessions"], 1)
         self.assertEqual(live["tasks"]["aedt_pool_draining_sessions"], 1)
         self.assertEqual(live["tasks"]["aedt"], 2)
+
+    def test_dashboard_distinguishes_allocation_drain_from_physical_node_state(self) -> None:
+        allocation_id = self.app.state.db.create_allocation(
+            "a", "cpu", "cpu-a", 48, 512 * 1024
+        )
+        self.app.state.db.update_allocation(
+            allocation_id,
+            state="draining",
+            slurm_job_id="allocation-draining-node-mix",
+            drain_reason="AEDT pool solver fault quarantine",
+        )
+        self.app.state.db.replace_pestat_nodes(
+            [
+                PestatNode(
+                    hostname="cpu-a",
+                    partition="cpu",
+                    state="mix",
+                    cpu_used=24,
+                    cpu_total=64,
+                    cpu_load=20.0,
+                    memory_mb=1024 * 1024,
+                    free_memory_mb=512 * 1024,
+                )
+            ]
+        )
+
+        html = self.route_endpoint("/", "GET")(self.dashboard_request()).body.decode(
+            "utf-8"
+        )
+
+        self.assertIn("<th>Allocation State</th>", html)
+        self.assertIn("<th>Node State</th>", html)
+        self.assertIn('data-allocation-state="draining"', html)
+        self.assertIn('data-node-state="mix"', html)
 
     def test_dashboard_pages_large_active_population_without_hiding_rows(self) -> None:
         task_ids = [

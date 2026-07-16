@@ -724,12 +724,12 @@
     </div>
     <div class="table-scroll">
       <table>
-        <thead><tr><th>ID</th><th>State</th><th>Pool</th><th>Account</th><th>Node</th><th>FEA (alloc)</th><th>FEA CPU / owned</th><th>CPU Load</th><th>Node RAM</th><th>GPU</th><th>Slurm ID</th><th>Time</th><th>Action</th></tr></thead>
+        <thead><tr><th>ID</th><th>Allocation State</th><th>Pool</th><th>Account</th><th>Slurm Node</th><th>Node State</th><th>FEA (alloc)</th><th>FEA CPU / owned</th><th>CPU Load</th><th>Node RAM</th><th>GPU</th><th>Slurm ID</th><th>Time</th><th>Action</th></tr></thead>
         <tbody>
         {% for allocation in allocations %}
           <tr class="{{ 'warm-pool-row' if allocation.is_warm_pool else '' }}">
             <td>{{ allocation.id }}</td>
-            <td>{{ allocation.state }}</td>
+            <td data-allocation-state="{{ allocation.state }}" title="Scheduler allocation lifecycle state; this is not the physical Slurm node state">{{ allocation.state }}</td>
             <td>
               {{ allocation.resource_pool or "cpu" }}
               {% if allocation.is_warm_pool %}<span class="warm-pool-tag">warm</span>{% endif %}
@@ -745,6 +745,9 @@
               {% if allocation.node_name and allocation.partition and "," not in allocation.partition %}
                 <div class="muted">{{ allocation.partition }}</div>
               {% endif %}
+            </td>
+            <td data-node-state="{{ allocation.node_pestat_state or '' }}" title="Physical Slurm node state from the latest pestat observation">
+              {{ allocation.node_pestat_state or "unknown" }}
             </td>
             <td title="FEA tasks in this allocation (slurm job {{ allocation.slurm_job_id }})">{{ allocation.node_fea_worker_count if allocation.node_name else "" }}</td>
             <td class="mono-cell" title="Scheduler-owned running/attaching FEA requested CPU on {{ allocation.node_name }} / scheduler-owned CPU allocation cores on that node">
@@ -801,7 +804,7 @@
             </td>
           </tr>
         {% else %}
-          <tr><td colspan="13" class="muted">No active allocations.</td></tr>
+          <tr><td colspan="14" class="muted">No active allocations.</td></tr>
         {% endfor %}
         </tbody>
       </table>
