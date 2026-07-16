@@ -4704,6 +4704,29 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(shape["node_name"], "gpu-fast")
         self.assertEqual(shape["gpus"], 0)
 
+    def test_cpu_only_pool_rejects_gpu_partition_fallback(self) -> None:
+        inventory = parse_scontrol_nodes(
+            "NodeName=gpu-fast CPUTot=64 RealMemory=1024000 "
+            "Gres=gpu:a6000:4 GresUsed=gpu:a6000:0 State=IDLE Partitions=gpu5\n"
+        )
+        self.db.replace_node_inventory(inventory)
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "gpu-fast gpu5 idle 0 64 0.0 1024000 900000\n"
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+
+        shape = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            requested_cpus=12,
+            require_fea_eligible_node=True,
+            cpu_only_nodes=True,
+        )
+
+        self.assertIsNone(shape)
+
     def test_cpu_pool_can_disable_gpu_partition_candidates(self) -> None:
         inventory = parse_scontrol_nodes(
             "NodeName=cpu-old CPUTot=48 RealMemory=768000 Gres=(null) State=IDLE Partitions=cpu1\n"

@@ -4883,6 +4883,7 @@ class AedtRuntimeTests(AedtPoolTestCase):
             config.project_cpus * config.projects_per_session,
         )
         self.assertEqual(fake.open_calls[0]["requested_cpus"], 12)
+        self.assertTrue(fake.open_calls[0]["cpu_only_nodes"])
         self.assertLessEqual(self.service.config().node_cpu_factor, 2.0)
 
     def test_pending_dedicated_node_prevents_duplicate_scale_out(self) -> None:

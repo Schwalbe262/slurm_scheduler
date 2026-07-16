@@ -6016,6 +6016,10 @@ class AedtPoolRuntime:
                     config.project_cpus * config.projects_per_session
                 ),
                 require_fea_eligible_node=True,
+                # Desktop hosts are CPU-pool infrastructure.  Generic CPU work
+                # may borrow idle GPU nodes, but the long-lived AEDT pool must
+                # not consume GPU partitions as a fallback.
+                cpu_only_nodes=True,
             )
             if not allocation:
                 break
