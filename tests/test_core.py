@@ -5221,6 +5221,20 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(queued_shape["cpus"], 52)
         self.assertEqual(queued_shape["memory_mb"], 393216)
 
+        quota_shape = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            requested_cpus=13,
+            requested_memory_mb=98304,
+            require_fea_eligible_node=True,
+            cpu_only_nodes=True,
+            aedt_pool_node_sharing=True,
+            aedt_pool_max_sessions=2,
+        )
+        self.assertEqual(quota_shape["partition"], "cpu2")
+        self.assertEqual(quota_shape["node_name"], "")
+        self.assertEqual(quota_shape["cpus"], 26)
+        self.assertEqual(quota_shape["memory_mb"], 196608)
+
         scheduler.enforce_cpu_partition_allocation_limits()
         self.assertTrue(
             all(
@@ -5395,6 +5409,39 @@ class SchedulerTests(unittest.TestCase):
         )
 
         self.assertEqual(shape["node_name"], "cpu2-memory")
+        self.assertEqual(shape["cpus"], 26)
+        self.assertEqual(shape["memory_mb"], 196608)
+
+    def test_aedt_pool_shape_never_exceeds_exact_session_demand_quota(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "cpu2-quota cpu2 idle 0 256 0.0 1031519 900000\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            allocation_partition="cpu2",
+            allocation_cpus=64,
+            allocation_memory="768G",
+            fea_soft_memory_free_percent=0,
+            fea_hard_memory_free_percent=0,
+        )
+
+        shape = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            requested_cpus=13,
+            requested_memory_mb=98304,
+            require_fea_eligible_node=True,
+            cpu_only_nodes=True,
+            aedt_pool_node_sharing=True,
+            aedt_pool_max_sessions=2,
+        )
+
+        self.assertEqual(shape["node_name"], "cpu2-quota")
         self.assertEqual(shape["cpus"], 26)
         self.assertEqual(shape["memory_mb"], 196608)
 

@@ -7553,6 +7553,7 @@ class Scheduler:
         require_fea_eligible_node: bool = False,
         cpu_only_nodes: bool = False,
         aedt_pool_node_sharing: bool = False,
+        aedt_pool_max_sessions: int = 0,
     ) -> bool:
         return self.open_allocation_record(
             reason=reason,
@@ -7569,6 +7570,7 @@ class Scheduler:
             require_fea_eligible_node=require_fea_eligible_node,
             cpu_only_nodes=cpu_only_nodes,
             aedt_pool_node_sharing=aedt_pool_node_sharing,
+            aedt_pool_max_sessions=aedt_pool_max_sessions,
         ) is not None
 
     def open_allocation_record(
@@ -7587,6 +7589,7 @@ class Scheduler:
         require_fea_eligible_node: bool = False,
         cpu_only_nodes: bool = False,
         aedt_pool_node_sharing: bool = False,
+        aedt_pool_max_sessions: int = 0,
     ) -> dict | None:
         account = self.choose_account_for_allocation(
             preferred_accounts=preferred_accounts,
@@ -7607,6 +7610,7 @@ class Scheduler:
             require_fea_eligible_node=require_fea_eligible_node,
             cpu_only_nodes=cpu_only_nodes,
             aedt_pool_node_sharing=aedt_pool_node_sharing,
+            aedt_pool_max_sessions=aedt_pool_max_sessions,
         )
         if not shape:
             return None
@@ -8023,6 +8027,7 @@ class Scheduler:
         require_fea_eligible_node: bool = False,
         cpu_only_nodes: bool = False,
         aedt_pool_node_sharing: bool = False,
+        aedt_pool_max_sessions: int = 0,
     ) -> dict | None:
         inventory_by_node = {row["node_name"]: row for row in self.db.list_node_inventory()}
         nodes = [
@@ -8061,6 +8066,7 @@ class Scheduler:
         # into a 64-CPU/768-GiB allocation that can only host four sessions.
         aedt_session_cpus = int(requested_cpus or 0)
         aedt_session_memory_mb = int(requested_memory_mb or 0)
+        aedt_session_limit = max(0, int(aedt_pool_max_sessions or 0))
         if aedt_pool_node_sharing and (
             aedt_session_cpus <= 0 or aedt_session_memory_mb <= 0
         ):
@@ -8252,6 +8258,8 @@ class Scheduler:
                         available_cpus // aedt_session_cpus,
                         node_free_memory_for_shape // aedt_session_memory_mb,
                     )
+                    if aedt_session_limit:
+                        session_count = min(session_count, aedt_session_limit)
                     if session_count <= 0:
                         continue
                     cpus = session_count * aedt_session_cpus
@@ -8458,6 +8466,8 @@ class Scheduler:
             if fallback_cpu_capacity:
                 target_cpu_budget = min(target_cpu_budget, fallback_cpu_capacity)
             session_count = target_cpu_budget // aedt_session_cpus
+            if aedt_session_limit:
+                session_count = min(session_count, aedt_session_limit)
             if fallback_memory_capacity:
                 session_count = min(
                     session_count,

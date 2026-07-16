@@ -374,6 +374,18 @@ class AedtPoolGateTests(AedtPoolTestCase):
             plan["node_requests_by_account"],
             {account: 9 for account in accounts},
         )
+        self.assertEqual(
+            plan["node_request_session_counts_by_account"],
+            {
+                # Split each account's exact deficit across nine requests;
+                # never reserve a tenth phantom session.
+                accounts[0]: [4] * 8 + [3],
+                accounts[1]: [4] * 8 + [3],
+                accounts[2]: [4] * 8 + [3],
+                accounts[3]: [4] * 7 + [3, 3],
+                accounts[4]: [4] * 7 + [3, 3],
+            },
+        )
         self.assertEqual(plan["node_requests"], 45)
 
     def test_busy_mft_sessions_do_not_mask_motor_family_session_demand(self) -> None:
@@ -6406,9 +6418,28 @@ class AedtRuntimeCapacityTests(AedtPoolTestCase):
             config.project_memory_mb * config.projects_per_session,
         )
         self.assertTrue(fake.open_calls[0]["aedt_pool_node_sharing"])
+        self.assertEqual(fake.open_calls[0]["aedt_pool_max_sessions"], 1)
         self.assertFalse(fake.open_calls[0].get("exclusive_node", False))
         self.assertTrue(fake.open_calls[0]["cpu_only_nodes"])
         self.assertLessEqual(self.service.config().node_cpu_factor, 2.0)
+
+    def test_node_request_quota_matches_two_session_account_deficit(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=10,
+            target_projects=6,
+            projects_per_session=3,
+        )
+        self.make_operational()
+        for index in range(6):
+            self.request(f"two-session-deficit-{index}")
+        fake = FakeRuntimeScheduler()
+        runtime = AedtPoolRuntime(self.service, fake, interval_seconds=30)
+
+        plan = runtime.tick()
+
+        self.assertEqual(plan["node_request_session_counts_by_account"], {"": [2]})
+        self.assertEqual(plan["node_allocations_opened"], 1)
+        self.assertEqual(fake.open_calls[0]["aedt_pool_max_sessions"], 2)
 
     def test_runtime_interleaves_account_scale_out_across_ticks(self) -> None:
         self.make_operational()

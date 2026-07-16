@@ -6579,6 +6579,14 @@ class AedtPoolService:
             for account, count in unplaced_after_pending_by_account.items()
             if count > 0
         }
+        node_request_session_counts_by_account: dict[str, list[int]] = {}
+        for account, request_count in node_requests_by_account.items():
+            sessions = unplaced_after_pending_by_account[account]
+            whole, extra = divmod(sessions, request_count)
+            node_request_session_counts_by_account[account] = [
+                whole + (1 if index < extra else 0)
+                for index in range(request_count)
+            ]
         node_requests = sum(node_requests_by_account.values())
         if warm_spare_deficit and not warm_spare_status_reason:
             if demand_sessions + config.min_idle_sessions > config.max_sessions:
@@ -6635,6 +6643,9 @@ class AedtPoolService:
             "pending_node_session_capacity_by_account": pending_capacity_by_account,
             "node_requests": node_requests,
             "node_requests_by_account": node_requests_by_account,
+            "node_request_session_counts_by_account": (
+                node_request_session_counts_by_account
+            ),
             "sessions_per_new_node": sessions_per_new_node,
             "state_counts": state_counts,
             "lease_counts": lease_counts,
@@ -8250,18 +8261,26 @@ class AedtPoolRuntime:
             for account_name, count in raw_requests_by_account.items()
             if int(count) > 0
         }
+        raw_session_counts = plan.get("node_request_session_counts_by_account") or {}
+        session_counts_by_account = {
+            str(account_name or ""): [max(1, int(item)) for item in counts]
+            for account_name, counts in raw_session_counts.items()
+            if isinstance(counts, list)
+        }
         account_order = sorted(request_counts)
         if account_order:
             offset = self._account_request_cursor % len(account_order)
             account_order = account_order[offset:] + account_order[:offset]
-        requests_by_account: list[str] = []
+        requests_by_account: list[tuple[str, int]] = []
         while len(requests_by_account) < request_budget and any(
             request_counts.values()
         ):
             for account_name in account_order:
                 if request_counts.get(account_name, 0) <= 0:
                     continue
-                requests_by_account.append(account_name)
+                quotas = session_counts_by_account.get(account_name, [])
+                session_quota = quotas.pop(0) if quotas else 0
+                requests_by_account.append((account_name, session_quota))
                 request_counts[account_name] -= 1
                 if len(requests_by_account) >= request_budget:
                     break
@@ -8271,7 +8290,7 @@ class AedtPoolRuntime:
             ) % len(account_order)
         opened = 0
         opened_by_account: dict[str, int] = {}
-        for account_name in requests_by_account:
+        for account_name, session_quota in requests_by_account:
             allocation = self.scheduler.open_allocation_record(
                 "AEDT pool project demand",
                 resource_pool="cpu",
@@ -8295,6 +8314,10 @@ class AedtPoolRuntime:
                 # Slurm/DB CPU and memory reservations remain the hard node
                 # capacity boundary.
                 aedt_pool_node_sharing=True,
+                # Bound this allocation to the exact account-level session
+                # deficit assigned to it. Without this quota, a two-session
+                # need expands to the generic four-session/64-CPU target.
+                aedt_pool_max_sessions=session_quota,
                 require_fea_eligible_node=True,
                 # Desktop hosts are CPU-pool infrastructure.  Generic CPU work
                 # may borrow idle GPU nodes, but the long-lived AEDT pool must
