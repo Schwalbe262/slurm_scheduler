@@ -7391,6 +7391,222 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(diagnostics["replayed_tasks"], 500)
         self.assertEqual(diagnostics["scanned_tasks"], 0)
 
+    def test_reservation_plan_ignores_allocation_heartbeat_during_build(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=1,
+            total_memory_mb=1024,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="fit-plan-heartbeat",
+        )
+        task_id = self.db.create_task(
+            TaskCreate("fit-plan-heartbeat", "~/case", "run", cpus=1, memory_mb=1)
+        )
+        queued_tasks = [self.db.get_task(task_id)]
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+        reserve = scheduler.reserve_inflight_capacity_for_task
+        mutated = False
+
+        def reserve_with_heartbeat(*args, **kwargs):
+            nonlocal mutated
+            allocation = reserve(*args, **kwargs)
+            if not mutated:
+                mutated = True
+                self.db.update_allocation(
+                    allocation_id,
+                    last_active_at="2099-01-01 00:00:00",
+                    updated_at="2099-01-01 00:00:01",
+                )
+            return allocation
+
+        with mock.patch.object(
+            scheduler,
+            "reserve_inflight_capacity_for_task",
+            side_effect=reserve_with_heartbeat,
+        ):
+            plan = scheduler.queued_task_allocation_reservation_plan(queued_tasks)
+
+        self.assertTrue(plan.reusable)
+        self.assertEqual(plan.changed_while_built, ())
+        self.assertEqual(
+            scheduler.reservation_plan_state_matches(plan, queued_tasks),
+            (True, ""),
+        )
+
+    def test_reservation_plan_reports_fit_allocation_change_during_build(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=1,
+            total_memory_mb=1024,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="fit-plan-capacity-race",
+        )
+        task_id = self.db.create_task(
+            TaskCreate("fit-plan-capacity-race", "~/case", "run", cpus=1, memory_mb=1)
+        )
+        queued_tasks = [self.db.get_task(task_id)]
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+        reserve = scheduler.reserve_inflight_capacity_for_task
+        mutated = False
+
+        def reserve_with_capacity_change(*args, **kwargs):
+            nonlocal mutated
+            allocation = reserve(*args, **kwargs)
+            if not mutated:
+                mutated = True
+                self.db.update_allocation(allocation_id, free_cpus=0)
+            return allocation
+
+        with mock.patch.object(
+            scheduler,
+            "reserve_inflight_capacity_for_task",
+            side_effect=reserve_with_capacity_change,
+        ):
+            plan = scheduler.queued_task_allocation_reservation_plan(queued_tasks)
+
+        self.assertFalse(plan.reusable)
+        self.assertEqual(plan.changed_while_built, ("allocation.free_cpus",))
+        self.assertEqual(
+            scheduler.reservation_plan_state_matches(plan, queued_tasks),
+            (False, "plan_changed_while_built:allocation.free_cpus"),
+        )
+
+    def test_reservation_plan_ignores_active_task_timestamp_during_build(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=2,
+            total_memory_mb=2048,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="fit-plan-active-heartbeat",
+        )
+        active_id = self.db.create_task(
+            TaskCreate("fit-plan-active", "~/case", "run", cpus=1, memory_mb=1)
+        )
+        self.db.update_task(
+            active_id,
+            status=TaskStatus.RUNNING.value,
+            allocation_id=allocation_id,
+            account_name="a",
+            started_at="CURRENT_TIMESTAMP",
+        )
+        queued_id = self.db.create_task(
+            TaskCreate("fit-plan-after-active", "~/case", "run", cpus=1, memory_mb=1)
+        )
+        queued_tasks = [self.db.get_task(queued_id)]
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+        reserve = scheduler.reserve_inflight_capacity_for_task
+        mutated = False
+
+        def reserve_with_active_heartbeat(*args, **kwargs):
+            nonlocal mutated
+            allocation = reserve(*args, **kwargs)
+            if not mutated:
+                mutated = True
+                self.db.update_task(active_id, updated_at="2099-01-01 00:00:00")
+            return allocation
+
+        with mock.patch.object(
+            scheduler,
+            "reserve_inflight_capacity_for_task",
+            side_effect=reserve_with_active_heartbeat,
+        ):
+            plan = scheduler.queued_task_allocation_reservation_plan(queued_tasks)
+
+        self.assertTrue(plan.reusable)
+        self.assertEqual(plan.changed_while_built, ())
+
+    def test_reservation_plan_reports_active_task_membership_change_during_build(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=2,
+            total_memory_mb=2048,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="fit-plan-active-race",
+        )
+        active_id = self.db.create_task(
+            TaskCreate("fit-plan-finishing-active", "~/case", "run", cpus=1, memory_mb=1)
+        )
+        self.db.update_task(
+            active_id,
+            status=TaskStatus.RUNNING.value,
+            allocation_id=allocation_id,
+            account_name="a",
+            started_at="CURRENT_TIMESTAMP",
+        )
+        queued_id = self.db.create_task(
+            TaskCreate("fit-plan-after-finish", "~/case", "run", cpus=1, memory_mb=1)
+        )
+        queued_tasks = [self.db.get_task(queued_id)]
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+        reserve = scheduler.reserve_inflight_capacity_for_task
+        mutated = False
+
+        def reserve_with_active_finish(*args, **kwargs):
+            nonlocal mutated
+            allocation = reserve(*args, **kwargs)
+            if not mutated:
+                mutated = True
+                self.db.update_task(
+                    active_id,
+                    status=TaskStatus.COMPLETED.value,
+                    finished_at="CURRENT_TIMESTAMP",
+                )
+            return allocation
+
+        with mock.patch.object(
+            scheduler,
+            "reserve_inflight_capacity_for_task",
+            side_effect=reserve_with_active_finish,
+        ):
+            plan = scheduler.queued_task_allocation_reservation_plan(queued_tasks)
+
+        self.assertFalse(plan.reusable)
+        self.assertEqual(plan.changed_while_built, ("active_task.membership",))
+
     def test_fit_aware_scale_out_discards_plan_after_allocation_change(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",

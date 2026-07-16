@@ -49,6 +49,39 @@ TERMINAL_AEDT_WORKSPACE_SUBMIT_LIMIT = 128
 TERMINAL_AEDT_WORKSPACE_DELETED_MARKER = "SLURM_AEDT_WORKSPACE_DELETED"
 TERMINAL_AEDT_WORKSPACE_ABSENT_MARKER = "SLURM_AEDT_WORKSPACE_ABSENT"
 
+# Only fields that can change queued-task placement or fit belong in the
+# reservation certificate.  Allocation/task heartbeat writers update
+# ``updated_at`` and ``last_active_at`` continuously; including those
+# operational timestamps made every long queue scan look stale even when its
+# capacity inputs had not changed.
+_RESERVATION_ALLOCATION_FIT_FIELDS = (
+    "state",
+    "account_name",
+    "partition",
+    "node_name",
+    "total_cpus",
+    "free_cpus",
+    "total_memory_mb",
+    "free_memory_mb",
+    "total_gpus",
+    "free_gpus",
+    "gpu_model",
+    "resource_pool",
+    "exclusive_node",
+    "drain_reason",
+)
+_RESERVATION_ACTIVE_TASK_FIT_FIELDS = (
+    "status",
+    "allocation_id",
+    "cpus",
+    "memory_mb",
+    "gpus",
+    "scheduling_profile",
+    "aedt_backend",
+    "project",
+    "exclusive_node",
+)
+
 
 LMSTAT_FEATURE_RE = re.compile(
     r"Users of (\S+):\s+\(Total of (\d+) licenses? issued;\s+Total of (\d+) licenses? in use\)"
@@ -90,9 +123,10 @@ class _QueuedTaskAllocationReservationPlan:
     reservations: dict[int, list[int]]
     reserved_task_ids: frozenset[int]
     task_signatures_by_id: dict[int, str]
-    allocation_signature: tuple[str, ...]
+    allocation_signature: tuple[tuple[Any, ...], ...]
     fit_state_signature: tuple[Any, ...]
     steps: tuple[_QueuedTaskAllocationReservationStep, ...]
+    changed_while_built: tuple[str, ...]
     reusable: bool
 
 
@@ -7243,11 +7277,47 @@ class Scheduler:
     def _reservation_record_signature(record: dict) -> str:
         return json.dumps(record, sort_keys=True, separators=(",", ":"), default=str)
 
-    def _reservation_allocation_signature(self, allocations: list[dict]) -> tuple[str, ...]:
+    @staticmethod
+    def _reservation_records_signature(
+        records: list[dict],
+        fields: tuple[str, ...],
+    ) -> tuple[tuple[Any, ...], ...]:
         return tuple(
-            self._reservation_record_signature(allocation)
-            for allocation in sorted(allocations, key=lambda item: int(item.get("id") or 0))
+            (
+                int(record.get("id") or 0),
+                *(record.get(field) for field in fields),
+            )
+            for record in sorted(records, key=lambda item: int(item.get("id") or 0))
         )
+
+    def _reservation_allocation_signature(
+        self, allocations: list[dict]
+    ) -> tuple[tuple[Any, ...], ...]:
+        return self._reservation_records_signature(
+            allocations,
+            _RESERVATION_ALLOCATION_FIT_FIELDS,
+        )
+
+    @staticmethod
+    def _reservation_record_signature_changes(
+        before: tuple[tuple[Any, ...], ...],
+        after: tuple[tuple[Any, ...], ...],
+        fields: tuple[str, ...],
+        prefix: str,
+    ) -> list[str]:
+        before_by_id = {int(item[0]): item[1:] for item in before}
+        after_by_id = {int(item[0]): item[1:] for item in after}
+        changes: list[str] = []
+        if before_by_id.keys() != after_by_id.keys():
+            changes.append(f"{prefix}.membership")
+        common_ids = before_by_id.keys() & after_by_id.keys()
+        for index, field in enumerate(fields):
+            if any(
+                before_by_id[record_id][index] != after_by_id[record_id][index]
+                for record_id in common_ids
+            ):
+                changes.append(f"{prefix}.{field}")
+        return changes
 
     def current_reservation_allocations(self) -> list[dict]:
         return [
@@ -7266,18 +7336,46 @@ class Scheduler:
             [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value],
             limit=5000,
         )
-        active_signature = tuple(
-            self._reservation_record_signature(task)
-            for task in sorted(active_tasks, key=lambda item: int(item.get("id") or 0))
+        active_signature = self._reservation_records_signature(
+            active_tasks,
+            _RESERVATION_ACTIVE_TASK_FIT_FIELDS,
         )
-        aedt_pressure_signature = self._reservation_record_signature(
-            self.db.aedt_project_pressure_by_allocation()
+        aedt_pressure_signature = tuple(
+            (
+                int(allocation_id),
+                int(pressure.get("workers") or 0),
+                int(pressure.get("shadow_cpus") or 0),
+                int(pressure.get("live_projects") or 0),
+            )
+            for allocation_id, pressure in sorted(
+                self.db.aedt_project_pressure_by_allocation().items()
+            )
         )
         return (
             active_signature,
             aedt_pressure_signature,
             tuple(sorted(self._tick_attach_workers_by_node.items())),
+            self.db.aedt_pool_project_cpus(),
         )
+
+    def _reservation_fit_state_changes(
+        self,
+        before: tuple[Any, ...],
+        after: tuple[Any, ...],
+    ) -> list[str]:
+        changes = self._reservation_record_signature_changes(
+            before[0],
+            after[0],
+            _RESERVATION_ACTIVE_TASK_FIT_FIELDS,
+            "active_task",
+        )
+        if before[1] != after[1]:
+            changes.append("aedt_pressure")
+        if before[2] != after[2]:
+            changes.append("tick_attach_workers")
+        if before[3] != after[3]:
+            changes.append("aedt_project_cpus")
+        return changes
 
     def queued_tasks_for_allocation_reservations(self) -> list[dict]:
         return sorted(
@@ -7310,7 +7408,19 @@ class Scheduler:
                 continue
             reservations.setdefault(int(allocation["id"]), []).append(int(task["id"]))
         current_allocations = self.current_reservation_allocations()
+        current_allocation_signature = self._reservation_allocation_signature(
+            current_allocations
+        )
         fit_state_after = self._reservation_fit_state_signature()
+        changed_while_built = tuple(
+            self._reservation_record_signature_changes(
+                allocation_signature,
+                current_allocation_signature,
+                _RESERVATION_ALLOCATION_FIT_FIELDS,
+                "allocation",
+            )
+            + self._reservation_fit_state_changes(fit_state_before, fit_state_after)
+        )
         task_signatures_by_id = {
             int(task["id"]): self._reservation_record_signature(task)
             for task in tasks
@@ -7326,10 +7436,8 @@ class Scheduler:
             allocation_signature=allocation_signature,
             fit_state_signature=fit_state_before,
             steps=tuple(steps),
-            reusable=(
-                allocation_signature == self._reservation_allocation_signature(current_allocations)
-                and fit_state_before == fit_state_after
-            ),
+            changed_while_built=changed_while_built,
+            reusable=not changed_while_built,
         )
 
     def reservation_plan_state_matches(
@@ -7338,7 +7446,8 @@ class Scheduler:
         queued_tasks: list[dict],
     ) -> tuple[bool, str]:
         if not plan.reusable:
-            return False, "plan_changed_while_built"
+            details = ",".join(plan.changed_while_built)
+            return False, f"plan_changed_while_built:{details}"
         for task in queued_tasks:
             task_id = int(task["id"])
             signature = plan.task_signatures_by_id.get(task_id)
