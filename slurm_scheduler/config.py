@@ -132,6 +132,13 @@ class AppConfig:
     fea_adaptive_memory_min_coverage_seconds: int = 2700
     fea_adaptive_memory_margin_percent: float = 5.0
     fea_adaptive_memory_max_attach_per_tick: int = 1
+    # Bound physical standalone AEDT Desktops independently from a project's
+    # logical queued+attaching+running campaign target.  A configured project
+    # may therefore keep a deep refill queue without launching more than this
+    # many standalone FEA workers at once.
+    standalone_aedt_max_running_by_project: dict[str, int] = field(
+        default_factory=dict
+    )
     # Experimental pooled AEDT backend.  The operator-facing limit lives in
     # scheduler_settings; these fields configure the separately deployed
     # node-side session-host adapter.  Disabled is the production default.
@@ -227,6 +234,28 @@ def _read_yaml(path: str | Path) -> dict[str, Any]:
 
 def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
     data = _read_yaml(path)
+    standalone_caps = data.get("standalone_aedt_max_running_by_project", {})
+    if standalone_caps is None:
+        standalone_caps = {}
+    if not isinstance(standalone_caps, dict):
+        raise ValueError(
+            "standalone_aedt_max_running_by_project must be a mapping"
+        )
+    normalized_standalone_caps: dict[str, int] = {}
+    for raw_project, raw_limit in standalone_caps.items():
+        project = str(raw_project).strip()
+        if (
+            not project
+            or isinstance(raw_limit, bool)
+            or not isinstance(raw_limit, int)
+            or raw_limit <= 0
+        ):
+            raise ValueError(
+                "standalone_aedt_max_running_by_project entries require a "
+                "non-empty project and a positive integer limit"
+            )
+        normalized_standalone_caps[project] = raw_limit
+    data["standalone_aedt_max_running_by_project"] = normalized_standalone_caps
     gpu_prewarm = data.pop("gpu_prewarm", None)
     if isinstance(gpu_prewarm, dict):
         mapping = {

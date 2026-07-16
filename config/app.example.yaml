@@ -90,6 +90,11 @@ fea_bursty:
   # CPU declarations need only bridge the delay until load/sstat observes a
   # newly attached worker; do not double-count CPU for the full RAM window.
   cpu_footprint_maturity_seconds: 120
+# Keep the logical MFT refill pool deep while limiting the physical standalone
+# AEDT Desktops (running+attaching) to 100. Pooled clients and the internal
+# _aedt_pool_hosts project are not counted by this limit.
+standalone_aedt_max_running_by_project:
+  MFT_1MW_2026v1: 100
 license_monitor:
   enabled: false
   account: "account_a"

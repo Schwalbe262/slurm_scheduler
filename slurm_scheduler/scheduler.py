@@ -230,6 +230,7 @@ class Scheduler:
         watchdog_stall_seconds: int = 0,
         ssh_parallelism: int = 4,
         license_admission_reserve_exempt_projects: list[str] | None = None,
+        standalone_aedt_max_running_by_project: dict[str, int] | None = None,
     ):
         self.db = db
         self.accounts = accounts
@@ -321,6 +322,25 @@ class Scheduler:
         self.fea_adaptive_memory_max_attach_per_tick = max(
             1, int(fea_adaptive_memory_max_attach_per_tick)
         )
+        standalone_caps = standalone_aedt_max_running_by_project or {}
+        if not isinstance(standalone_caps, dict):
+            raise ValueError(
+                "standalone_aedt_max_running_by_project must be a mapping"
+            )
+        self.standalone_aedt_max_running_by_project: dict[str, int] = {}
+        for raw_project, raw_limit in standalone_caps.items():
+            project = str(raw_project).strip()
+            if (
+                not project
+                or isinstance(raw_limit, bool)
+                or not isinstance(raw_limit, int)
+                or raw_limit <= 0
+            ):
+                raise ValueError(
+                    "standalone_aedt_max_running_by_project entries require "
+                    "a non-empty project and a positive integer limit"
+                )
+            self.standalone_aedt_max_running_by_project[project] = raw_limit
         # hostname -> deque[(monotonic, free_memory_mb)]: rolling pestat
         # observations backing the adaptive memory relax. In-memory only, so a
         # web-worker restart re-arms the coverage requirement before relaxing.
@@ -3487,6 +3507,42 @@ class Scheduler:
             return ""
         return f"project active cap reached for {project_name}: {active}/{limit} attaching+running"
 
+    def standalone_aedt_running_cap_status(self, task: dict) -> tuple[int, int]:
+        """Return ``(active, limit)`` for a capped standalone FEA project.
+
+        Active includes ATTACHING because the Desktop launch has already been
+        reserved at that boundary.  Queued tasks remain logical campaign
+        capacity and do not consume this physical-AEDT limit.
+        """
+
+        project_name = str(task.get("project") or "").strip()
+        if (
+            not project_name
+            or self.task_is_fea_infra(task)
+            or not self.task_is_fea_bursty(task)
+            or self.task_aedt_backend(task) != AedtBackend.STANDALONE.value
+        ):
+            return 0, 0
+        limit = int(
+            self.standalone_aedt_max_running_by_project.get(project_name, 0)
+        )
+        if limit <= 0:
+            return 0, 0
+        active = self.db.count_active_standalone_fea_tasks_by_project(
+            project_name
+        )
+        return active, limit
+
+    def standalone_aedt_running_cap_reason(self, task: dict) -> str:
+        active, limit = self.standalone_aedt_running_cap_status(task)
+        if limit <= 0 or active < limit:
+            return ""
+        project_name = str(task.get("project") or "").strip()
+        return (
+            f"standalone AEDT running cap reached for {project_name}: "
+            f"{active}/{limit} attaching+running standalone FEA"
+        )
+
     def assign_queued_task(
         self, task: dict, background: bool = False, fea_baseline_only: bool = False
     ) -> bool:
@@ -3498,6 +3554,8 @@ class Scheduler:
         # same-node web fast path can also call this method; strict enforcement
         # across concurrent callers requires one transactional check/transition.
         if self.project_active_cap_reason(task):
+            return False
+        if self.standalone_aedt_running_cap_reason(task):
             return False
         if not self.prepare_aedt_backend_task(task):
             return False
@@ -3544,6 +3602,12 @@ class Scheduler:
                 if account is None:
                     return None
             if self.aedt_backend_block_reason(task):
+                return None
+            # This is the final, serialized standalone-AEDT admission point.
+            # The first claimant becomes ATTACHING before the assignment lock
+            # is released, so the next concurrent caller observes the spent
+            # project seat rather than racing past the configured boundary.
+            if self.standalone_aedt_running_cap_reason(task):
                 return None
             if self.allocation_profile_conflicts(allocation, task, refresh=True):
                 return None
@@ -4283,6 +4347,21 @@ class Scheduler:
             queue_state = "blocked"
             reason = project_cap_reason
 
+        standalone_aedt_active, standalone_aedt_limit = (
+            self.standalone_aedt_running_cap_status(task)
+        )
+        if (
+            standalone_aedt_limit > 0
+            and standalone_aedt_active >= standalone_aedt_limit
+        ):
+            queue_state = "blocked"
+            project_name = str(task.get("project") or "").strip()
+            reason = (
+                f"standalone AEDT running cap reached for {project_name}: "
+                f"{standalone_aedt_active}/{standalone_aedt_limit} "
+                "attaching+running standalone FEA"
+            )
+
         if not reason and requested_allocation_id:
             if not requested_allocation:
                 queue_state = "blocked"
@@ -4371,7 +4450,7 @@ class Scheduler:
                         queue_state = "opening"
                         reason = f"no single ready pool has {int(task.get('cpus') or 0)} free CPUs; opening demand pools"
 
-        return {
+        diagnostics = {
             "ready_fit_slots": ready_slots,
             "pending_fit_slots": pending_slots,
             "inflight_fit_slots": inflight_slots,
@@ -4379,6 +4458,17 @@ class Scheduler:
             "queue_reason": reason,
             "preferred_node_relaxed": preferred_node_relaxed,
         }
+        if standalone_aedt_limit > 0:
+            diagnostics.update(
+                {
+                    "standalone_aedt_active": standalone_aedt_active,
+                    "standalone_aedt_max_running": standalone_aedt_limit,
+                    "standalone_aedt_available": max(
+                        0, standalone_aedt_limit - standalone_aedt_active
+                    ),
+                }
+            )
+        return diagnostics
 
     def fea_worker_limit_reason_for_task(
         self,

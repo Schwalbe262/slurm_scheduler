@@ -109,6 +109,20 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertEqual(default_config.project_max_active_tasks_ceiling, 300)
         self.assertEqual(overridden_config.project_max_active_tasks_ceiling, 600)
 
+    def test_load_app_config_parses_standalone_aedt_project_running_caps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "app.yaml"
+            path.write_text(
+                "standalone_aedt_max_running_by_project:\n"
+                "  MFT_1MW_2026v1: 100\n",
+                encoding="utf-8",
+            )
+            config = load_app_config(path)
+        self.assertEqual(
+            config.standalone_aedt_max_running_by_project,
+            {"MFT_1MW_2026v1": 100},
+        )
+
     def test_load_app_config_parses_gpu_prewarm_cpu_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "app.yaml"
@@ -2811,6 +2825,181 @@ class SchedulerTests(unittest.TestCase):
             diagnostics["queue_reason"],
             "project active cap reached for limited: 1/1 attaching+running",
         )
+
+    def test_standalone_aedt_project_cap_holds_queue_and_reports_diagnostic(self) -> None:
+        project = "MFT_1MW_2026v1"
+        active_id = self.db.create_task(
+            TaskCreate(
+                "active-standalone",
+                "~/case",
+                "run",
+                project=project,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                aedt_backend=AedtBackend.STANDALONE.value,
+            )
+        )
+        self.db.update_task(active_id, status=TaskStatus.ATTACHING.value)
+        queued_id = self.db.create_task(
+            TaskCreate(
+                "queued-standalone",
+                "~/case",
+                "run",
+                project=project,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                aedt_backend=AedtBackend.STANDALONE.value,
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            standalone_aedt_max_running_by_project={project: 1},
+        )
+
+        self.assertFalse(scheduler.assign_queued_task(self.db.get_task(queued_id)))
+        self.assertEqual(
+            self.db.get_task(queued_id)["status"], TaskStatus.QUEUED.value
+        )
+        self.assertEqual(
+            self.db.count_tasks_by_project(
+                project,
+                [
+                    TaskStatus.QUEUED.value,
+                    TaskStatus.ATTACHING.value,
+                    TaskStatus.RUNNING.value,
+                ],
+            ),
+            2,
+        )
+        diagnostics = scheduler.task_queue_diagnostics(
+            self.db.get_task(queued_id)
+        )
+        self.assertEqual(diagnostics["queue_state"], "blocked")
+        self.assertEqual(
+            diagnostics["queue_reason"],
+            "standalone AEDT running cap reached for MFT_1MW_2026v1: "
+            "1/1 attaching+running standalone FEA",
+        )
+        self.assertEqual(diagnostics["standalone_aedt_active"], 1)
+        self.assertEqual(diagnostics["standalone_aedt_max_running"], 1)
+        self.assertEqual(diagnostics["standalone_aedt_available"], 0)
+
+    def test_standalone_aedt_project_count_excludes_queue_pool_and_infra(self) -> None:
+        project = "MFT_1MW_2026v1"
+
+        def make_task(
+            name: str,
+            *,
+            task_project: str = project,
+            status: str = TaskStatus.RUNNING.value,
+            profile: str = SchedulingProfile.FEA_BURSTY.value,
+            backend: str = AedtBackend.STANDALONE.value,
+        ) -> int:
+            task_id = self.db.create_task(
+                TaskCreate(
+                    name,
+                    "~/case",
+                    "run",
+                    project=task_project,
+                    scheduling_profile=profile,
+                    aedt_backend=backend,
+                )
+            )
+            self.db.update_task(task_id, status=status)
+            return task_id
+
+        make_task("running-standalone")
+        make_task("attaching-standalone", status=TaskStatus.ATTACHING.value)
+        make_task("queued-standalone", status=TaskStatus.QUEUED.value)
+        make_task("running-pooled", backend=AedtBackend.POOLED.value)
+        make_task(
+            "running-standard",
+            profile=SchedulingProfile.STANDARD.value,
+        )
+        make_task("session-host", task_project="_aedt_pool_hosts")
+
+        self.assertEqual(
+            self.db.count_active_standalone_fea_tasks_by_project(project), 2
+        )
+        self.assertEqual(
+            self.db.count_active_standalone_fea_tasks_by_project(
+                "_aedt_pool_hosts"
+            ),
+            0,
+        )
+
+    def test_concurrent_standalone_aedt_last_project_seat_is_claimed_once(self) -> None:
+        project = "MFT_1MW_2026v1"
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="standalone-cap-race",
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 1.0 262144 240000 idle\n"
+            )
+        )
+        task_ids = [
+            self.db.create_task(
+                TaskCreate(
+                    f"standalone-cap-race-{index}",
+                    "~/case",
+                    "run",
+                    cpus=4,
+                    memory_mb=8192,
+                    project=project,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                    aedt_backend=AedtBackend.STANDALONE.value,
+                )
+            )
+            for index in range(2)
+        ]
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            standalone_aedt_max_running_by_project={project: 1},
+        )
+        original_best = scheduler.best_allocation_for_task
+        both_selected = threading.Barrier(2)
+
+        def synchronized_best(task: dict, **kwargs) -> dict | None:
+            selected = original_best(task, **kwargs)
+            both_selected.wait(timeout=2)
+            return selected
+
+        scheduler.best_allocation_for_task = synchronized_best  # type: ignore[method-assign]
+        results: list[bool] = []
+        threads = [
+            threading.Thread(
+                target=lambda task_id=task_id: results.append(
+                    scheduler.assign_queued_task(self.db.get_task(task_id))
+                )
+            )
+            for task_id in task_ids
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(sorted(results), [False, True])
+        statuses = [self.db.get_task(task_id)["status"] for task_id in task_ids]
+        self.assertEqual(statuses.count(TaskStatus.RUNNING.value), 1)
+        self.assertEqual(statuses.count(TaskStatus.QUEUED.value), 1)
+        self.assertEqual(len(FakeClient.attached_tasks), 1)
 
     def test_gpu_task_accepts_ordered_gpu_model_candidates(self) -> None:
         allocation_id = self.db.create_allocation(

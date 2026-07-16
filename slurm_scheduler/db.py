@@ -2548,6 +2548,39 @@ class Database:
                 row = conn.execute("SELECT COUNT(*) FROM tasks WHERE project = ?", (project,)).fetchone()
             return int(row[0]) if row else 0
 
+    def count_active_standalone_fea_tasks_by_project(self, project: str) -> int:
+        """Count physical standalone AEDT workers consuming a project cap.
+
+        Queued work deliberately remains outside this count so a campaign can
+        maintain a deeper logical pool.  Legacy empty backend values are
+        standalone; pooled clients and the internal session-host project are
+        never physical standalone project Desktops.
+        """
+
+        project = str(project or "").strip()
+        if not project or project == "_aedt_pool_hosts":
+            return 0
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM tasks
+                WHERE project = ?
+                  AND status IN (?, ?)
+                  AND LOWER(TRIM(COALESCE(scheduling_profile, ''))) = ?
+                  AND LOWER(TRIM(COALESCE(aedt_backend, 'standalone')))
+                      IN ('', 'standalone')
+                  AND TRIM(COALESCE(project, '')) != '_aedt_pool_hosts'
+                """,
+                (
+                    project,
+                    TaskStatus.ATTACHING.value,
+                    TaskStatus.RUNNING.value,
+                    SchedulingProfile.FEA_BURSTY.value,
+                ),
+            ).fetchone()
+            return int(row[0]) if row else 0
+
     def list_projects(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute("SELECT * FROM projects ORDER BY name").fetchall()
