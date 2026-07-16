@@ -590,6 +590,9 @@ class AedtPoolGateTests(AedtPoolTestCase):
     def test_native_solve_serial_stop_loss_has_validated_parallel_mode(self) -> None:
         self.assertEqual(self.service.native_solve_mode, "serial")
         self.assertEqual(self.service._parallel_safe_native_solve_families, frozenset())
+        serial_config = self.service.summary()["config"]
+        self.assertEqual(serial_config["native_solve_mode"], "serial")
+        self.assertEqual(serial_config["parallel_safe_native_solve_families"], [])
 
         validated = AedtPoolService(
             self.db,
@@ -602,6 +605,18 @@ class AedtPoolGateTests(AedtPoolTestCase):
             frozenset({"mft_validated_async"}),
         )
         self.assertNotIn("mft", validated._parallel_safe_native_solve_families)
+        router = create_aedt_pool_router(validated)
+        summary_endpoint = next(
+            route.endpoint
+            for route in router.routes
+            if getattr(route, "path", "") == "/api/aedt-pool"
+        )
+        validated_config = summary_endpoint()["config"]
+        self.assertEqual(validated_config["native_solve_mode"], "validated_parallel")
+        self.assertEqual(
+            validated_config["parallel_safe_native_solve_families"],
+            ["mft_validated_async"],
+        )
         with self.assertRaisesRegex(ValueError, "must be one of"):
             AedtPoolService(self.db, native_solve_mode="unsafe")
 

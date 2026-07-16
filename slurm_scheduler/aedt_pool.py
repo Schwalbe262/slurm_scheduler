@@ -7473,6 +7473,10 @@ class AedtPoolService:
                 "session_reserved_memory_mb": (
                     config.project_memory_mb * config.projects_per_session
                 ),
+                "native_solve_mode": self.native_solve_mode,
+                "parallel_safe_native_solve_families": sorted(
+                    self._parallel_safe_native_solve_families
+                ),
                 "control_plane_url": config.control_plane_url,
                 "hard_counted_states": list(SESSION_COUNTED_STATES),
             },
