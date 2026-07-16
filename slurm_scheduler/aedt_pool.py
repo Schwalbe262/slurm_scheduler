@@ -65,6 +65,15 @@ ALLOCATION_AGE_ROTATION_REASON = "AEDT pool allocation age rotation"
 DEFAULT_HOST_LAUNCH_STAGGER_SECONDS = 15
 HOST_LAUNCH_STAGGER_ENV = "AEDT_POOL_HOST_LAUNCH_STAGGER_SECONDS"
 
+# A three-project MFT cohort has completed end-to-end on one Desktop while its
+# native Maxwell solves overlapped.  Other workload families have not proved
+# that same native-solver/gRPC concurrency contract.  A sealed Desktop may
+# still contain mixed projects, but the control plane admits their native
+# pipelines in deterministic waves: every MFT sibling can run together, while
+# an unproved family runs one project at a time after the preceding wave has
+# completed its AEDT work and released its projects.
+PARALLEL_SAFE_NATIVE_SOLVE_FAMILIES = frozenset({"mft"})
+
 
 AEDT_POOL_SCHEMA = """
 CREATE TABLE IF NOT EXISTS aedt_sessions (
@@ -2574,7 +2583,16 @@ class AedtPoolService:
         *,
         allow_underfilled: bool,
     ) -> bool:
-        """Atomically seal one Desktop batch before any native solve starts."""
+        """Atomically seal one Desktop and grant its next safe solve wave.
+
+        Homogeneous, proven-parallel MFT projects retain the 1:3 concurrent
+        native-solve behavior.  A mixed or otherwise unproved family waits in
+        ``active`` without a permit until every member of the preceding wave
+        has both marked its native pipeline complete and released its project.
+        This prevents a long blocking Maxwell 2D Analyze call from invalidating
+        a sibling Maxwell 3D client's gRPC handle while preserving MFT/MFT
+        overlap on the same Desktop.
+        """
 
         if session_id <= 0:
             return False
@@ -2587,30 +2605,38 @@ class AedtPoolService:
             return False
         occupants = conn.execute(
             """
-            SELECT id, state, exclusive_session FROM aedt_project_leases
+            SELECT id, state, exclusive_session, workload_family,
+                   solve_permit_at, solve_permit_generation,
+                   native_pipeline_completed_at,
+                   native_pipeline_session_id, native_pipeline_generation
+            FROM aedt_project_leases
             WHERE session_id = ?
               AND state IN ('offered','leased','attaching','active','releasing')
             ORDER BY id ASC
             """,
             (int(session_id),),
         ).fetchall()
-        if not self._mixed_canary_batch_is_complete(conn, int(session_id)):
-            # A one-shot mixed admission is evidence only if all three exact
-            # reserved projects are ACTIVE before the atomic permit.  In
-            # particular, the ordinary bounded underfilled fallback must not
-            # seal this session and make the remaining reservation unusable.
-            return False
-        if not self._exact_session_reservations_are_active(conn, int(session_id)):
-            # A bounded underfilled fallback must not seal the Desktop while a
-            # bootstrap-reserved peer still owns an exact slot on this session.
-            return False
-        if not occupants or any(str(row["state"]) != "active" for row in occupants):
-            return False
-        full = len(occupants) >= int(session["slots_total"] or 1)
-        exclusive = any(bool(row["exclusive_session"]) for row in occupants)
-        if not (full or exclusive or allow_underfilled):
-            return False
-        if not str(session["solve_batch_sealed_at"] or ""):
+        sealed = bool(str(session["solve_batch_sealed_at"] or ""))
+
+        if not sealed:
+            if not self._mixed_canary_batch_is_complete(conn, int(session_id)):
+                # A one-shot mixed admission is evidence only if all three
+                # exact reserved projects are ACTIVE before the first wave.
+                return False
+            if not self._exact_session_reservations_are_active(
+                conn, int(session_id)
+            ):
+                # Do not seal while a bootstrap-reserved peer still owns a
+                # slot on this exact session.
+                return False
+            if not occupants or any(
+                str(row["state"]) != "active" for row in occupants
+            ):
+                return False
+            full = len(occupants) >= int(session["slots_total"] or 1)
+            exclusive = any(bool(row["exclusive_session"]) for row in occupants)
+            if not (full or exclusive or allow_underfilled):
+                return False
             conn.execute(
                 """
                 UPDATE aedt_sessions
@@ -2621,20 +2647,129 @@ class AedtPoolService:
                 """,
                 (now, now, int(session_id)),
             )
+        else:
+            # A waiting client polls request_solve_permit while the preceding
+            # wave is active/releasing.  Never let that poll widen the sealed
+            # cohort.  Only a fully attested, successfully released generation
+            # can authorize the next family wave.
+            generation = int(session["solve_batch_generation"] or 0)
+            granted = conn.execute(
+                """
+                SELECT state, native_pipeline_completed_at,
+                       native_pipeline_session_id, native_pipeline_generation
+                FROM aedt_project_leases
+                WHERE session_id = ? AND solve_permit_generation = ?
+                  AND solve_permit_at IS NOT NULL
+                ORDER BY id
+                """,
+                (int(session_id), generation),
+            ).fetchall()
+            if not granted:
+                return False
+            if any(str(row["state"]) in LEASE_LIVE_STATES for row in granted):
+                return False
+            predecessor_ok = all(
+                str(row["state"]) == "released"
+                and bool(str(row["native_pipeline_completed_at"] or ""))
+                and int(row["native_pipeline_session_id"] or 0)
+                == int(session_id)
+                and int(row["native_pipeline_generation"] or 0) == generation
+                for row in granted
+            )
+            if not predecessor_ok:
+                failure = (
+                    "sealed native solve predecessor wave failed; "
+                    "refusing mixed-family continuation"
+                )
+                conn.execute(
+                    """
+                    UPDATE aedt_sessions
+                    SET state = 'draining',
+                        failure_message = ?,
+                        drain_requested_at = COALESCE(drain_requested_at, ?),
+                        updated_at = ?
+                    WHERE id = ? AND state IN ('ready','busy')
+                    """,
+                    (
+                        failure,
+                        now,
+                        now,
+                        int(session_id),
+                    ),
+                )
+                # Waiting members already own projects, so use the normal
+                # two-phase host close instead of stranding an ACTIVE lease on
+                # a draining Desktop.  The client observes ``releasing`` and
+                # fails closed; the host ACK then frees every reserved slot.
+                conn.execute(
+                    """
+                    UPDATE aedt_project_leases
+                    SET state = 'releasing', failure_message = ?,
+                        release_requested_at = COALESCE(release_requested_at, ?),
+                        updated_at = ?
+                    WHERE session_id = ? AND state = 'active'
+                      AND solve_permit_at IS NULL
+                    """,
+                    (failure, now, now, int(session_id)),
+                )
+                return False
+            waiting = [
+                row
+                for row in occupants
+                if str(row["state"]) == "active"
+                and not str(row["solve_permit_at"] or "")
+            ]
+            if not waiting:
+                return False
+            conn.execute(
+                """
+                UPDATE aedt_sessions
+                SET solve_batch_generation = solve_batch_generation + 1,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, int(session_id)),
+            )
+
+        waiting = [
+            row
+            for row in occupants
+            if str(row["state"]) == "active"
+            and not str(row["solve_permit_at"] or "")
+        ]
+        if not waiting:
+            return False
+        families: dict[str, list[Any]] = {}
+        for row in waiting:
+            family = str(row["workload_family"] or "").strip().lower()
+            families.setdefault(family, []).append(row)
+        # Prefer the proven-parallel MFT wave so a mixed 2+1 canary preserves
+        # the useful two-way Maxwell 3D overlap before the exclusive motor run.
+        selected_family = (
+            "mft" if "mft" in families else sorted(families)[0]
+        )
+        selected = families[selected_family]
+        if selected_family not in PARALLEL_SAFE_NATIVE_SOLVE_FAMILIES:
+            selected = selected[:1]
+
         generation = int(
             conn.execute(
                 "SELECT solve_batch_generation FROM aedt_sessions WHERE id = ?",
                 (int(session_id),),
             ).fetchone()[0]
         )
+        lease_ids = [int(row["id"]) for row in selected]
+        placeholders = ",".join("?" for _ in lease_ids)
         conn.execute(
-            """
+            f"""
             UPDATE aedt_project_leases
             SET solve_permit_at = COALESCE(solve_permit_at, ?),
                 solve_permit_generation = ?, updated_at = ?
             WHERE session_id = ? AND state = 'active'
+              AND solve_permit_at IS NULL
+              AND id IN ({placeholders})
             """,
-            (now, generation, now, int(session_id)),
+            (now, generation, now, int(session_id), *lease_ids),
         )
         return True
 

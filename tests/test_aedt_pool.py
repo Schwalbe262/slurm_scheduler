@@ -1060,6 +1060,10 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         leases, tokens = self.activate_exact_cohort()
         generation = int(leases[0]["solve_permit_generation"])
         self.assertGreater(generation, 0)
+        self.assertEqual(
+            int(leases[1]["solve_permit_generation"]), generation
+        )
+        self.assertFalse(leases[2]["solve_permit_granted"])
 
         first = self.service.complete_native_pipeline(
             int(leases[0]["id"]),
@@ -1068,7 +1072,7 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         )
         self.assertTrue(first["native_pipeline_completed"])
         self.assertEqual(first["native_pipeline_completed_count"], 1)
-        self.assertEqual(first["native_pipeline_expected_count"], 3)
+        self.assertEqual(first["native_pipeline_expected_count"], 2)
         self.assertFalse(first["native_pipeline_barrier_granted"])
         first_completed_at = first["native_pipeline_completed_at"]
 
@@ -1087,25 +1091,53 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
             solve_permit_generation=generation,
         )
         self.assertEqual(second["native_pipeline_completed_count"], 2)
-        self.assertFalse(second["native_pipeline_barrier_granted"])
-        third = self.service.complete_native_pipeline(
-            int(leases[2]["id"]),
-            tokens[2],
-            solve_permit_generation=generation,
-        )
-        self.assertEqual(third["native_pipeline_completed_count"], 3)
-        self.assertTrue(third["native_pipeline_barrier_granted"])
+        self.assertTrue(second["native_pipeline_barrier_granted"])
         self.assertTrue(
             self.service.lease_status(
                 int(leases[0]["id"]), tokens[0]
             )["native_pipeline_barrier_granted"]
         )
 
+        # The mixed IPMSM project remains active but cannot enter its native
+        # Analyze while either MFT project can still issue AEDT postprocessing
+        # calls.  Only two successful project-close ACKs open generation 2.
+        for index in (0, 1):
+            releasing = self.service.cancel_lease(
+                int(leases[index]["id"]), tokens[index]
+            )
+            self.assertEqual(releasing["state"], "releasing")
+            self.service.complete_release(
+                int(self.session["id"]),
+                self.host_token,
+                int(leases[index]["id"]),
+                success=True,
+            )
+            waiting = self.service.request_solve_permit(
+                int(leases[2]["id"]), tokens[2]
+            )
+            if index == 0:
+                self.assertFalse(waiting["solve_permit_granted"])
+
+        motor = self.service.request_solve_permit(
+            int(leases[2]["id"]), tokens[2]
+        )
+        self.assertTrue(motor["solve_permit_granted"])
+        motor_generation = int(motor["solve_permit_generation"])
+        self.assertGreater(motor_generation, generation)
+        third = self.service.complete_native_pipeline(
+            int(leases[2]["id"]),
+            tokens[2],
+            solve_permit_generation=motor_generation,
+        )
+        self.assertEqual(third["native_pipeline_completed_count"], 1)
+        self.assertEqual(third["native_pipeline_expected_count"], 1)
+        self.assertTrue(third["native_pipeline_barrier_granted"])
+
         with self.assertRaisesRegex(ValueError, "generation mismatch"):
             self.service.complete_native_pipeline(
-                int(leases[0]["id"]),
-                tokens[0],
-                solve_permit_generation=generation + 1,
+                int(leases[2]["id"]),
+                tokens[2],
+                solve_permit_generation=motor_generation + 1,
             )
 
     def test_native_pipeline_barrier_breaks_if_unmarked_member_exits(self) -> None:
@@ -1127,7 +1159,32 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         )
         self.assertFalse(waiting["native_pipeline_barrier_granted"])
         self.assertTrue(waiting["native_pipeline_barrier_broken"])
-        self.assertEqual(waiting["native_pipeline_expected_count"], 3)
+        self.assertEqual(waiting["native_pipeline_expected_count"], 2)
+
+        # Even after both MFT projects are physically closed, an unmarked
+        # predecessor must never authorize the waiting motor wave on a
+        # potentially contaminated Desktop.
+        self.service.complete_release(
+            int(self.session["id"]),
+            self.host_token,
+            int(leases[1]["id"]),
+            success=True,
+        )
+        self.service.cancel_lease(int(leases[0]["id"]), tokens[0])
+        self.service.complete_release(
+            int(self.session["id"]),
+            self.host_token,
+            int(leases[0]["id"]),
+            success=True,
+        )
+        refused = self.service.request_solve_permit(
+            int(leases[2]["id"]), tokens[2]
+        )
+        self.assertFalse(refused["solve_permit_granted"])
+        self.assertEqual(refused["state"], "releasing")
+        session = self.service.get_session(int(self.session["id"]))
+        self.assertEqual(session["state"], "draining")
+        self.assertIn("predecessor wave failed", session["failure_message"])
 
     def test_bootstrap_admission_forces_three_mixed_tasks_to_exact_empty_session(self) -> None:
         admission = self.service.create_mixed_canary_admission(
@@ -1171,9 +1228,24 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         permitted = [
             self.service.get_lease(int(lease["id"])) for lease in leases
         ]
-        self.assertTrue(all(lease["solve_permit_granted"] for lease in permitted))
+        mft_permitted = [
+            lease for lease in permitted if lease["workload_family"] == "mft"
+        ]
+        motor_waiting = [
+            lease for lease in permitted if lease["workload_family"] == "ipmsm"
+        ]
+        self.assertTrue(
+            all(lease["solve_permit_granted"] for lease in mft_permitted)
+        )
+        self.assertEqual(len(motor_waiting), 1)
+        self.assertFalse(motor_waiting[0]["solve_permit_granted"])
         self.assertEqual(
-            len({int(lease["solve_permit_generation"]) for lease in permitted}),
+            len(
+                {
+                    int(lease["solve_permit_generation"])
+                    for lease in mft_permitted
+                }
+            ),
             1,
         )
         self.assertTrue(
