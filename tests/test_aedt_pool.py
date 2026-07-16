@@ -547,7 +547,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
             for route in router.routes
             if set(getattr(route, "methods", set())) & {"POST", "PATCH", "PUT", "DELETE"}
         ]
-        self.assertEqual(len(mutating_routes), 22)
+        self.assertEqual(len(mutating_routes), 23)
         bootstrap_routes = []
         client_routes = []
         lease_scoped_routes = []
@@ -578,7 +578,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
 
         self.assertEqual(len(bootstrap_routes), 13)
         self.assertEqual(len(client_routes), 1)
-        self.assertEqual(len(lease_scoped_routes), 8)
+        self.assertEqual(len(lease_scoped_routes), 9)
         guard = next(
             dependency.call
             for dependency in bootstrap_routes[0].dependant.dependencies
@@ -1030,6 +1030,104 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         lease = self.service.accept_lease(int(lease["id"]), token)
         self.assertEqual(lease["state"], "attaching")
         return self.service.activate_lease(int(lease["id"]), token), token
+
+    def activate_exact_cohort(self) -> tuple[list[dict], list[str]]:
+        admission = self.service.create_mixed_canary_admission(
+            session_id=int(self.session["id"]),
+            mft_projects=2,
+            ipmsm_projects=1,
+        )
+        leases = []
+        tokens = []
+        for index, slot in enumerate(admission["slots"]):
+            task_id = self.create_task_for_slot(slot, f"barrier-{index}")
+            lease, token = self.request_slot(
+                slot,
+                task_id=task_id,
+                suffix=f"barrier-{index}",
+            )
+            self.service.accept_lease(int(lease["id"]), token)
+            leases.append(lease)
+            tokens.append(token)
+        for lease, token in zip(leases, tokens, strict=True):
+            self.service.activate_lease(int(lease["id"]), token)
+        return (
+            [self.service.get_lease(int(lease["id"])) for lease in leases],
+            tokens,
+        )
+
+    def test_native_pipeline_barrier_waits_for_exact_sealed_cohort(self) -> None:
+        leases, tokens = self.activate_exact_cohort()
+        generation = int(leases[0]["solve_permit_generation"])
+        self.assertGreater(generation, 0)
+
+        first = self.service.complete_native_pipeline(
+            int(leases[0]["id"]),
+            tokens[0],
+            solve_permit_generation=generation,
+        )
+        self.assertTrue(first["native_pipeline_completed"])
+        self.assertEqual(first["native_pipeline_completed_count"], 1)
+        self.assertEqual(first["native_pipeline_expected_count"], 3)
+        self.assertFalse(first["native_pipeline_barrier_granted"])
+        first_completed_at = first["native_pipeline_completed_at"]
+
+        self.clock.advance(5)
+        replay = self.service.complete_native_pipeline(
+            int(leases[0]["id"]),
+            tokens[0],
+            solve_permit_generation=generation,
+        )
+        self.assertEqual(
+            replay["native_pipeline_completed_at"], first_completed_at
+        )
+        second = self.service.complete_native_pipeline(
+            int(leases[1]["id"]),
+            tokens[1],
+            solve_permit_generation=generation,
+        )
+        self.assertEqual(second["native_pipeline_completed_count"], 2)
+        self.assertFalse(second["native_pipeline_barrier_granted"])
+        third = self.service.complete_native_pipeline(
+            int(leases[2]["id"]),
+            tokens[2],
+            solve_permit_generation=generation,
+        )
+        self.assertEqual(third["native_pipeline_completed_count"], 3)
+        self.assertTrue(third["native_pipeline_barrier_granted"])
+        self.assertTrue(
+            self.service.lease_status(
+                int(leases[0]["id"]), tokens[0]
+            )["native_pipeline_barrier_granted"]
+        )
+
+        with self.assertRaisesRegex(ValueError, "generation mismatch"):
+            self.service.complete_native_pipeline(
+                int(leases[0]["id"]),
+                tokens[0],
+                solve_permit_generation=generation + 1,
+            )
+
+    def test_native_pipeline_barrier_breaks_if_unmarked_member_exits(self) -> None:
+        leases, tokens = self.activate_exact_cohort()
+        generation = int(leases[0]["solve_permit_generation"])
+        self.service.complete_native_pipeline(
+            int(leases[0]["id"]),
+            tokens[0],
+            solve_permit_generation=generation,
+        )
+        cancelled = self.service.cancel_lease(
+            int(leases[1]["id"]),
+            tokens[1],
+            reason="native pipeline member failed",
+        )
+        self.assertEqual(cancelled["state"], "releasing")
+        waiting = self.service.lease_status(
+            int(leases[0]["id"]), tokens[0]
+        )
+        self.assertFalse(waiting["native_pipeline_barrier_granted"])
+        self.assertTrue(waiting["native_pipeline_barrier_broken"])
+        self.assertEqual(waiting["native_pipeline_expected_count"], 3)
 
     def test_bootstrap_admission_forces_three_mixed_tasks_to_exact_empty_session(self) -> None:
         admission = self.service.create_mixed_canary_admission(
@@ -3921,6 +4019,25 @@ class AttachClientTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.lock_tmp.cleanup()
 
+    def test_three_project_client_default_lock_timeout_covers_long_postprocess(
+        self,
+    ) -> None:
+        lease = AedtProjectLease(
+            SimpleNamespace(),
+            1,
+            "client-token",
+            "project",
+            state="active",
+            protocol_version=2,
+            automation_lock_path=self.automation_lock_path,
+        )
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(
+                "AEDT_POOL_AUTOMATION_LOCK_TIMEOUT_SECONDS", None
+            )
+            lock = lease.automation_lock()
+        self.assertEqual(lock.timeout_seconds, 7200.0)
+
     def test_connect_path_forces_pyaedt_multi_desktop_setting(self) -> None:
         ansys_module = ModuleType("ansys")
         aedt_module = ModuleType("ansys.aedt")
@@ -4281,6 +4398,90 @@ class AttachClientTests(unittest.TestCase):
             payload for method, path, payload in calls if path.endswith("/solve-permit")
         )
         self.assertEqual(seal_call, {"seal_underfilled": True})
+
+    def test_native_pipeline_client_marks_once_and_polls_exact_cohort(self) -> None:
+        calls: list[tuple[str, str, dict | None]] = []
+        reads = 0
+
+        class Http:
+            def request(self, method, path, payload=None, **_kwargs):
+                nonlocal reads
+                calls.append((method, path, payload))
+                completed = 1
+                granted = False
+                if method == "GET":
+                    reads += 1
+                    completed = min(3, reads + 1)
+                    granted = completed == 3
+                return {
+                    "state": "active",
+                    "endpoint": "cpu-01:50001",
+                    "solve_permit_granted": True,
+                    "solve_permit_generation": 12,
+                    "native_pipeline_completed": True,
+                    "native_pipeline_expected_count": 3,
+                    "native_pipeline_completed_count": completed,
+                    "native_pipeline_barrier_granted": granted,
+                    "native_pipeline_barrier_broken": False,
+                }
+
+        lease = AedtProjectLease(
+            Http(),
+            13,
+            "client-token",
+            "project",
+            state="active",
+            endpoint="cpu-01:50001",
+            protocol_version=2,
+            solve_permit_granted=True,
+            solve_permit_generation=12,
+        )
+        with patch(
+            "slurm_scheduler.aedt_attach_client.time.sleep", return_value=None
+        ):
+            completed = lease.wait_for_native_pipeline_barrier(
+                timeout_seconds=5, poll_seconds=0
+            )
+
+        self.assertTrue(completed["native_pipeline_barrier_granted"])
+        self.assertEqual(reads, 2)
+        self.assertEqual(
+            calls[0],
+            (
+                "POST",
+                "/api/aedt-pool/leases/13/native-pipeline-complete",
+                {"solve_permit_generation": 12},
+            ),
+        )
+
+    def test_native_pipeline_client_fails_closed_on_broken_cohort(self) -> None:
+        class Http:
+            def request(self, method, path, payload=None, **_kwargs):
+                return {
+                    "state": "active",
+                    "endpoint": "cpu-01:50001",
+                    "solve_permit_granted": True,
+                    "solve_permit_generation": 4,
+                    "native_pipeline_completed": True,
+                    "native_pipeline_expected_count": 3,
+                    "native_pipeline_completed_count": 1,
+                    "native_pipeline_barrier_granted": False,
+                    "native_pipeline_barrier_broken": True,
+                }
+
+        lease = AedtProjectLease(
+            Http(),
+            17,
+            "client-token",
+            "project",
+            state="active",
+            endpoint="cpu-01:50001",
+            protocol_version=2,
+            solve_permit_granted=True,
+            solve_permit_generation=4,
+        )
+        with self.assertRaisesRegex(AedtLeaseError, "cohort broke"):
+            lease.wait_for_native_pipeline_barrier(timeout_seconds=5)
 
     def test_connect_rejects_stale_port_pid_and_version_before_project_work(self) -> None:
         cases = {

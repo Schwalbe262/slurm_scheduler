@@ -240,6 +240,11 @@ class AedtProjectLease:
     session_active_lease_count: int = 0
     session_live_lease_count: int = 0
     session_slots_total: int = 0
+    native_pipeline_completed: bool = False
+    native_pipeline_expected_count: int = 0
+    native_pipeline_completed_count: int = 0
+    native_pipeline_barrier_granted: bool = False
+    native_pipeline_barrier_broken: bool = False
     control_plane_outage_seconds: float = field(
         default_factory=_control_plane_outage_seconds_from_env
     )
@@ -345,6 +350,21 @@ class AedtProjectLease:
             status.get("session_live_lease_count") or 0
         )
         self.session_slots_total = int(status.get("session_slots_total") or 0)
+        self.native_pipeline_completed = bool(
+            status.get("native_pipeline_completed", False)
+        )
+        self.native_pipeline_expected_count = int(
+            status.get("native_pipeline_expected_count") or 0
+        )
+        self.native_pipeline_completed_count = int(
+            status.get("native_pipeline_completed_count") or 0
+        )
+        self.native_pipeline_barrier_granted = bool(
+            status.get("native_pipeline_barrier_granted", False)
+        )
+        self.native_pipeline_barrier_broken = bool(
+            status.get("native_pipeline_barrier_broken", False)
+        )
 
     def heartbeat(self) -> dict[str, Any]:
         status = self._call_with_retry("POST", "/heartbeat", {})
@@ -643,7 +663,13 @@ class AedtProjectLease:
             or self._automation_lock.path != self.automation_lock_path
         ):
             raw_timeout = os.environ.get(
-                "AEDT_POOL_AUTOMATION_LOCK_TIMEOUT_SECONDS", "1800"
+                # One valid MFT thermal field-summary extraction has been
+                # observed at ~1950s.  After the native-pipeline barrier, up
+                # to three such Desktop-global postprocessors serialize, so a
+                # 1800s contender timeout rejects healthy work.  Keep the
+                # configured override but make the bounded maximum the safe
+                # default for 1:3 cohorts.
+                "AEDT_POOL_AUTOMATION_LOCK_TIMEOUT_SECONDS", "7200"
             ).strip()
             try:
                 timeout_seconds = float(raw_timeout)
@@ -883,6 +909,88 @@ class AedtProjectLease:
                     "is still incomplete; refusing to start native analyze"
                 )
             time.sleep(min(max(0.1, float(poll_seconds)), remaining))
+
+    def wait_for_native_pipeline_barrier(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        poll_seconds: float = 2.0,
+    ) -> dict[str, Any]:
+        """Wait until every sealed cohort member has ended native analysis.
+
+        This call performs no AEDT operation and must be made while the caller
+        has suspended the Desktop automation transaction.  The first request
+        durably marks this lease complete for its exact session/solve
+        generation; subsequent reads wait for the remaining cohort members.
+        """
+
+        if self.protocol_version < 2:
+            return self.status()
+        if self.state != "active" or not self.solve_permit_granted \
+                or self.solve_permit_generation <= 0:
+            latest = self.status()
+            if self.state != "active" or not self.solve_permit_granted \
+                    or self.solve_permit_generation <= 0:
+                raise AedtLeaseError(
+                    "native pipeline barrier requires an active sealed lease"
+                )
+        if timeout_seconds is None:
+            raw_timeout = os.environ.get(
+                "AEDT_POOL_NATIVE_PIPELINE_BARRIER_TIMEOUT_SECONDS", "7200"
+            ).strip()
+            try:
+                timeout_seconds = float(raw_timeout)
+            except (TypeError, ValueError) as exc:
+                raise AedtLeaseError(
+                    "AEDT_POOL_NATIVE_PIPELINE_BARRIER_TIMEOUT_SECONDS must "
+                    "be numeric"
+                ) from exc
+            if not 30 <= timeout_seconds <= 86400:
+                raise AedtLeaseError(
+                    "AEDT_POOL_NATIVE_PIPELINE_BARRIER_TIMEOUT_SECONDS must "
+                    "be between 30 and 86400"
+                )
+        timeout = float(timeout_seconds)
+        poll = float(poll_seconds)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("native pipeline barrier timeout must be positive")
+        if not math.isfinite(poll) or poll < 0:
+            raise ValueError("native pipeline barrier poll interval must be non-negative")
+
+        generation = int(self.solve_permit_generation)
+        latest = self._call_with_retry(
+            "POST",
+            "/native-pipeline-complete",
+            {"solve_permit_generation": generation},
+        )
+        self._apply_status(latest)
+        deadline = time.monotonic() + timeout
+        while True:
+            if self.native_pipeline_barrier_granted:
+                return latest
+            if self.native_pipeline_barrier_broken:
+                raise AedtLeaseError(
+                    "native pipeline cohort broke before every member "
+                    "completed"
+                )
+            if self.state != "active":
+                raise AedtLeaseError(
+                    f"AEDT lease {self.lease_id} became {self.state} while "
+                    "waiting for native pipeline completion"
+                )
+            if int(self.solve_permit_generation) != generation:
+                raise AedtLeaseError(
+                    "native pipeline solve generation changed while waiting"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "timed out waiting for sealed AEDT cohort native pipeline "
+                    f"completion ({self.native_pipeline_completed_count}/"
+                    f"{self.native_pipeline_expected_count})"
+                )
+            time.sleep(min(max(0.1, poll), remaining))
+            latest = self.status()
 
     def release(self, *, wait_seconds: int = 300) -> dict[str, Any]:
         status = self._call_with_retry(
