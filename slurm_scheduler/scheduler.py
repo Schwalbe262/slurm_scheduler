@@ -2698,6 +2698,15 @@ class Scheduler:
     def expire_pending_allocation_if_stale(self, allocation: dict) -> None:
         if self.allocation_pending_timeout_seconds <= 0:
             return
+        if self.allocation_is_dedicated_aedt_pool(allocation):
+            # AEDT demand allocations are durable, owner-managed capacity.
+            # Generic close is intentionally refused for these allocations;
+            # applying the generic timeout first would therefore refresh the
+            # global CPU backoff every scheduler tick while leaving the Slurm
+            # request alive. That permanently suppresses unrelated accounts
+            # and replacement AEDT capacity. Keep the request queued and let
+            # the AEDT reconciler/Slurm own its lifecycle.
+            return
         submitted_at = self._timestamp(allocation.get("submitted_at") or allocation.get("created_at"))
         if not submitted_at:
             return

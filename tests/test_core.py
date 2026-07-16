@@ -2587,6 +2587,40 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(live, [])
         self.assertTrue(scheduler.allocation_pool_in_backoff("gpu:a6000"))
 
+    def test_stale_pending_aedt_pool_allocation_does_not_poison_cpu_backoff(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu2",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=131072,
+            resource_pool="cpu",
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.PENDING.value,
+            slurm_job_id="pending-aedt-pool",
+            drain_reason="AEDT pool project demand",
+            pending_reason="(Resources)",
+            submitted_at="2000-01-01 00:00:00",
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            allocation_pending_timeout_seconds=1,
+            allocation_pending_backoff_seconds=3600,
+        )
+
+        scheduler.apply_allocation_lifecycle()
+
+        allocation = self.db.get_allocation(allocation_id)
+        self.assertEqual(allocation["state"], AllocationStatus.PENDING.value)
+        self.assertEqual(FakeClient.cancelled, [])
+        self.assertFalse(scheduler.allocation_pool_in_backoff("cpu"))
+
     def test_stale_pending_a6000_warm_pool_priority_is_not_cancelled(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",
