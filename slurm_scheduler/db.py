@@ -2557,12 +2557,35 @@ class Database:
         never physical standalone project Desktops.
         """
 
+        return self.count_active_standalone_fea_tasks_by_scope(project)
+
+    def count_active_standalone_fea_tasks_by_scope(
+        self, project: str, *, name_prefix: str = ""
+    ) -> int:
+        """Count active physical standalone AEDT workers in one exact scope.
+
+        ``project`` is an exact match.  When supplied, ``name_prefix`` is a
+        case-sensitive literal prefix (not a SQL wildcard expression).
+        Queued, pooled, standard-profile, and session-host tasks are excluded.
+        """
+
         project = str(project or "").strip()
+        name_prefix = str(name_prefix or "")
         if not project or project == "_aedt_pool_hosts":
             return 0
+        name_clause = ""
+        params: list[Any] = [
+            project,
+            TaskStatus.ATTACHING.value,
+            TaskStatus.RUNNING.value,
+            SchedulingProfile.FEA_BURSTY.value,
+        ]
+        if name_prefix:
+            name_clause = "AND SUBSTR(name, 1, LENGTH(?)) = ?"
+            params.extend([name_prefix, name_prefix])
         with self.connect() as conn:
             row = conn.execute(
-                """
+                f"""
                 SELECT COUNT(*)
                 FROM tasks
                 WHERE project = ?
@@ -2571,13 +2594,9 @@ class Database:
                   AND LOWER(TRIM(COALESCE(aedt_backend, 'standalone')))
                       IN ('', 'standalone')
                   AND TRIM(COALESCE(project, '')) != '_aedt_pool_hosts'
+                  {name_clause}
                 """,
-                (
-                    project,
-                    TaskStatus.ATTACHING.value,
-                    TaskStatus.RUNNING.value,
-                    SchedulingProfile.FEA_BURSTY.value,
-                ),
+                params,
             ).fetchone()
             return int(row[0]) if row else 0
 

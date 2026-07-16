@@ -123,6 +123,68 @@ class SlurmParsingTests(unittest.TestCase):
             {"MFT_1MW_2026v1": 100},
         )
 
+    def test_load_app_config_parses_exact_standalone_aedt_running_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "app.yaml"
+            path.write_text(
+                "\n".join(
+                    [
+                        "standalone_aedt_running_lanes:",
+                        "  mft_data:",
+                        "    project: MFT_1MW_2026v1",
+                        "    name_prefix: mft-camp-",
+                        "    aedt_backend: standalone",
+                        "    max_running: 100",
+                        "  mft_nsga_fea_validation:",
+                        "    project: MFT_1MW_2026v1",
+                        "    name_prefix: mft-nsgafea-",
+                        "    aedt_backend: standalone",
+                        "    max_running: 8",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config = load_app_config(path)
+        self.assertEqual(
+            config.standalone_aedt_running_lanes,
+            {
+                "mft_data": {
+                    "project": "MFT_1MW_2026v1",
+                    "name_prefix": "mft-camp-",
+                    "aedt_backend": "standalone",
+                    "max_running": 100,
+                },
+                "mft_nsga_fea_validation": {
+                    "project": "MFT_1MW_2026v1",
+                    "name_prefix": "mft-nsgafea-",
+                    "aedt_backend": "standalone",
+                    "max_running": 8,
+                },
+            },
+        )
+
+    def test_load_app_config_rejects_overlapping_standalone_aedt_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "app.yaml"
+            path.write_text(
+                "\n".join(
+                    [
+                        "standalone_aedt_running_lanes:",
+                        "  broad:",
+                        "    project: MFT_1MW_2026v1",
+                        "    name_prefix: mft-",
+                        "    max_running: 100",
+                        "  nested:",
+                        "    project: MFT_1MW_2026v1",
+                        "    name_prefix: mft-nsgafea-",
+                        "    max_running: 8",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "overlapping"):
+                load_app_config(path)
+
     def test_load_app_config_parses_gpu_prewarm_cpu_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "app.yaml"
@@ -2927,6 +2989,96 @@ class SchedulerTests(unittest.TestCase):
                 "_aedt_pool_hosts"
             ),
             0,
+        )
+
+    def test_exact_standalone_aedt_lanes_are_independent_with_shared_project(self) -> None:
+        project = "MFT_1MW_2026v1"
+
+        def make_task(name: str, status: str, backend: str = "standalone") -> int:
+            task_id = self.db.create_task(
+                TaskCreate(
+                    name,
+                    "~/case",
+                    "run",
+                    project=project,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                    aedt_backend=backend,
+                )
+            )
+            self.db.update_task(task_id, status=status)
+            return task_id
+
+        make_task("mft-camp-active", TaskStatus.RUNNING.value)
+        make_task("mft-nsgafea-active", TaskStatus.ATTACHING.value)
+        # Neither queue nor a same-prefix pooled client consumes a lane seat.
+        make_task("mft-nsgafea-queued", TaskStatus.QUEUED.value)
+        make_task(
+            "mft-nsgafea-pooled",
+            TaskStatus.RUNNING.value,
+            backend=AedtBackend.POOLED.value,
+        )
+        data_queued_id = make_task("mft-camp-next", TaskStatus.QUEUED.value)
+        validation_queued_id = make_task(
+            "mft-nsgafea-next", TaskStatus.QUEUED.value
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            standalone_aedt_max_running_by_project={project: 100},
+            standalone_aedt_running_lanes={
+                "mft_data": {
+                    "project": project,
+                    "name_prefix": "mft-camp-",
+                    "aedt_backend": "standalone",
+                    "max_running": 1,
+                },
+                "mft_nsga_fea_validation": {
+                    "project": project,
+                    "name_prefix": "mft-nsgafea-",
+                    "aedt_backend": "standalone",
+                    "max_running": 8,
+                },
+            },
+        )
+
+        self.assertEqual(
+            scheduler.standalone_aedt_running_cap_status(
+                self.db.get_task(data_queued_id)
+            ),
+            (1, 1),
+        )
+        self.assertEqual(
+            scheduler.standalone_aedt_running_cap_status(
+                self.db.get_task(validation_queued_id)
+            ),
+            (1, 8),
+        )
+        self.assertIn(
+            "lane mft_data",
+            scheduler.standalone_aedt_running_cap_reason(
+                self.db.get_task(data_queued_id)
+            ),
+        )
+        self.assertEqual(
+            scheduler.standalone_aedt_running_cap_reason(
+                self.db.get_task(validation_queued_id)
+            ),
+            "",
+        )
+        diagnostics = scheduler.task_queue_diagnostics(
+            self.db.get_task(data_queued_id)
+        )
+        self.assertEqual(diagnostics["standalone_aedt_lane"], "mft_data")
+        self.assertEqual(
+            diagnostics["standalone_aedt_name_prefix"], "mft-camp-"
+        )
+        self.assertEqual(
+            self.db.count_active_standalone_fea_tasks_by_scope(
+                project, name_prefix="mft-nsgafea-"
+            ),
+            1,
         )
 
     def test_concurrent_standalone_aedt_last_project_seat_is_claimed_once(self) -> None:

@@ -95,6 +95,20 @@ fea_bursty:
 # _aedt_pool_hosts project are not counted by this limit.
 standalone_aedt_max_running_by_project:
   MFT_1MW_2026v1: 100
+# Exact lanes override the broad project fallback for matching standalone FEA
+# tasks. This keeps the 100-worker data lane and 8-worker NSGA validation lane
+# active concurrently even though both use the same scheduler project.
+standalone_aedt_running_lanes:
+  mft_data:
+    project: MFT_1MW_2026v1
+    name_prefix: "mft-camp-"
+    aedt_backend: standalone
+    max_running: 100
+  mft_nsga_fea_validation:
+    project: MFT_1MW_2026v1
+    name_prefix: "mft-nsgafea-"
+    aedt_backend: standalone
+    max_running: 8
 license_monitor:
   enabled: false
   account: "account_a"

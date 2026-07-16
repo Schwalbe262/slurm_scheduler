@@ -231,6 +231,7 @@ class Scheduler:
         ssh_parallelism: int = 4,
         license_admission_reserve_exempt_projects: list[str] | None = None,
         standalone_aedt_max_running_by_project: dict[str, int] | None = None,
+        standalone_aedt_running_lanes: dict[str, dict[str, Any]] | None = None,
     ):
         self.db = db
         self.accounts = accounts
@@ -341,6 +342,59 @@ class Scheduler:
                     "a non-empty project and a positive integer limit"
                 )
             self.standalone_aedt_max_running_by_project[project] = raw_limit
+        standalone_lanes = standalone_aedt_running_lanes or {}
+        if not isinstance(standalone_lanes, dict):
+            raise ValueError("standalone_aedt_running_lanes must be a mapping")
+        self.standalone_aedt_running_lanes: list[dict[str, Any]] = []
+        lane_scopes: list[tuple[str, str, str, str]] = []
+        for raw_lane_name, raw_lane in standalone_lanes.items():
+            lane_name = str(raw_lane_name).strip()
+            if not lane_name or not isinstance(raw_lane, dict):
+                raise ValueError(
+                    "standalone_aedt_running_lanes entries require a non-empty "
+                    "lane name and a mapping"
+                )
+            project = str(raw_lane.get("project") or "").strip()
+            name_prefix = str(raw_lane.get("name_prefix") or "").strip()
+            backend = str(raw_lane.get("aedt_backend") or "standalone").strip().lower()
+            raw_limit = raw_lane.get("max_running")
+            if not project or not name_prefix or backend != AedtBackend.STANDALONE.value:
+                raise ValueError(
+                    f"standalone AEDT lane {lane_name!r} requires exact project, "
+                    "name_prefix, and aedt_backend: standalone"
+                )
+            if (
+                isinstance(raw_limit, bool)
+                or not isinstance(raw_limit, int)
+                or raw_limit <= 0
+            ):
+                raise ValueError(
+                    f"standalone AEDT lane {lane_name!r} requires a positive "
+                    "integer max_running"
+                )
+            for other_name, other_project, other_backend, other_prefix in lane_scopes:
+                if (
+                    project == other_project
+                    and backend == other_backend
+                    and (
+                        name_prefix.startswith(other_prefix)
+                        or other_prefix.startswith(name_prefix)
+                    )
+                ):
+                    raise ValueError(
+                        f"standalone AEDT lanes {other_name!r} and {lane_name!r} "
+                        "have overlapping project/backend/name_prefix scopes"
+                    )
+            lane_scopes.append((lane_name, project, backend, name_prefix))
+            self.standalone_aedt_running_lanes.append(
+                {
+                    "name": lane_name,
+                    "project": project,
+                    "name_prefix": name_prefix,
+                    "aedt_backend": backend,
+                    "max_running": raw_limit,
+                }
+            )
         # hostname -> deque[(monotonic, free_memory_mb)]: rolling pestat
         # observations backing the adaptive memory relax. In-memory only, so a
         # web-worker restart re-arms the coverage requirement before relaxing.
@@ -3508,12 +3562,13 @@ class Scheduler:
             return ""
         return f"project active cap reached for {project_name}: {active}/{limit} attaching+running"
 
-    def standalone_aedt_running_cap_status(self, task: dict) -> tuple[int, int]:
-        """Return ``(active, limit)`` for a capped standalone FEA project.
+    def standalone_aedt_running_cap_details(self, task: dict) -> dict[str, Any]:
+        """Return the exact standalone-AEDT cap scope for ``task``.
 
         Active includes ATTACHING because the Desktop launch has already been
         reserved at that boundary.  Queued tasks remain logical campaign
-        capacity and do not consume this physical-AEDT limit.
+        capacity and do not consume this physical-AEDT limit.  An exact lane
+        match takes precedence over the broad per-project compatibility cap.
         """
 
         project_name = str(task.get("project") or "").strip()
@@ -3523,24 +3578,51 @@ class Scheduler:
             or not self.task_is_fea_bursty(task)
             or self.task_aedt_backend(task) != AedtBackend.STANDALONE.value
         ):
-            return 0, 0
+            return {"active": 0, "limit": 0, "lane": "", "name_prefix": ""}
+        task_name = str(task.get("name") or "")
+        for lane in self.standalone_aedt_running_lanes:
+            if (
+                project_name == lane["project"]
+                and self.task_aedt_backend(task) == lane["aedt_backend"]
+                and task_name.startswith(str(lane["name_prefix"]))
+            ):
+                active = self.db.count_active_standalone_fea_tasks_by_scope(
+                    project_name,
+                    name_prefix=str(lane["name_prefix"]),
+                )
+                return {
+                    "active": active,
+                    "limit": int(lane["max_running"]),
+                    "lane": str(lane["name"]),
+                    "name_prefix": str(lane["name_prefix"]),
+                }
         limit = int(
             self.standalone_aedt_max_running_by_project.get(project_name, 0)
         )
         if limit <= 0:
-            return 0, 0
+            return {"active": 0, "limit": 0, "lane": "", "name_prefix": ""}
         active = self.db.count_active_standalone_fea_tasks_by_project(
             project_name
         )
-        return active, limit
+        return {"active": active, "limit": limit, "lane": "", "name_prefix": ""}
+
+    def standalone_aedt_running_cap_status(self, task: dict) -> tuple[int, int]:
+        """Return ``(active, limit)`` for compatibility with existing callers."""
+
+        details = self.standalone_aedt_running_cap_details(task)
+        return int(details["active"]), int(details["limit"])
 
     def standalone_aedt_running_cap_reason(self, task: dict) -> str:
-        active, limit = self.standalone_aedt_running_cap_status(task)
+        details = self.standalone_aedt_running_cap_details(task)
+        active = int(details["active"])
+        limit = int(details["limit"])
         if limit <= 0 or active < limit:
             return ""
         project_name = str(task.get("project") or "").strip()
+        lane = str(details.get("lane") or "")
+        lane_context = f" lane {lane}" if lane else ""
         return (
-            f"standalone AEDT running cap reached for {project_name}: "
+            f"standalone AEDT running cap reached for {project_name}{lane_context}: "
             f"{active}/{limit} attaching+running standalone FEA"
         )
 
@@ -4348,20 +4430,15 @@ class Scheduler:
             queue_state = "blocked"
             reason = project_cap_reason
 
-        standalone_aedt_active, standalone_aedt_limit = (
-            self.standalone_aedt_running_cap_status(task)
-        )
+        standalone_aedt_details = self.standalone_aedt_running_cap_details(task)
+        standalone_aedt_active = int(standalone_aedt_details["active"])
+        standalone_aedt_limit = int(standalone_aedt_details["limit"])
         if (
             standalone_aedt_limit > 0
             and standalone_aedt_active >= standalone_aedt_limit
         ):
             queue_state = "blocked"
-            project_name = str(task.get("project") or "").strip()
-            reason = (
-                f"standalone AEDT running cap reached for {project_name}: "
-                f"{standalone_aedt_active}/{standalone_aedt_limit} "
-                "attaching+running standalone FEA"
-            )
+            reason = self.standalone_aedt_running_cap_reason(task)
 
         if not reason and requested_allocation_id:
             if not requested_allocation:
@@ -4469,6 +4546,15 @@ class Scheduler:
                     ),
                 }
             )
+            if standalone_aedt_details.get("lane"):
+                diagnostics.update(
+                    {
+                        "standalone_aedt_lane": standalone_aedt_details["lane"],
+                        "standalone_aedt_name_prefix": standalone_aedt_details[
+                            "name_prefix"
+                        ],
+                    }
+                )
         return diagnostics
 
     def fea_worker_limit_reason_for_task(

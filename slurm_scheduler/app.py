@@ -601,6 +601,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         fea_adaptive_memory_margin_percent=config.fea_adaptive_memory_margin_percent,
         fea_adaptive_memory_max_attach_per_tick=config.fea_adaptive_memory_max_attach_per_tick,
         standalone_aedt_max_running_by_project=config.standalone_aedt_max_running_by_project,
+        standalone_aedt_running_lanes=config.standalone_aedt_running_lanes,
         cleanup_enabled=config.cleanup_enabled,
         cleanup_interval_seconds=config.cleanup_interval_seconds,
         cleanup_finished_task_ttl_seconds=config.cleanup_finished_task_ttl_seconds,

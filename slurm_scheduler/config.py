@@ -139,6 +139,14 @@ class AppConfig:
     standalone_aedt_max_running_by_project: dict[str, int] = field(
         default_factory=dict
     )
+    # Optional exact standalone-AEDT lanes.  A matching lane takes precedence
+    # over the broad per-project fallback above, so independent workloads that
+    # share one scheduler project can reserve separate physical Desktop caps.
+    # Every lane is scoped by exact project, case-sensitive task-name prefix,
+    # and the standalone backend.
+    standalone_aedt_running_lanes: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )
     # Experimental pooled AEDT backend.  The operator-facing limit lives in
     # scheduler_settings; these fields configure the separately deployed
     # node-side session-host adapter.  Disabled is the production default.
@@ -256,6 +264,71 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
             )
         normalized_standalone_caps[project] = raw_limit
     data["standalone_aedt_max_running_by_project"] = normalized_standalone_caps
+    standalone_lanes = data.get("standalone_aedt_running_lanes", {})
+    if standalone_lanes is None:
+        standalone_lanes = {}
+    if not isinstance(standalone_lanes, dict):
+        raise ValueError("standalone_aedt_running_lanes must be a mapping")
+    normalized_standalone_lanes: dict[str, dict[str, Any]] = {}
+    lane_scopes: list[tuple[str, str, str, str]] = []
+    allowed_lane_keys = {"project", "name_prefix", "aedt_backend", "max_running"}
+    for raw_lane_name, raw_lane in standalone_lanes.items():
+        lane_name = str(raw_lane_name).strip()
+        if not lane_name or not isinstance(raw_lane, dict):
+            raise ValueError(
+                "standalone_aedt_running_lanes entries require a non-empty "
+                "lane name and a mapping"
+            )
+        unknown_keys = set(raw_lane) - allowed_lane_keys
+        if unknown_keys:
+            raise ValueError(
+                f"standalone AEDT lane {lane_name!r} has unknown keys: "
+                f"{', '.join(sorted(str(item) for item in unknown_keys))}"
+            )
+        project = str(raw_lane.get("project") or "").strip()
+        name_prefix = str(raw_lane.get("name_prefix") or "").strip()
+        backend = str(raw_lane.get("aedt_backend") or "standalone").strip().lower()
+        max_running = raw_lane.get("max_running")
+        if not project or not name_prefix:
+            raise ValueError(
+                f"standalone AEDT lane {lane_name!r} requires non-empty "
+                "project and name_prefix"
+            )
+        if backend != "standalone":
+            raise ValueError(
+                f"standalone AEDT lane {lane_name!r} requires "
+                "aedt_backend: standalone"
+            )
+        if (
+            isinstance(max_running, bool)
+            or not isinstance(max_running, int)
+            or max_running <= 0
+        ):
+            raise ValueError(
+                f"standalone AEDT lane {lane_name!r} requires a positive "
+                "integer max_running"
+            )
+        for other_name, other_project, other_backend, other_prefix in lane_scopes:
+            if (
+                project == other_project
+                and backend == other_backend
+                and (
+                    name_prefix.startswith(other_prefix)
+                    or other_prefix.startswith(name_prefix)
+                )
+            ):
+                raise ValueError(
+                    f"standalone AEDT lanes {other_name!r} and {lane_name!r} "
+                    "have overlapping project/backend/name_prefix scopes"
+                )
+        lane_scopes.append((lane_name, project, backend, name_prefix))
+        normalized_standalone_lanes[lane_name] = {
+            "project": project,
+            "name_prefix": name_prefix,
+            "aedt_backend": backend,
+            "max_running": max_running,
+        }
+    data["standalone_aedt_running_lanes"] = normalized_standalone_lanes
     gpu_prewarm = data.pop("gpu_prewarm", None)
     if isinstance(gpu_prewarm, dict):
         mapping = {
