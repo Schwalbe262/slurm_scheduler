@@ -226,6 +226,7 @@ class Scheduler:
         self.poll_interval_seconds = poll_interval_seconds
         self.client_factory = client_factory
         self._aedt_backend_admission_checker: Callable[[dict], tuple[bool, str]] | None = None
+        self._aedt_backend_task_preparer: Callable[[dict], tuple[bool, str]] | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._snapshot_cache: tuple[float, list[AccountSnapshot]] | None = None
@@ -2822,6 +2823,15 @@ class Scheduler:
             allocation = self.db.get_allocation(requested_id)
             if allocation and allocation.get("state") not in terminal_states:
                 continue
+            if (
+                self.task_aedt_backend(task) == AedtBackend.POOLED.value
+                and self.db.task_has_auto_aedt_reservation(int(task["id"]))
+            ):
+                # Automatic pins are renewable scheduler state, not operator
+                # intent.  The side-effecting pre-admission hook will fail the
+                # stale reservation and either repin a healthy session or keep
+                # this task queued and unpinned.
+                continue
             state = allocation.get("state") if allocation else "not found"
             self.db.update_task(
                 task["id"],
@@ -3336,6 +3346,14 @@ class Scheduler:
         # across concurrent callers requires one transactional check/transition.
         if self.project_active_cap_reason(task):
             return False
+        if not self.prepare_aedt_backend_task(task):
+            return False
+        # Pooled pre-admission atomically writes the exact allocation/node pin
+        # and the real four-core project request.  Never select from the stale
+        # thin-client snapshot supplied by the caller.
+        task = self.db.get_task(int(task["id"])) or task
+        if task.get("status") != TaskStatus.QUEUED.value:
+            return False
         allocation = self.best_allocation_for_task(task, fea_baseline_only=fea_baseline_only)
         if not allocation:
             return False
@@ -3406,9 +3424,7 @@ class Scheduler:
                 return None
             task = self.apply_dynamic_env_profile(task, account)
             attach_token = uuid.uuid4().hex
-            if not self.db.update_task_if_status(
-                task["id"],
-                [TaskStatus.QUEUED.value],
+            claim_fields = dict(
                 status=TaskStatus.ATTACHING.value,
                 allocation_id=allocation["id"],
                 account_name=allocation["account_name"],
@@ -3424,7 +3440,38 @@ class Scheduler:
                 started_at=None,
                 finished_at=None,
                 exit_code=None,
-            ):
+            )
+            if self.task_aedt_backend(task) == AedtBackend.POOLED.value:
+                try:
+                    heartbeat_timeout = max(
+                        30,
+                        int(
+                            self.db.get_setting(
+                                "aedt_pool_session_heartbeat_timeout_seconds"
+                            )
+                            or 600
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    heartbeat_timeout = 600
+                now_dt = datetime.now(timezone.utc)
+                claimed = self.db.update_pooled_task_if_reserved_capacity(
+                    int(task["id"]),
+                    int(allocation["id"]),
+                    heartbeat_cutoff=(
+                        now_dt - timedelta(seconds=heartbeat_timeout)
+                    ).strftime("%Y-%m-%d %H:%M:%S"),
+                    now=now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    project_cpus=self.db.aedt_pool_project_cpus(),
+                    **claim_fields,
+                )
+            else:
+                claimed = self.db.update_task_if_status(
+                    task["id"],
+                    [TaskStatus.QUEUED.value],
+                    **claim_fields,
+                )
+            if not claimed:
                 return None
             self._license_record_claim_locked(task, attach_token)
             self._record_attach_delta(allocation, task)
@@ -3686,6 +3733,7 @@ class Scheduler:
             and str(allocation.get("node_name") or "")
         }
         counts: dict[str, int] = {}
+        project_cpus = self.db.aedt_pool_project_cpus()
         for task in self.db.list_tasks_by_statuses(
             [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
         ):
@@ -3695,10 +3743,22 @@ class Scheduler:
                 continue
             if self.task_is_fea_infra(task):
                 continue
+            if (
+                self.task_aedt_backend(task) == AedtBackend.POOLED.value
+                and int(task.get("cpus") or 0) < project_cpus
+            ):
+                continue
             node_name = allocation_node_by_id.get(int(task.get("allocation_id") or 0))
             if not node_name:
                 continue
             counts[node_name] = counts.get(node_name, 0) + 1
+        for allocation_id, usage in self.db.aedt_project_pressure_by_allocation().items():
+            node_name = allocation_node_by_id.get(int(allocation_id))
+            if not node_name:
+                continue
+            counts[node_name] = counts.get(node_name, 0) + int(
+                usage.get("workers") or 0
+            )
         return counts
 
     def annotate_fea_node_worker_counts(self, allocations: list[dict]) -> None:
@@ -4371,6 +4431,16 @@ class Scheduler:
             if self.task_requires_gpu(task):
                 gpu_slots = int(allocation.get("free_gpus") or 0) // max(1, int(task.get("gpus") or 1))
                 slots = min(slots, gpu_slots)
+            if self.task_aedt_backend(task) == AedtBackend.POOLED.value:
+                project_cpus = self.db.aedt_pool_project_cpus()
+                density_cap = int(allocation.get("total_cpus") or 0) // project_cpus
+                active = self.db.active_pooled_aedt_tasks_by_allocation().get(
+                    int(allocation.get("id") or 0), 0
+                )
+                reserved = int(
+                    allocation.get("_reserved_pooled_aedt_client_slots") or 0
+                )
+                slots = min(slots, max(0, density_cap - active - reserved))
             return max(0, slots - reserved_slots)
         memory_slots = int(allocation.get("free_memory_mb") or 0) // max(1, int(task.get("memory_mb") or 1))
         if self.task_requires_gpu(task):
@@ -4419,6 +4489,36 @@ class Scheduler:
         self, checker: Callable[[dict], tuple[bool, str]] | None
     ) -> None:
         self._aedt_backend_admission_checker = checker
+
+    def set_aedt_backend_task_preparer(
+        self, preparer: Callable[[dict], tuple[bool, str]] | None
+    ) -> None:
+        """Install the side-effecting pooled pre-admission hook.
+
+        Unlike the pure admission checker used by dashboards and planning,
+        this hook is called only from the actual queued-task assignment path.
+        """
+
+        self._aedt_backend_task_preparer = preparer
+
+    def prepare_aedt_backend_task(self, task: dict) -> bool:
+        if self.task_aedt_backend(task) == AedtBackend.STANDALONE.value:
+            return True
+        preparer = self._aedt_backend_task_preparer
+        if preparer is None:
+            return False
+        try:
+            prepared, reason = preparer(task)
+        except Exception:
+            LOGGER.exception("AEDT pooled backend pre-admission failed")
+            return False
+        if not prepared:
+            LOGGER.debug(
+                "holding pooled task %s before launch: %s",
+                task.get("id"),
+                str(reason or "no healthy AEDT session slot is ready"),
+            )
+        return bool(prepared)
 
     def task_aedt_backend(self, task: dict) -> str:
         return normalize_aedt_backend(str(task.get("aedt_backend") or ""))
@@ -4649,6 +4749,7 @@ class Scheduler:
 
         requested_cpus_by_node: dict[str, int] = {}
         workers_by_node: dict[str, int] = {}
+        project_cpus = self.db.aedt_pool_project_cpus()
         for task in self.db.list_tasks_by_statuses(
             [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
         ):
@@ -4657,6 +4758,11 @@ class Scheduler:
             if not self.task_is_fea_bursty(task):
                 continue
             if self.task_is_fea_infra(task):
+                continue
+            if (
+                self.task_aedt_backend(task) == AedtBackend.POOLED.value
+                and int(task.get("cpus") or 0) < project_cpus
+            ):
                 continue
             node_name = allocation_node_by_id.get(int(task.get("allocation_id") or 0))
             if not node_name:
@@ -4672,14 +4778,16 @@ class Scheduler:
         # accepted/live project lease instead of charging the 12-CPU session
         # infrastructure task, which would undercount a full three-project
         # session and overcount an idle one.
-        for allocation_id, project_cpus in (
-            self.db.aedt_attached_project_cpus_by_allocation().items()
-        ):
+        for allocation_id, usage in self.db.aedt_project_pressure_by_allocation().items():
             node_name = allocation_node_by_id.get(int(allocation_id))
             if not node_name:
                 continue
+            workers_by_node[node_name] = workers_by_node.get(node_name, 0) + int(
+                usage.get("workers") or 0
+            )
             requested_cpus_by_node[node_name] = (
-                requested_cpus_by_node.get(node_name, 0) + int(project_cpus)
+                requested_cpus_by_node.get(node_name, 0)
+                + int(usage.get("shadow_cpus") or 0)
             )
 
         pressures: dict[str, dict[str, int]] = {}
@@ -4719,6 +4827,7 @@ class Scheduler:
             owned_by_alloc[int(allocation["id"])] = owned
         requested_by_alloc: dict[int, int] = {}
         workers_by_alloc: dict[int, int] = {}
+        project_cpus = self.db.aedt_pool_project_cpus()
         for task in self.db.list_tasks_by_statuses(
             [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
         ):
@@ -4728,16 +4837,26 @@ class Scheduler:
                 continue
             if self.task_is_fea_infra(task):
                 continue
+            if (
+                self.task_aedt_backend(task) == AedtBackend.POOLED.value
+                and int(task.get("cpus") or 0) < project_cpus
+            ):
+                continue
             alloc_id = int(task.get("allocation_id") or 0)
             if alloc_id not in owned_by_alloc:
                 continue
             workers_by_alloc[alloc_id] = workers_by_alloc.get(alloc_id, 0) + 1
             requested_by_alloc[alloc_id] = requested_by_alloc.get(alloc_id, 0) + int(task.get("cpus") or 0)
-        for alloc_id, project_cpus in self.db.aedt_attached_project_cpus_by_allocation().items():
+        for alloc_id, usage in self.db.aedt_project_pressure_by_allocation().items():
             if int(alloc_id) not in owned_by_alloc:
                 continue
+            workers_by_alloc[int(alloc_id)] = (
+                workers_by_alloc.get(int(alloc_id), 0)
+                + int(usage.get("workers") or 0)
+            )
             requested_by_alloc[int(alloc_id)] = (
-                requested_by_alloc.get(int(alloc_id), 0) + int(project_cpus)
+                requested_by_alloc.get(int(alloc_id), 0)
+                + int(usage.get("shadow_cpus") or 0)
             )
         return {
             alloc_id: {
@@ -4887,6 +5006,12 @@ class Scheduler:
             if task["status"] not in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
                 continue
             if not self.task_is_fea_bursty(task):
+                continue
+            if (
+                self.task_aedt_backend(task) == AedtBackend.POOLED.value
+                and int(task.get("cpus") or 0)
+                < self.db.aedt_pool_project_cpus()
+            ):
                 continue
             node_name = node_by_allocation_id.get(int(task.get("allocation_id") or 0))
             if not node_name:
@@ -5300,6 +5425,8 @@ class Scheduler:
                 continue
             if not self.task_is_fea_bursty(task):
                 continue
+            if self.task_aedt_backend(task) == AedtBackend.POOLED.value:
+                continue
             alloc_id = int(task.get("allocation_id") or 0)
             if alloc_id in allocation_by_id:
                 tasks_by_alloc.setdefault(alloc_id, []).append(task)
@@ -5562,6 +5689,7 @@ class Scheduler:
             # races the background attach thread.
             and task["status"] == TaskStatus.RUNNING.value
             and self.task_is_fea_bursty(task)
+            and self.task_aedt_backend(task) != AedtBackend.POOLED.value
         ]
         if not candidates:
             return None
@@ -6029,6 +6157,7 @@ class Scheduler:
                 if task["status"] == TaskStatus.QUEUED.value
                 and not int(task.get("exclusive_node") or 0)
                 and self.task_aedt_backend_admitted(task)
+                and self.task_aedt_backend(task) == AedtBackend.STANDALONE.value
             ],
             key=lambda item: (-int(item.get("priority") or 0), int(item["id"])),
         )
@@ -6120,6 +6249,7 @@ class Scheduler:
                 for task in self.db.list_tasks(limit=5000)
                 if task["status"] == TaskStatus.QUEUED.value
                 and self.task_aedt_backend_admitted(task)
+                and self.task_aedt_backend(task) == AedtBackend.STANDALONE.value
             ],
             key=lambda item: int(item["id"]),
         )
@@ -6171,6 +6301,10 @@ class Scheduler:
             allocation["_reserved_scheduling_profile"] = allocation_profile
         if self.task_is_fea_bursty(effective_task):
             allocation["_reserved_fea_slots"] = int(allocation.get("_reserved_fea_slots") or 0) + 1
+            if self.task_aedt_backend(effective_task) == AedtBackend.POOLED.value:
+                allocation["_reserved_pooled_aedt_client_slots"] = int(
+                    allocation.get("_reserved_pooled_aedt_client_slots") or 0
+                ) + 1
             if self.task_requires_gpu(effective_task):
                 allocation["free_gpus"] = max(0, int(allocation.get("free_gpus") or 0) - int(effective_task.get("gpus") or 0))
             return allocation

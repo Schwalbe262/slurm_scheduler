@@ -4,7 +4,7 @@ import json
 import sqlite3
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -441,22 +441,219 @@ class Database:
                 # operator setting; the pool's documented default is four.
                 project_cpus = 4
 
+            usage = self._aedt_project_pressure_rows(conn, project_cpus)
+            return {
+                allocation_id: int(item["shadow_cpus"])
+                for allocation_id, item in usage.items()
+            }
+
+    @staticmethod
+    def _aedt_project_pressure_rows(
+        conn: sqlite3.Connection, project_cpus: int
+    ) -> dict[int, dict[str, int]]:
+        rows = conn.execute(
+            """
+            SELECT s.allocation_id AS host_allocation_id,
+                   l.task_id, t.allocation_id AS task_allocation_id,
+                   t.status AS task_status, t.cpus AS task_cpus,
+                   t.aedt_backend AS task_aedt_backend
+            FROM aedt_project_leases AS l
+            JOIN aedt_sessions AS s ON s.id = l.session_id
+            LEFT JOIN tasks AS t ON t.id = l.task_id
+            WHERE l.state IN ('leased', 'attaching', 'active', 'releasing')
+              AND s.allocation_id > 0
+              AND s.state IN (
+                  'starting', 'ready', 'busy', 'draining', 'unhealthy'
+              )
+            ORDER BY l.id
+            """
+        ).fetchall()
+        usage: dict[int, dict[str, int]] = {}
+        for row in rows:
+            host_allocation_id = int(row["host_allocation_id"] or 0)
+            direct_same_allocation = bool(
+                str(row["task_status"] or "") in {"attaching", "running"}
+                and str(row["task_aedt_backend"] or "").strip().lower()
+                == "pooled"
+                and int(row["task_allocation_id"] or 0) == host_allocation_id
+                and int(row["task_cpus"] or 0) >= project_cpus
+            )
+            item = usage.setdefault(
+                host_allocation_id,
+                {"workers": 0, "shadow_cpus": 0, "live_projects": 0},
+            )
+            item["live_projects"] += 1
+            if not direct_same_allocation:
+                item["workers"] += 1
+                item["shadow_cpus"] += project_cpus
+        return usage
+
+    def aedt_project_pressure_by_allocation(self) -> dict[int, dict[str, int]]:
+        """Return only the lease pressure not represented by a local task."""
+
+        with self.connect() as conn:
+            tables = {
+                str(row["name"])
+                for row in conn.execute(
+                    """
+                    SELECT name FROM sqlite_master WHERE type = 'table'
+                      AND name IN ('aedt_sessions', 'aedt_project_leases')
+                    """
+                ).fetchall()
+            }
+            if tables != {"aedt_sessions", "aedt_project_leases"}:
+                return {}
+            setting = conn.execute(
+                "SELECT value FROM scheduler_settings WHERE key = 'aedt_pool_project_cpus'"
+            ).fetchone()
+            try:
+                project_cpus = max(1, int(setting["value"] if setting else 4))
+            except (TypeError, ValueError):
+                project_cpus = 4
+            return self._aedt_project_pressure_rows(conn, project_cpus)
+
+    def aedt_pool_project_cpus(self) -> int:
+        value = self.get_setting("aedt_pool_project_cpus")
+        try:
+            return max(1, int(value or 4))
+        except (TypeError, ValueError):
+            return 4
+
+    def active_pooled_aedt_tasks_by_allocation(self) -> dict[int, int]:
+        """Count launched pooled clients, including clients not yet leased."""
+
+        with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT s.allocation_id, COUNT(*) AS project_count
-                FROM aedt_project_leases AS l
-                JOIN aedt_sessions AS s ON s.id = l.session_id
-                WHERE l.state IN ('leased', 'attaching', 'active', 'releasing')
-                  AND s.allocation_id > 0
-                  AND s.state IN ('starting', 'ready', 'busy', 'draining', 'unhealthy')
-                GROUP BY s.allocation_id
+                SELECT allocation_id, COUNT(*) AS task_count
+                FROM tasks
+                WHERE allocation_id IS NOT NULL
+                  AND LOWER(TRIM(COALESCE(aedt_backend, ''))) = 'pooled'
+                  AND status IN ('attaching','running')
+                GROUP BY allocation_id
                 """
             ).fetchall()
-            return {
-                int(row["allocation_id"]): int(row["project_count"] or 0)
-                * project_cpus
-                for row in rows
+        return {
+            int(row["allocation_id"]): int(row["task_count"] or 0)
+            for row in rows
+            if int(row["allocation_id"] or 0) > 0
+        }
+
+    def task_has_auto_aedt_reservation(self, task_id: int) -> bool:
+        with self.connect() as conn:
+            table = conn.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'aedt_exact_session_reservations'
+                """
+            ).fetchone()
+            if not table:
+                return False
+            row = conn.execute(
+                """
+                SELECT 1 FROM aedt_exact_session_reservations
+                WHERE task_id = ? AND reservation_key LIKE 'aedt-auto:%'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (int(task_id),),
+            ).fetchone()
+            return bool(row)
+
+    def update_pooled_task_if_reserved_capacity(
+        self,
+        task_id: int,
+        target_allocation_id: int,
+        *,
+        heartbeat_cutoff: str,
+        now: str,
+        project_cpus: int,
+        **fields: Any,
+    ) -> bool:
+        """Atomically claim a queued pooled task and its allocation density.
+
+        SQLite serializes this conditional UPDATE as one writer operation, so
+        independent scheduler processes cannot both consume the final 64/4 or
+        48/4 client slot.  The exact healthy session reservation is checked in
+        the same statement; a stale pin can never launch unreserved.
+        """
+
+        if not fields:
+            return False
+        fields["updated_at"] = fields.get("updated_at", "CURRENT_TIMESTAMP")
+        assignments: list[str] = []
+        values: list[Any] = []
+        for key, value in fields.items():
+            if value == "CURRENT_TIMESTAMP":
+                assignments.append(f"{key} = CURRENT_TIMESTAMP")
+            else:
+                assignments.append(f"{key} = ?")
+                values.append(value)
+        project_cpus = max(1, int(project_cpus))
+        with self.connect() as conn:
+            tables = {
+                str(row["name"])
+                for row in conn.execute(
+                    """
+                    SELECT name FROM sqlite_master WHERE type = 'table'
+                      AND name IN (
+                          'aedt_sessions','aedt_exact_session_reservations'
+                      )
+                    """
+                ).fetchall()
             }
+            if tables != {"aedt_sessions", "aedt_exact_session_reservations"}:
+                return False
+            cursor = conn.execute(
+                f"""
+                UPDATE tasks SET {', '.join(assignments)}
+                WHERE id = ? AND status = 'queued'
+                  AND LOWER(TRIM(COALESCE(aedt_backend, ''))) = 'pooled'
+                  AND requested_allocation_id = ?
+                  AND cpus >= ?
+                  AND EXISTS (
+                      SELECT 1
+                      FROM aedt_exact_session_reservations r
+                      JOIN aedt_sessions s ON s.id = r.session_id
+                      JOIN allocations a ON a.id = s.allocation_id
+                      WHERE r.task_id = tasks.id
+                        AND r.state = 'reserved'
+                        AND r.expires_at > ?
+                        AND s.allocation_id = ?
+                        AND s.generation = r.session_generation
+                        AND s.session_profile = r.session_profile
+                        AND s.state IN ('ready','busy')
+                        AND a.state IN ('warm','active')
+                        AND s.last_heartbeat_at >= ?
+                        AND (s.quarantine_until IS NULL OR s.quarantine_until <= ?)
+                        AND s.reuse_blocked_at IS NULL
+                        AND s.solve_batch_sealed_at IS NULL
+                        AND s.drain_requested_at IS NULL
+                  )
+                  AND (
+                      SELECT COUNT(*) FROM tasks active
+                      WHERE active.allocation_id = ?
+                        AND LOWER(TRIM(COALESCE(active.aedt_backend, ''))) = 'pooled'
+                        AND active.status IN ('attaching','running')
+                  ) < (
+                      SELECT CAST(total_cpus / ? AS INTEGER)
+                      FROM allocations WHERE id = ?
+                  )
+                """,
+                (
+                    *values,
+                    int(task_id),
+                    int(target_allocation_id),
+                    project_cpus,
+                    now,
+                    int(target_allocation_id),
+                    heartbeat_cutoff,
+                    now,
+                    int(target_allocation_id),
+                    project_cpus,
+                    int(target_allocation_id),
+                ),
+            )
+            return cursor.rowcount == 1
 
     def record_event(
         self,
@@ -960,18 +1157,95 @@ class Database:
         name_filter, name_params = self._name_contains_filter(name_contains)
         with self.connect() as conn:
             aedt_pool_sessions = 0
+            aedt_pool_session_states: dict[str, int] = {}
+            aedt_pool_project_workers = 0
             aedt_sessions_table = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'aedt_sessions'"
             ).fetchone()
             if aedt_sessions_table:
-                aedt_pool_sessions = int(
+                aedt_pool_session_states = {
+                    str(item["state"]): int(item["count"] or 0)
+                    for item in conn.execute(
+                        """
+                        SELECT state, COUNT(*) AS count FROM aedt_sessions
+                        WHERE state IN (
+                            'starting','ready','busy','draining','unhealthy'
+                        )
+                        GROUP BY state
+                        """
+                    ).fetchall()
+                }
+                timeout_row = conn.execute(
+                    """
+                    SELECT value FROM scheduler_settings
+                    WHERE key = 'aedt_pool_session_heartbeat_timeout_seconds'
+                    """
+                ).fetchone()
+                try:
+                    heartbeat_timeout = max(
+                        30, int(timeout_row["value"] if timeout_row else 600)
+                    )
+                except (TypeError, ValueError):
+                    heartbeat_timeout = 600
+                heartbeat_cutoff = (
+                    datetime.now(timezone.utc)
+                    - timedelta(seconds=heartbeat_timeout)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                assignable_ready = int(
                     conn.execute(
                         """
-                        SELECT COUNT(*) FROM aedt_sessions
-                        WHERE state IN ('starting','ready','busy','draining','unhealthy')
+                        SELECT COUNT(*)
+                        FROM aedt_sessions s
+                        JOIN allocations a ON a.id = s.allocation_id
+                        WHERE s.state = 'ready'
+                          AND a.state IN ('warm','active')
+                          AND s.solve_batch_sealed_at IS NULL
+                          AND s.drain_requested_at IS NULL
+                          AND s.reuse_blocked_at IS NULL
+                          AND s.last_heartbeat_at >= ?
+                        """,
+                        (heartbeat_cutoff,),
+                    ).fetchone()[0]
+                )
+                active_busy = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM aedt_sessions s
+                        JOIN allocations a ON a.id = s.allocation_id
+                        WHERE s.state = 'busy'
+                          AND a.state IN ('warm','active','draining')
                         """
                     ).fetchone()[0]
                 )
+                aedt_pool_sessions = (
+                    assignable_ready
+                    + active_busy
+                )
+                leases_table = conn.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'aedt_project_leases'
+                    """
+                ).fetchone()
+                if leases_table:
+                    aedt_pool_project_workers = int(
+                        conn.execute(
+                            f"""
+                            SELECT COUNT(*) FROM (
+                                SELECT l.id
+                                FROM aedt_project_leases l
+                                JOIN tasks t ON t.id = l.task_id
+                                WHERE l.state IN ('leased','attaching','active')
+                                  AND t.status IN ('running','attaching')
+                                  {name_filter}
+                                ORDER BY t.id DESC
+                                LIMIT ?
+                            )
+                            """,
+                            (*name_params, max(0, int(active_limit))),
+                        ).fetchone()[0]
+                    )
             row = conn.execute(
                 f"""
                 WITH active AS (
@@ -998,8 +1272,8 @@ class Database:
                     COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running,
                     COALESCE(SUM(CASE WHEN status = 'attaching' THEN 1 ELSE 0 END), 0) AS attaching,
                     COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued,
-                    COALESCE(SUM(CASE WHEN status IN ('running', 'attaching') AND LOWER(TRIM(COALESCE(scheduling_profile, ''))) = 'fea_bursty' AND TRIM(COALESCE(project, '')) != '_aedt_pool_hosts' THEN 1 ELSE 0 END), 0) AS fea,
-                    COALESCE(SUM(CASE WHEN status = 'running' AND LOWER(TRIM(COALESCE(scheduling_profile, ''))) = 'fea_bursty' AND TRIM(COALESCE(project, '')) != '_aedt_pool_hosts' THEN 1 ELSE 0 END), 0) AS fea_running,
+                    COALESCE(SUM(CASE WHEN status IN ('running', 'attaching') AND LOWER(TRIM(COALESCE(scheduling_profile, ''))) = 'fea_bursty' AND TRIM(COALESCE(project, '')) != '_aedt_pool_hosts' AND LOWER(TRIM(COALESCE(aedt_backend, 'standalone'))) IN ('', 'standalone') THEN 1 ELSE 0 END), 0) AS fea,
+                    COALESCE(SUM(CASE WHEN status = 'running' AND LOWER(TRIM(COALESCE(scheduling_profile, ''))) = 'fea_bursty' AND TRIM(COALESCE(project, '')) != '_aedt_pool_hosts' AND LOWER(TRIM(COALESCE(aedt_backend, 'standalone'))) IN ('', 'standalone') THEN 1 ELSE 0 END), 0) AS fea_running,
                     COALESCE(SUM(CASE WHEN status = 'running' AND LOWER(TRIM(COALESCE(scheduling_profile, ''))) = 'fea_bursty' AND TRIM(COALESCE(project, '')) != '_aedt_pool_hosts' AND LOWER(TRIM(COALESCE(aedt_backend, 'standalone'))) IN ('', 'standalone') THEN 1 ELSE 0 END), 0) AS standalone_aedt,
                     COALESCE(SUM(CASE WHEN LOWER(TRIM(COALESCE(scheduling_profile, ''))) != 'fea_bursty' AND TRIM(COALESCE(project, '')) != '_aedt_pool_hosts' THEN 1 ELSE 0 END), 0) AS standard,
                     COALESCE(SUM(CASE WHEN COALESCE(gpus, 0) > 0 THEN 1 ELSE 0 END), 0) AS gpu,
@@ -1032,6 +1306,19 @@ class Database:
         )
         summary = {key: int(row[key] or 0) for key in keys}
         summary["aedt_pool_sessions"] = aedt_pool_sessions
+        summary["aedt_pool_active_sessions"] = aedt_pool_sessions
+        summary["aedt_pool_starting_sessions"] = aedt_pool_session_states.get(
+            "starting", 0
+        )
+        summary["aedt_pool_draining_sessions"] = aedt_pool_session_states.get(
+            "draining", 0
+        )
+        summary["aedt_pool_unhealthy_sessions"] = aedt_pool_session_states.get(
+            "unhealthy", 0
+        )
+        summary["aedt_pool_project_workers"] = aedt_pool_project_workers
+        summary["fea"] += aedt_pool_project_workers
+        summary["fea_running"] += aedt_pool_project_workers
         summary["aedt"] = aedt_pool_sessions + summary.pop("standalone_aedt")
         return summary
 
