@@ -1596,6 +1596,11 @@ class AedtPoolService:
                 # Otherwise the worker would launch with an exact reservation
                 # and request_lease would require an incompatible canary slot.
                 return None
+        # Account selection can refresh Slurm/storage state over SSH.  Resolve
+        # it before BEGIN IMMEDIATE, then authenticate the routing fingerprint
+        # again against the task row inside the writer transaction.
+        selector_configured = self._task_account_selector is not None
+        task_account_selection = self._preselect_task_account(task_id)
         now_dt = self._now()
         now = _sql_time(now_dt)
         heartbeat_cutoff = _sql_time(
@@ -1629,6 +1634,33 @@ class AedtPoolService:
                 )
                 if part.strip()
             }
+            task_snapshot = {
+                "task_id": int(task["id"]),
+                "name": str(task["name"] or ""),
+                "project": str(task["project"] or ""),
+                "requested_account_name": task["requested_account_name"],
+                "task_account_name": task["account_name"],
+                "required_capability": str(task["required_capability"] or ""),
+                "env_profile": str(task["env_profile"] or ""),
+            }
+            selected_account = ""
+            selection_matches = False
+            if task_account_selection is not None:
+                selected_fingerprint, selected_value = task_account_selection
+                selection_matches = selected_fingerprint == (
+                    self._task_account_fingerprint(task_snapshot)
+                )
+                if selection_matches:
+                    selected_account = str(selected_value or "").strip()
+            selection_required = bool(
+                selector_configured and len(requested_accounts) != 1
+            )
+            if (
+                selection_required
+                and requested_accounts
+                and selected_account not in requested_accounts
+            ):
+                selected_account = ""
 
             latest = conn.execute(
                 """
@@ -1647,6 +1679,12 @@ class AedtPoolService:
                 """,
                 (task_id,),
             ).fetchone()
+            latest_is_operator_pin = bool(
+                latest
+                and not str(latest["reservation_key"] or "").startswith(
+                    "aedt-auto:"
+                )
+            )
             if latest and str(latest["state"]) in {"reserved", "claimed"}:
                 metadata_matches = bool(
                     not str(latest["workload_family"] or "")
@@ -1695,9 +1733,7 @@ class AedtPoolService:
                         ),
                     )
                     return dict(latest)
-            if latest and not str(latest["reservation_key"] or "").startswith(
-                "aedt-auto:"
-            ):
+            if latest_is_operator_pin:
                 # A bootstrap/operator pin is fail-closed.  Automatic placement
                 # must never silently replace it with a different Desktop.
                 return None
@@ -1709,17 +1745,33 @@ class AedtPoolService:
                     failure_message="automatic AEDT reservation target became unavailable",
                 )
 
+            if selection_required and (
+                not selection_matches or not selected_account
+            ):
+                conn.execute(
+                    """
+                    UPDATE tasks SET requested_allocation_id = 0, node_name = '',
+                        updated_at = ?
+                    WHERE id = ? AND status = 'queued'
+                    """,
+                    (now, task_id),
+                )
+                return None
+
             allocation_predicate = ""
             params: list[Any] = [heartbeat_cutoff, now, normalized_profile]
             if allowed_allocations:
                 placeholders = ",".join("?" for _ in allowed_allocations)
                 allocation_predicate = f" AND s.allocation_id IN ({placeholders})"
                 params.extend(allowed_allocations)
+            candidate_accounts = (
+                {selected_account} if selection_required else requested_accounts
+            )
             account_predicate = ""
-            if requested_accounts:
-                placeholders = ",".join("?" for _ in requested_accounts)
+            if candidate_accounts:
+                placeholders = ",".join("?" for _ in candidate_accounts)
                 account_predicate = f" AND a.account_name IN ({placeholders})"
-                params.extend(sorted(requested_accounts))
+                params.extend(sorted(candidate_accounts))
             candidates = conn.execute(
                 f"""
                 SELECT s.*,
@@ -5785,6 +5837,62 @@ class AedtPoolService:
             )
         )
 
+    @staticmethod
+    def _task_requested_accounts(task: dict[str, Any]) -> list[str]:
+        requested_value = task.get("requested_account_name")
+        if requested_value is None:
+            requested_value = task.get("task_account_name")
+        return [
+            item.strip()
+            for item in re.split(r"[\s,;/|]+", str(requested_value or ""))
+            if item.strip()
+        ]
+
+    def _select_task_account_from_snapshot(
+        self, task: dict[str, Any]
+    ) -> tuple[tuple[str, ...], str] | None:
+        """Resolve one non-singleton task route with no DB transaction held."""
+
+        selector = self._task_account_selector
+        if selector is None or len(self._task_requested_accounts(task)) == 1:
+            return None
+        task_id = int(task.get("task_id") or 0)
+        try:
+            selected = str(selector(dict(task)) or "").strip()
+        except Exception:
+            LOGGER.exception(
+                "AEDT pooled demand account selection failed for task %s",
+                task_id,
+            )
+            selected = ""
+        # Preserve an empty result for single-task pre-admission.  It is an
+        # authoritative fail-closed decision, not permission to search every
+        # account for an existing Desktop slot.
+        return self._task_account_fingerprint(task), selected
+
+    def _preselect_task_account(
+        self, task_id: int
+    ) -> tuple[tuple[str, ...], str] | None:
+        """Snapshot and route one queued pooled task outside a writer lock."""
+
+        if self._task_account_selector is None:
+            return None
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id AS task_id, name, project, requested_account_name,
+                       account_name AS task_account_name,
+                       required_capability, env_profile
+                FROM tasks
+                WHERE id = ? AND status = 'queued'
+                  AND LOWER(TRIM(COALESCE(aedt_backend, ''))) = 'pooled'
+                """,
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._select_task_account_from_snapshot(dict(row))
+
     def _preselect_task_accounts(
         self,
     ) -> dict[int, tuple[tuple[str, ...], str]]:
@@ -5851,29 +5959,9 @@ class AedtPoolService:
             task_id = int(task.get("task_id") or 0)
             if task_id <= 0:
                 continue
-            requested_value = task.get("requested_account_name")
-            if requested_value is None:
-                requested_value = task.get("task_account_name")
-            requested = [
-                item.strip()
-                for item in re.split(r"[\s,;/|]+", str(requested_value or ""))
-                if item.strip()
-            ]
-            if len(requested) == 1:
-                continue
-            try:
-                selected = str(selector(dict(task)) or "").strip()
-            except Exception:
-                LOGGER.exception(
-                    "AEDT pooled demand account selection failed for task %s",
-                    task_id,
-                )
-                continue
-            if selected:
-                selections[task_id] = (
-                    self._task_account_fingerprint(task),
-                    selected,
-                )
+            selection = self._select_task_account_from_snapshot(task)
+            if selection is not None and selection[1]:
+                selections[task_id] = selection
         return selections
 
     def _plan(

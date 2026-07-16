@@ -5896,6 +5896,232 @@ class AedtRuntimeTests(AedtPoolTestCase):
 
 class AedtPreadmissionTests(AedtExactSessionReservationTests):
 
+    def add_ready_account_session(self, account: str, node: str) -> tuple[int, int]:
+        allocation_id = self.db.create_allocation(
+            account, "cpu", node, 64, 512 * 1024
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state="active",
+            slurm_job_id=f"job-{account}",
+            drain_reason="AEDT pool project demand",
+        )
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO aedt_sessions (
+                    session_key, allocation_id, account_name, node_name,
+                    endpoint, process_id, session_profile, slots_total, state,
+                    last_heartbeat_at, started_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 3, 'ready', ?, ?, ?, ?)
+                """,
+                (
+                    f"route-{account}-session",
+                    allocation_id,
+                    account,
+                    node,
+                    f"{node}:53001",
+                    "53001",
+                    EXPECTED_SESSION_PROFILE_JSON,
+                    now,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            session_id = int(cursor.lastrowid)
+        return allocation_id, session_id
+
+    def test_flexible_preadmission_uses_storage_selected_account_outside_lock(
+        self,
+    ) -> None:
+        safe_allocation, _safe_session = self.add_ready_account_session(
+            "safe", "cpu-safe"
+        )
+        task_id = self.create_pooled_task("storage-selected-safe")
+        selector_calls: list[int] = []
+
+        def selector(task: dict) -> str:
+            selector_calls.append(int(task["task_id"]))
+            # This succeeds only when the selector is invoked without the
+            # prepare_pooled_task_session writer transaction being held.
+            with self.db.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("ROLLBACK")
+            return "safe"
+
+        self.service.set_task_account_selector(selector)
+
+        reservation = self.service.prepare_pooled_task_session(
+            task_id=task_id,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="mft",
+            isolation_policy="family",
+        )
+
+        self.assertIsNotNone(reservation)
+        self.assertEqual(selector_calls, [task_id])
+        self.assertEqual(int(reservation["allocation_id"]), safe_allocation)
+
+    def test_flexible_preadmission_empty_error_and_stale_selection_fail_closed(
+        self,
+    ) -> None:
+        self.add_ready_account_session("safe", "cpu-safe")
+
+        cases = ("empty", "error", "stale")
+        for case in cases:
+            with self.subTest(case=case):
+                task_id = self.create_pooled_task(f"selection-{case}")
+
+                def selector(_task: dict, *, _case: str = case) -> str:
+                    if _case == "error":
+                        raise RuntimeError("storage selector failed")
+                    if _case == "stale":
+                        self.db.update_task(task_id, account_name="raced")
+                        return "safe"
+                    return ""
+
+                self.service.set_task_account_selector(selector)
+                reservation = self.service.prepare_pooled_task_session(
+                    task_id=task_id,
+                    session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                    workload_family="mft",
+                    isolation_policy="family",
+                )
+
+                self.assertIsNone(reservation)
+                task = self.db.get_task(task_id)
+                self.assertEqual(int(task["requested_allocation_id"] or 0), 0)
+                self.assertEqual(str(task["node_name"] or ""), "")
+
+    def test_explicit_and_operator_pins_override_flexible_selector(self) -> None:
+        _safe_allocation, _safe_session = self.add_ready_account_session(
+            "safe", "cpu-safe"
+        )
+        selector_calls: list[int] = []
+
+        def selector(task: dict) -> str:
+            selector_calls.append(int(task["task_id"]))
+            return "safe"
+
+        self.service.set_task_account_selector(selector)
+        explicit_task = self.db.create_task(
+            TaskCreate(
+                name="explicit-account-a",
+                remote_cwd="/work/explicit-account-a",
+                command="true",
+                account_name="a",
+                aedt_backend="pooled",
+            )
+        )
+        explicit = self.service.prepare_pooled_task_session(
+            task_id=explicit_task,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="mft",
+            isolation_policy="family",
+        )
+        self.assertIsNotNone(explicit)
+        self.assertEqual(
+            self.db.get_allocation(int(explicit["allocation_id"]))["account_name"],
+            "a",
+        )
+        self.assertEqual(selector_calls, [])
+
+        operator_task = self.create_pooled_task("operator-pin-a")
+        self.reserve("operator-pin-a", self.sessions[1], [operator_task])
+        operator = self.service.prepare_pooled_task_session(
+            task_id=operator_task,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="mft",
+            isolation_policy="family",
+        )
+        self.assertIsNotNone(operator)
+        self.assertEqual(int(operator["session_id"]), int(self.sessions[1]["id"]))
+        self.assertEqual(selector_calls, [operator_task])
+
+    def test_existing_auto_cohort_is_not_moved_when_selector_changes(self) -> None:
+        self.add_ready_account_session("safe", "cpu-safe")
+        self.service.set_task_account_selector(lambda _task: "a")
+        task_ids = [
+            self.create_pooled_task(f"stable-auto-{index}")
+            for index in range(3)
+        ]
+        reservations = [
+            self.service.prepare_pooled_task_session(
+                task_id=task_id,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                workload_family="mft",
+                isolation_policy="family",
+            )
+            for task_id in task_ids
+        ]
+        self.assertTrue(all(reservations))
+        self.assertEqual(
+            len({int(item["session_id"]) for item in reservations}), 1
+        )
+        lease, token = self.request_v2("stable-auto-0", task_id=task_ids[0])
+        self.service.accept_lease(int(lease["id"]), token)
+        self.service.activate_lease(int(lease["id"]), token)
+
+        self.service.set_task_account_selector(lambda _task: "safe")
+        replay = self.service.prepare_pooled_task_session(
+            task_id=task_ids[1],
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="mft",
+            isolation_policy="family",
+        )
+
+        self.assertIsNotNone(replay)
+        self.assertEqual(int(replay["session_id"]), int(reservations[1]["session_id"]))
+        self.assertEqual(replay["reservation_key"], reservations[1]["reservation_key"])
+        self.assertEqual(self.service.get_lease(int(lease["id"]))["state"], "active")
+        cohort = self.service.get_exact_session_reservation(
+            str(reservations[1]["reservation_key"])
+        )
+        self.assertNotIn("failed", {slot["state"] for slot in cohort["slots"]})
+
+    def test_multi_account_preadmission_uses_selected_member_only(self) -> None:
+        safe_allocation, _safe_session = self.add_ready_account_session(
+            "safe", "cpu-safe"
+        )
+
+        def create_multi(suffix: str) -> int:
+            return self.db.create_task(
+                TaskCreate(
+                    name=f"multi-account-{suffix}",
+                    remote_cwd=f"/work/multi-account-{suffix}",
+                    command="true",
+                    account_name="a,safe",
+                    aedt_backend="pooled",
+                )
+            )
+
+        selected_task = create_multi("selected")
+        self.service.set_task_account_selector(lambda _task: "safe")
+        selected = self.service.prepare_pooled_task_session(
+            task_id=selected_task,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="mft",
+            isolation_policy="family",
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(int(selected["allocation_id"]), safe_allocation)
+
+        outside_task = create_multi("outside-request")
+        self.service.set_task_account_selector(lambda _task: "outside")
+        blocked = self.service.prepare_pooled_task_session(
+            task_id=outside_task,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="mft",
+            isolation_policy="family",
+        )
+        self.assertIsNone(blocked)
+        self.assertEqual(
+            int(self.db.get_task(outside_task)["requested_allocation_id"] or 0),
+            0,
+        )
+
     def test_app_preadmission_uses_motor_clients_canonical_ipmsm_family(self) -> None:
         from slurm_scheduler.aedt_pool import canonical_workload_family
 
