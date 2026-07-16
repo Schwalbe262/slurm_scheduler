@@ -6239,6 +6239,14 @@ class Scheduler:
             # races the background attach thread.
             and task["status"] == TaskStatus.RUNNING.value
             and self.task_is_fea_bursty(task)
+            # A pooled session host owns one shared Desktop and every solver
+            # process for its attached projects.  Treating it as an ordinary
+            # disposable FEA worker turns one node-level pressure sample into a
+            # three-project cascade, and the per-allocation loop can kill every
+            # Desktop on the same physical node in one tick.  Slurm already
+            # accounts the host's reserved CPU/RAM; pool draining/recycling is
+            # the only safe way to retire it.
+            and not self.task_is_fea_infra(task)
             and self.task_aedt_backend(task) != AedtBackend.POOLED.value
         ]
         if not candidates:

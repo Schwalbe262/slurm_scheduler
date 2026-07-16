@@ -9558,6 +9558,51 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.db.get_task(standard)["status"], TaskStatus.RUNNING.value)
         self.assertEqual(FakeClient.cancelled_tasks, [])
 
+    def test_fea_hard_memory_pressure_does_not_kill_aedt_session_host(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=52,
+            total_memory_mb=393216,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="alloc-aedt",
+            drain_reason="AEDT pool project demand",
+        )
+        host = self.db.create_task(
+            TaskCreate(
+                "aedt-session-host-1",
+                "~/pool",
+                "run-host",
+                cpus=13,
+                memory_mb=98304,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                project="_aedt_pool_hosts",
+            )
+        )
+        self.db.update_task(
+            host,
+            status=TaskStatus.RUNNING.value,
+            account_name="a",
+            allocation_id=allocation_id,
+            wrapper_pid="4321",
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 240 256 240.0 1000000 50000 alloc-aedt\n"
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+
+        scheduler.handle_fea_memory_pressure()
+
+        self.assertEqual(self.db.get_task(host)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(FakeClient.cancelled_tasks, [])
+
     def test_gpu_task_does_not_attach_when_gpu_matches_but_cpu_is_exhausted(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",
