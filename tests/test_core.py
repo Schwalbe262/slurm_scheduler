@@ -1583,6 +1583,67 @@ class SchedulerTests(unittest.TestCase):
         self.assertIn(running_id, visible_ids)
         self.assertTrue(set(finished_ids[-2:]).issubset(visible_ids))
 
+    def test_dashboard_task_pages_preserve_status_rank_and_make_all_rows_reachable(self) -> None:
+        queued_ids = [
+            self.db.create_task(TaskCreate(f"page-queued-{index}", "~/work", "run"))
+            for index in range(3)
+        ]
+        attaching_ids = [
+            self.db.create_task(TaskCreate(f"page-attaching-{index}", "~/work", "run"))
+            for index in range(2)
+        ]
+        running_ids = [
+            self.db.create_task(TaskCreate(f"page-running-{index}", "~/work", "run"))
+            for index in range(3)
+        ]
+        for task_id in attaching_ids:
+            self.db.update_task(task_id, status=TaskStatus.ATTACHING.value)
+        for task_id in running_ids:
+            self.db.update_task(task_id, status=TaskStatus.RUNNING.value)
+
+        pages = [
+            self.db.list_dashboard_tasks(limit=3, offset=offset)
+            for offset in (0, 3, 6)
+        ]
+        rows = [row for page in pages for row in page]
+
+        self.assertEqual(
+            [int(row["id"]) for row in rows],
+            [
+                *reversed(running_ids),
+                *reversed(attaching_ids),
+                *reversed(queued_ids),
+            ],
+        )
+        filtered = self.db.list_dashboard_tasks(
+            limit=10, name_contains="attaching"
+        )
+        self.assertEqual(
+            [int(row["id"]) for row in filtered],
+            list(reversed(attaching_ids)),
+        )
+
+    def test_list_allocations_by_ids_deduplicates_one_batch(self) -> None:
+        first = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n1",
+            total_cpus=8,
+            total_memory_mb=32768,
+        )
+        second = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n2",
+            total_cpus=8,
+            total_memory_mb=32768,
+        )
+
+        rows = self.db.list_allocations_by_ids([second, first, second])
+
+        self.assertEqual({int(row["id"]) for row in rows}, {first, second})
+        self.assertEqual(self.db.list_allocations_by_ids([]), [])
+
     def test_list_tasks_applies_project_and_prefix_filters_before_limit(self) -> None:
         matching_ids = [
             self.db.create_task(TaskCreate(f"campaign-job-{index}", "~/work", "run", project="motor"))
@@ -1633,6 +1694,8 @@ class SchedulerTests(unittest.TestCase):
             TaskCreate("campaign-page-foreign", "~/work", "run", project="other")
         )
         self.db.create_task(TaskCreate("unrelated-newer", "~/work", "run", project="motor"))
+        started_at = "2026-07-16T01:23:45+00:00"
+        self.db.update_task(matching_ids[-1], started_at=started_at)
 
         first = self.db.list_task_inventory(
             limit=2, project="motor", name_prefix="campaign-page-"
@@ -1654,7 +1717,14 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(
             [int(row["id"]) for row in rows], list(reversed(matching_ids))
         )
-        self.assertTrue(all(set(row) == {"id", "name", "status", "project"} for row in rows))
+        self.assertTrue(
+            all(
+                set(row) == {"id", "name", "status", "project", "started_at"}
+                for row in rows
+            )
+        )
+        by_id = {int(row["id"]): row for row in rows}
+        self.assertEqual(by_id[matching_ids[-1]]["started_at"], started_at)
 
     def test_list_finished_tasks_can_filter_by_name_before_limit(self) -> None:
         for index in range(5):
@@ -9589,6 +9659,44 @@ class ProjectApiTests(unittest.TestCase):
         self.assertEqual([int(item["id"]) for item in payload], list(reversed(matching_ids[-2:])))
         self.assertEqual({item["project"] for item in payload}, {"motor"})
 
+    def test_task_list_api_prefetches_distinct_allocations_in_one_batch(self) -> None:
+        allocation_id = self.app.state.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n1",
+            total_cpus=8,
+            total_memory_mb=32768,
+        )
+        self.app.state.db.update_allocation(
+            allocation_id, slurm_job_id="batch-prefetch"
+        )
+        for index in range(4):
+            task_id = self.app.state.db.create_task(
+                TaskCreate(f"api-prefetch-{index}", "~/case", "run")
+            )
+            self.app.state.db.update_task(task_id, allocation_id=allocation_id)
+
+        with mock.patch.object(
+            self.app.state.db,
+            "get_allocation",
+            side_effect=AssertionError("per-task allocation lookup used"),
+        ), mock.patch.object(
+            self.app.state.db,
+            "list_allocations_by_ids",
+            wraps=self.app.state.db.list_allocations_by_ids,
+        ) as batch:
+            payload = self.list_tasks(
+                include_diagnostics=False,
+                limit=10,
+                project="",
+                name_prefix="api-prefetch-",
+                status=None,
+            )
+
+        self.assertEqual(len(payload), 4)
+        self.assertTrue(all(item["slurm_job_id"] == "batch-prefetch" for item in payload))
+        batch.assert_called_once()
+
     def test_task_list_api_compact_pages_avoid_full_task_serialization(self) -> None:
         matching_ids = [
             self.app.state.db.create_task(
@@ -9596,6 +9704,8 @@ class ProjectApiTests(unittest.TestCase):
             )
             for index in range(3)
         ]
+        started_at = "2026-07-16T01:23:45+00:00"
+        self.app.state.db.update_task(matching_ids[-1], started_at=started_at)
 
         with mock.patch.object(
             self.app.state.db,
@@ -9626,8 +9736,13 @@ class ProjectApiTests(unittest.TestCase):
             [int(item["id"]) for item in payload], list(reversed(matching_ids))
         )
         self.assertTrue(
-            all(set(item) == {"id", "name", "status", "project"} for item in payload)
+            all(
+                set(item) == {"id", "name", "status", "project", "started_at"}
+                for item in payload
+            )
         )
+        by_id = {int(item["id"]): item for item in payload}
+        self.assertEqual(by_id[matching_ids[-1]]["started_at"], started_at)
         parameters = {
             item["name"]
             for item in self.app.openapi()["paths"]["/api/tasks"]["get"]["parameters"]

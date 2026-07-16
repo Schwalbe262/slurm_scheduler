@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Form, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from starlette.middleware.gzip import GZipMiddleware
 
 from .allocation_metrics import annotate_allocation_fea_pressure, annotate_allocation_node_metrics
 from .aedt_pool import AedtPoolRuntime, AedtPoolService
@@ -36,6 +37,7 @@ from .project_env import ProjectEnvManager, repo_dir_name
 from .scheduler import Scheduler
 from .slurm import SlurmAccountClient, SSHSession
 from .task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, build_git_task_command
+from .web_read_guard import WebReadGuardMiddleware
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -634,6 +636,16 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     )
 
     app = FastAPI(title="Slurm Scheduler")
+    # A single application process owns the scheduler loop.  Protect that
+    # process from large dashboard/list bursts instead of adding duplicate web
+    # workers, and compress the sizeable HTML/JSON responses sent over the VPN.
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+    app.add_middleware(
+        WebReadGuardMiddleware,
+        ttl_seconds=2.0,
+        max_bulk_concurrency=4,
+        max_task_detail_concurrency=16,
+    )
     app.state.config = config
     app.state.db = db
     app.state.scheduler = scheduler
@@ -1424,7 +1436,12 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request) -> HTMLResponse:
         attached_task_name_filter = (request.query_params.get("task_name_contains") or "").strip()
+        active_page_size = 100
         finished_page_size = 50
+        try:
+            active_page = max(0, int(request.query_params.get("active_page") or 0))
+        except ValueError:
+            active_page = 0
         try:
             finished_page = max(0, int(request.query_params.get("finished_page") or 0))
         except ValueError:
@@ -1461,29 +1478,27 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             pending=sum(1 for item in active_allocations if item["state"] == "pending"),
         )
         closed_allocations = [item for item in allocations if item["state"] in terminal_allocation_states]
-        active_running_rows = db.list_tasks_by_statuses(
-            ["running", "attaching"],
-            limit=5000,
-            name_contains=attached_task_name_filter,
-        )
-        visible_queued_rows = db.list_tasks_by_statuses(
-            ["queued"],
-            limit=50,
-            name_contains=attached_task_name_filter,
-        )
         task_summary = db.task_activity_summary(
             name_contains=attached_task_name_filter,
         )
+        active_task_statuses = ["running", "attaching", "queued"]
+        active_task_count = db.count_tasks_by_statuses(
+            active_task_statuses,
+            name_contains=attached_task_name_filter,
+        )
+        active_page_count = max(1, ceil(active_task_count / active_page_size))
+        active_page = min(active_page, active_page_count - 1)
+        active_task_rows = db.list_dashboard_tasks(
+            limit=active_page_size,
+            name_contains=attached_task_name_filter,
+            offset=active_page * active_page_size,
+        )
         aedt_dashboard_summary = aedt_pool.summary()
-        active_task_rows = {
-            int(task["id"]): task
-            for task in (active_running_rows + visible_queued_rows)
-        }
         # Queue reasons are shown on the task detail page only; computing them
         # for the dashboard list was the most expensive part of the render.
         queued_diagnostics_remaining = 0
         active_task_items = []
-        for task in attach_task_elapsed(list(active_task_rows.values())):
+        for task in attach_task_elapsed(active_task_rows):
             include_diagnostics = False
             if task.get("status") == "queued" and queued_diagnostics_remaining > 0:
                 include_diagnostics = True
@@ -1546,6 +1561,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 "tasks": active_tasks,
                 "task_summary": task_summary,
                 "aedt_pool_summary": aedt_dashboard_summary,
+                "active_task_count": active_task_count,
+                "active_page": active_page,
+                "active_page_size": active_page_size,
+                "active_page_count": active_page_count,
                 "finished_tasks": finished_tasks,
                 "finished_task_count": finished_task_count,
                 "finished_page": finished_page,
@@ -2092,6 +2111,20 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         else:
             # Preserve the existing newest-plus-active behavior with no filters.
             tasks = db.list_tasks_with_active()
+        if allocation_by_id is None:
+            # The legacy/full serializer needs allocation fields, but doing a
+            # get_allocation query twice per task turns one inventory request
+            # into hundreds of SQLite connections.  Resolve the distinct IDs
+            # once while keeping the response shape unchanged.
+            allocation_ids = [
+                int(task["allocation_id"])
+                for task in tasks
+                if task.get("allocation_id")
+            ]
+            allocation_by_id = {
+                int(allocation["id"]): allocation
+                for allocation in db.list_allocations_by_ids(allocation_ids)
+            }
         return [
             task_json(
                 task,

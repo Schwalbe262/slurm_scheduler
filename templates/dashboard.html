@@ -806,6 +806,15 @@
         </tbody>
       </table>
     </div>
+    <div class="section-gap" style="display: flex; gap: 10px; align-items: center;">
+      {% if active_page > 0 %}
+        <a class="button" href="/?active_page={{ active_page - 1 }}{% if finished_page > 0 %}&finished_page={{ finished_page }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">&laquo; Prev active</a>
+      {% endif %}
+      <span class="muted">Active page {{ active_page + 1 }} / {{ active_page_count }} ({{ active_task_count }} tasks, {{ active_page_size }} per page)</span>
+      {% if active_page + 1 < active_page_count %}
+        <a class="button" href="/?active_page={{ active_page + 1 }}{% if finished_page > 0 %}&finished_page={{ finished_page }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">Next active &raquo;</a>
+      {% endif %}
+    </div>
     <details class="section-gap">
       <summary>Closed allocations: recent {{ closed_allocations|length }}{% if closed_allocation_count > closed_allocations|length %} of {{ closed_allocation_count }}{% endif %}</summary>
       <div class="table-scroll section-gap">
@@ -1143,11 +1152,11 @@
       </div>
       <div class="section-gap" style="display: flex; gap: 10px; align-items: center;">
         {% if finished_page > 0 %}
-          <a class="button" href="/?finished_page={{ finished_page - 1 }}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">&laquo; Prev</a>
+          <a class="button" href="/?finished_page={{ finished_page - 1 }}{% if active_page > 0 %}&active_page={{ active_page }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">&laquo; Prev</a>
         {% endif %}
         <span class="muted">Page {{ finished_page + 1 }} / {{ finished_page_count }} ({{ finished_task_count }} tasks)</span>
         {% if finished_page + 1 < finished_page_count %}
-          <a class="button" href="/?finished_page={{ finished_page + 1 }}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">Next &raquo;</a>
+          <a class="button" href="/?finished_page={{ finished_page + 1 }}{% if active_page > 0 %}&active_page={{ active_page }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">Next &raquo;</a>
         {% endif %}
       </div>
     </details>
@@ -1169,6 +1178,7 @@
         const finishedRows = finishedTbody ? Array.from(finishedTbody.querySelectorAll("[data-finished-task-row]")) : [];
         const defaultState = { filter: "", sortKey: "id", direction: "desc" };
         const serverFilter = {{ attached_task_name_filter|tojson }};
+        const activePageCount = {{ active_page_count }};
 
         function loadState() {
           try {
@@ -1235,6 +1245,9 @@
         }
 
         function updateAttachedSummary(visibleRows) {
+          // On a paged campaign the server/live summary represents the whole
+          // filtered population.  Do not replace it with counts from one page.
+          if (activePageCount > 1) return;
           const counts = {
             total: 0,
             running: 0,
@@ -1288,6 +1301,7 @@
           } else {
             url.searchParams.delete("task_name_contains");
           }
+          url.searchParams.delete("active_page");
           return url.toString();
         }
 
@@ -1323,6 +1337,7 @@
           const url = new URL(window.location.href);
           if (url.searchParams.has("task_name_contains")) {
             url.searchParams.delete("task_name_contains");
+            url.searchParams.delete("active_page");
             window.location.assign(url.toString());
             return;
           }

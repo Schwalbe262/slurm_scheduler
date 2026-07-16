@@ -773,7 +773,7 @@ class Database:
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT id, name, status, project "
+                "SELECT id, name, status, project, started_at "
                 f"FROM tasks{where} ORDER BY id DESC LIMIT ?",
                 (*params, max(0, int(limit))),
             ).fetchall()
@@ -816,6 +816,39 @@ class Database:
             rows = conn.execute(
                 f"SELECT * FROM tasks WHERE status IN ({placeholders}){name_filter} ORDER BY id DESC LIMIT ? OFFSET ?",
                 (*statuses, *name_params, limit, max(0, int(offset))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_dashboard_tasks(
+        self,
+        limit: int = 100,
+        *,
+        name_contains: str = "",
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Page active dashboard rows in their displayed status order.
+
+        Running, attaching, and queued rows used to be loaded with independent
+        high limits and combined in Python.  At campaign scale that made every
+        dashboard request render thousands of rows.  Keeping the ordering in
+        SQL makes the same population available through bounded pages.
+        """
+
+        name_filter, name_params = self._name_contains_filter(name_contains)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM tasks
+                WHERE status IN ('running', 'attaching', 'queued'){name_filter}
+                ORDER BY CASE status
+                    WHEN 'running' THEN 0
+                    WHEN 'attaching' THEN 1
+                    WHEN 'queued' THEN 2
+                    ELSE 9
+                END ASC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*name_params, max(0, int(limit)), max(0, int(offset))),
             ).fetchall()
             return [dict(row) for row in rows]
 
@@ -1166,6 +1199,18 @@ class Database:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM allocations WHERE id = ?", (allocation_id,)).fetchone()
             return dict(row) if row else None
+
+    def list_allocations_by_ids(self, allocation_ids: list[int]) -> list[dict[str, Any]]:
+        unique_ids = sorted({item for item in map(int, allocation_ids) if item > 0})
+        if not unique_ids:
+            return []
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM allocations WHERE id IN ({placeholders})",
+                tuple(unique_ids),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def list_allocations(self, limit: int = 200) -> list[dict[str, Any]]:
         with self.connect() as conn:

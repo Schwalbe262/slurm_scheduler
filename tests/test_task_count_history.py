@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -404,6 +405,28 @@ class TaskCountHistoryRouteTests(unittest.TestCase):
         self.assertEqual(live["tasks"]["fea"], 3)
         self.assertEqual(live["tasks"]["aedt_pool_sessions"], 2)
         self.assertEqual(live["tasks"]["aedt"], 3)
+
+    def test_dashboard_pages_large_active_population_without_hiding_rows(self) -> None:
+        task_ids = [
+            self.app.state.db.create_task(
+                TaskCreate(f"dashboard-page-{index:03d}", "~/case", "run")
+            )
+            for index in range(105)
+        ]
+        dashboard = self.route_endpoint("/", "GET")
+
+        first_html = dashboard(self.dashboard_request()).body.decode("utf-8")
+        second_html = dashboard(
+            self.dashboard_request(b"active_page=1")
+        ).body.decode("utf-8")
+
+        self.assertEqual(len(re.findall(r"<tr\s+data-task-row", first_html)), 100)
+        self.assertEqual(len(re.findall(r"<tr\s+data-task-row", second_html)), 5)
+        self.assertIn(f'data-id="{task_ids[-1]}"', first_html)
+        self.assertNotIn(f'data-id="{task_ids[0]}"', first_html)
+        self.assertIn(f'data-id="{task_ids[0]}"', second_html)
+        self.assertIn("Active page 1 / 2 (105 tasks, 100 per page)", first_html)
+        self.assertIn("Active page 2 / 2 (105 tasks, 100 per page)", second_html)
 
 
 if __name__ == "__main__":
