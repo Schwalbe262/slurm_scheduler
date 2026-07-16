@@ -22,6 +22,7 @@ from slurm_scheduler.aedt_attach_client import (
     AedtLeaseError,
     AedtPoolHttpClient,
     AedtProjectLease,
+    MAX_POOL_FILL_TIMEOUT_SECONDS,
     _keepalive_delay,
     _lease_keepalive_worker,
     acquire_project_lease,
@@ -5328,6 +5329,53 @@ class AttachClientTests(unittest.TestCase):
             payload for method, path, payload in calls if path.endswith("/solve-permit")
         )
         self.assertEqual(seal_call, {"seal_underfilled": True})
+
+    def test_solve_permit_fill_timeout_accepts_campaign_7200_seconds(self) -> None:
+        class Http:
+            @staticmethod
+            def request(method, path, payload=None, **_kwargs):
+                if method != "GET":
+                    raise AssertionError((method, path, payload))
+                return {
+                    "state": "active",
+                    "endpoint": "cpu-01:50001",
+                    "solve_permit_required": False,
+                    "solve_permit_granted": True,
+                    "solve_permit_generation": 14,
+                }
+
+        lease = AedtProjectLease(
+            Http(),
+            14,
+            "client-token",
+            "project",
+            state="active",
+            endpoint="cpu-01:50001",
+            protocol_version=2,
+            solve_permit_required=True,
+        )
+        self.assertEqual(MAX_POOL_FILL_TIMEOUT_SECONDS, 7200.0)
+        with patch.dict(
+            os.environ, {"MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS": "7200"}, clear=False
+        ):
+            status = lease.wait_for_solve_permit()
+
+        self.assertTrue(status["solve_permit_granted"])
+        self.assertEqual(lease.solve_permit_generation, 14)
+
+    def test_solve_permit_fill_timeout_rejects_above_campaign_deadline(self) -> None:
+        lease = AedtProjectLease(
+            AedtPoolHttpClient("http://scheduler.invalid"),
+            15,
+            "client-token",
+            "project",
+            state="active",
+            endpoint="cpu-01:50001",
+            protocol_version=2,
+            solve_permit_required=True,
+        )
+        with self.assertRaisesRegex(AedtLeaseError, "between 0 and 7200 seconds"):
+            lease.wait_for_solve_permit(fill_timeout_seconds=7200.001)
 
     def test_native_pipeline_client_marks_once_and_polls_exact_cohort(self) -> None:
         calls: list[tuple[str, str, dict | None]] = []
