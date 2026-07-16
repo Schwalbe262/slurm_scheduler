@@ -5994,7 +5994,10 @@ class AedtPoolRuntime:
                     ),
                     scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                     node_name=str(allocation.get("node_name") or ""),
-                    priority=100000,
+                    # Keep 0..9 available for ordering ordinary simulation
+                    # families.  Session hosts sit just above that band;
+                    # reserve large priorities for canaries/recovery work.
+                    priority=10,
                     timeout_seconds=0,
                     dedupe_key=dedupe_key,
                     project="_aedt_pool_hosts",
