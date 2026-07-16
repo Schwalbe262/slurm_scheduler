@@ -27,7 +27,11 @@ from .aedt_automation_lock import automation_lock_path
 
 LOGGER = logging.getLogger(__name__)
 
-SESSION_COUNTED_STATES = ("starting", "ready", "busy", "draining", "unhealthy")
+# The hard cap represents capacity that can become assignable without replacing
+# the Desktop.  Draining/unhealthy rows remain live lifecycle records, but they
+# cannot satisfy capacity or consume the global replacement-start budget.
+SESSION_HARD_CAP_STATES = ("starting", "ready", "busy")
+SESSION_VISIBLE_STATES = (*SESSION_HARD_CAP_STATES, "draining", "unhealthy")
 SESSION_HISTORY_STATES = ("failed", "closed")
 SESSION_HISTORY_LIMIT = 30
 SESSION_ASSIGNABLE_STATES = ("ready", "busy")
@@ -5803,7 +5807,7 @@ class AedtPoolService:
                 "SELECT state, COUNT(*) AS count FROM aedt_project_leases GROUP BY state"
             ).fetchall()
         }
-        hard_count = sum(state_counts.get(state, 0) for state in SESSION_COUNTED_STATES)
+        hard_count = sum(state_counts.get(state, 0) for state in SESSION_HARD_CAP_STATES)
         session_heartbeat_cutoff = _sql_time(
             self._now()
             - timedelta(seconds=config.session_heartbeat_timeout_seconds)
@@ -6346,21 +6350,23 @@ class AedtPoolService:
             # only for freeing wrong-account capacity needed by queued work.
             rebalance_drains_by_account = {}
         planned_rebalance_drains = sum(rebalance_drains_by_account.values())
-        dead_parent_session_count = int(
+        dead_parent_counted_session_count = int(
             conn.execute(
                 """
                 SELECT COUNT(*)
                 FROM aedt_sessions s
                 JOIN allocations a ON a.id = s.allocation_id
-                WHERE s.state IN ('starting','ready','busy','draining','unhealthy')
+                WHERE s.state IN ('starting','ready','busy')
                   AND a.state IN ('closed','failed')
                 """
             ).fetchone()[0]
         )
-        # Draining is a two-phase native Desktop shutdown, not freed license
-        # headroom. Wait until terminal close, except when the parent Slurm
-        # allocation is already conclusively closed/failed.
-        effective_hard_count = max(0, hard_count - dead_parent_session_count)
+        # Counted rows whose parent allocation is conclusively gone cannot
+        # consume usable capacity either. Draining/unhealthy rows are already
+        # excluded from hard_count regardless of their parent lifecycle.
+        effective_hard_count = max(
+            0, hard_count - dead_parent_counted_session_count
+        )
         global_start_budget = max(0, config.max_sessions - effective_hard_count)
         blocked_start_needed_by_account = {
             account: count
@@ -7825,7 +7831,7 @@ class AedtPoolService:
         config = self.config()
         plan = self.dry_run()
         latest = self.latest_validation()
-        live_state_placeholders = ", ".join("?" for _ in SESSION_COUNTED_STATES)
+        live_state_placeholders = ", ".join("?" for _ in SESSION_VISIBLE_STATES)
         history_state_placeholders = ", ".join("?" for _ in SESSION_HISTORY_STATES)
         with self.db.connect() as conn:
             sessions = [
@@ -7839,7 +7845,7 @@ class AedtPoolService:
                     WHERE s.state IN ({live_state_placeholders})
                     ORDER BY s.id DESC
                     """,
-                    SESSION_COUNTED_STATES,
+                    SESSION_VISIBLE_STATES,
                 ).fetchall()
             ]
             session_history = [
@@ -7952,7 +7958,7 @@ class AedtPoolService:
                     self._parallel_safe_native_solve_families
                 ),
                 "control_plane_url": config.control_plane_url,
-                "hard_counted_states": list(SESSION_COUNTED_STATES),
+                "hard_counted_states": list(SESSION_HARD_CAP_STATES),
             },
             "plan": plan,
             "active_session_count": int(plan.get("active_session_count") or 0),

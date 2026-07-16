@@ -3565,6 +3565,46 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(history[0]["quarantine_reason"], "solver_timeout-34")
         self.assertEqual(history[-1]["session_key"], "history-5")
 
+    def test_nonactive_lifecycle_states_are_visible_but_excluded_from_capacity(
+        self,
+    ) -> None:
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        lifecycle_states = ("starting", "ready", "busy", "draining", "unhealthy")
+        with self.db.connect() as conn:
+            for state in lifecycle_states:
+                conn.execute(
+                    """
+                    INSERT INTO aedt_sessions (
+                        session_key, allocation_id, account_name, node_name,
+                        slots_total, state, last_heartbeat_at, created_at, updated_at
+                    ) VALUES (?, ?, 'a', 'cpu-01', 2, ?, ?, ?, ?)
+                    """,
+                    (f"capacity-{state}", self.allocation_id, state, now, now, now),
+                )
+
+        summary = self.service.summary()
+        plan = summary["plan"]
+
+        self.assertEqual(
+            summary["config"]["hard_counted_states"],
+            ["starting", "ready", "busy"],
+        )
+        self.assertEqual(
+            {
+                session["state"]
+                for session in summary["sessions"]
+                if str(session["session_key"]).startswith("capacity-")
+            },
+            set(lifecycle_states),
+        )
+        self.assertEqual(plan["hard_session_count"], 3)
+        self.assertEqual(plan["active_session_count"], 2)
+        self.assertEqual(plan["active_project_capacity"], 4)
+        self.assertEqual(plan["idle_session_count"], 1)
+        self.assertEqual(plan["draining_session_count"], 1)
+        self.assertEqual(plan["unhealthy_session_count"], 1)
+        self.assertEqual(plan["unavailable_session_count"], 2)
+
     def test_min_idle_session_starts_and_refills_when_last_idle_is_leased(self) -> None:
         self.service.set_operator_limits(
             max_sessions=2,
@@ -3626,30 +3666,66 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(plan["warm_spare_starts_authorized"], 0)
         self.assertIn("license capacity exhausted", plan["warm_spare_status_reason"])
 
-    def test_min_idle_session_does_not_replace_on_unsafe_allocation(self) -> None:
+    def test_min_idle_replenishment_ignores_nonactive_sessions_for_hard_cap(
+        self,
+    ) -> None:
         self.service.set_operator_limits(
-            max_sessions=2,
+            max_sessions=1,
             min_idle_sessions=1,
-            target_projects=4,
+            target_projects=2,
         )
+        replacement_allocation_id = self.add_dedicated_allocation(node="cpu-02")
         with self.db.connect() as conn:
-            conn.execute(
+            conn.executemany(
                 """
                 INSERT INTO aedt_sessions (
                     session_key, allocation_id, account_name, node_name,
                     slots_total, state, failure_message
-                ) VALUES ('unhealthy-owner', ?, 'a', 'cpu-01', 2, 'unhealthy', 'lost heartbeat')
+                ) VALUES (?, ?, 'a', 'cpu-01', 2, ?, ?)
                 """,
-                (self.allocation_id,),
+                (
+                    (
+                        "draining-owner",
+                        self.allocation_id,
+                        "draining",
+                        "shutdown in progress",
+                    ),
+                    (
+                        "unhealthy-owner",
+                        self.allocation_id,
+                        "unhealthy",
+                        "lost heartbeat",
+                    ),
+                ),
             )
+
+        plan = self.service.summary()["plan"]
+        self.assertEqual(plan["unavailable_session_count"], 2)
+        self.assertEqual(plan["hard_session_count"], 0)
+        self.assertEqual(plan["warm_spare_deficit"], 1)
+        self.assertEqual(plan["start_needed"], 1)
+        self.assertEqual(self.service.starting_sessions(), [])
+        self.assertEqual(plan["node_requests"], 0)
+        self.assertEqual(
+            [placement["allocation_id"] for placement in plan["placements"]],
+            [replacement_allocation_id],
+        )
 
         self.service.reconcile(execute=True)
 
-        plan = self.service.summary()["plan"]
-        self.assertEqual(plan["unavailable_session_count"], 1)
-        self.assertEqual(plan["hard_session_count"], 1)
-        self.assertEqual(self.service.starting_sessions(), [])
-        self.assertEqual(plan["node_requests"], 1)
+        starts = self.service.starting_sessions()
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(int(starts[0]["allocation_id"]), replacement_allocation_id)
+        after = self.service.summary()
+        self.assertEqual(after["plan"]["hard_session_count"], 1)
+        self.assertEqual(
+            {
+                session["state"]
+                for session in after["sessions"]
+                if session["session_key"] in {"draining-owner", "unhealthy-owner"}
+            },
+            {"draining", "unhealthy"},
+        )
 
     def test_ready_session_on_draining_allocation_is_unavailable_and_replaced(
         self,
