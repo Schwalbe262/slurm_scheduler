@@ -402,6 +402,61 @@ class Database:
             ).fetchone()
             return bool(row)
 
+    def aedt_attached_project_cpus_by_allocation(self) -> dict[int, int]:
+        """Return AEDT solver CPU reservations keyed by the host allocation.
+
+        Pooled solver work runs inside the long-lived Desktop process rather
+        than in the thin scheduler task that owns the lease.  Consequently it
+        is absent from ``tasks.cpus`` and must be derived from live project
+        leases.  An unaccepted offer has not attached a project yet, while a
+        legacy ``leased`` project and protocol-v2 ``attaching``/``active``/
+        ``releasing`` projects reserve the configured per-project CPU budget.
+
+        The AEDT pool is optional, so databases without its schema report no
+        extra pressure instead of making the base scheduler depend on pool
+        initialization order.
+        """
+        with self.connect() as conn:
+            tables = {
+                str(row["name"])
+                for row in conn.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type = 'table'
+                      AND name IN ('aedt_sessions', 'aedt_project_leases')
+                    """
+                ).fetchall()
+            }
+            if tables != {"aedt_sessions", "aedt_project_leases"}:
+                return {}
+
+            setting = conn.execute(
+                "SELECT value FROM scheduler_settings WHERE key = 'aedt_pool_project_cpus'"
+            ).fetchone()
+            try:
+                project_cpus = max(1, int(setting["value"] if setting else 4))
+            except (TypeError, ValueError):
+                # Keep accounting available during recovery from a malformed
+                # operator setting; the pool's documented default is four.
+                project_cpus = 4
+
+            rows = conn.execute(
+                """
+                SELECT s.allocation_id, COUNT(*) AS project_count
+                FROM aedt_project_leases AS l
+                JOIN aedt_sessions AS s ON s.id = l.session_id
+                WHERE l.state IN ('leased', 'attaching', 'active', 'releasing')
+                  AND s.allocation_id > 0
+                  AND s.state IN ('starting', 'ready', 'busy', 'draining', 'unhealthy')
+                GROUP BY s.allocation_id
+                """
+            ).fetchall()
+            return {
+                int(row["allocation_id"]): int(row["project_count"] or 0)
+                * project_cpus
+                for row in rows
+            }
+
     def record_event(
         self,
         kind: str,
