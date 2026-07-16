@@ -3267,7 +3267,8 @@ class AedtPoolService:
                         last_fault_at = ?,
                         native_snapshot_path = CASE WHEN ? = ''
                             THEN native_snapshot_path ELSE ? END,
-                        drain_requested_at = NULL,
+                        drain_requested_at = CASE WHEN ?
+                            THEN NULL ELSE COALESCE(drain_requested_at, ?) END,
                         last_heartbeat_at = CASE WHEN ?
                             THEN ? ELSE last_heartbeat_at END,
                         updated_at = ?
@@ -3279,6 +3280,8 @@ class AedtPoolService:
                         now,
                         native_snapshot_path,
                         native_snapshot_path,
+                        int(bool(live_native_owner)),
+                        now,
                         int(bool(live_native_owner)),
                         now,
                         now,
@@ -5316,13 +5319,38 @@ class AedtPoolService:
                     """
                     SELECT id FROM aedt_sessions
                     WHERE state = 'unhealthy'
-                      AND COALESCE(last_heartbeat_at, started_at, created_at) < ?
-                      AND COALESCE(
-                          drain_requested_at, last_heartbeat_at,
-                          updated_at, created_at
-                      ) < ?
+                      AND (
+                          (
+                              failure_message LIKE 'host native liveness suspect:%'
+                              AND COALESCE(
+                                  drain_requested_at, last_heartbeat_at,
+                                  started_at, created_at
+                              ) < ?
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM aedt_project_leases owner
+                                  WHERE owner.session_id = aedt_sessions.id
+                                    AND owner.state IN (
+                                        'offered','leased','attaching',
+                                        'active','releasing'
+                                    )
+                              )
+                          )
+                          OR (
+                              COALESCE(
+                                  last_heartbeat_at, started_at, created_at
+                              ) < ?
+                              AND COALESCE(
+                                  drain_requested_at, last_heartbeat_at,
+                                  updated_at, created_at
+                              ) < ?
+                          )
+                      )
                     """,
-                    (reap_cutoff, unhealthy_recycle_cutoff),
+                    (
+                        unhealthy_recycle_cutoff,
+                        reap_cutoff,
+                        unhealthy_recycle_cutoff,
+                    ),
                 ).fetchall()
             ]
             for session_id in stale_unhealthy:

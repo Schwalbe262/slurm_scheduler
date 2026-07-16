@@ -1650,6 +1650,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
                 evidence={"process_id": "123", "port": 50001},
             )
             self.assertEqual(suspect["state"], "unhealthy")
+            self.assertIsNone(suspect["drain_requested_at"])
             self.assertEqual(
                 suspect["last_heartbeat_at"],
                 self.clock.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1791,23 +1792,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             "last_heartbeat_at"
         ]
 
-        for _count in range(4):
-            self.clock.advance(600)
-            suspect = self.service.report_session_fault(
-                session_id,
-                host_token,
-                kind="native_probe_suspect",
-                failure_message="idle GetVersion worker remains blocked",
-            )
-            self.assertEqual(suspect["last_heartbeat_at"], confirmed_heartbeat)
-            self.service.reconcile(execute=True)
-            self.assertEqual(self.service.get_session(session_id)["state"], "unhealthy")
-
-        # The host still reaches the control plane with suspect reports, but
-        # none is a fresh native-liveness proof.  Once the existing conservative
-        # reap horizon is crossed, the idle stuck Desktop can no longer pin the
-        # allocation forever.
-        self.clock.advance(601)
+        self.clock.advance(1)
         suspect = self.service.report_session_fault(
             session_id,
             host_token,
@@ -1815,6 +1800,32 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             failure_message="idle GetVersion worker remains blocked",
         )
         self.assertEqual(suspect["last_heartbeat_at"], confirmed_heartbeat)
+        first_drain_requested_at = suspect["drain_requested_at"]
+        self.assertIsNotNone(first_drain_requested_at)
+
+        # Repeated authenticated suspect reports are not native-liveness proof
+        # and must not postpone recycling an idle wedged Desktop.  Keep the
+        # longer heartbeat horizon only for a session with a live solve owner.
+        self.clock.advance(
+            self.service.config().unhealthy_recycle_grace_seconds - 1
+        )
+        suspect = self.service.report_session_fault(
+            session_id,
+            host_token,
+            kind="native_probe_suspect",
+            failure_message="idle GetVersion worker remains blocked",
+        )
+        self.assertEqual(suspect["drain_requested_at"], first_drain_requested_at)
+        self.service.reconcile(execute=True)
+        self.assertEqual(self.service.get_session(session_id)["state"], "unhealthy")
+
+        self.clock.advance(2)
+        self.service.report_session_fault(
+            session_id,
+            host_token,
+            kind="native_probe_suspect",
+            failure_message="idle GetVersion worker remains blocked",
+        )
         self.service.reconcile(execute=True)
 
         reaped = self.service.get_session(session_id)
