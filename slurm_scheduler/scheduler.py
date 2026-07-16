@@ -6503,6 +6503,7 @@ class Scheduler:
         requested_cpus: int = 0,
         requested_memory_mb: int = 0,
         require_fea_eligible_node: bool = False,
+        cpu_only_nodes: bool = False,
     ) -> bool:
         return self.open_allocation_record(
             reason=reason,
@@ -6517,6 +6518,7 @@ class Scheduler:
             requested_cpus=requested_cpus,
             requested_memory_mb=requested_memory_mb,
             require_fea_eligible_node=require_fea_eligible_node,
+            cpu_only_nodes=cpu_only_nodes,
         ) is not None
 
     def open_allocation_record(
@@ -6533,6 +6535,7 @@ class Scheduler:
         requested_cpus: int = 0,
         requested_memory_mb: int = 0,
         require_fea_eligible_node: bool = False,
+        cpu_only_nodes: bool = False,
     ) -> dict | None:
         account = self.choose_account_for_allocation(
             preferred_accounts=preferred_accounts,
@@ -6551,6 +6554,7 @@ class Scheduler:
             requested_cpus=requested_cpus,
             requested_memory_mb=requested_memory_mb,
             require_fea_eligible_node=require_fea_eligible_node,
+            cpu_only_nodes=cpu_only_nodes,
         )
         if not shape:
             return None
@@ -6965,6 +6969,7 @@ class Scheduler:
         requested_cpus: int = 0,
         requested_memory_mb: int = 0,
         require_fea_eligible_node: bool = False,
+        cpu_only_nodes: bool = False,
     ) -> dict | None:
         inventory_by_node = {row["node_name"]: row for row in self.db.list_node_inventory()}
         nodes = [
@@ -7059,7 +7064,13 @@ class Scheduler:
             else:
                 if target_partition != "auto" and not self.partition_spec_allows(target_partition, node.partition):
                     continue
-                if target_partition == "auto" and node_gpu_count > 0 and not self.cpu_pool_allow_gpu_partitions:
+                if node_gpu_count > 0 and (
+                    cpu_only_nodes
+                    or (
+                        target_partition == "auto"
+                        and not self.cpu_pool_allow_gpu_partitions
+                    )
+                ):
                     continue
             if target_partition != "auto" and not self.partition_spec_allows(target_partition, node.partition):
                 continue
