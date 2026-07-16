@@ -91,7 +91,16 @@ class WebWorkerSupervisor:
     def _spawn(self) -> subprocess.Popen:
         env = dict(os.environ)
         env["SLURM_SCHEDULER_UVICORN_WORKER"] = "1"
-        command = [sys.executable, "-m", "slurm_scheduler"]
+        executable = sys.executable
+        if os.name == "nt":
+            # Scripts/python.exe in a Windows venv is a redirector process. If
+            # Popen tracks that redirector, terminating a wedged worker can
+            # leave the real base-Python/Uvicorn child (and scheduler thread)
+            # orphaned. Launch the base image directly while this interpreter
+            # hint preserves the venv prefix and site-packages in the child.
+            executable = getattr(sys, "_base_executable", "") or sys.executable
+            env["__PYVENV_LAUNCHER__"] = sys.executable
+        command = [executable, "-m", "slurm_scheduler"]
         LOGGER.info("starting web worker: %s", " ".join(command))
         return subprocess.Popen(command, env=env)
 

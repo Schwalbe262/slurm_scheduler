@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -51,6 +52,23 @@ class WebWorkerSupervisorTests(unittest.TestCase):
         with mock.patch.object(supervisor, "_spawn", return_value=_ExitedChild()) as spawn:
             self.assertEqual(supervisor.run(), 70)
         spawn.assert_called_once_with()
+
+    @unittest.skipUnless(os.name == "nt", "Windows venv redirector semantics")
+    def test_windows_spawn_tracks_base_worker_while_preserving_venv(self) -> None:
+        supervisor = WebWorkerSupervisor(host="127.0.0.1", port=8000)
+        base_executable = str(
+            getattr(sys, "_base_executable", "") or sys.executable
+        )
+        child = object()
+        with mock.patch(
+            "slurm_scheduler.web_supervisor.subprocess.Popen", return_value=child
+        ) as popen:
+            self.assertIs(supervisor._spawn(), child)
+        command = popen.call_args.args[0]
+        env = popen.call_args.kwargs["env"]
+        self.assertEqual(command, [base_executable, "-m", "slurm_scheduler"])
+        self.assertEqual(env["__PYVENV_LAUNCHER__"], sys.executable)
+        self.assertEqual(env["SLURM_SCHEDULER_UVICORN_WORKER"], "1")
 
     def test_python_startup_rejects_existing_listener_before_worker_start(self) -> None:
         config = SimpleNamespace(

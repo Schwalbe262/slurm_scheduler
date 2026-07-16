@@ -18,6 +18,14 @@ if %errorlevel%==0 (
 )
 echo [%date% %time%] start_web.cmd: starting slurm_scheduler >> logs\web.log
 .venv\Scripts\python.exe -m slurm_scheduler >> logs\web.log 2>&1
-echo [%date% %time%] start_web.cmd: exited with code %errorlevel%; restarting in 5s >> logs\web.log
-timeout /t 5 /nobreak >nul
+set "scheduler_exit_code=%errorlevel%"
+if "%scheduler_exit_code%"=="70" (
+  rem Exit 70 is a threshold-confirmed watchdog restart. The worker is already
+  rem stopped and the port guard above prevents duplicate generations, so the
+  rem generic crash-loop delay only lengthens a known outage.
+  echo [%date% %time%] start_web.cmd: watchdog exit 70; restarting immediately >> logs\web.log
+) else (
+  echo [%date% %time%] start_web.cmd: exited with code %scheduler_exit_code%; restarting in 5s >> logs\web.log
+  timeout /t 5 /nobreak >nul
+)
 goto loop

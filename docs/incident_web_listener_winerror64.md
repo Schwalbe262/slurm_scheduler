@@ -16,6 +16,9 @@ half-alive WEB process.
 - The external service launcher is the only restart authority, preventing a dying Python generation
   and `start_web.cmd` from both creating replacements. SQLite and remote Slurm steps remain
   authoritative when the new generation reconciles.
+- On Windows, the supervisor launches the base Python image directly with the venv launcher hint.
+  This makes its tracked child PID the real Uvicorn process instead of a venv redirector, so worker
+  termination cannot leave an untracked scheduler process behind.
 
 Default policy:
 
@@ -32,6 +35,8 @@ while another process owns `0.0.0.0:8000`, and Python also refuses to start when
 listener is already live. The Uvicorn worker reserves its Windows socket before importing the app,
 so a simultaneous losing generation exits before opening SQLite. Set
 `SLURM_SCHEDULER_UVICORN_WORKER=1` only for a directly managed Uvicorn child or tests.
+The launcher skips its generic five-second crash backoff only for watchdog exit code 70; other exit
+codes retain the delay so persistent startup failures cannot create a tight restart loop.
 
 ## Verification before deployment
 
