@@ -121,8 +121,20 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
                         raise ValueError(
                             "projects_per_aedt must be an integer between 1 and 3"
                         )
-                    max_sessions = ceil(
-                        concurrent_simulations / projects_per_session
+                    min_idle_sessions = payload.get(
+                        "min_idle_aedt_sessions",
+                        service.config().min_idle_sessions,
+                    )
+                    if (
+                        type(min_idle_sessions) is not int
+                        or not 0 <= min_idle_sessions <= 550
+                    ):
+                        raise ValueError(
+                            "min_idle_aedt_sessions must be an integer between 0 and 550"
+                        )
+                    max_sessions = (
+                        ceil(concurrent_simulations / projects_per_session)
+                        + min_idle_sessions
                     )
                     if max_sessions > 550:
                         raise ValueError(
@@ -165,7 +177,7 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
             "project_cpus": config.project_cpus,
             "project_memory_mb": config.project_memory_mb,
             "session_reserved_cpus": (
-                config.project_cpus * config.projects_per_session
+                1 + config.project_cpus * config.projects_per_session
             ),
             "session_reserved_memory_mb": (
                 config.project_memory_mb * config.projects_per_session

@@ -36,8 +36,9 @@
     <details id="advanced-operator-limits" class="section-gap">
       <summary>고급 설정</summary>
       <p class="muted">
-        Limits are durable even while the pool is disabled. Starting, ready, busy, draining,
-        and unhealthy sessions consume the AEDT ceiling. The project target must not exceed
+        Limits are durable even while the pool is disabled. Only healthy active ready/busy
+        sessions consume the AEDT ceiling; starting, draining, and unhealthy lifecycle rows
+        are displayed separately. The project target must not exceed
         AEDT sessions × projects per AEDT; changing slot count requires a fully drained pool.
       </p>
       <form id="limit-form" class="form-grid">
@@ -279,6 +280,7 @@
   function updateDerivedSessions() {
     const simulations = Number(document.getElementById("concurrent-simulations").value);
     const projectsPerAedt = Number(document.getElementById("projects-per-aedt").value);
+    const minimumIdle = Number(document.getElementById("min-idle-aedt-sessions").value);
     const output = document.getElementById("derived-aedt-sessions");
     if (!Number.isInteger(simulations) || simulations < 0
         || !Number.isInteger(projectsPerAedt) || projectsPerAedt < 1) {
@@ -286,7 +288,8 @@
       output.textContent = "—";
       return;
     }
-    const sessions = Math.ceil(simulations / projectsPerAedt);
+    const sessions = Math.ceil(simulations / projectsPerAedt)
+      + (Number.isInteger(minimumIdle) && minimumIdle > 0 ? minimumIdle : 0);
     output.className = sessions > 550 ? "summary-value error" : "summary-value";
     output.textContent = `${sessions}개 (${simulations} ÷ ${projectsPerAedt}, 올림)${sessions > 550 ? " · 최대 550 초과" : ""}`;
   }
@@ -317,7 +320,10 @@
 
     const capacity = document.getElementById("capacity");
     capacity.replaceChildren(
-      summaryItem("Hard-counted AEDT", plan.hard_session_count ?? 0),
+      summaryItem("Active AEDT", plan.active_session_count ?? 0),
+      summaryItem("Starting AEDT", plan.starting_session_count ?? 0),
+      summaryItem("Draining AEDT", plan.draining_session_count ?? 0),
+      summaryItem("Unhealthy AEDT", plan.unhealthy_session_count ?? 0),
       summaryItem("Desired AEDT", plan.desired_sessions ?? 0),
       summaryItem("Idle AEDT", plan.idle_session_count ?? 0),
       summaryItem("Minimum idle", config.min_idle_aedt_sessions ?? 0),

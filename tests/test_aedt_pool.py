@@ -215,6 +215,245 @@ class AedtPoolTestCase(unittest.TestCase):
 
 
 class AedtPoolGateTests(AedtPoolTestCase):
+    def test_queued_pooled_backlog_plans_500_projects_plus_three_spares(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=170,
+            min_idle_sessions=3,
+            target_projects=500,
+            projects_per_session=3,
+        )
+        for index in range(500):
+            self.db.create_task(
+                TaskCreate(
+                    name=f"mft-backlog-{index}",
+                    remote_cwd=f"/work/backlog/{index}",
+                    command="true",
+                    aedt_backend="pooled",
+                    project="MFT_1MW_2026v1",
+                )
+            )
+        self.make_operational()
+
+        plan = self.service.dry_run()
+
+        self.assertEqual(plan["queued_pooled_task_backlog"], 500)
+        self.assertEqual(plan["demand_sessions"], 167)
+        self.assertEqual(plan["desired_sessions"], 170)
+        self.assertEqual(plan["start_needed"], 170)
+        self.assertEqual(plan["active_session_count"], 0)
+
+    def test_five_account_500_backlog_scales_every_account_with_three_spares(
+        self,
+    ) -> None:
+        accounts = [f"account-{index}" for index in range(5)]
+        self.service.set_operator_limits(
+            max_sessions=173,
+            min_idle_sessions=3,
+            target_projects=500,
+            projects_per_session=3,
+        )
+        for account in accounts:
+            for index in range(100):
+                self.db.create_task(
+                    TaskCreate(
+                        name=f"mft-{account}-{index}",
+                        remote_cwd=f"/work/{account}/{index}",
+                        command="true",
+                        account_name=account,
+                        aedt_backend="pooled",
+                        project="MFT_1MW_2026v1",
+                    )
+                )
+        self.make_operational()
+
+        plan = self.service.dry_run()
+
+        self.assertEqual(plan["queued_pooled_task_backlog"], 500)
+        self.assertEqual(
+            plan["queued_pooled_task_backlog_by_account"],
+            {account: 100 for account in accounts},
+        )
+        self.assertEqual(
+            plan["demand_sessions_by_account"],
+            {account: 34 for account in accounts},
+        )
+        self.assertEqual(plan["demand_sessions"], 170)
+        self.assertEqual(plan["desired_sessions"], 173)
+        self.assertEqual(
+            plan["start_needed_by_account"],
+            {
+                accounts[0]: 35,
+                accounts[1]: 35,
+                accounts[2]: 35,
+                accounts[3]: 34,
+                accounts[4]: 34,
+            },
+        )
+        self.assertEqual(
+            plan["node_requests_by_account"],
+            {account: 9 for account in accounts},
+        )
+        self.assertEqual(plan["node_requests"], 45)
+
+    def test_busy_mft_sessions_do_not_mask_motor_family_session_demand(self) -> None:
+        allocation_id = self.add_dedicated_allocation()
+        self.service.set_operator_limits(
+            max_sessions=3,
+            min_idle_sessions=0,
+            target_projects=5,
+            projects_per_session=3,
+        )
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.db.connect() as conn:
+            session_ids = []
+            for index in range(2):
+                session_ids.append(
+                    int(
+                        conn.execute(
+                            """
+                            INSERT INTO aedt_sessions (
+                                session_key, allocation_id, account_name,
+                                node_name, endpoint, process_id,
+                                session_profile, slots_total, state,
+                                last_heartbeat_at, started_at, created_at, updated_at
+                            ) VALUES (?, ?, 'a', 'cpu-01', ?, ?, ?, 3, 'busy',
+                                      ?, ?, ?, ?)
+                            """,
+                            (
+                                f"family-bound-{index}",
+                                allocation_id,
+                                f"cpu-01:{53000 + index}",
+                                str(53000 + index),
+                                EXPECTED_SESSION_PROFILE_JSON,
+                                now,
+                                now,
+                                now,
+                                now,
+                            ),
+                        ).lastrowid
+                    )
+                )
+            for index, session_id in enumerate(session_ids):
+                conn.execute(
+                    """
+                    INSERT INTO aedt_project_leases (
+                        request_key, project_name, placement_group,
+                        workload_family, session_profile, project_namespace,
+                        isolation_policy, protocol_version, session_id,
+                        slot_index, state, client_token_hash, expires_at
+                    ) VALUES (?, ?, 'mft', 'mft', ?, 'mft', 'family', 2,
+                              ?, 0, 'active', 'token', '2099-01-01 00:00:00')
+                    """,
+                    (
+                        f"family-bound-lease-{index}",
+                        f"mft-family-bound-{index}",
+                        EXPECTED_SESSION_PROFILE_JSON,
+                        session_id,
+                    ),
+                )
+        for index in range(3):
+            self.db.create_task(
+                TaskCreate(
+                    name=f"ipmsm-family-demand-{index}",
+                    remote_cwd=f"/work/ipmsm/{index}",
+                    command="true",
+                    account_name="a",
+                    aedt_backend="pooled",
+                    project="pyaedt_motor",
+                )
+            )
+        self.make_operational()
+
+        plan = self.service.dry_run()
+
+        self.assertEqual(plan["demand_sessions_by_account"], {"a": 3})
+        self.assertEqual(plan["active_sessions_by_account"], {"a": 2})
+        self.assertEqual(plan["start_needed_by_account"], {"a": 1})
+        self.assertEqual(plan["start_needed"], 1)
+
+    def test_account_rebalance_drains_wrong_account_before_replacement_start(
+        self,
+    ) -> None:
+        allocation_a = self.add_dedicated_allocation(node="cpu-a")
+        allocation_b = self.db.create_allocation(
+            "b", "cpu", "cpu-b", 64, 512 * 1024
+        )
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.db.update_allocation(
+            allocation_b,
+            state="active",
+            slurm_job_id="job-b",
+            drain_reason="AEDT pool project demand",
+            created_at=now,
+            started_at=now,
+        )
+        self.service.set_operator_limits(
+            max_sessions=40,
+            min_idle_sessions=0,
+            target_projects=102,
+            projects_per_session=3,
+        )
+        with self.db.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO aedt_sessions (
+                    session_key, allocation_id, account_name, node_name,
+                    endpoint, process_id, session_profile, slots_total,
+                    state, last_heartbeat_at, started_at, created_at, updated_at
+                ) VALUES (?, ?, 'a', 'cpu-a', ?, ?, ?, 3, 'ready', ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        f"rebalance-a-{index}",
+                        allocation_a,
+                        f"cpu-a:{54000 + index}",
+                        str(54000 + index),
+                        EXPECTED_SESSION_PROFILE_JSON,
+                        now,
+                        now,
+                        now,
+                        now,
+                    )
+                    for index in range(34)
+                ),
+            )
+        for index in range(102):
+            self.db.create_task(
+                TaskCreate(
+                    name=f"mft-rebalance-b-{index}",
+                    remote_cwd=f"/work/b/{index}",
+                    command="true",
+                    account_name="b",
+                    aedt_backend="pooled",
+                    project="MFT_1MW_2026v1",
+                )
+            )
+        self.make_operational()
+
+        dry_plan = self.service.dry_run()
+
+        self.assertEqual(dry_plan["rebalance_drains_by_account"], {"a": 34})
+        self.assertEqual(dry_plan["start_needed_by_account"], {"b": 6})
+        self.assertLessEqual(
+            dry_plan["hard_session_count"]
+            + dry_plan["start_needed"],
+            40,
+        )
+
+        self.service.reconcile(execute=True)
+        with self.db.connect() as conn:
+            counted = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM aedt_sessions
+                    WHERE state IN (
+                        'starting','ready','busy','draining','unhealthy'
+                    )
+                    """
+                ).fetchone()[0]
+            )
+        self.assertLessEqual(counted, 40)
+
     def test_scheduler_pressure_charges_attached_projects_to_session_allocation(self) -> None:
         host_allocation_id = self.add_dedicated_allocation(node="cpu-host")
         client_allocation_id = self.add_dedicated_allocation(node="cpu-client")
@@ -223,7 +462,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 "aedt-session-host",
                 "~/pool",
                 "host",
-                cpus=12,
+                cpus=1,
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 project="_aedt_pool_hosts",
             )
@@ -233,8 +472,9 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 "host-local-client",
                 "~/case",
                 "run",
-                cpus=1,
+                cpus=4,
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                aedt_backend="pooled",
                 project="MFT_1MW_2026v1",
             )
         )
@@ -245,6 +485,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 "run",
                 cpus=1,
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                aedt_backend="pooled",
                 project="MFT_1MW_2026v1",
             )
         )
@@ -271,44 +512,49 @@ class AedtPoolGateTests(AedtPoolTestCase):
                     (host_allocation_id,),
                 ).lastrowid
             )
-            for slot, state in enumerate(
-                ("leased", "attaching", "active", "releasing", "offered"), start=1
-            ):
+            lease_specs = (
+                ("leased", 0),
+                ("attaching", remote_client_task_id),
+                ("active", host_client_task_id),
+                ("releasing", 0),
+                ("offered", 0),
+            )
+            for slot, (state, task_id) in enumerate(lease_specs, start=1):
                 conn.execute(
                     """
                     INSERT INTO aedt_project_leases (
-                        request_key, project_name, session_id, slot_index, state,
+                        request_key, project_name, task_id, session_id, slot_index, state,
                         client_token_hash, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, 'token', '2099-01-01 00:00:00')
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'token', '2099-01-01 00:00:00')
                     """,
-                    (f"pressure-{state}", f"project-{state}", session_id, slot, state),
+                    (
+                        f"pressure-{state}", f"project-{state}", task_id,
+                        session_id, slot, state,
+                    ),
                 )
 
         scheduler = Scheduler(self.db, [], 30)
 
-        # Four accepted/live leases reserve 4 CPUs each.  The unaccepted offer
-        # contributes zero; the 12-CPU Desktop host task is infrastructure and
-        # is replaced by the lease-derived solver charge.
+        # The local four-core pooled task directly represents one project.  The
+        # remote legacy thin task is ignored and its host lease supplies the
+        # four-core shadow; the two taskless accepted leases do the same.
         self.assertEqual(
             self.db.aedt_attached_project_cpus_by_allocation(),
-            {host_allocation_id: 16},
+            {host_allocation_id: 12},
         )
         self.assertEqual(
             scheduler.fea_allocation_pressures()[host_allocation_id],
-            {"workers": 1, "requested_cpus": 17, "owned_cpus": 64},
+            {"workers": 4, "requested_cpus": 16, "owned_cpus": 64},
         )
         self.assertEqual(
             scheduler.fea_allocation_pressures()[client_allocation_id],
-            {"workers": 1, "requested_cpus": 1, "owned_cpus": 64},
+            {"workers": 0, "requested_cpus": 0, "owned_cpus": 64},
         )
         self.assertEqual(
             scheduler.fea_owned_node_pressures()["cpu-host"],
-            {"workers": 1, "requested_cpus": 17, "owned_cpus": 64},
+            {"workers": 4, "requested_cpus": 16, "owned_cpus": 64},
         )
-        self.assertEqual(
-            scheduler.fea_owned_node_pressures()["cpu-client"],
-            {"workers": 1, "requested_cpus": 1, "owned_cpus": 64},
-        )
+        self.assertNotIn("cpu-client", scheduler.fea_owned_node_pressures())
 
     def test_placement_group_derivation_and_explicit_override(self) -> None:
         cases = {
@@ -332,7 +578,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
     def test_requested_250_500_is_staged_but_disabled(self) -> None:
         config = self.service.config()
         self.assertEqual(config.max_sessions, 250)
-        self.assertEqual(config.min_idle_sessions, 0)
+        self.assertEqual(config.min_idle_sessions, 3)
         self.assertEqual(config.target_projects, 500)
         self.assertEqual(config.unhealthy_recycle_grace_seconds, 180)
         self.assertEqual(config.idle_ttl_seconds, 3600)
@@ -428,7 +674,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
             projects_per_session=3,
         )
         self.assertEqual(config.projects_per_session, 3)
-        self.assertEqual(self.service.summary()["plan"]["sessions_per_new_node"], 5)
+        self.assertEqual(self.service.summary()["plan"]["sessions_per_new_node"], 4)
         with self.assertRaisesRegex(ValueError, "projects_per_aedt"):
             self.service.set_operator_limits(projects_per_session=4)
         with self.assertRaisesRegex(ValueError, "cannot exceed"):
@@ -527,10 +773,11 @@ class AedtPoolGateTests(AedtPoolTestCase):
 
         self.assertEqual(response["concurrent_simulations"], 401)
         self.assertEqual(response["target_project_concurrency"], 401)
-        self.assertEqual(response["max_aedt_sessions"], 201)
+        self.assertEqual(response["max_aedt_sessions"], 204)
+        self.assertEqual(response["session_reserved_cpus"], 9)
         config = self.service.config()
         self.assertEqual(config.target_projects, 401)
-        self.assertEqual(config.max_sessions, 201)
+        self.assertEqual(config.max_sessions, 204)
 
     def test_api_operator_surface_accepts_durable_rotation_and_idle_timeouts(
         self,
@@ -585,6 +832,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
             {
                 "concurrent_simulations": 1650,
                 "projects_per_aedt": 3,
+                "min_idle_aedt_sessions": 0,
             }
         )
 
@@ -784,7 +1032,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
         for required in (
             'href="/aedt-pool"',
             'id="aedt-dashboard-sessions"',
-            "aedt_pool_summary.plan.hard_session_count",
+            "aedt_pool_summary.plan.active_session_count",
             "aedt_pool_summary.config.max_aedt_sessions",
             'id="aedt-dashboard-projects"',
             "aedt_pool_summary.plan.live_projects",
@@ -1581,6 +1829,99 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
 
 
 class AedtLeaseLifecycleTests(AedtPoolTestCase):
+    def test_release_barrier_revokes_sibling_offer_until_native_heartbeat(self) -> None:
+        def request_v2(suffix: str):
+            return self.service.request_lease(
+                request_key=f"release-race-{suffix}",
+                project_name=f"mft-release-race-{suffix}",
+                workload_family="mft",
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                project_namespace="mft",
+                isolation_policy="family",
+                workspace_path=f"/work/release-race/{suffix}",
+                protocol_version=2,
+                client_token=f"release-race-token-{suffix}-000000000",
+            )
+
+        first, first_token = request_v2("first")
+        second, second_token = request_v2("second")
+        session, host_token = self.start_one_session(self.allocation_id)
+        self.assertEqual(self.service.get_lease(int(first["id"]))["state"], "offered")
+        self.assertEqual(self.service.get_lease(int(second["id"]))["state"], "offered")
+
+        self.service.accept_lease(int(first["id"]), first_token)
+        self.service.cancel_lease(int(first["id"]), first_token)
+        revoked = self.service.accept_lease(int(second["id"]), second_token)
+        self.assertEqual(revoked["state"], "queued")
+        self.assertIsNone(revoked["session_id"])
+
+        self.service.complete_release(
+            int(session["id"]), host_token, int(first["id"]), success=True
+        )
+        self.assertEqual(self.service.get_lease(int(second["id"]))["state"], "queued")
+        self.clock.advance(1)
+        self.service.heartbeat_session(int(session["id"]), host_token)
+        reoffered = self.service.get_lease(int(second["id"]))
+        self.assertEqual(reoffered["state"], "offered")
+        self.assertEqual(int(reoffered["session_id"]), int(session["id"]))
+        accepted = self.service.accept_lease(int(second["id"]), second_token)
+        self.assertEqual(accepted["state"], "attaching")
+
+    def test_failed_release_never_clears_reuse_barrier_on_heartbeat(self) -> None:
+        lease, lease_token = self.request(
+            "failed-release-barrier",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        self.service.release_lease(int(lease["id"]), lease_token)
+        self.service.complete_release(
+            int(session["id"]),
+            host_token,
+            int(lease["id"]),
+            success=False,
+            failure_message="native project close failed",
+        )
+        self.clock.advance(1)
+        heartbeat = self.service.heartbeat_session(int(session["id"]), host_token)
+        self.assertEqual(heartbeat["state"], "unhealthy")
+        self.assertIsNotNone(heartbeat["reuse_blocked_at"])
+
+        waiting, _ = self.request("after-failed-release")
+        self.assertEqual(waiting["state"], "queued")
+        self.assertIsNone(waiting["session_id"])
+
+    def test_lost_release_ack_is_reaped_after_native_session_heartbeat_expires(
+        self,
+    ) -> None:
+        lease, lease_token = self.request(
+            "lost-release-ack",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        self.service.release_lease(int(lease["id"]), lease_token)
+
+        self.clock.advance(
+            self.service.config().session_heartbeat_timeout_seconds + 1
+        )
+        self.service.reconcile(execute=False)
+
+        reaped = self.service.get_lease(int(lease["id"]))
+        current_session = self.service.get_session(int(session["id"]))
+        self.assertEqual(reaped["state"], "failed")
+        self.assertEqual(current_session["state"], "unhealthy")
+        self.assertIsNotNone(current_session["reuse_blocked_at"])
+        self.assertEqual(current_session["quarantine_reason"], "release_ack_lost")
+
+        self.clock.advance(1)
+        first_late = self.service.heartbeat_session(int(session["id"]), host_token)
+        self.clock.advance(1)
+        second_late = self.service.heartbeat_session(int(session["id"]), host_token)
+        self.assertEqual(first_late["state"], "unhealthy")
+        self.assertEqual(second_late["state"], "unhealthy")
+        self.assertIsNotNone(second_late["reuse_blocked_at"])
+
     def test_protocol_v2_rejects_blank_or_drifted_runtime_contract(self) -> None:
         with self.assertRaisesRegex(ValueError, "workspace_path"):
             self.service.request_lease(
@@ -2373,6 +2714,8 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertFalse(
             bool(self.service.get_session(int(session["id"]))["solve_batch_sealed_at"])
         )
+        self.clock.advance(1)
+        self.service.heartbeat_session(int(session["id"]), host_token)
         self.service.reconcile(execute=True)
         self.assertEqual(self.service.get_lease(int(late["id"]))["state"], "offered")
 
@@ -2435,6 +2778,10 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
 
     def setUp(self) -> None:
         super().setUp()
+        # Most lifecycle tests exercise one explicit Desktop.  Keep the new
+        # production default of three warm spares out of those legacy fixtures;
+        # dedicated planner tests set their own idle target explicitly.
+        self.service.set_operator_limits(min_idle_sessions=0)
         self.allocation_id = self.add_dedicated_allocation()
         self.make_operational()
 
@@ -3181,6 +3528,44 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             int(starts[0]["allocation_id"]), replacement_allocation_id
         )
 
+    def test_busy_session_on_closed_allocation_is_not_active_and_is_replaced(
+        self,
+    ) -> None:
+        self.service.set_operator_limits(
+            max_sessions=1,
+            min_idle_sessions=0,
+            target_projects=1,
+        )
+        lease, _lease_token = self.request(
+            "closed-allocation-busy-owner",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, _host_token = self.start_one_session(self.allocation_id)
+        self.assertEqual(
+            self.service.get_lease(int(lease["id"]))["session_id"],
+            session["id"],
+        )
+        replacement_allocation_id = self.add_dedicated_allocation(node="cpu-02")
+        self.db.update_allocation(self.allocation_id, state="closed")
+
+        dry_plan = self.service.summary()["plan"]
+
+        self.assertEqual(dry_plan["active_session_count"], 0)
+        self.assertEqual(dry_plan["unavailable_busy_session_count"], 1)
+        self.assertEqual(dry_plan["start_needed"], 1)
+        self.assertEqual(
+            [item["allocation_id"] for item in dry_plan["placements"]],
+            [replacement_allocation_id],
+        )
+
+        self.service.reconcile(execute=True)
+        starts = self.service.starting_sessions()
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(
+            int(starts[0]["allocation_id"]), replacement_allocation_id
+        )
+
     def test_reaps_stale_unhealthy_session_and_frees_its_allocation_claim(
         self,
     ) -> None:
@@ -3557,6 +3942,12 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.service.complete_release(
             int(session["id"]), host_token, int(first["id"]), success=True
         )
+        self.assertEqual(self.service.get_lease(int(third["id"]))["state"], "queued")
+        self.assertIsNotNone(
+            self.service.get_session(int(session["id"]))["reuse_blocked_at"]
+        )
+        self.clock.advance(1)
+        self.service.heartbeat_session(int(session["id"]), host_token)
         self.assertEqual(self.service.get_lease(int(third["id"]))["state"], "leased")
         self.assertEqual(self.service.get_lease(int(second["id"]))["state"], "leased")
 
@@ -3584,6 +3975,9 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
                 success=False,
                 failure_message="contradictory replay",
             )
+
+        self.clock.advance(1)
+        self.service.heartbeat_session(int(session["id"]), host_token)
 
         failed_lease, failed_token = self.request(
             "failed-release-replay",
@@ -4195,6 +4589,7 @@ class AedtExactSessionReservationTests(AedtPoolTestCase):
         starts = self.service.starting_sessions()
         self.assertEqual(len(starts), 2)
         self.sessions = []
+        self.session_tokens = {}
         for index, start in enumerate(starts):
             host_id = f"exact-pin-host-{index}"
             self.service.claim_start(
@@ -4204,7 +4599,7 @@ class AedtExactSessionReservationTests(AedtPoolTestCase):
                 host_id=host_id,
                 bootstrap_token="secret",
             )
-            session, _token = self.service.register_session(
+            session, token = self.service.register_session(
                 session_id=int(start["id"]),
                 host_id=host_id,
                 endpoint=f"cpu-01:{51001 + index}",
@@ -4213,6 +4608,7 @@ class AedtExactSessionReservationTests(AedtPoolTestCase):
                 bootstrap_token="secret",
             )
             self.sessions.append(session)
+            self.session_tokens[int(session["id"])] = token
         self.sessions.sort(key=lambda item: int(item["id"]))
 
     def create_pooled_task(self, suffix: str, *, payload_json: str = "") -> int:
@@ -4490,10 +4886,9 @@ class AedtExactSessionReservationTests(AedtPoolTestCase):
         )
 
         first_lease, first_token = leases[0]
-        self.service.accept_lease(int(first_lease["id"]), first_token)
-        activated = self.service.activate_lease(int(first_lease["id"]), first_token)
-        self.assertEqual(activated["state"], "failed")
-        self.assertIn("before solve permit", activated["failure_message"])
+        rejected = self.service.accept_lease(int(first_lease["id"]), first_token)
+        self.assertEqual(rejected["state"], "failed")
+        self.assertIn("accept-time ownership/liveness", rejected["failure_message"])
         self.assertEqual(
             {
                 self.service.get_lease(int(lease["id"]))["state"]
@@ -4623,6 +5018,10 @@ class FakeHostLaunchScheduler(FakeRuntimeScheduler):
 
 
 class AedtRuntimeTests(AedtPoolTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.service.set_operator_limits(min_idle_sessions=0)
+
     def test_canonical_host_command_pins_aedt_version_and_profile(self) -> None:
         runtime = AedtPoolRuntime(
             self.service,
@@ -4799,11 +5198,364 @@ class AedtRuntimeTests(AedtPoolTestCase):
         self.assertTrue(
             all(int(task["requested_allocation_id"]) > 0 for task in scheduler.host_tasks)
         )
-        self.assertTrue(all(int(task["cpus"]) == 8 for task in scheduler.host_tasks))
+        self.assertTrue(all(int(task["cpus"]) == 1 for task in scheduler.host_tasks))
         self.assertTrue(
             all(int(task["memory_mb"]) >= 64 * 1024 for task in scheduler.host_tasks)
         )
         self.assertTrue(all(int(task["priority"]) == 10 for task in scheduler.host_tasks))
+
+
+class AedtPreadmissionTests(AedtExactSessionReservationTests):
+
+    def test_app_preadmission_uses_motor_clients_canonical_ipmsm_family(self) -> None:
+        from slurm_scheduler.aedt_pool import canonical_workload_family
+
+        self.assertEqual(
+            canonical_workload_family("", "pyaedt_motor campaign"),
+            "ipmsm",
+        )
+        self.assertEqual(
+            canonical_workload_family("", "IPMSM_v2_stage3_001"),
+            "ipmsm",
+        )
+        self.assertEqual(
+            canonical_workload_family("custom-motor", "pyaedt_motor campaign"),
+            "custom-motor",
+        )
+
+    def test_auto_preadmission_pins_four_core_task_before_launch(self) -> None:
+        task_id = self.create_pooled_task("auto-preadmit")
+
+        reservation = self.service.prepare_pooled_task_session(
+            task_id=task_id,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="mft",
+            isolation_policy="family",
+        )
+
+        self.assertIsNotNone(reservation)
+        task = self.db.get_task(task_id)
+        self.assertEqual(int(task["cpus"]), 4)
+        self.assertEqual(
+            int(task["requested_allocation_id"]),
+            int(reservation["allocation_id"]),
+        )
+        self.assertEqual(task["node_name"], reservation["node_name"])
+        self.assertTrue(str(reservation["reservation_key"]).startswith("aedt-auto:"))
+
+    def test_auto_preadmission_atomically_enforces_project_target(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=2,
+            min_idle_sessions=0,
+            target_projects=1,
+            projects_per_session=3,
+        )
+        task_ids = [
+            self.create_pooled_task("target-cap-first"),
+            self.create_pooled_task("target-cap-second"),
+        ]
+
+        reservations = [
+            self.service.prepare_pooled_task_session(
+                task_id=task_id,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                workload_family="mft",
+                isolation_policy="family",
+            )
+            for task_id in task_ids
+        ]
+
+        self.assertEqual([item is not None for item in reservations], [True, False])
+        with self.db.connect() as conn:
+            admitted = self.service._admitted_project_count(conn)
+        self.assertEqual(admitted, 1)
+
+    def test_operator_exact_cohort_atomically_enforces_project_target(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=2,
+            min_idle_sessions=0,
+            target_projects=1,
+            projects_per_session=3,
+        )
+        task_ids = [
+            self.create_pooled_task("operator-cap-first"),
+            self.create_pooled_task("operator-cap-second"),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "target project concurrency"):
+            self.reserve("operator-target-cap", self.sessions[0], task_ids)
+
+        with self.db.connect() as conn:
+            admitted = self.service._admitted_project_count(conn)
+        self.assertEqual(admitted, 0)
+
+    def test_shared_preadmission_waits_for_mixed_isolation_validation(self) -> None:
+        task_id = self.create_pooled_task("shared-validation-gate")
+
+        blocked = self.service.prepare_pooled_task_session(
+            task_id=task_id,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="mft",
+            isolation_policy="shared_if_compatible",
+        )
+
+        self.assertIsNone(blocked)
+
+    def test_family_preadmission_does_not_join_same_family_shared_reservation(
+        self,
+    ) -> None:
+        self.service.record_validation(
+            {
+                **PASSING_EVIDENCE,
+                "mixed_mft_ipmsm_isolation_passed": True,
+                "mixed_validation_artifact": "mixed-mft-ipmsm.json",
+            }
+        )
+        shared_task = self.create_pooled_task("shared-symmetric-contract")
+        shared = self.service.prepare_pooled_task_session(
+            task_id=shared_task,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="mft",
+            isolation_policy="shared_if_compatible",
+        )
+        self.assertIsNotNone(shared)
+        family_task = self.create_pooled_task("family-symmetric-contract")
+
+        family = self.service.prepare_pooled_task_session(
+            task_id=family_task,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="mft",
+            isolation_policy="family",
+        )
+
+        self.assertIsNotNone(family)
+        self.assertNotEqual(int(family["session_id"]), int(shared["session_id"]))
+
+    def test_auto_preadmission_never_crosses_requested_account(self) -> None:
+        task_id = self.db.create_task(
+            TaskCreate(
+                name="auto-account-dhj02",
+                remote_cwd="/work/auto-account",
+                command="true",
+                account_name="dhj02",
+                aedt_backend="pooled",
+            )
+        )
+        blocked = self.service.prepare_pooled_task_session(
+            task_id=task_id,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="mft",
+            isolation_policy="family",
+        )
+        self.assertIsNone(blocked)
+        self.assertEqual(int(self.db.get_task(task_id)["requested_allocation_id"]), 0)
+
+        allocation_id = self.db.create_allocation(
+            "dhj02", "cpu", "cpu-dhj02", 64, 512 * 1024
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state="active",
+            slurm_job_id="job-dhj02",
+            drain_reason="AEDT pool project demand",
+        )
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO aedt_sessions (
+                    session_key, allocation_id, account_name, node_name,
+                    endpoint, process_id, session_profile, slots_total, state,
+                    last_heartbeat_at, started_at, created_at, updated_at
+                ) VALUES (
+                    'auto-account-dhj02-session', ?, 'dhj02', 'cpu-dhj02',
+                    'cpu-dhj02:52001', '52001', ?, 3, 'ready', ?, ?, ?, ?
+                )
+                """,
+                (
+                    allocation_id,
+                    EXPECTED_SESSION_PROFILE_JSON,
+                    now,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        admitted = self.service.prepare_pooled_task_session(
+            task_id=task_id,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="mft",
+            isolation_policy="family",
+        )
+        self.assertIsNotNone(admitted)
+        self.assertEqual(admitted["allocation_id"], allocation_id)
+
+    def test_auto_preadmission_keeps_mft_and_motor_families_separate(self) -> None:
+        mft_sessions = []
+        for index in range(3):
+            task_id = self.create_pooled_task(f"family-mft-{index}")
+            reservation = self.service.prepare_pooled_task_session(
+                task_id=task_id,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                workload_family="mft",
+                isolation_policy="family",
+            )
+            self.assertIsNotNone(reservation)
+            mft_sessions.append(int(reservation["session_id"]))
+        self.assertEqual(len(set(mft_sessions)), 1)
+
+        motor_task_id = self.create_pooled_task("family-pyaedt-motor")
+        motor = self.service.prepare_pooled_task_session(
+            task_id=motor_task_id,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="ipmsm",
+            isolation_policy="family",
+        )
+        self.assertIsNotNone(motor)
+        self.assertNotEqual(int(motor["session_id"]), mft_sessions[0])
+
+    def test_generic_placement_honors_pending_exact_family_reservation(self) -> None:
+        task_id = self.create_pooled_task("pending-family-mft")
+        reserved = self.service.prepare_pooled_task_session(
+            task_id=task_id,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="mft",
+            isolation_policy="family",
+        )
+        self.assertIsNotNone(reserved)
+
+        motor, _ = self.service.request_lease(
+            request_key="pending-family-motor-lease",
+            project_name="pyaedt-motor-pending-family",
+            workload_family="ipmsm",
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            project_namespace="pyaedt_motor",
+            isolation_policy="family",
+            workspace_path="/work/pending-family-motor",
+            protocol_version=2,
+            client_token="pending-family-motor-client-token-000000",
+        )
+
+        self.assertEqual(motor["state"], "offered")
+        self.assertNotEqual(int(motor["session_id"]), int(reserved["session_id"]))
+
+    def test_accept_fails_closed_if_exact_reservation_ownership_disappears(self) -> None:
+        task_id = self.create_pooled_task("accept-reservation-released")
+        reserved = self.service.prepare_pooled_task_session(
+            task_id=task_id,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="mft",
+            isolation_policy="family",
+        )
+        self.assertIsNotNone(reserved)
+        lease, token = self.request_v2(
+            "accept-reservation-released", task_id=task_id
+        )
+        self.assertEqual(lease["state"], "offered")
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE aedt_exact_session_reservations
+                SET state = 'released', finished_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (int(lease["exact_session_reservation_id"]),),
+            )
+
+        failed = self.service.accept_lease(int(lease["id"]), token)
+
+        self.assertEqual(failed["state"], "failed")
+        self.assertIn("ownership/liveness", failed["failure_message"])
+
+    def test_atomic_pooled_density_claim_stops_exactly_at_sixteen(self) -> None:
+        for index in range(15):
+            existing_id = self.create_pooled_task(f"density-existing-{index}")
+            self.db.update_task(
+                existing_id,
+                status=TaskStatus.RUNNING.value,
+                allocation_id=self.allocation_id,
+                account_name="a",
+                cpus=1,
+            )
+        task_ids = [
+            self.create_pooled_task("density-candidate-a"),
+            self.create_pooled_task("density-candidate-b"),
+        ]
+        for task_id in task_ids:
+            reservation = self.service.prepare_pooled_task_session(
+                task_id=task_id,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                workload_family="mft",
+                isolation_policy="family",
+            )
+            self.assertIsNotNone(reservation)
+
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        def claim(task_id: int) -> bool:
+            return self.db.update_pooled_task_if_reserved_capacity(
+                task_id,
+                self.allocation_id,
+                heartbeat_cutoff="2000-01-01 00:00:00",
+                now=now,
+                project_cpus=4,
+                status=TaskStatus.ATTACHING.value,
+                allocation_id=self.allocation_id,
+                account_name="a",
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(claim, task_ids))
+        self.assertEqual(sum(bool(result) for result in results), 1)
+        self.assertEqual(
+            self.db.active_pooled_aedt_tasks_by_allocation()[self.allocation_id],
+            16,
+        )
+
+    def test_exact_offer_release_barrier_restores_claim_until_heartbeat(self) -> None:
+        target = self.sessions[0]
+        task_ids = [
+            self.create_pooled_task("exact-release-a"),
+            self.create_pooled_task("exact-release-b"),
+        ]
+        self.reserve("exact-release-barrier", target, task_ids)
+        (first, first_token), (second, second_token) = [
+            self.request_v2(f"exact-release-{index}", task_id=task_id)
+            for index, task_id in enumerate(task_ids)
+        ]
+        self.service.accept_lease(int(first["id"]), first_token)
+        self.service.cancel_lease(int(first["id"]), first_token)
+
+        revoked = self.service.accept_lease(int(second["id"]), second_token)
+        self.assertEqual(revoked["state"], "queued")
+        reservation = self.service.get_exact_session_reservation(
+            "exact-release-barrier"
+        )
+        second_slot = next(
+            slot for slot in reservation["slots"] if int(slot["task_id"]) == task_ids[1]
+        )
+        self.assertEqual(second_slot["state"], "claimed")
+
+        host_token = self.session_tokens[int(target["id"])]
+        self.service.complete_release(
+            int(target["id"]), host_token, int(first["id"]), success=True
+        )
+        self.clock.advance(1)
+        self.service.heartbeat_session(int(target["id"]), host_token)
+        reoffered = self.service.get_lease(int(second["id"]))
+        self.assertEqual(reoffered["state"], "offered")
+        self.assertEqual(int(reoffered["session_id"]), int(target["id"]))
+        self.assertEqual(
+            self.service.accept_lease(int(second["id"]), second_token)["state"],
+            "attaching",
+        )
+
+
+class AedtRuntimeCapacityTests(AedtPoolTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.service.set_operator_limits(min_idle_sessions=0)
 
     def test_session_capacity_is_bounded_by_free_cpu_and_memory(self) -> None:
         config = self.service.config()
@@ -4828,7 +5580,7 @@ class AedtRuntimeTests(AedtPoolTestCase):
             config,
             current_sessions=2,
         )
-        self.assertEqual(occupied_plus_free, 8)
+        self.assertEqual(occupied_plus_free, 7)
 
     def test_session_capacity_tracks_48_and_64_cpu_allocation_shapes(self) -> None:
         self.service.set_operator_limits(projects_per_session=3)
@@ -4845,7 +5597,7 @@ class AedtRuntimeTests(AedtPoolTestCase):
             )
             for cpus in (48, 64)
         ]
-        self.assertEqual(capacities, [4, 5])
+        self.assertEqual(capacities, [3, 4])
 
     def test_reconcile_caps_48_cpu_allocation_at_four_three_project_sessions(self) -> None:
         self.service.set_operator_limits(
@@ -4866,7 +5618,7 @@ class AedtRuntimeTests(AedtPoolTestCase):
             for session in self.service.starting_sessions()
             if int(session["allocation_id"]) == allocation_id
         ]
-        self.assertEqual(len(sessions), 4)
+        self.assertEqual(len(sessions), 3)
         self.assertTrue(all(int(session["slots_total"]) == 3 for session in sessions))
 
     def test_node_request_uses_one_complete_session_as_scheduler_shape_floor(self) -> None:
@@ -4880,11 +5632,38 @@ class AedtRuntimeTests(AedtPoolTestCase):
         config = self.service.config()
         self.assertEqual(
             fake.open_calls[0]["requested_cpus"],
-            config.project_cpus * config.projects_per_session,
+            1 + config.project_cpus * config.projects_per_session,
         )
-        self.assertEqual(fake.open_calls[0]["requested_cpus"], 12)
+        self.assertEqual(fake.open_calls[0]["requested_cpus"], 13)
         self.assertTrue(fake.open_calls[0]["cpu_only_nodes"])
         self.assertLessEqual(self.service.config().node_cpu_factor, 2.0)
+
+    def test_runtime_interleaves_account_scale_out_across_ticks(self) -> None:
+        self.make_operational()
+        fake = FakeRuntimeScheduler()
+        runtime = AedtPoolRuntime(self.service, fake, interval_seconds=30)
+        plan = {
+            "node_requests": 50,
+            "node_requests_by_account": {
+                account: 10 for account in ("a", "b", "c", "d", "e")
+            },
+            "placements": [],
+            "drain_needed": 0,
+            "rebalance_drains_by_account": {},
+        }
+
+        with patch.object(self.service, "reconcile", return_value=plan):
+            runtime.tick()
+            runtime.tick()
+
+        self.assertEqual(
+            [call["account_name"] for call in fake.open_calls[:4]],
+            ["a", "b", "c", "d"],
+        )
+        self.assertEqual(
+            [call["account_name"] for call in fake.open_calls[4:8]],
+            ["e", "a", "b", "c"],
+        )
 
     def test_pending_dedicated_node_prevents_duplicate_scale_out(self) -> None:
         self.make_operational()

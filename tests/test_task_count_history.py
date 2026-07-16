@@ -145,23 +145,36 @@ class TaskCountSamplerTests(unittest.TestCase):
                 "cpu": 3,
                 "same_node": 1,
                 "aedt_pool_sessions": 0,
+                "aedt_pool_active_sessions": 0,
+                "aedt_pool_starting_sessions": 0,
+                "aedt_pool_draining_sessions": 0,
+                "aedt_pool_unhealthy_sessions": 0,
+                "aedt_pool_project_workers": 0,
                 "aedt": 1,
             },
         )
 
     def test_fea_aedt_counts_pool_sessions_and_only_standalone_running_desktops(self) -> None:
         AedtPoolService(self.db).init()
+        allocation_id = self.db.create_allocation(
+            "a", "cpu", "cpu-a", 48, 512 * 1024
+        )
+        self.db.update_allocation(allocation_id, state="warm")
         with self.db.connect() as conn:
             conn.executemany(
-                "INSERT INTO aedt_sessions(session_key, state) VALUES (?, ?)",
+                """
+                INSERT INTO aedt_sessions(
+                    session_key, state, allocation_id, last_heartbeat_at
+                ) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                """,
                 [
-                    ("session-starting", "starting"),
-                    ("session-ready", "ready"),
-                    ("session-busy", "busy"),
-                    ("session-draining", "draining"),
-                    ("session-unhealthy", "unhealthy"),
-                    ("session-closed", "closed"),
-                    ("session-failed", "failed"),
+                    ("session-starting", "starting", allocation_id),
+                    ("session-ready", "ready", allocation_id),
+                    ("session-busy", "busy", allocation_id),
+                    ("session-draining", "draining", allocation_id),
+                    ("session-unhealthy", "unhealthy", allocation_id),
+                    ("session-closed", "closed", allocation_id),
+                    ("session-failed", "failed", allocation_id),
                 ],
             )
 
@@ -190,10 +203,14 @@ class TaskCountSamplerTests(unittest.TestCase):
 
         summary = self.db.task_activity_summary(name_contains="desktop-")
 
-        self.assertEqual(summary["fea"], 4)
-        self.assertEqual(summary["fea_running"], 2)
-        self.assertEqual(summary["aedt_pool_sessions"], 5)
-        self.assertEqual(summary["aedt"], 6)
+        self.assertEqual(summary["fea"], 2)
+        self.assertEqual(summary["fea_running"], 1)
+        self.assertEqual(summary["aedt_pool_sessions"], 2)
+        self.assertEqual(summary["aedt_pool_active_sessions"], 2)
+        self.assertEqual(summary["aedt_pool_starting_sessions"], 1)
+        self.assertEqual(summary["aedt_pool_draining_sessions"], 1)
+        self.assertEqual(summary["aedt_pool_unhealthy_sessions"], 1)
+        self.assertEqual(summary["aedt"], 3)
 
     def test_scheduler_tick_runs_sampler_before_later_stage_failure(self) -> None:
         scheduler = Scheduler(
@@ -361,13 +378,21 @@ class TaskCountHistoryRouteTests(unittest.TestCase):
         )
 
     def test_dashboard_initial_filtered_and_live_fea_aedt_counts_match(self) -> None:
+        allocation_id = self.app.state.db.create_allocation(
+            "a", "cpu", "cpu-a", 48, 512 * 1024
+        )
+        self.app.state.db.update_allocation(allocation_id, state="warm")
         with self.app.state.db.connect() as conn:
             conn.executemany(
-                "INSERT INTO aedt_sessions(session_key, state) VALUES (?, ?)",
+                """
+                INSERT INTO aedt_sessions(
+                    session_key, state, allocation_id, last_heartbeat_at
+                ) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                """,
                 [
-                    ("route-ready", "ready"),
-                    ("route-draining", "draining"),
-                    ("route-closed", "closed"),
+                    ("route-ready", "ready", allocation_id),
+                    ("route-draining", "draining", allocation_id),
+                    ("route-closed", "closed", allocation_id),
                 ],
             )
 
@@ -400,11 +425,12 @@ class TaskCountHistoryRouteTests(unittest.TestCase):
             task_name_contains="counter-match"
         )
 
-        self.assertIn('data-aedt-pool-sessions="2">4 / 4</span>', initial_html)
-        self.assertIn('data-aedt-pool-sessions="2">3 / 3</span>', filtered_html)
-        self.assertEqual(live["tasks"]["fea"], 3)
-        self.assertEqual(live["tasks"]["aedt_pool_sessions"], 2)
-        self.assertEqual(live["tasks"]["aedt"], 3)
+        self.assertIn('data-aedt-pool-sessions="1">2 / 3</span>', initial_html)
+        self.assertIn('data-aedt-pool-sessions="1">1 / 2</span>', filtered_html)
+        self.assertEqual(live["tasks"]["fea"], 1)
+        self.assertEqual(live["tasks"]["aedt_pool_sessions"], 1)
+        self.assertEqual(live["tasks"]["aedt_pool_draining_sessions"], 1)
+        self.assertEqual(live["tasks"]["aedt"], 2)
 
     def test_dashboard_pages_large_active_population_without_hiding_rows(self) -> None:
         task_ids = [

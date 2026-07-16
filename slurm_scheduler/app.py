@@ -19,7 +19,11 @@ from starlette.concurrency import run_in_threadpool
 from starlette.middleware.gzip import GZipMiddleware
 
 from .allocation_metrics import annotate_allocation_fea_pressure, annotate_allocation_node_metrics
-from .aedt_pool import AedtPoolRuntime, AedtPoolService
+from .aedt_pool import (
+    AedtPoolRuntime,
+    AedtPoolService,
+    canonical_workload_family,
+)
 from .aedt_pool_api import create_aedt_pool_router
 from .aedt_session_host import (
     EXPECTED_AEDT_VERSION,
@@ -692,7 +696,46 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             return True, ""
         return False, "AEDT pooled backend is not operational"
 
+    def prepare_aedt_backend_task(task) -> tuple[bool, str]:
+        """Acquire an exact healthy session slot before launching a client."""
+
+        values = _literal_task_environment(task)
+        profile = values.get("MFT_AEDT_SESSION_PROFILE", "")
+        isolation_policy = values.get("MFT_AEDT_ISOLATION_POLICY", "family")
+        workload_family = canonical_workload_family(
+            values.get("MFT_AEDT_WORKLOAD_FAMILY", ""),
+            str(task.get("project") or task.get("name") or ""),
+        )
+        if not workload_family:
+            return False, "pooled task workload family is unavailable"
+        reservation = aedt_pool.prepare_pooled_task_session(
+            task_id=int(task["id"]),
+            session_profile=profile,
+            workload_family=workload_family,
+            isolation_policy=isolation_policy,
+        )
+        if reservation is None:
+            return False, "waiting for a healthy ready AEDT session slot"
+        return True, ""
+
+    def select_aedt_pool_demand_account(task: dict) -> str:
+        """Mirror the scheduler's real account choice for unplaced pool demand."""
+
+        normalized_task = dict(task)
+        if not normalized_task.get("id") and normalized_task.get("task_id"):
+            normalized_task["id"] = normalized_task["task_id"]
+        pool_config = aedt_pool.config()
+        account = scheduler.choose_account_for_allocation(
+            required_capability=pool_config.required_capability,
+            env_profile=pool_config.env_profile,
+            account_name=scheduler.task_requested_account_name(normalized_task),
+            require_fea_storage_headroom=True,
+        )
+        return account.name if account else ""
+
     scheduler.set_aedt_backend_admission_checker(aedt_backend_admission)
+    scheduler.set_aedt_backend_task_preparer(prepare_aedt_backend_task)
+    aedt_pool.set_task_account_selector(select_aedt_pool_demand_account)
     relay_account = scheduler.account_by_name(config.control_plane_relay_account.strip())
     relay_bind_host = config.bind_host.strip() or "127.0.0.1"
     if relay_bind_host == "0.0.0.0":
