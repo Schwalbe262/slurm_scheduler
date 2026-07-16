@@ -39,6 +39,14 @@ LOGGER = logging.getLogger(__name__)
 ClientFactory = Callable[[AccountConfig], SlurmAccountClient]
 FEA_PROJECT_CURSOR_SETTING = "fea_project_last_claim_by_priority"
 TASK_COUNT_SAMPLE_INTERVAL_SECONDS = 60
+TERMINAL_AEDT_WORKSPACE_ROOT = "/gpfs/tmp_cpu2/mft_pool"
+TERMINAL_AEDT_WORKSPACE_SWEEP_INTERVAL_SECONDS = 60
+TERMINAL_AEDT_WORKSPACE_RETRY_SECONDS = 60
+TERMINAL_AEDT_WORKSPACE_CLAIM_STALE_SECONDS = 600
+TERMINAL_AEDT_WORKSPACE_SCAN_LIMIT = 1000
+TERMINAL_AEDT_WORKSPACE_SUBMIT_LIMIT = 128
+TERMINAL_AEDT_WORKSPACE_DELETED_MARKER = "SLURM_AEDT_WORKSPACE_DELETED"
+TERMINAL_AEDT_WORKSPACE_ABSENT_MARKER = "SLURM_AEDT_WORKSPACE_ABSENT"
 
 
 LMSTAT_FEATURE_RE = re.compile(
@@ -458,6 +466,13 @@ class Scheduler:
         self._ssh_executor = ThreadPoolExecutor(
             max_workers=self.ssh_parallelism, thread_name_prefix="ssh-fanout"
         )
+        self._terminal_aedt_workspace_cleanup_executor = ThreadPoolExecutor(
+            max_workers=max(1, min(4, len(self.accounts))),
+            thread_name_prefix="aedt-workspace-cleanup",
+        )
+        self._terminal_aedt_workspace_cleanup_lock = threading.Lock()
+        self._terminal_aedt_workspace_cleanup_inflight: set[int] = set()
+        self._last_terminal_aedt_workspace_sweep_at = 0.0
 
     @property
     def gpu_prewarm_enabled(self) -> bool:
@@ -495,6 +510,9 @@ class Scheduler:
         if backup_thread and backup_thread is not threading.current_thread():
             backup_thread.join()
         self._ssh_executor.shutdown(wait=False, cancel_futures=True)
+        self._terminal_aedt_workspace_cleanup_executor.shutdown(
+            wait=False, cancel_futures=True
+        )
 
     def _fan_out_by_account(
         self,
@@ -828,6 +846,10 @@ class Scheduler:
                 run_stage("refresh_cluster_state", self.refresh_cluster_state_if_due)
                 run_stage("refresh_allocations", self.refresh_allocations)
                 run_stage("refresh_tasks", self.refresh_tasks)
+                run_stage(
+                    "aedt_workspace_cleanup",
+                    self.cleanup_terminal_aedt_workspaces_if_due,
+                )
                 run_stage("allocation_lifecycle", self.apply_allocation_lifecycle)
                 run_stage("fea_memory_pressure", self.handle_fea_memory_pressure)
                 run_stage("fea_cpu_cap", self.enforce_fea_node_cpu_cap)
@@ -5548,12 +5570,328 @@ class Scheduler:
         if rebalanced:
             self.recalculate_allocation_capacity()
 
+    @staticmethod
+    def _terminal_aedt_workspace_timestamp(value: datetime) -> str:
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _terminal_aedt_workspace_cutoffs(self) -> tuple[str, str, str]:
+        now = self._now()
+        return (
+            self._terminal_aedt_workspace_timestamp(now),
+            self._terminal_aedt_workspace_timestamp(
+                now
+                - timedelta(seconds=TERMINAL_AEDT_WORKSPACE_RETRY_SECONDS)
+            ),
+            self._terminal_aedt_workspace_timestamp(
+                now
+                - timedelta(
+                    seconds=TERMINAL_AEDT_WORKSPACE_CLAIM_STALE_SECONDS
+                )
+            ),
+        )
+
+    @staticmethod
+    def _validated_terminal_aedt_workspace_path(
+        task_id: int, workspace_path: str
+    ) -> str:
+        """Accept only the one canonical MFT scratch leaf owned by a task."""
+
+        if int(task_id or 0) <= 0:
+            raise ValueError("AEDT workspace cleanup task identity is unavailable")
+        raw = str(workspace_path or "").strip()
+        if not raw or "\x00" in raw or not raw.startswith("/"):
+            raise ValueError("AEDT workspace cleanup path must be absolute")
+        normalized = posixpath.normpath(raw)
+        root = posixpath.normpath(TERMINAL_AEDT_WORKSPACE_ROOT)
+        expected_leaf = f"mft-{int(task_id)}"
+        expected = posixpath.join(root, expected_leaf)
+        if raw != normalized:
+            raise ValueError(
+                "AEDT workspace cleanup path is not canonical: "
+                f"{workspace_path!r}"
+            )
+        if (
+            normalized != expected
+            or posixpath.dirname(normalized) != root
+            or posixpath.basename(normalized) != expected_leaf
+        ):
+            raise ValueError(
+                "AEDT workspace cleanup path is not the exact task leaf: "
+                f"expected={expected!r}, actual={workspace_path!r}"
+            )
+        return normalized
+
+    @staticmethod
+    def _terminal_aedt_workspace_remove_command(
+        task_id: int, workspace_path: str
+    ) -> str:
+        """Build a fail-closed, same-account removal of one exact GPFS leaf."""
+
+        root = posixpath.normpath(TERMINAL_AEDT_WORKSPACE_ROOT)
+        leaf = f"mft-{int(task_id)}"
+        script = "\n".join(
+            [
+                "set -u",
+                "fail() { code=$1; shift; printf '%s\\n' \"$*\" >&2; exit \"$code\"; }",
+                f"root={shlex.quote(root)}",
+                f"target={shlex.quote(workspace_path)}",
+                f"leaf={shlex.quote(leaf)}",
+                "[ -d \"$root\" ] || fail 70 'AEDT workspace root is unavailable'",
+                "[ ! -L \"$root\" ] || fail 71 'AEDT workspace root is a symlink'",
+                "root_real=$(readlink -f -- \"$root\") || fail 72 'cannot canonicalize AEDT workspace root'",
+                "[ \"$root_real\" = \"$root\" ] || fail 73 'AEDT workspace root is not canonical'",
+                "if [ ! -e \"$target\" ] && [ ! -L \"$target\" ]; then",
+                f"  printf '%s\\n' {shlex.quote(TERMINAL_AEDT_WORKSPACE_ABSENT_MARKER)}",
+                "  exit 0",
+                "fi",
+                "[ -d \"$target\" ] || fail 74 'AEDT workspace target is not a directory'",
+                "[ ! -L \"$target\" ] || fail 75 'AEDT workspace target is a symlink'",
+                "target_real=$(readlink -f -- \"$target\") || fail 76 'cannot canonicalize AEDT workspace target'",
+                "[ \"$target_real\" = \"$target\" ] || fail 77 'AEDT workspace target is not canonical'",
+                "[ \"$(dirname -- \"$target_real\")\" = \"$root_real\" ] || fail 78 'AEDT workspace target escaped its root'",
+                "[ \"$(basename -- \"$target_real\")\" = \"$leaf\" ] || fail 79 'AEDT workspace target leaf changed'",
+                "uid=$(id -u) || fail 80 'cannot determine remote account uid'",
+                "owner=$(stat -c %u -- \"$target\") || fail 81 'cannot stat AEDT workspace target'",
+                "[ \"$owner\" = \"$uid\" ] || fail 82 'AEDT workspace target belongs to another account'",
+                "bad_link=$(find -P \"$target\" -xdev -type l -print -quit 2>/dev/null) || fail 83 'cannot attest AEDT workspace symlinks'",
+                "[ -z \"$bad_link\" ] || fail 84 'AEDT workspace contains a symlink'",
+                "bad_owner=$(find -P \"$target\" -xdev ! -uid \"$uid\" -print -quit 2>/dev/null) || fail 85 'cannot attest AEDT workspace ownership'",
+                "[ -z \"$bad_owner\" ] || fail 86 'AEDT workspace contains cross-account content'",
+                "rm -rf --one-file-system -- \"$target\" || fail 87 'exact AEDT workspace removal failed'",
+                "if [ -e \"$target\" ] || [ -L \"$target\" ]; then fail 88 'exact AEDT workspace still exists'; fi",
+                f"printf '%s\\n' {shlex.quote(TERMINAL_AEDT_WORKSPACE_DELETED_MARKER)}",
+            ]
+        )
+        return "sh -c " + shlex.quote(script)
+
+    def _finish_terminal_aedt_workspace_failure(
+        self,
+        *,
+        task_id: int,
+        workspace_path: str,
+        account_name: str,
+        error: str,
+    ) -> None:
+        finished_at, _retry_before, _stale_before = (
+            self._terminal_aedt_workspace_cutoffs()
+        )
+        self.db.finish_terminal_aedt_workspace_cleanup(
+            task_id,
+            workspace_path,
+            state="failed",
+            finished_at=finished_at,
+            error=error,
+        )
+        self.record_event(
+            "aedt_workspace_cleanup_failed",
+            f"exact workspace cleanup failed for task {task_id}: {error[:500]}",
+            entity_type="task",
+            entity_id=task_id,
+            account_name=account_name,
+        )
+
+    def _cleanup_terminal_aedt_workspace_task(
+        self, task_id: int, trigger_state: str
+    ) -> None:
+        now, retry_before, stale_before = self._terminal_aedt_workspace_cutoffs()
+        candidates = self.db.list_terminal_aedt_workspace_cleanup_candidates(
+            task_id=int(task_id),
+            retry_before=retry_before,
+            stale_claim_before=stale_before,
+            limit=100,
+        )
+        for candidate in candidates:
+            workspace_path = str(candidate.get("workspace_path") or "")
+            account_name = str(candidate.get("account_name") or "").strip()
+            try:
+                exact_path = self._validated_terminal_aedt_workspace_path(
+                    int(task_id), workspace_path
+                )
+            except ValueError as exc:
+                self.db.reject_terminal_aedt_workspace_cleanup(
+                    int(task_id),
+                    workspace_path,
+                    rejected_at=now,
+                    error=str(exc),
+                )
+                self.record_event(
+                    "aedt_workspace_cleanup_rejected",
+                    f"refused workspace cleanup for task {task_id}: {exc}",
+                    entity_type="task",
+                    entity_id=task_id,
+                    account_name=account_name,
+                )
+                continue
+            if not self.db.claim_terminal_aedt_workspace_cleanup(
+                int(task_id),
+                exact_path,
+                retry_before=retry_before,
+                stale_claim_before=stale_before,
+                claimed_at=now,
+            ):
+                continue
+            account = self.account_by_name(account_name)
+            if not account:
+                self._finish_terminal_aedt_workspace_failure(
+                    task_id=int(task_id),
+                    workspace_path=exact_path,
+                    account_name=account_name,
+                    error="task account is not configured",
+                )
+                continue
+            command = self._terminal_aedt_workspace_remove_command(
+                int(task_id), exact_path
+            )
+            try:
+                with SSHSession(account, default_timeout=1800) as ssh:
+                    result = ssh.run(command, timeout=1800)
+            except Exception as exc:
+                self._finish_terminal_aedt_workspace_failure(
+                    task_id=int(task_id),
+                    workspace_path=exact_path,
+                    account_name=account.name,
+                    error=f"remote cleanup error: {exc}",
+                )
+                continue
+            stdout_lines = {
+                line.strip() for line in result.stdout.splitlines() if line.strip()
+            }
+            if (
+                result.exit_code == 0
+                and TERMINAL_AEDT_WORKSPACE_DELETED_MARKER in stdout_lines
+            ):
+                cleanup_state = "deleted"
+            elif (
+                result.exit_code == 0
+                and TERMINAL_AEDT_WORKSPACE_ABSENT_MARKER in stdout_lines
+            ):
+                cleanup_state = "absent"
+            else:
+                detail = (
+                    result.stderr.strip()
+                    or result.stdout.strip()
+                    or "remote cleanup returned no attestation marker"
+                )
+                self._finish_terminal_aedt_workspace_failure(
+                    task_id=int(task_id),
+                    workspace_path=exact_path,
+                    account_name=account.name,
+                    error=f"remote exit {result.exit_code}: {detail[:1000]}",
+                )
+                continue
+            finished_at, _retry_before, _stale_before = (
+                self._terminal_aedt_workspace_cutoffs()
+            )
+            if not self.db.finish_terminal_aedt_workspace_cleanup(
+                int(task_id),
+                exact_path,
+                state=cleanup_state,
+                finished_at=finished_at,
+            ):
+                self.record_event(
+                    "aedt_workspace_cleanup_failed",
+                    f"workspace {cleanup_state} remotely but cleanup claim changed for task {task_id}",
+                    entity_type="task",
+                    entity_id=task_id,
+                    account_name=account.name,
+                )
+                continue
+            LOGGER.info(
+                "terminal AEDT workspace %s for task %s on %s",
+                cleanup_state,
+                task_id,
+                account.name,
+            )
+            self.record_event(
+                "aedt_workspace_cleanup",
+                f"exact scratch {exact_path} {cleanup_state} after task "
+                f"{task_id} ended ({trigger_state})",
+                entity_type="task",
+                entity_id=task_id,
+                account_name=account.name,
+            )
+
+    def _terminal_aedt_workspace_cleanup_done(
+        self, task_id: int, future: Any
+    ) -> None:
+        with self._terminal_aedt_workspace_cleanup_lock:
+            self._terminal_aedt_workspace_cleanup_inflight.discard(int(task_id))
+        try:
+            future.result()
+        except Exception:
+            LOGGER.exception(
+                "terminal AEDT workspace cleanup worker crashed for task %s",
+                task_id,
+            )
+
+    def _schedule_terminal_aedt_workspace_cleanup(
+        self, task_id: int, trigger_state: str
+    ) -> bool:
+        normalized_task_id = int(task_id or 0)
+        if not self.cleanup_enabled or normalized_task_id <= 0:
+            return False
+        with self._terminal_aedt_workspace_cleanup_lock:
+            if normalized_task_id in self._terminal_aedt_workspace_cleanup_inflight:
+                return False
+            self._terminal_aedt_workspace_cleanup_inflight.add(normalized_task_id)
+        try:
+            future = self._terminal_aedt_workspace_cleanup_executor.submit(
+                self._cleanup_terminal_aedt_workspace_task,
+                normalized_task_id,
+                str(trigger_state or "terminal"),
+            )
+        except RuntimeError:
+            with self._terminal_aedt_workspace_cleanup_lock:
+                self._terminal_aedt_workspace_cleanup_inflight.discard(
+                    normalized_task_id
+                )
+            return False
+        future.add_done_callback(
+            lambda completed, exact_task_id=normalized_task_id: (
+                self._terminal_aedt_workspace_cleanup_done(
+                    exact_task_id, completed
+                )
+            )
+        )
+        return True
+
+    def cleanup_terminal_aedt_workspaces_if_due(self) -> None:
+        """Retry pending/failed exact cleanup without blocking a scheduler tick."""
+
+        if not self.cleanup_enabled:
+            return
+        now_monotonic = time.monotonic()
+        if (
+            now_monotonic - self._last_terminal_aedt_workspace_sweep_at
+            < TERMINAL_AEDT_WORKSPACE_SWEEP_INTERVAL_SECONDS
+        ):
+            return
+        self._last_terminal_aedt_workspace_sweep_at = now_monotonic
+        _now, retry_before, stale_before = self._terminal_aedt_workspace_cutoffs()
+        candidates = self.db.list_terminal_aedt_workspace_cleanup_candidates(
+            retry_before=retry_before,
+            stale_claim_before=stale_before,
+            limit=TERMINAL_AEDT_WORKSPACE_SCAN_LIMIT,
+        )
+        submitted = 0
+        for candidate in candidates:
+            if submitted >= TERMINAL_AEDT_WORKSPACE_SUBMIT_LIMIT:
+                break
+            if self._schedule_terminal_aedt_workspace_cleanup(
+                int(candidate.get("task_id") or 0), "periodic retry"
+            ):
+                submitted += 1
+
     def on_task_terminal(self, task: dict, state: str = "terminal") -> None:
         """Run the task's declared cleanup on EVERY terminal path (completed,
         failed, cancelled, timed out, allocation lost) — shell-level cleanup
         inside the task command cannot cover cancel/kill because nothing after
         the killed process runs. Only the scheduler sees all exits."""
         self._license_mark_terminal(task)
+        if str(task.get("aedt_backend") or "").strip().lower() == AedtBackend.POOLED.value:
+            self._schedule_terminal_aedt_workspace_cleanup(
+                int(task.get("id") or 0), state
+            )
         globs = [
             g.strip()
             for g in str(task.get("cleanup_globs") or "").split(",")

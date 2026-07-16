@@ -142,6 +142,10 @@ CREATE TABLE IF NOT EXISTS aedt_project_leases (
     project_namespace TEXT NOT NULL DEFAULT '',
     isolation_policy TEXT NOT NULL DEFAULT 'family',
     workspace_path TEXT NOT NULL DEFAULT '',
+    workspace_cleanup_state TEXT NOT NULL DEFAULT 'pending',
+    workspace_cleanup_attempts INTEGER NOT NULL DEFAULT 0,
+    workspace_cleanup_at TEXT,
+    workspace_cleanup_error TEXT NOT NULL DEFAULT '',
     protocol_version INTEGER NOT NULL DEFAULT 1,
     task_id INTEGER NOT NULL DEFAULT 0,
     requested_allocation_id INTEGER NOT NULL DEFAULT 0,
@@ -556,6 +560,7 @@ class AedtPoolService:
                     "PRAGMA table_info(aedt_project_leases)"
                 ).fetchall()
             }
+            cleanup_state_added = "workspace_cleanup_state" not in lease_columns
             for name, ddl in {
                 "exclusive_session": "INTEGER NOT NULL DEFAULT 0",
                 "placement_group": "TEXT",
@@ -564,6 +569,10 @@ class AedtPoolService:
                 "project_namespace": "TEXT NOT NULL DEFAULT ''",
                 "isolation_policy": "TEXT NOT NULL DEFAULT 'family'",
                 "workspace_path": "TEXT NOT NULL DEFAULT ''",
+                "workspace_cleanup_state": "TEXT NOT NULL DEFAULT 'pending'",
+                "workspace_cleanup_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "workspace_cleanup_at": "TEXT",
+                "workspace_cleanup_error": "TEXT NOT NULL DEFAULT ''",
                 "protocol_version": "INTEGER NOT NULL DEFAULT 1",
                 "offered_at": "TEXT",
                 "offer_expires_at": "TEXT",
@@ -588,6 +597,28 @@ class AedtPoolService:
                     conn.execute(
                         f"ALTER TABLE aedt_project_leases ADD COLUMN {name} {ddl}"
                     )
+            if cleanup_state_added:
+                # Rows that were already terminal before this migration are
+                # historical scratch.  Some were produced by a different
+                # session-host account and must be handled by the separately
+                # attested one-shot cleanup, never by a new broad automatic
+                # delete.  Leases that are still live remain pending so the
+                # durable terminal hook owns their eventual exact workspace.
+                conn.execute(
+                    """
+                    UPDATE aedt_project_leases
+                    SET workspace_cleanup_state = CASE
+                            WHEN state IN ('released','failed','cancelled','expired')
+                            THEN 'legacy'
+                            ELSE 'pending'
+                        END,
+                        workspace_cleanup_error = CASE
+                            WHEN state IN ('released','failed','cancelled','expired')
+                            THEN 'predates durable exact-workspace cleanup'
+                            ELSE ''
+                        END
+                    """
+                )
             exact_reservation_columns = {
                 str(row["name"])
                 for row in conn.execute(
@@ -641,6 +672,14 @@ class AedtPoolService:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_aedt_leases_project_name "
                 "ON aedt_project_leases(project_name, state)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_aedt_leases_workspace_cleanup "
+                "ON aedt_project_leases(workspace_cleanup_state, workspace_cleanup_at, task_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_aedt_leases_workspace_path "
+                "ON aedt_project_leases(workspace_path, state, task_id)"
             )
             # A deploy may land while a host is already closing a project.
             # Backfill the reuse barrier before placement can see that slot.

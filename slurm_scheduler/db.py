@@ -12,6 +12,13 @@ from .models import AedtBackend, AllocationStatus, JobCreate, JobStatus, Schedul
 
 
 TASK_COUNT_SAMPLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
+AEDT_WORKSPACE_TERMINAL_TASK_STATES = ("completed", "failed", "cancelled")
+AEDT_WORKSPACE_TERMINAL_LEASE_STATES = (
+    "released",
+    "failed",
+    "cancelled",
+    "expired",
+)
 
 
 def json_dumps(value: Any) -> str:
@@ -518,6 +525,369 @@ class Database:
             return max(1, int(value or 4))
         except (TypeError, ValueError):
             return 4
+
+    @staticmethod
+    def _aedt_workspace_cleanup_schema_available(
+        conn: sqlite3.Connection,
+    ) -> bool:
+        table = conn.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'aedt_project_leases'
+            """
+        ).fetchone()
+        if not table:
+            return False
+        columns = {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(aedt_project_leases)"
+            ).fetchall()
+        }
+        return {
+            "workspace_path",
+            "workspace_cleanup_state",
+            "workspace_cleanup_attempts",
+            "workspace_cleanup_at",
+            "workspace_cleanup_error",
+        }.issubset(columns)
+
+    def list_terminal_aedt_workspace_cleanup_candidates(
+        self,
+        *,
+        task_id: int = 0,
+        retry_before: str = "",
+        stale_claim_before: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return exact pooled workspaces whose task and every reference ended.
+
+        Historical pre-migration rows use ``legacy`` and are deliberately not
+        returned.  Failed attempts become eligible only after ``retry_before``;
+        an abandoned in-progress claim is recoverable after
+        ``stale_claim_before``.
+        """
+
+        terminal_tasks = ",".join(
+            "?" for _ in AEDT_WORKSPACE_TERMINAL_TASK_STATES
+        )
+        terminal_leases = ",".join(
+            "?" for _ in AEDT_WORKSPACE_TERMINAL_LEASE_STATES
+        )
+        task_predicate = ""
+        task_params: tuple[Any, ...] = ()
+        if int(task_id or 0) > 0:
+            task_predicate = "AND t.id = ?"
+            task_params = (int(task_id),)
+        with self.connect() as conn:
+            if not self._aedt_workspace_cleanup_schema_available(conn):
+                return []
+            rows = conn.execute(
+                f"""
+                SELECT t.id AS task_id, t.account_name, t.status AS task_status,
+                       l.workspace_path,
+                       MIN(l.workspace_cleanup_attempts) AS cleanup_attempts,
+                       MIN(l.workspace_cleanup_at) AS cleanup_at
+                FROM tasks t
+                JOIN aedt_project_leases l ON l.task_id = t.id
+                WHERE LOWER(TRIM(COALESCE(t.aedt_backend, ''))) = 'pooled'
+                  AND l.protocol_version >= 2
+                  AND t.status IN ({terminal_tasks})
+                  AND TRIM(COALESCE(l.workspace_path, '')) != ''
+                  AND (
+                        l.workspace_cleanup_state = 'pending'
+                        OR (
+                            l.workspace_cleanup_state = 'failed'
+                            AND COALESCE(l.workspace_cleanup_at, '') <= ?
+                        )
+                        OR (
+                            l.workspace_cleanup_state = 'in_progress'
+                            AND COALESCE(l.workspace_cleanup_at, '') <= ?
+                        )
+                  )
+                  {task_predicate}
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM aedt_project_leases task_ref
+                      WHERE task_ref.task_id = t.id
+                        AND task_ref.state NOT IN ({terminal_leases})
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM aedt_project_leases active_ref
+                      LEFT JOIN tasks active_task
+                        ON active_task.id = active_ref.task_id
+                      WHERE active_ref.workspace_path = l.workspace_path
+                        AND (
+                            active_ref.state NOT IN ({terminal_leases})
+                            OR active_task.id IS NULL
+                            OR active_task.status NOT IN ({terminal_tasks})
+                        )
+                  )
+                GROUP BY t.id, t.account_name, t.status, l.workspace_path
+                ORDER BY
+                    CASE
+                        WHEN MIN(l.workspace_cleanup_state) = 'pending' THEN 0
+                        ELSE 1
+                    END,
+                    t.id ASC
+                LIMIT ?
+                """,
+                (
+                    *AEDT_WORKSPACE_TERMINAL_TASK_STATES,
+                    str(retry_before or ""),
+                    str(stale_claim_before or ""),
+                    *task_params,
+                    *AEDT_WORKSPACE_TERMINAL_LEASE_STATES,
+                    *AEDT_WORKSPACE_TERMINAL_LEASE_STATES,
+                    *AEDT_WORKSPACE_TERMINAL_TASK_STATES,
+                    max(1, int(limit)),
+                ),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def claim_terminal_aedt_workspace_cleanup(
+        self,
+        task_id: int,
+        workspace_path: str,
+        *,
+        retry_before: str,
+        stale_claim_before: str,
+        claimed_at: str,
+    ) -> bool:
+        """CAS one eligible exact workspace into ``in_progress``."""
+
+        candidates = self.list_terminal_aedt_workspace_cleanup_candidates(
+            task_id=int(task_id),
+            retry_before=retry_before,
+            stale_claim_before=stale_claim_before,
+            limit=100,
+        )
+        if not any(
+            str(row.get("workspace_path") or "") == str(workspace_path)
+            for row in candidates
+        ):
+            return False
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not self._aedt_workspace_cleanup_schema_available(conn):
+                return False
+            # Re-check every terminal/reference predicate while the writer lock
+            # is held.  The preliminary read above is only a cheap fast path.
+            terminal_tasks = ",".join(
+                "?" for _ in AEDT_WORKSPACE_TERMINAL_TASK_STATES
+            )
+            terminal_leases = ",".join(
+                "?" for _ in AEDT_WORKSPACE_TERMINAL_LEASE_STATES
+            )
+            eligible = conn.execute(
+                f"""
+                SELECT 1
+                FROM tasks t
+                JOIN aedt_project_leases l ON l.task_id = t.id
+                WHERE t.id = ?
+                  AND l.workspace_path = ?
+                  AND LOWER(TRIM(COALESCE(t.aedt_backend, ''))) = 'pooled'
+                  AND l.protocol_version >= 2
+                  AND t.status IN ({terminal_tasks})
+                  AND (
+                        l.workspace_cleanup_state = 'pending'
+                        OR (
+                            l.workspace_cleanup_state = 'failed'
+                            AND COALESCE(l.workspace_cleanup_at, '') <= ?
+                        )
+                        OR (
+                            l.workspace_cleanup_state = 'in_progress'
+                            AND COALESCE(l.workspace_cleanup_at, '') <= ?
+                        )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM aedt_project_leases task_ref
+                      WHERE task_ref.task_id = t.id
+                        AND task_ref.state NOT IN ({terminal_leases})
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM aedt_project_leases active_ref
+                      LEFT JOIN tasks active_task
+                        ON active_task.id = active_ref.task_id
+                      WHERE active_ref.workspace_path = l.workspace_path
+                        AND (
+                            active_ref.state NOT IN ({terminal_leases})
+                            OR active_task.id IS NULL
+                            OR active_task.status NOT IN ({terminal_tasks})
+                        )
+                  )
+                LIMIT 1
+                """,
+                (
+                    int(task_id),
+                    str(workspace_path),
+                    *AEDT_WORKSPACE_TERMINAL_TASK_STATES,
+                    str(retry_before or ""),
+                    str(stale_claim_before or ""),
+                    *AEDT_WORKSPACE_TERMINAL_LEASE_STATES,
+                    *AEDT_WORKSPACE_TERMINAL_LEASE_STATES,
+                    *AEDT_WORKSPACE_TERMINAL_TASK_STATES,
+                ),
+            ).fetchone()
+            if not eligible:
+                return False
+            cursor = conn.execute(
+                """
+                UPDATE aedt_project_leases
+                SET workspace_cleanup_state = 'in_progress',
+                    workspace_cleanup_attempts = workspace_cleanup_attempts + 1,
+                    workspace_cleanup_at = ?, workspace_cleanup_error = '',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE task_id = ? AND workspace_path = ?
+                  AND workspace_cleanup_state IN ('pending','failed','in_progress')
+                """,
+                (str(claimed_at), int(task_id), str(workspace_path)),
+            )
+            return cursor.rowcount > 0
+
+    def finish_terminal_aedt_workspace_cleanup(
+        self,
+        task_id: int,
+        workspace_path: str,
+        *,
+        state: str,
+        finished_at: str,
+        error: str = "",
+    ) -> bool:
+        """Finish a claimed attempt without discarding the audited path."""
+
+        normalized_state = str(state or "").strip().lower()
+        if normalized_state not in {"deleted", "absent", "failed", "rejected"}:
+            raise ValueError(f"unsupported AEDT workspace cleanup state: {state}")
+        with self.connect() as conn:
+            if not self._aedt_workspace_cleanup_schema_available(conn):
+                return False
+            terminal_tasks = ",".join(
+                "?" for _ in AEDT_WORKSPACE_TERMINAL_TASK_STATES
+            )
+            terminal_leases = ",".join(
+                "?" for _ in AEDT_WORKSPACE_TERMINAL_LEASE_STATES
+            )
+            cursor = conn.execute(
+                f"""
+                UPDATE aedt_project_leases
+                SET workspace_cleanup_state = ?, workspace_cleanup_at = ?,
+                    workspace_cleanup_error = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE task_id = ? AND workspace_path = ?
+                  AND workspace_cleanup_state = 'in_progress'
+                  AND EXISTS (
+                      SELECT 1 FROM tasks terminal_task
+                      WHERE terminal_task.id = ?
+                        AND terminal_task.status IN ({terminal_tasks})
+                        AND LOWER(TRIM(COALESCE(terminal_task.aedt_backend, '')))
+                            = 'pooled'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM aedt_project_leases task_ref
+                      WHERE task_ref.task_id = ?
+                        AND task_ref.state NOT IN ({terminal_leases})
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM aedt_project_leases active_ref
+                      LEFT JOIN tasks active_task
+                        ON active_task.id = active_ref.task_id
+                      WHERE active_ref.workspace_path = ?
+                        AND (
+                            active_ref.state NOT IN ({terminal_leases})
+                            OR active_task.id IS NULL
+                            OR active_task.status NOT IN ({terminal_tasks})
+                        )
+                  )
+                """,
+                (
+                    normalized_state,
+                    str(finished_at),
+                    str(error or "")[:2000],
+                    int(task_id),
+                    str(workspace_path),
+                    int(task_id),
+                    *AEDT_WORKSPACE_TERMINAL_TASK_STATES,
+                    int(task_id),
+                    *AEDT_WORKSPACE_TERMINAL_LEASE_STATES,
+                    str(workspace_path),
+                    *AEDT_WORKSPACE_TERMINAL_LEASE_STATES,
+                    *AEDT_WORKSPACE_TERMINAL_TASK_STATES,
+                ),
+            )
+            return cursor.rowcount > 0
+
+    def reject_terminal_aedt_workspace_cleanup(
+        self,
+        task_id: int,
+        workspace_path: str,
+        *,
+        rejected_at: str,
+        error: str,
+    ) -> bool:
+        """Permanently quarantine an invalid path without touching storage."""
+
+        with self.connect() as conn:
+            if not self._aedt_workspace_cleanup_schema_available(conn):
+                return False
+            terminal_tasks = ",".join(
+                "?" for _ in AEDT_WORKSPACE_TERMINAL_TASK_STATES
+            )
+            terminal_leases = ",".join(
+                "?" for _ in AEDT_WORKSPACE_TERMINAL_LEASE_STATES
+            )
+            cursor = conn.execute(
+                f"""
+                UPDATE aedt_project_leases
+                SET workspace_cleanup_state = 'rejected',
+                    workspace_cleanup_attempts = workspace_cleanup_attempts + 1,
+                    workspace_cleanup_at = ?, workspace_cleanup_error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE task_id = ? AND workspace_path = ?
+                  AND state IN ('released','failed','cancelled','expired')
+                  AND workspace_cleanup_state IN ('pending','failed')
+                  AND EXISTS (
+                      SELECT 1 FROM tasks terminal_task
+                      WHERE terminal_task.id = ?
+                        AND terminal_task.status IN ({terminal_tasks})
+                        AND LOWER(TRIM(COALESCE(terminal_task.aedt_backend, '')))
+                            = 'pooled'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM aedt_project_leases task_ref
+                      WHERE task_ref.task_id = ?
+                        AND task_ref.state NOT IN ({terminal_leases})
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM aedt_project_leases active_ref
+                      LEFT JOIN tasks active_task
+                        ON active_task.id = active_ref.task_id
+                      WHERE active_ref.workspace_path = ?
+                        AND (
+                            active_ref.state NOT IN ({terminal_leases})
+                            OR active_task.id IS NULL
+                            OR active_task.status NOT IN ({terminal_tasks})
+                        )
+                  )
+                """,
+                (
+                    str(rejected_at),
+                    str(error or "")[:2000],
+                    int(task_id),
+                    str(workspace_path),
+                    int(task_id),
+                    *AEDT_WORKSPACE_TERMINAL_TASK_STATES,
+                    int(task_id),
+                    *AEDT_WORKSPACE_TERMINAL_LEASE_STATES,
+                    str(workspace_path),
+                    *AEDT_WORKSPACE_TERMINAL_LEASE_STATES,
+                    *AEDT_WORKSPACE_TERMINAL_TASK_STATES,
+                ),
+            )
+            return cursor.rowcount > 0
 
     def active_pooled_aedt_tasks_by_allocation(self) -> dict[int, int]:
         """Count launched pooled clients, including clients not yet leased."""
