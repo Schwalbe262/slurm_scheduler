@@ -7086,7 +7086,7 @@ class AttachClientTests(unittest.TestCase):
                 self.assertEqual(fault["phase"], "attach")
                 self.assertFalse(any(path.endswith("/activate") for _m, path, _p in calls))
 
-    def test_release_detaches_wrapper_only_after_terminal_host_ack(self) -> None:
+    def test_release_drops_wrapper_without_desktop_release_after_host_ack(self) -> None:
         events: list[object] = []
 
         class Http:
@@ -7116,13 +7116,145 @@ class AttachClientTests(unittest.TestCase):
             [
                 "cancel-releasing",
                 "host-released",
-                (
-                    "detach",
-                    {"close_projects": False, "close_on_exit": False},
-                ),
             ],
         )
         self.assertIsNone(lease._desktop_proxy)
+
+    def test_pooled_desktop_has_no_release_callback_or_application_exit_owner(
+        self,
+    ) -> None:
+        class ExitRegistry:
+            def __init__(self) -> None:
+                self.callbacks: list[tuple[object, tuple, dict]] = []
+
+            def register(self, callback, *args, **kwargs):
+                self.callbacks.append((callback, args, kwargs))
+                return callback
+
+            def run(self) -> None:
+                for callback, args, kwargs in reversed(self.callbacks):
+                    callback(*args, **kwargs)
+
+        class Plugin:
+            def __init__(self) -> None:
+                self.release_calls: list[str] = []
+
+            def Release(self) -> None:
+                self.release_calls.append("Release")
+
+            def ReleaseAll(self) -> None:
+                self.release_calls.append("ReleaseAll")
+
+        registry = ExitRegistry()
+        desktop_module = ModuleType("ansys.aedt.core.desktop")
+        desktop_module.atexit = registry
+
+        class Desktop:
+            def __init__(self, **kwargs) -> None:
+                self.port = int(kwargs["port"])
+                self.aedt_process_id = "7001"
+                self.odesktop = SimpleNamespace(
+                    GetVersion=lambda: "2025.2.0"
+                )
+                self.grpc_plugin = Plugin()
+                self.close_on_exit = bool(kwargs["close_on_exit"])
+                # PyAEDT 0.22 does this even for close_on_exit=False.  Its
+                # real callback reaches grpc_plugin.Release/ReleaseAll.
+                desktop_module.atexit.register(
+                    lambda: self._Desktop__release_and_close_desktop(
+                        close_projects=self.close_on_exit,
+                        close_aedt_app=self.close_on_exit,
+                    )
+                )
+
+            def release_desktop(self, *_args, **_kwargs):
+                self.grpc_plugin.Release()
+                return True
+
+            def close_desktop(self):
+                self.grpc_plugin.ReleaseAll()
+                return True
+
+            def __release_and_close_desktop(self, **_kwargs):
+                self.grpc_plugin.Release()
+                return True
+
+        Desktop.__module__ = desktop_module.__name__
+        desktop_module.Desktop = Desktop
+
+        class PooledDesktop(Desktop):
+            pass
+
+        # The production MFT factory is likewise a subclass declared in the
+        # runner module, not ansys.aedt.core.desktop itself.
+        PooledDesktop.__module__ = "mft.runner"
+
+        ansys_module = ModuleType("ansys")
+        aedt_module = ModuleType("ansys.aedt")
+        core_module = ModuleType("ansys.aedt.core")
+        core_module.settings = SimpleNamespace(use_multi_desktop=False)
+        ansys_module.aedt = aedt_module
+        aedt_module.core = core_module
+
+        class Http:
+            @staticmethod
+            def request(_method, path, _payload=None, **_kwargs):
+                if path.endswith("/cancel"):
+                    return {"state": "released", "endpoint": ""}
+                return {
+                    "state": "attaching",
+                    "endpoint": "cpu-01:50001",
+                    "session_key": "session-7",
+                    "session_process_id": "7001",
+                    "expected_aedt_version": "2025.2",
+                }
+
+        lease = AedtProjectLease(
+            Http(),
+            7,
+            "client-token",
+            "project",
+            state="attaching",
+            endpoint="cpu-01:50001",
+            protocol_version=2,
+            automation_lock_path=self.automation_lock_path,
+        )
+        lease.start_heartbeat = lambda **_kwargs: None
+        with patch.dict(
+            sys.modules,
+            {
+                "ansys": ansys_module,
+                "ansys.aedt": aedt_module,
+                "ansys.aedt.core": core_module,
+                desktop_module.__name__: desktop_module,
+            },
+        ):
+            desktop = lease.connect_desktop(
+                desktop_factory=PooledDesktop,
+                endpoint_probe=lambda _machine, _port: True,
+            )
+            # A later application wrapper may try to register the same owner
+            # callback or release its shared desktop during __exit__.
+            desktop_module.atexit.register(
+                lambda: desktop.grpc_plugin.Release()
+            )
+            desktop.release_desktop(close_projects=True, close_on_exit=True)
+            desktop.close_desktop()
+
+            unrelated: list[str] = []
+            desktop_module.atexit.register(
+                lambda: unrelated.append("unrelated callback retained")
+            )
+            registry.run()
+
+        self.assertEqual(desktop.grpc_plugin.release_calls, [])
+        self.assertEqual(unrelated, ["unrelated callback retained"])
+        self.assertTrue(desktop._slurm_aedt_nonowning)
+        self.assertEqual(len(registry.callbacks), 1)
+
+        lease.release(wait_seconds=0)
+        self.assertIsNone(lease._desktop_proxy)
+        self.assertEqual(desktop.grpc_plugin.release_calls, [])
 
     def test_two_sequential_leases_attach_to_distinct_authorized_endpoints(self) -> None:
         events: list[object] = []
@@ -7196,16 +7328,7 @@ class AttachClientTests(unittest.TestCase):
         self.assertEqual(factory_ports, [50001, 50002])
         self.assertEqual(first_desktop.port, 50001)
         self.assertEqual(second_desktop.port, 50002)
-        self.assertEqual(
-            events,
-            [
-                (
-                    "detached",
-                    50001,
-                    {"close_projects": False, "close_on_exit": False},
-                )
-            ],
-        )
+        self.assertEqual(events, [])
 
     def test_lease_heartbeat_retries_transient_5xx(self) -> None:
         http = TransientLeaseHeartbeatHttp()

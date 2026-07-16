@@ -10,6 +10,7 @@ import random
 import re
 import secrets
 import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -29,6 +30,151 @@ DEFAULT_POOL_FILL_TIMEOUT_SECONDS = 900.0
 MAX_POOL_FILL_TIMEOUT_SECONDS = 7200.0
 POOL_FILL_TIMEOUT_ENV = "MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS"
 TRANSIENT_HTTP_STATUSES = {408, 425, 429}
+
+
+_PYAEDT_DESKTOP_MODULE_NAMES = {
+    "ansys.aedt.core.desktop",
+    "pyaedt.desktop",
+}
+_PYAEDT_NONOWNING_GUARD_LOCK = threading.RLock()
+
+
+class _NonOwningDesktopAtexitProxy:
+    """Forward atexit registrations except PyAEDT Desktop ownership hooks.
+
+    PyAEDT 0.22 registers a ``Desktop.__init__`` lambda even when
+    ``close_on_exit=False``.  That lambda still calls
+    ``grpc_plugin.Release()`` (and therefore ``ReleaseAll()``) when the client
+    interpreter exits.  A pooled project is a non-owner, so its Desktop module
+    gets this process-local proxy before the wrapper is constructed.
+    """
+
+    def __init__(self, delegate: Any, desktop_types: tuple[type, ...]) -> None:
+        self._delegate = delegate
+        self._desktop_types = desktop_types
+
+    def add_desktop_types(self, desktop_types: tuple[type, ...]) -> None:
+        merged = list(self._desktop_types)
+        for desktop_type in desktop_types:
+            if desktop_type not in merged:
+                merged.append(desktop_type)
+        self._desktop_types = tuple(merged)
+
+    def _owns_desktop_lifecycle(self, callback: Any) -> bool:
+        bound_owner = getattr(callback, "__self__", None)
+        if self._desktop_types and isinstance(bound_owner, self._desktop_types):
+            return True
+        for cell in getattr(callback, "__closure__", ()) or ():
+            try:
+                value = cell.cell_contents
+            except ValueError:
+                continue
+            if self._desktop_types and isinstance(value, self._desktop_types):
+                return True
+        module_name = str(getattr(callback, "__module__", "") or "")
+        qualname = str(getattr(callback, "__qualname__", "") or "")
+        return (
+            module_name in _PYAEDT_DESKTOP_MODULE_NAMES
+            and "Desktop.__init__.<locals>" in qualname
+        )
+
+    def register(self, callback: Any, *args: Any, **kwargs: Any) -> Any:
+        if self._owns_desktop_lifecycle(callback):
+            # Match atexit.register's return contract without retaining the
+            # callback (and, transitively, the shared Desktop wrapper).
+            return callback
+        return self._delegate.register(callback, *args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+
+def _pyaedt_desktop_types(desktop_factory: Any) -> tuple[type, ...]:
+    """Find PyAEDT Desktop in a custom factory's MRO.
+
+    MFT deliberately passes a ``Desktop`` subclass to disable autosave, so
+    checking only ``desktop_factory.__module__`` would miss the production
+    attach path.
+    """
+
+    if not isinstance(desktop_factory, type):
+        return ()
+    matches: list[type] = []
+    for candidate in getattr(desktop_factory, "__mro__", ()):
+        if (
+            str(getattr(candidate, "__module__", "") or "")
+            in _PYAEDT_DESKTOP_MODULE_NAMES
+            and str(getattr(candidate, "__name__", "") or "") == "Desktop"
+        ):
+            matches.append(candidate)
+    return tuple(matches)
+
+
+def _install_nonowning_pyaedt_atexit_guard(
+    desktop_factory: Any,
+    *,
+    required: bool,
+) -> None:
+    """Suppress PyAEDT's per-wrapper Desktop release callback persistently."""
+
+    desktop_types = _pyaedt_desktop_types(desktop_factory)
+    if not desktop_types:
+        if required:
+            raise AedtLeaseError(
+                "PyAEDT Desktop lifecycle ownership guard is unavailable"
+            )
+        return
+    module_names = {
+        str(desktop_type.__module__) for desktop_type in desktop_types
+    }
+    with _PYAEDT_NONOWNING_GUARD_LOCK:
+        for module_name in module_names:
+            desktop_module = sys.modules.get(module_name)
+            exit_api = getattr(desktop_module, "atexit", None)
+            if desktop_module is None or not callable(
+                getattr(exit_api, "register", None)
+            ):
+                raise AedtLeaseError(
+                    "PyAEDT Desktop atexit registry is unavailable; refusing "
+                    "a non-owning attach"
+                )
+            if isinstance(exit_api, _NonOwningDesktopAtexitProxy):
+                exit_api.add_desktop_types(desktop_types)
+                continue
+            desktop_module.atexit = _NonOwningDesktopAtexitProxy(
+                exit_api, desktop_types
+            )
+
+
+def _nonowning_lifecycle_noop(*_args: Any, **_kwargs: Any) -> bool:
+    """Preserve the host-owned Desktop when application wrappers clean up."""
+
+    return True
+
+
+def _guard_nonowning_desktop_lifecycle(desktop: Any) -> None:
+    """Make every known PyAEDT Desktop-wide release path a local no-op."""
+
+    try:
+        desktop.close_on_exit = False
+        desktop.release_desktop = _nonowning_lifecycle_noop
+        desktop.close_desktop = _nonowning_lifecycle_noop
+        for desktop_type in type(desktop).__mro__:
+            private_release = (
+                f"_{desktop_type.__name__}__release_and_close_desktop"
+            )
+            if hasattr(desktop, private_release):
+                setattr(desktop, private_release, _nonowning_lifecycle_noop)
+        plugin = getattr(desktop, "grpc_plugin", None)
+        if plugin is not None:
+            for method_name in ("Release", "ReleaseAll"):
+                if callable(getattr(plugin, method_name, None)):
+                    setattr(plugin, method_name, _nonowning_lifecycle_noop)
+        desktop._slurm_aedt_nonowning = True
+    except Exception as exc:
+        raise AedtLeaseError(
+            "failed to revoke Desktop lifecycle ownership from pooled client"
+        ) from exc
 
 
 def normalize_aedt_version(value: Any) -> str:
@@ -696,6 +842,11 @@ class AedtProjectLease:
         # Custom factories remain usable in tests/environments without PyAEDT,
         # but when PyAEDT is present the setting is still mandatory.
         self._enable_pyaedt_multi_desktop(required=using_default_factory)
+        pyaedt_desktop_types = _pyaedt_desktop_types(desktop_factory)
+        _install_nonowning_pyaedt_atexit_guard(
+            desktop_factory,
+            required=using_default_factory or bool(pyaedt_desktop_types),
+        )
         machine, port_text = self.endpoint.rsplit(":", 1)
         endpoint_port = int(port_text)
         probe = endpoint_probe or self._endpoint_is_listening
@@ -754,6 +905,7 @@ class AedtProjectLease:
             kwargs["version"] = resolved_version
         with self.automation_guard():
             desktop = desktop_factory(**kwargs)
+            _guard_nonowning_desktop_lifecycle(desktop)
             self._desktop_proxy = desktop
             # Attaching is intentionally distinct from active: the client must
             # create/open and fully model its first design before activation.
@@ -870,16 +1022,23 @@ class AedtProjectLease:
             )
 
     def _detach_wrapper_best_effort(self) -> None:
+        """Drop this client's wrapper without invoking Desktop lifecycle APIs.
+
+        The node-side session host is the sole Desktop owner and closes the
+        exact project before acknowledging a terminal lease.  Even PyAEDT's
+        ``release_desktop(False, False)`` calls ``grpc_plugin.ReleaseAll()`` in
+        the pinned 0.22 runtime, so it is not a safe client-side detach.
+        """
+
         desktop = self._desktop_proxy
         if desktop is None:
             return
         try:
-            with self.automation_guard():
-                desktop.release_desktop(
-                    close_projects=False,
-                    close_on_exit=False,
-                )
-                self.detach_error = ""
+            # Keep the non-owning guard installed on the wrapper because other
+            # PyAEDT application objects may still reference it until process
+            # exit.  Only this lease drops its strong reference here.
+            _guard_nonowning_desktop_lifecycle(desktop)
+            self.detach_error = ""
         except Exception as exc:
             self.detach_error = str(exc)
         finally:
