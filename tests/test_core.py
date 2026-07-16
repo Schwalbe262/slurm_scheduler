@@ -4526,6 +4526,62 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(shape["node_name"], "large")
         self.assertEqual(shape["cpus"], 64)
 
+    def test_fea_pool_shape_uses_48_core_node_above_session_floor(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "cpu1-idle cpu1 idle 0 48 0.0 768000 700000\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            allocation_partition="auto",
+            allocation_cpus=64,
+            cpu_pool_allow_gpu_partitions=False,
+        )
+
+        shape = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            requested_cpus=12,
+            require_fea_eligible_node=True,
+        )
+
+        self.assertIsNotNone(shape)
+        self.assertEqual(shape["partition"], "cpu1")
+        self.assertEqual(shape["node_name"], "cpu1-idle")
+        self.assertEqual(shape["cpus"], 48)
+
+    def test_fea_pool_shape_retains_64_core_target_above_session_floor(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "cpu2-idle cpu2 idle 0 128 0.0 1024000 900000\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            allocation_partition="auto",
+            allocation_cpus=64,
+            single_job_per_node_partitions=["cpu2"],
+        )
+
+        shape = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            requested_cpus=12,
+            require_fea_eligible_node=True,
+        )
+
+        self.assertIsNotNone(shape)
+        self.assertEqual(shape["partition"], "cpu2")
+        self.assertEqual(shape["node_name"], "cpu2-idle")
+        self.assertEqual(shape["cpus"], 64)
+
     def test_shared_cpu_pool_can_use_mixed_single_job_partition_capacity(self) -> None:
         nodes = parse_pestat(
             "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"

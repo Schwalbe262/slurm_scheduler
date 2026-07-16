@@ -6005,11 +6005,15 @@ class AedtPoolRuntime:
                 required_capability=config.required_capability,
                 env_profile=config.env_profile,
                 account_name=config.account_name,
-                # Ask for the scheduler's normal full node shape.  Requesting
-                # only 8 CPUs here would accidentally create one-AEDT nodes.
-                requested_cpus=max(
-                    int(getattr(self.scheduler, "allocation_cpus", 0) or 0),
-                    config.project_cpus * config.projects_per_session,
+                # This is a floor, not the final pool shape.  The scheduler
+                # expands a shared CPU pool to its configured target, capped by
+                # the physical node size.  Keeping the floor at one complete
+                # session lets 48-core CPU nodes grant a 48-core pool while
+                # 64+-core nodes retain the normal 64-core pool.  Per-allocation
+                # session capacity then limits those shapes to 4 and 5 hosts,
+                # respectively, for the 3 projects x 4 CPUs topology.
+                requested_cpus=(
+                    config.project_cpus * config.projects_per_session
                 ),
                 require_fea_eligible_node=True,
             )

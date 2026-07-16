@@ -4803,6 +4803,7 @@ class AedtRuntimeTests(AedtPoolTestCase):
         self.assertTrue(
             all(int(task["memory_mb"]) >= 64 * 1024 for task in scheduler.host_tasks)
         )
+        self.assertTrue(all(int(task["priority"]) == 10 for task in scheduler.host_tasks))
 
     def test_session_capacity_is_bounded_by_free_cpu_and_memory(self) -> None:
         config = self.service.config()
@@ -4829,14 +4830,59 @@ class AedtRuntimeTests(AedtPoolTestCase):
         )
         self.assertEqual(occupied_plus_free, 8)
 
-    def test_node_request_uses_full_scheduler_shape_not_eight_cpu_micro_node(self) -> None:
+    def test_session_capacity_tracks_48_and_64_cpu_allocation_shapes(self) -> None:
+        self.service.set_operator_limits(projects_per_session=3)
+        config = self.service.config()
+        capacities = [
+            self.service._allocation_session_capacity(
+                {
+                    "total_cpus": cpus,
+                    "free_cpus": cpus,
+                    "total_memory_mb": 512 * 1024,
+                    "free_memory_mb": 512 * 1024,
+                },
+                config,
+            )
+            for cpus in (48, 64)
+        ]
+        self.assertEqual(capacities, [4, 5])
+
+    def test_reconcile_caps_48_cpu_allocation_at_four_three_project_sessions(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=5,
+            target_projects=15,
+            projects_per_session=3,
+        )
+        allocation_id = self.add_dedicated_allocation(cpus=48)
+        for index in range(15):
+            self.request(f"shape-48-demand-{index}")
+        self.make_operational()
+
+        self.service.reconcile(execute=True)
+        self.service.reconcile(execute=True)
+
+        sessions = [
+            session
+            for session in self.service.starting_sessions()
+            if int(session["allocation_id"]) == allocation_id
+        ]
+        self.assertEqual(len(sessions), 4)
+        self.assertTrue(all(int(session["slots_total"]) == 3 for session in sessions))
+
+    def test_node_request_uses_one_complete_session_as_scheduler_shape_floor(self) -> None:
+        self.service.set_operator_limits(projects_per_session=3)
         self.make_operational()
         self.request("needs-node")
         fake = FakeRuntimeScheduler()
         runtime = AedtPoolRuntime(self.service, fake, interval_seconds=30)
         plan = runtime.tick()
         self.assertEqual(plan["node_allocations_opened"], 1)
-        self.assertEqual(fake.open_calls[0]["requested_cpus"], 64)
+        config = self.service.config()
+        self.assertEqual(
+            fake.open_calls[0]["requested_cpus"],
+            config.project_cpus * config.projects_per_session,
+        )
+        self.assertEqual(fake.open_calls[0]["requested_cpus"], 12)
         self.assertLessEqual(self.service.config().node_cpu_factor, 2.0)
 
     def test_pending_dedicated_node_prevents_duplicate_scale_out(self) -> None:
