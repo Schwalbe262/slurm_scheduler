@@ -21,7 +21,7 @@ from slurm_scheduler.allocation_metrics import annotate_allocation_fea_pressure,
 from slurm_scheduler.conda_sync import conda_bootstrap, env_prefix_lookup_command
 from slurm_scheduler.db import Database
 from slurm_scheduler.git_auth import find_git_credential, git_task_payload
-from slurm_scheduler.models import AccountSnapshot, AllocationStatus, JobCreate, JobStatus, SchedulingProfile, TaskCreate, TaskStatus
+from slurm_scheduler.models import AedtBackend, AccountSnapshot, AllocationStatus, JobCreate, JobStatus, SchedulingProfile, TaskCreate, TaskStatus
 from slurm_scheduler.scheduler import Scheduler
 from slurm_scheduler.inventory import parse_scontrol_nodes, parse_sinfo_nodes, partition_rank
 from slurm_scheduler.pestat import parse_pestat, plan_dynamic_allocations
@@ -9093,6 +9093,176 @@ class SchedulerTests(unittest.TestCase):
         )
         self.assertTrue(scheduler.account_storage_blocked(account, for_fea=True))
         self.assertFalse(scheduler.account_storage_blocked(account, for_fea=False))
+
+    def test_aedt_storage_shadow_is_independent_across_five_accounts(self) -> None:
+        accounts = [
+            AccountConfig(name, "host", 22, name, "key", "/work", 4, 10, 10)
+            for name in ["a", "b", "c", "d", "e"]
+        ]
+        scheduler = Scheduler(
+            self.db,
+            accounts,
+            30,
+            client_factory=FakeClient,
+            storage_guard_min_free_gb=20.0,
+            aedt_storage_reservation_per_project_gb=4.0,
+            aedt_storage_reservation_maturity_seconds=900,
+        )
+        observed_at = time.time()
+        for account in accounts:
+            scheduler._storage_quota_cache[account.name] = (
+                observed_at,
+                StorageQuotaProbe(
+                    "gpfs", GpfsBlockQuota("gpfs", 76.0, 0.0, 100.0)
+                ),
+            )
+
+        first_id = self.db.create_task(
+            TaskCreate(
+                "a-attaching",
+                "~/case",
+                "run",
+                account_name="a",
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                aedt_backend=AedtBackend.POOLED.value,
+            )
+        )
+        self.db.update_task(first_id, status=TaskStatus.ATTACHING.value)
+
+        self.assertTrue(
+            scheduler.account_storage_blocked(
+                accounts[0], for_fea=True, additional_future_projects=1
+            )
+        )
+        for account in accounts[1:]:
+            self.assertFalse(
+                scheduler.account_storage_blocked(
+                    account, for_fea=True, additional_future_projects=1
+                )
+            )
+
+    def test_aedt_storage_shadow_matures_only_against_probe_and_releases_terminal(
+        self,
+    ) -> None:
+        observed = datetime.now(timezone.utc).replace(microsecond=0)
+
+        def pooled_task(name: str, status: str, started_at: str) -> int:
+            task_id = self.db.create_task(
+                TaskCreate(
+                    name,
+                    "~/case",
+                    "run",
+                    account_name="a",
+                    aedt_backend=AedtBackend.POOLED.value,
+                )
+            )
+            self.db.update_task(
+                task_id,
+                status=status,
+                started_at=started_at,
+                attached_at=started_at,
+            )
+            return task_id
+
+        old = (observed - timedelta(seconds=901)).strftime("%Y-%m-%d %H:%M:%S")
+        young = (observed - timedelta(seconds=899)).strftime("%Y-%m-%d %H:%M:%S")
+        pooled_task("old-running", TaskStatus.RUNNING.value, old)
+        pooled_task("young-running", TaskStatus.RUNNING.value, young)
+        pooled_task("old-attaching", TaskStatus.ATTACHING.value, old)
+        pooled_task("terminal-young", TaskStatus.COMPLETED.value, young)
+
+        counts = self.db.aedt_storage_growth_reservations_by_account(
+            (observed - timedelta(seconds=900)).strftime("%Y-%m-%d %H:%M:%S")
+        )["a"]
+        self.assertEqual(counts["attaching_projects"], 1)
+        self.assertEqual(counts["young_running_projects"], 1)
+        self.assertEqual(counts["total_projects"], 2)
+
+    def test_concurrent_pooled_attach_claims_cannot_spend_same_quota_probe(
+        self,
+    ) -> None:
+        account = self.accounts[0]
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="alloc-quota",
+        )
+        task_ids = [
+            self.db.create_task(
+                TaskCreate(
+                    f"pooled-quota-{index}",
+                    "~/case",
+                    "run",
+                    account_name="a",
+                    cpus=4,
+                    memory_mb=8192,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                    aedt_backend=AedtBackend.POOLED.value,
+                    requested_allocation_id=allocation_id,
+                )
+            )
+            for index in range(3)
+        ]
+        scheduler = Scheduler(
+            self.db,
+            [account],
+            30,
+            client_factory=FakeClient,
+            storage_guard_min_free_gb=20.0,
+            aedt_storage_reservation_per_project_gb=4.0,
+            aedt_storage_reservation_maturity_seconds=900,
+        )
+        scheduler._storage_quota_cache["a"] = (
+            time.time(),
+            StorageQuotaProbe(
+                "gpfs", GpfsBlockQuota("gpfs", 72.0, 0.0, 100.0)
+            ),
+        )
+        scheduler.set_aedt_backend_admission_checker(lambda _task: (True, ""))
+        scheduler.allocation_profile_conflicts = lambda *_args, **_kwargs: False  # type: ignore[method-assign]
+        scheduler.allocation_can_run_task = lambda *_args, **_kwargs: True  # type: ignore[method-assign]
+        scheduler.fit_slots_for_allocation = lambda *_args, **_kwargs: 99  # type: ignore[method-assign]
+
+        def claim_without_pool_schema(
+            task_id: int, _allocation_id: int, **fields
+        ) -> bool:
+            fields.pop("heartbeat_cutoff", None)
+            fields.pop("now", None)
+            fields.pop("project_cpus", None)
+            return self.db.update_task_if_status(
+                task_id, [TaskStatus.QUEUED.value], **fields
+            )
+
+        scheduler.db.update_pooled_task_if_reserved_capacity = claim_without_pool_schema  # type: ignore[method-assign]
+        allocation = self.db.get_allocation(allocation_id)
+        barrier = threading.Barrier(len(task_ids))
+        results: list[int] = []
+
+        def reserve(task_id: int) -> None:
+            barrier.wait()
+            claimed = scheduler.reserve_task_on_allocation(
+                self.db.get_task(task_id), allocation, account
+            )
+            if claimed:
+                results.append(task_id)
+
+        threads = [threading.Thread(target=reserve, args=(task_id,)) for task_id in task_ids]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertEqual(len(results), 2)
+        statuses = [self.db.get_task(task_id)["status"] for task_id in task_ids]
+        self.assertEqual(statuses.count(TaskStatus.ATTACHING.value), 2)
+        self.assertEqual(statuses.count(TaskStatus.QUEUED.value), 1)
 
     def test_fea_storage_guard_holds_unavailable_account_without_aborting_tick(self) -> None:
         account = AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)

@@ -888,7 +888,114 @@ class Database:
                 ),
             )
             return cursor.rowcount > 0
+    def aedt_storage_growth_reservations_by_account(
+        self, maturity_cutoff: str
+    ) -> dict[str, dict[str, int]]:
+        """Return not-yet-observed AEDT disk-growth units by account.
 
+        A claimed ``starting`` session reserves all of its future project
+        slots.  Once the session is usable, each attaching or young running
+        pooled task carries its own reservation.  Terminal tasks and mature
+        running tasks disappear from this derived ledger automatically, so a
+        scheduler restart cannot leak reservations.
+
+        ``maturity_cutoff`` is deliberately derived from the quota probe's
+        observation timestamp rather than wall-clock now.  A stale probe must
+        never age a project out before a newer observation can include its
+        writes.
+        """
+
+        reservations: dict[str, dict[str, int]] = {}
+
+        def item_for(account_name: str) -> dict[str, int]:
+            return reservations.setdefault(
+                account_name,
+                {
+                    "starting_project_slots": 0,
+                    "attaching_projects": 0,
+                    "young_running_projects": 0,
+                    "total_projects": 0,
+                },
+            )
+
+        with self.connect() as conn:
+            task_rows = conn.execute(
+                """
+                SELECT account_name,
+                       SUM(CASE WHEN status = 'attaching' THEN 1 ELSE 0 END)
+                           AS attaching_projects,
+                       SUM(CASE
+                               WHEN status = 'running'
+                                AND COALESCE(started_at, attached_at, updated_at, created_at) >= ?
+                               THEN 1 ELSE 0 END)
+                           AS young_running_projects
+                FROM tasks
+                WHERE LOWER(TRIM(COALESCE(aedt_backend, ''))) = 'pooled'
+                  AND status IN ('attaching', 'running')
+                  AND TRIM(COALESCE(account_name, '')) != ''
+                GROUP BY account_name
+                """,
+                (str(maturity_cutoff),),
+            ).fetchall()
+            for row in task_rows:
+                account_name = str(row["account_name"] or "").strip()
+                if not account_name:
+                    continue
+                item = item_for(account_name)
+                item["attaching_projects"] = int(row["attaching_projects"] or 0)
+                item["young_running_projects"] = int(
+                    row["young_running_projects"] or 0
+                )
+
+            session_table = conn.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'aedt_sessions'
+                """
+            ).fetchone()
+            if session_table:
+                session_columns = {
+                    str(row["name"])
+                    for row in conn.execute(
+                        "PRAGMA table_info(aedt_sessions)"
+                    ).fetchall()
+                }
+                required = {
+                    "allocation_id",
+                    "host_task_id",
+                    "slots_total",
+                    "state",
+                }
+                if required.issubset(session_columns):
+                    session_rows = conn.execute(
+                        """
+                        SELECT a.account_name,
+                               SUM(CASE WHEN s.slots_total > 0
+                                        THEN s.slots_total ELSE 1 END)
+                                   AS starting_project_slots
+                        FROM aedt_sessions AS s
+                        JOIN allocations AS a ON a.id = s.allocation_id
+                        WHERE s.state = 'starting'
+                          AND s.host_task_id > 0
+                          AND TRIM(COALESCE(a.account_name, '')) != ''
+                        GROUP BY a.account_name
+                        """
+                    ).fetchall()
+                    for row in session_rows:
+                        account_name = str(row["account_name"] or "").strip()
+                        if not account_name:
+                            continue
+                        item_for(account_name)["starting_project_slots"] = int(
+                            row["starting_project_slots"] or 0
+                        )
+
+        for item in reservations.values():
+            item["total_projects"] = (
+                int(item["starting_project_slots"])
+                + int(item["attaching_projects"])
+                + int(item["young_running_projects"])
+            )
+        return reservations
     def active_pooled_aedt_tasks_by_allocation(self) -> dict[int, int]:
         """Count launched pooled clients, including clients not yet leased."""
 

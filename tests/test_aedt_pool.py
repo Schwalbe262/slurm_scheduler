@@ -5490,6 +5490,65 @@ class AedtRuntimeTests(AedtPoolTestCase):
         )
         self.assertTrue(all(int(task["priority"]) == 10 for task in scheduler.host_tasks))
 
+    def test_session_host_admission_reserves_whole_three_project_cohort(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=3,
+            min_idle_sessions=3,
+            target_projects=0,
+            projects_per_session=3,
+        )
+        self.add_dedicated_allocation()
+        self.make_operational()
+        self.service.reconcile(execute=True)
+
+        class CohortStorageScheduler(FakeHostLaunchScheduler):
+            def __init__(self, db: Database) -> None:
+                super().__init__()
+                self.db = db
+                self.account = SimpleNamespace(name="a")
+
+            def account_storage_blocked(
+                self, account, *, for_fea: bool = False
+            ) -> bool:
+                self.assert_account(account)
+                reservations = self.db.aedt_storage_growth_reservations_by_account(
+                    "2000-01-01 00:00:00"
+                )
+                return int(
+                    (reservations.get("a") or {}).get("total_projects") or 0
+                ) > 3
+
+            @staticmethod
+            def assert_account(account) -> None:
+                if getattr(account, "name", "") != "a":
+                    raise AssertionError("wrong account")
+
+        scheduler = CohortStorageScheduler(self.db)
+        runtime = AedtPoolRuntime(
+            self.service,
+            scheduler,
+            interval_seconds=30,
+            scheduler_url="http://scheduler:8000",
+            host_remote_cwd="/work/aedt",
+            host_bootstrap_token_file="/shared/aedt-token",
+        )
+
+        started = runtime._ensure_session_hosts(self.service.config())
+
+        self.assertEqual(started, 1)
+        self.assertEqual(len(scheduler.host_tasks), 1)
+        with self.db.connect() as conn:
+            failed = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM aedt_sessions WHERE state = 'failed'"
+                ).fetchone()[0]
+            )
+        self.assertEqual(failed, 2)
+        reservations = self.db.aedt_storage_growth_reservations_by_account(
+            "2000-01-01 00:00:00"
+        )
+        self.assertEqual(reservations["a"]["starting_project_slots"], 3)
+
     def test_storage_blocked_account_retires_unclaimed_start_without_churn(
         self,
     ) -> None:

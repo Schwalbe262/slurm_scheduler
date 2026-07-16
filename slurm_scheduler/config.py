@@ -182,6 +182,12 @@ class AppConfig:
     orphan_process_min_age_seconds: int = 1800
     orphan_process_name_patterns: list[str] = field(default_factory=list)
     storage_guard_min_free_gb: float = 0.0
+    # A quota probe is cached for a short period while AEDT cohorts can start
+    # much faster than their writes become visible to GPFS.  Reserve this much
+    # future growth for each claimed session slot/attaching project/young
+    # pooled project until a fresh quota observation can account for it.
+    aedt_storage_reservation_per_project_gb: float = 4.0
+    aedt_storage_reservation_maturity_seconds: int = 900
     license_monitor_enabled: bool = False
     license_monitor_account: str = ""
     license_monitor_lmutil_path: str = ""

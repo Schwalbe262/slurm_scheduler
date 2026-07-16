@@ -209,6 +209,8 @@ class Scheduler:
         cleanup_finished_task_log_max_bytes: int = 0,
         cleanup_finished_task_log_trim_after_seconds: int = 86400,
         storage_guard_min_free_gb: float = 0.0,
+        aedt_storage_reservation_per_project_gb: float = 4.0,
+        aedt_storage_reservation_maturity_seconds: int = 900,
         license_monitor_enabled: bool = False,
         license_monitor_account: str = "",
         license_monitor_lmutil_path: str = "",
@@ -377,6 +379,12 @@ class Scheduler:
         self.cleanup_finished_task_log_max_bytes = max(0, int(cleanup_finished_task_log_max_bytes))
         self.cleanup_finished_task_log_trim_after_seconds = max(3600, int(cleanup_finished_task_log_trim_after_seconds))
         self.storage_guard_min_free_gb = max(0.0, float(storage_guard_min_free_gb))
+        self.aedt_storage_reservation_per_project_gb = max(
+            0.0, float(aedt_storage_reservation_per_project_gb)
+        )
+        self.aedt_storage_reservation_maturity_seconds = max(
+            0, int(aedt_storage_reservation_maturity_seconds)
+        )
         self._storage_guard_warned_at: dict[str, float] = {}
         self.license_monitor_enabled = license_monitor_enabled
         self.license_monitor_account = license_monitor_account
@@ -3294,10 +3302,90 @@ class Scheduler:
             account_name=account.name,
         )
 
-    def account_storage_blocked(self, account: AccountConfig, *, for_fea: bool = False) -> bool:
+    def _aedt_storage_growth_reservation(
+        self,
+        account: AccountConfig,
+        observation_at: float,
+        additional_future_projects: int = 0,
+    ) -> tuple[int, float, dict[str, int]]:
+        per_project_gb = self.aedt_storage_reservation_per_project_gb
+        additional = max(0, int(additional_future_projects or 0))
+        if per_project_gb <= 0:
+            return 0, 0.0, {}
+        observed = datetime.fromtimestamp(float(observation_at), tz=timezone.utc)
+        cutoff = observed - timedelta(
+            seconds=self.aedt_storage_reservation_maturity_seconds
+        )
+        reservations = self.db.aedt_storage_growth_reservations_by_account(
+            cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        )
+        detail = dict(reservations.get(account.name) or {})
+        projects = max(0, int(detail.get("total_projects") or 0)) + additional
+        if additional:
+            detail["prospective_projects"] = additional
+        detail["total_projects"] = projects
+        return projects, projects * per_project_gb, detail
+
+    def _storage_headroom_blocked(
+        self,
+        account: AccountConfig,
+        *,
+        observed_free_gb: float,
+        observation_at: float,
+        additional_future_projects: int,
+        label: str,
+        quota_context: str = "",
+    ) -> bool:
+        projects, reserved_gb, reservation_detail = (
+            self._aedt_storage_growth_reservation(
+                account,
+                observation_at,
+                additional_future_projects,
+            )
+        )
+        effective_free_gb = float(observed_free_gb) - reserved_gb
+        if effective_free_gb >= self.storage_guard_min_free_gb:
+            return False
+        reservation_context = ""
+        if projects:
+            reservation_context = (
+                f"; {reserved_gb:.1f} GB shadow-reserved for {projects} "
+                "starting/attaching/young pooled project(s)"
+            )
+            starting = int(reservation_detail.get("starting_project_slots") or 0)
+            attaching = int(reservation_detail.get("attaching_projects") or 0)
+            young = int(reservation_detail.get("young_running_projects") or 0)
+            prospective = int(reservation_detail.get("prospective_projects") or 0)
+            reservation_context += (
+                f" [starting slots {starting}, attaching {attaching}, "
+                f"young running {young}, prospective {prospective}]"
+            )
+        detail = (
+            f"{label}: {observed_free_gb:.1f} GB observed free"
+            f"{reservation_context}; {effective_free_gb:.1f} GB effective free "
+            f"is below the {self.storage_guard_min_free_gb:g} GB threshold"
+        )
+        if quota_context:
+            detail += f"; {quota_context}"
+        self._warn_storage_guard(account, detail)
+        return True
+
+    def account_storage_blocked(
+        self,
+        account: AccountConfig,
+        *,
+        for_fea: bool = False,
+        additional_future_projects: int = 0,
+    ) -> bool:
         """Quota guard: hold new attaches when the account's storage headroom
         is below the threshold, instead of letting tasks start and cascade
-        into disk-quota-exceeded failures."""
+        into disk-quota-exceeded failures.
+
+        Cached quota probes are adjusted by a DB-derived AEDT shadow
+        reservation.  Callers performing the final queued -> attaching claim
+        pass one prospective project so concurrent callers cannot all spend
+        the same cached free-space reading.
+        """
         if self.storage_guard_min_free_gb <= 0:
             return False
         if for_fea:
@@ -3322,18 +3410,24 @@ class Scheduler:
                 free_gb = probe.quota.free_gb
                 if free_gb is None:
                     return False
-                if free_gb >= self.storage_guard_min_free_gb:
-                    return False
-                detail = (
-                    f"FEA work held: GPFS {probe.quota.quota_type.lower()} block quota "
-                    f"for fileset {probe.fileset_name or probe.quota.fileset_name or 'unknown'} "
-                    f"has {free_gb:.1f} GB free "
-                    f"(< {self.storage_guard_min_free_gb:g} GB; "
-                    f"used+in_doubt {probe.quota.effective_used_gb:.1f} / "
-                    f"{probe.quota.block_limit_gb:.1f} GB)"
+                observation_at = self._storage_quota_cache.get(
+                    account.name, (time.time(), probe)
+                )[0]
+                return self._storage_headroom_blocked(
+                    account,
+                    observed_free_gb=free_gb,
+                    observation_at=observation_at,
+                    additional_future_projects=additional_future_projects,
+                    label=(
+                        f"FEA work held: GPFS {probe.quota.quota_type.lower()} "
+                        "block quota for fileset "
+                        f"{probe.fileset_name or probe.quota.fileset_name or 'unknown'}"
+                    ),
+                    quota_context=(
+                        f"used+in_doubt {probe.quota.effective_used_gb:.1f} / "
+                        f"{probe.quota.block_limit_gb:.1f} GB"
+                    ),
                 )
-                self._warn_storage_guard(account, detail)
-                return True
         if not account.storage_quota_gb:
             return False
         cached = self._storage_cache.get(account.name)
@@ -3341,13 +3435,14 @@ class Scheduler:
         if used is None:
             return False
         free_gb = float(account.storage_quota_gb) - float(used)
-        if free_gb >= self.storage_guard_min_free_gb:
-            return False
-        self._warn_storage_guard(
+        observation_at = cached[0] if cached else time.time()
+        return self._storage_headroom_blocked(
             account,
-            f"attaches held: {free_gb:.1f} GB free is below the {self.storage_guard_min_free_gb:g} GB threshold",
+            observed_free_gb=free_gb,
+            observation_at=observation_at,
+            additional_future_projects=additional_future_projects,
+            label="attaches held",
         )
-        return True
 
     def project_active_cap_reason(self, task: dict) -> str:
         project_name = str(task.get("project") or "").strip()
@@ -3416,6 +3511,11 @@ class Scheduler:
                 return None
             task = current_task
             allocation = current_allocation
+            allocation_account_name = str(allocation.get("account_name") or "")
+            if str(account.name) != allocation_account_name:
+                account = self.account_by_name(allocation_account_name)
+                if account is None:
+                    return None
             if self.aedt_backend_block_reason(task):
                 return None
             if self.allocation_profile_conflicts(allocation, task, refresh=True):
@@ -3448,6 +3548,21 @@ class Scheduler:
             if self.task_is_fea_bursty(task):
                 if self.fit_slots_for_allocation(allocation, task) <= 0:
                     return None
+
+            # This is the serialized, final quota admission point for pooled
+            # projects.  The prospective unit is evaluated before the row is
+            # changed to ATTACHING; once claimed, the next waiter sees that
+            # row in the DB-derived shadow ledger.  Thus many callers cannot
+            # all consume one cached GPFS free-space observation.
+            if (
+                self.task_aedt_backend(task) == AedtBackend.POOLED.value
+                and self.account_storage_blocked(
+                    account,
+                    for_fea=True,
+                    additional_future_projects=1,
+                )
+            ):
+                return None
 
             admitted, admission_reason = self._license_task_admitted_locked(task)
             if not admitted:

@@ -147,6 +147,13 @@ cleanup:
   finished_task_ttl_seconds: 259200
   finished_job_ttl_seconds: 259200
   closed_allocation_ttl_seconds: 86400
+# Keep this floor after subtracting conservative, not-yet-visible AEDT disk
+# growth from the latest per-account quota observation. Set the floor to 0 to
+# disable storage admission entirely, or reservation_per_project_gb to 0 to
+# retain the legacy observed-free-only guard.
+storage_guard_min_free_gb: 20
+aedt_storage_reservation_per_project_gb: 4.0
+aedt_storage_reservation_maturity_seconds: 900
 git_credentials:
   - id: private-project
     url_patterns:

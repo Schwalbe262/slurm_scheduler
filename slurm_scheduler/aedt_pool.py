@@ -8489,6 +8489,42 @@ class AedtPoolRuntime:
                 continue
             task = self.service.db.get_task(task_id)
             account = self.scheduler.account_by_name(str(allocation.get("account_name") or ""))
+            # Binding makes this starting session visible to the quota shadow
+            # ledger as ``slots_total`` future projects.  Recheck immediately
+            # and sequentially before the host task can launch, so a batch of
+            # planned three-project cohorts cannot all spend one cached GPFS
+            # headroom observation.
+            storage_checker = getattr(
+                self.scheduler, "account_storage_blocked", None
+            )
+            storage_failure = ""
+            if account and callable(storage_checker):
+                try:
+                    if storage_checker(account, for_fea=True):
+                        storage_failure = (
+                            "AEDT session start blocked by the account storage "
+                            "guard after reserving its project slots"
+                        )
+                except Exception as exc:
+                    LOGGER.exception(
+                        "AEDT session storage admission failed for %s",
+                        allocation_account,
+                    )
+                    storage_failure = (
+                        "AEDT session start blocked because the account storage "
+                        f"admission check failed: {exc}"
+                    )
+            if storage_failure:
+                self.service.db.update_task(
+                    task_id,
+                    status=TaskStatus.FAILED.value,
+                    failure_message=storage_failure,
+                    finished_at="CURRENT_TIMESTAMP",
+                )
+                self.service.fail_unclaimed_session_start(
+                    int(session["id"]), storage_failure
+                )
+                continue
             reserved = (
                 self.scheduler.reserve_task_on_allocation(task, allocation, account)
                 if task and account
