@@ -891,18 +891,21 @@ class Database:
     def aedt_storage_growth_reservations_by_account(
         self, maturity_cutoff: str
     ) -> dict[str, dict[str, int]]:
-        """Return not-yet-observed AEDT disk-growth units by account.
+        """Return projected AEDT disk-growth units by account.
 
         A claimed ``starting`` session reserves all of its future project
-        slots.  Once the session is usable, each attaching or young running
-        pooled task carries its own reservation.  Terminal tasks and mature
-        running tasks disappear from this derived ledger automatically, so a
-        scheduler restart cannot leak reservations.
+        slots.  Once the session is usable, every attaching or running pooled
+        task carries its own reservation until the task becomes terminal.  A
+        running task must not age out merely because an older quota sample may
+        already include some of its writes: Maxwell/Icepak projects can keep
+        growing through later solve stages.  This DB-derived ledger still
+        releases terminal tasks automatically, so a scheduler restart cannot
+        leak reservations.
 
         ``maturity_cutoff`` is deliberately derived from the quota probe's
-        observation timestamp rather than wall-clock now.  A stale probe must
-        never age a project out before a newer observation can include its
-        writes.
+        observation timestamp rather than wall-clock now.  It now classifies
+        running projects as young or mature for diagnostics only; both classes
+        remain reserved while active.
         """
 
         reservations: dict[str, dict[str, int]] = {}
@@ -913,7 +916,9 @@ class Database:
                 {
                     "starting_project_slots": 0,
                     "attaching_projects": 0,
+                    "running_projects": 0,
                     "young_running_projects": 0,
+                    "mature_running_projects": 0,
                     "total_projects": 0,
                 },
             )
@@ -928,7 +933,9 @@ class Database:
                                WHEN status = 'running'
                                 AND COALESCE(started_at, attached_at, updated_at, created_at) >= ?
                                THEN 1 ELSE 0 END)
-                           AS young_running_projects
+                           AS young_running_projects,
+                       SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END)
+                           AS running_projects
                 FROM tasks
                 WHERE LOWER(TRIM(COALESCE(aedt_backend, ''))) = 'pooled'
                   AND status IN ('attaching', 'running')
@@ -945,6 +952,12 @@ class Database:
                 item["attaching_projects"] = int(row["attaching_projects"] or 0)
                 item["young_running_projects"] = int(
                     row["young_running_projects"] or 0
+                )
+                item["running_projects"] = int(row["running_projects"] or 0)
+                item["mature_running_projects"] = max(
+                    0,
+                    int(item["running_projects"])
+                    - int(item["young_running_projects"]),
                 )
 
             session_table = conn.execute(
@@ -993,7 +1006,7 @@ class Database:
             item["total_projects"] = (
                 int(item["starting_project_slots"])
                 + int(item["attaching_projects"])
-                + int(item["young_running_projects"])
+                + int(item["running_projects"])
             )
         return reservations
     def active_pooled_aedt_tasks_by_allocation(self) -> dict[int, int]:

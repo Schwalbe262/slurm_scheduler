@@ -67,6 +67,9 @@ UNHEALTHY_ALLOCATION_RECYCLE_REASON = (
     "AEDT pool unhealthy/quarantined session allocation recycle"
 )
 ALLOCATION_AGE_ROTATION_REASON = "AEDT pool allocation age rotation"
+STORAGE_PRESSURE_DRAIN_REASON = (
+    "account storage pressure; draining before quota exhaustion"
+)
 DEFAULT_HOST_LAUNCH_STAGGER_SECONDS = 15
 HOST_LAUNCH_STAGGER_ENV = "AEDT_POOL_HOST_LAUNCH_STAGGER_SECONDS"
 HEARTBEAT_PERSIST_MAX_SECONDS = 30
@@ -2149,7 +2152,36 @@ class AedtPoolService:
                   OR s.generation != r.session_generation
                   OR s.session_profile != r.session_profile
                   OR s.state NOT IN ('ready','busy')
-                  OR s.drain_requested_at IS NOT NULL
+                  OR (
+                      s.drain_requested_at IS NOT NULL
+                      AND NOT (
+                          -- Confirmed storage pressure places a BUSY session
+                          -- into graceful no-new-lease drain. Preserve a fully
+                          -- attached cohort so its already-owned serialized
+                          -- solve waves can finish. Any reserved/claimed or
+                          -- detached member still invalidates the cohort.
+                          s.state = 'busy'
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM aedt_exact_session_reservations graceful
+                              LEFT JOIN aedt_project_leases graceful_lease
+                                ON graceful_lease.id = graceful.lease_id
+                              WHERE graceful.reservation_key = r.reservation_key
+                                AND graceful.state IN (
+                                    'reserved','claimed','consumed'
+                                )
+                                AND (
+                                    graceful.state != 'consumed'
+                                    OR graceful_lease.id IS NULL
+                                    OR graceful_lease.session_id != r.session_id
+                                    OR graceful_lease.state NOT IN (
+                                        'offered','leased','attaching',
+                                        'active','releasing'
+                                    )
+                                )
+                          )
+                      )
+                  )
                   OR (
                       a.state NOT IN ('warm','active')
                       AND NOT (
@@ -5598,6 +5630,12 @@ class AedtPoolService:
                 (session_id,),
             ).fetchone()[0]
         )
+        graceful_drain_pending = bool(session["drain_requested_at"])
+        next_state = (
+            "draining"
+            if graceful_drain_pending and not live
+            else ("busy" if live else "ready")
+        )
         conn.execute(
             """
             UPDATE aedt_sessions
@@ -5608,8 +5646,8 @@ class AedtPoolService:
             WHERE id = ?
             """,
             (
-                "busy" if live else "ready",
-                None if live else now,
+                next_state,
+                None if live or graceful_drain_pending else now,
                 live,
                 now,
                 session_id,
@@ -7130,6 +7168,7 @@ class AedtPoolService:
         execute: bool,
         excluded_start_accounts: set[str] | None = None,
         start_block_reasons: dict[str, str] | None = None,
+        storage_pressure_accounts: set[str] | None = None,
     ) -> dict[str, Any]:
         """Reap stale ownership, assign leases, and scale only when gated.
 
@@ -7148,6 +7187,11 @@ class AedtPoolService:
             for account, reason in (start_block_reasons or {}).items()
             if str(account or "").strip()
         }
+        storage_pressure_accounts = {
+            str(account or "").strip()
+            for account in (storage_pressure_accounts or set())
+            if str(account or "").strip()
+        }
         # Account selection can refresh remote Slurm/quota snapshots. Resolve
         # it before BEGIN IMMEDIATE so a slow SSH probe cannot block every API,
         # heartbeat, cancellation, and background attach writer.
@@ -7160,6 +7204,7 @@ class AedtPoolService:
         )
         now_dt = self._now()
         now = _sql_time(now_dt)
+        storage_pressure_drain_requested_this_tick = 0
         with self._lock, self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._refresh_exact_session_reservations(conn, now)
@@ -7233,6 +7278,62 @@ class AedtPoolService:
                             """,
                             (reason, now, now, session_id),
                         )
+
+            if execute and config.operational and storage_pressure_accounts:
+                # A valid quota observation below the projected-growth floor
+                # is stronger evidence than an unavailable/failed probe. Stop
+                # assigning those Desktops immediately. READY sessions become
+                # draining now. BUSY sessions keep that state only while their
+                # current owners finish, but drain_requested_at blocks every
+                # new lease; their final release promotes them to draining.
+                # Actual draining rows are excluded from hard/active capacity,
+                # so safe replacement capacity opens without counting them.
+                placeholders = ",".join("?" for _ in storage_pressure_accounts)
+                ready_cursor = conn.execute(
+                    f"""
+                    UPDATE aedt_sessions
+                    SET state = 'draining', failure_message = ?,
+                        drain_requested_at = COALESCE(drain_requested_at, ?),
+                        updated_at = ?
+                    WHERE state = 'ready' AND drain_requested_at IS NULL
+                      AND allocation_id IN (
+                          SELECT id FROM allocations
+                          WHERE account_name IN ({placeholders})
+                      )
+                    """,
+                    (
+                        STORAGE_PRESSURE_DRAIN_REASON,
+                        now,
+                        now,
+                        *sorted(storage_pressure_accounts),
+                    ),
+                )
+                busy_cursor = conn.execute(
+                    f"""
+                    UPDATE aedt_sessions
+                    SET failure_message = ?, drain_requested_at = ?,
+                        updated_at = ?
+                    WHERE state = 'busy' AND drain_requested_at IS NULL
+                      AND allocation_id IN (
+                          SELECT id FROM allocations
+                          WHERE account_name IN ({placeholders})
+                      )
+                    """,
+                    (
+                        STORAGE_PRESSURE_DRAIN_REASON,
+                        now,
+                        now,
+                        *sorted(storage_pressure_accounts),
+                    ),
+                )
+                storage_pressure_drain_requested_this_tick = max(
+                    0, int(ready_cursor.rowcount)
+                ) + max(0, int(busy_cursor.rowcount))
+                if storage_pressure_drain_requested_this_tick:
+                    # Pending exact-session reservations must not pin a newly
+                    # draining target. A fully attached busy cohort retains its
+                    # normal serialized solve-permit/completion/release path.
+                    self._refresh_exact_session_reservations(conn, now)
 
             if execute and config.allocation_max_age_seconds:
                 allocation_age_cutoff = _sql_time(
@@ -7875,6 +7976,31 @@ class AedtPoolService:
                 )
             plan["operational"] = config.operational
             plan["executed"] = bool(execute and config.operational)
+            plan["storage_pressure_accounts"] = sorted(
+                storage_pressure_accounts
+            )
+            plan["storage_pressure_sessions_drain_requested_this_tick"] = (
+                storage_pressure_drain_requested_this_tick
+            )
+            plan["storage_pressure_draining_session_count"] = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM aedt_sessions
+                    WHERE state = 'draining' AND failure_message = ?
+                    """,
+                    (STORAGE_PRESSURE_DRAIN_REASON,),
+                ).fetchone()[0]
+            )
+            plan["storage_pressure_finishing_session_count"] = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM aedt_sessions
+                    WHERE state = 'busy' AND drain_requested_at IS NOT NULL
+                      AND failure_message = ?
+                    """,
+                    (STORAGE_PRESSURE_DRAIN_REASON,),
+                ).fetchone()[0]
+            )
             return plan
 
     def summary(self) -> dict[str, Any]:
@@ -8176,20 +8302,32 @@ class AedtPoolRuntime:
                 LOGGER.exception("AEDT pool reconciliation failed")
             self._stop.wait(self.interval_seconds)
 
-    def _storage_start_block_reasons(self) -> dict[str, str]:
-        """Return accounts on which a new AEDT host must not be launched."""
+    def _storage_start_admission(self) -> tuple[dict[str, str], set[str]]:
+        """Return start blocks and accounts with confirmed quota pressure."""
 
+        status_checker = getattr(
+            self.scheduler, "account_storage_guard_status", None
+        )
         checker = getattr(self.scheduler, "account_storage_blocked", None)
         accounts = list(getattr(self.scheduler, "accounts", ()) or ())
-        if not callable(checker) or not accounts:
-            return {}
+        if not callable(status_checker) and not callable(checker):
+            return {}, set()
+        if not accounts:
+            return {}, set()
         blocked: dict[str, str] = {}
+        confirmed_pressure: set[str] = set()
         for account in accounts:
             account_name = str(getattr(account, "name", "") or "").strip()
             if not account_name:
                 continue
             try:
-                is_blocked = bool(checker(account, for_fea=True))
+                if callable(status_checker):
+                    result = status_checker(account, for_fea=True)
+                    is_blocked = bool(result[0])
+                    is_confirmed_pressure = bool(result[1])
+                else:
+                    is_blocked = bool(checker(account, for_fea=True))
+                    is_confirmed_pressure = False
             except Exception as exc:
                 LOGGER.exception(
                     "AEDT pool storage admission check failed for %s",
@@ -8204,7 +8342,14 @@ class AedtPoolRuntime:
                 blocked[account_name] = (
                     "AEDT session start blocked by the account storage guard"
                 )
-        return blocked
+                if is_confirmed_pressure:
+                    confirmed_pressure.add(account_name)
+        return blocked, confirmed_pressure
+
+    def _storage_start_block_reasons(self) -> dict[str, str]:
+        """Compatibility helper returning only AEDT host-start blocks."""
+
+        return self._storage_start_admission()[0]
 
     def tick(self) -> dict[str, Any]:
         config = self.service.config()
@@ -8236,14 +8381,18 @@ class AedtPoolRuntime:
                 }
             )
             return plan
-        start_block_reasons = (
-            self._storage_start_block_reasons() if config.operational else {}
-        )
+        if config.operational:
+            start_block_reasons, storage_pressure_accounts = (
+                self._storage_start_admission()
+            )
+        else:
+            start_block_reasons, storage_pressure_accounts = {}, set()
         blocked_start_accounts = set(start_block_reasons)
         plan = self.service.reconcile(
             execute=True,
             excluded_start_accounts=blocked_start_accounts,
             start_block_reasons=start_block_reasons,
+            storage_pressure_accounts=storage_pressure_accounts,
         )
         if self.require_published_control_plane_url:
             plan["control_plane_ready"] = True

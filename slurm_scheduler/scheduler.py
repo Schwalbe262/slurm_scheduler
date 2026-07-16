@@ -3480,15 +3480,20 @@ class Scheduler:
         if projects:
             reservation_context = (
                 f"; {reserved_gb:.1f} GB shadow-reserved for {projects} "
-                "starting/attaching/young pooled project(s)"
+                "starting/active pooled project(s)"
             )
             starting = int(reservation_detail.get("starting_project_slots") or 0)
             attaching = int(reservation_detail.get("attaching_projects") or 0)
+            running = int(reservation_detail.get("running_projects") or 0)
             young = int(reservation_detail.get("young_running_projects") or 0)
+            mature = int(
+                reservation_detail.get("mature_running_projects") or 0
+            )
             prospective = int(reservation_detail.get("prospective_projects") or 0)
             reservation_context += (
                 f" [starting slots {starting}, attaching {attaching}, "
-                f"young running {young}, prospective {prospective}]"
+                f"running {running} (young {young}, mature {mature}), "
+                f"prospective {prospective}]"
             )
         detail = (
             f"{label}: {observed_free_gb:.1f} GB observed free"
@@ -3500,25 +3505,29 @@ class Scheduler:
         self._warn_storage_guard(account, detail)
         return True
 
-    def account_storage_blocked(
+    def account_storage_guard_status(
         self,
         account: AccountConfig,
         *,
         for_fea: bool = False,
         additional_future_projects: int = 0,
         refresh_reservations: bool = False,
-    ) -> bool:
-        """Quota guard: hold new attaches when the account's storage headroom
-        is below the threshold, instead of letting tasks start and cascade
-        into disk-quota-exceeded failures.
+    ) -> tuple[bool, bool]:
+        """Return ``(blocked, confirmed_pressure)`` for storage admission.
+
+        A failed or unavailable GPFS probe fails closed for new work but is
+        not confirmed pressure: callers may hold admission, but must not drain
+        a healthy Desktop on that evidence alone. ``confirmed_pressure`` is
+        true only when a valid quota/usage observation plus projected active
+        AEDT growth is actually below the configured floor.
 
         Cached quota probes are adjusted by a DB-derived AEDT shadow
-        reservation.  Callers performing the final queued -> attaching claim
+        reservation. Callers performing the final queued -> attaching claim
         pass one prospective project so concurrent callers cannot all spend
         the same cached free-space reading.
         """
         if self.storage_guard_min_free_gb <= 0:
-            return False
+            return False, False
         if for_fea:
             try:
                 probe = self.cached_storage_quota(
@@ -3529,22 +3538,25 @@ class Scheduler:
                     account,
                     f"FEA work held: account unavailable this tick ({exc})",
                 )
-                return True
+                return True, False
             if probe.error:
                 detail = f"FEA work held: storage quota probe failed ({probe.error[:200]})"
                 self._warn_storage_guard(account, detail)
-                return True
+                return True, False
             if probe.is_gpfs:
                 if probe.quota is None:
-                    self._warn_storage_guard(account, "FEA work held: GPFS quota status is unavailable")
-                    return True
+                    self._warn_storage_guard(
+                        account,
+                        "FEA work held: GPFS quota status is unavailable",
+                    )
+                    return True, False
                 free_gb = probe.quota.free_gb
                 if free_gb is None:
-                    return False
+                    return False, False
                 observation_at = self._storage_quota_cache.get(
                     account.name, (time.time(), probe)
                 )[0]
-                return self._storage_headroom_blocked(
+                blocked = self._storage_headroom_blocked(
                     account,
                     observed_free_gb=free_gb,
                     observation_at=observation_at,
@@ -3560,15 +3572,16 @@ class Scheduler:
                     ),
                     refresh_reservations=refresh_reservations,
                 )
+                return blocked, blocked
         if not account.storage_quota_gb:
-            return False
+            return False, False
         cached = self._storage_cache.get(account.name)
         used = cached[1] if cached else None
         if used is None:
-            return False
+            return False, False
         free_gb = float(account.storage_quota_gb) - float(used)
         observation_at = cached[0] if cached else time.time()
-        return self._storage_headroom_blocked(
+        blocked = self._storage_headroom_blocked(
             account,
             observed_free_gb=free_gb,
             observation_at=observation_at,
@@ -3576,6 +3589,25 @@ class Scheduler:
             label="attaches held",
             refresh_reservations=refresh_reservations,
         )
+        return blocked, blocked
+
+    def account_storage_blocked(
+        self,
+        account: AccountConfig,
+        *,
+        for_fea: bool = False,
+        additional_future_projects: int = 0,
+        refresh_reservations: bool = False,
+    ) -> bool:
+        """Hold new work when storage is low or its FEA quota probe failed."""
+
+        blocked, _confirmed_pressure = self.account_storage_guard_status(
+            account,
+            for_fea=for_fea,
+            additional_future_projects=additional_future_projects,
+            refresh_reservations=refresh_reservations,
+        )
+        return blocked
 
     def project_active_cap_reason(self, task: dict) -> str:
         project_name = str(task.get("project") or "").strip()

@@ -9962,6 +9962,35 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(scheduler.account_storage_blocked(account, for_fea=True))
         self.assertFalse(scheduler.account_storage_blocked(account, for_fea=False))
 
+    def test_storage_guard_status_only_confirms_valid_observed_pressure(self) -> None:
+        account = AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)
+        scheduler = Scheduler(
+            self.db,
+            [account],
+            30,
+            client_factory=FakeClient,
+            storage_guard_min_free_gb=5.0,
+        )
+        scheduler._storage_quota_cache["a"] = (
+            time.time(),
+            StorageQuotaProbe(
+                "gpfs", GpfsBlockQuota("gpfs", 97.0, 0.0, 100.0)
+            ),
+        )
+        self.assertEqual(
+            scheduler.account_storage_guard_status(account, for_fea=True),
+            (True, True),
+        )
+
+        scheduler._storage_quota_cache["a"] = (
+            time.time(),
+            StorageQuotaProbe(filesystem_type="gpfs", error="probe failed"),
+        )
+        self.assertEqual(
+            scheduler.account_storage_guard_status(account, for_fea=True),
+            (True, False),
+        )
+
     def test_aedt_storage_shadow_is_independent_across_five_accounts(self) -> None:
         accounts = [
             AccountConfig(name, "host", 22, name, "key", "/work", 4, 10, 10)
@@ -10009,7 +10038,7 @@ class SchedulerTests(unittest.TestCase):
                 )
             )
 
-    def test_aedt_storage_shadow_matures_only_against_probe_and_releases_terminal(
+    def test_aedt_storage_shadow_persists_for_mature_running_and_releases_terminal(
         self,
     ) -> None:
         observed = datetime.now(timezone.utc).replace(microsecond=0)
@@ -10043,8 +10072,34 @@ class SchedulerTests(unittest.TestCase):
             (observed - timedelta(seconds=900)).strftime("%Y-%m-%d %H:%M:%S")
         )["a"]
         self.assertEqual(counts["attaching_projects"], 1)
+        self.assertEqual(counts["running_projects"], 2)
         self.assertEqual(counts["young_running_projects"], 1)
-        self.assertEqual(counts["total_projects"], 2)
+        self.assertEqual(counts["mature_running_projects"], 1)
+        self.assertEqual(counts["total_projects"], 3)
+
+        account = AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)
+        scheduler = Scheduler(
+            self.db,
+            [account],
+            30,
+            client_factory=FakeClient,
+            storage_guard_min_free_gb=20.0,
+            aedt_storage_reservation_per_project_gb=4.0,
+            aedt_storage_reservation_maturity_seconds=900,
+        )
+        scheduler._storage_quota_cache["a"] = (
+            observed.timestamp(),
+            StorageQuotaProbe(
+                "gpfs", GpfsBlockQuota("gpfs", 70.0, 0.0, 100.0)
+            ),
+        )
+        # 30 GB observed - (attaching + young + mature) * 4 GB = 18 GB.
+        # If the mature project incorrectly aged out, this would be 22 GB and
+        # admission would remain open.
+        self.assertEqual(
+            scheduler.account_storage_guard_status(account, for_fea=True),
+            (True, True),
+        )
 
     def test_concurrent_pooled_attach_claims_cannot_spend_same_quota_probe(
         self,

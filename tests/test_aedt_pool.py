@@ -34,6 +34,7 @@ from slurm_scheduler.aedt_automation_lock import (
 from slurm_scheduler.aedt_pool import (
     ALLOCATION_AGE_ROTATION_REASON,
     FAULTED_DESKTOP_ALLOCATION_RECYCLE_REASON,
+    STORAGE_PRESSURE_DRAIN_REASON,
     UNHEALTHY_ALLOCATION_RECYCLE_REASON,
     AedtPoolRuntime,
     AedtPoolService,
@@ -5627,6 +5628,130 @@ class AedtRuntimeTests(AedtPoolTestCase):
         self.assertEqual(failed_starts, 1)
         self.assertEqual(host_tasks, 0)
 
+    def test_confirmed_storage_pressure_drains_sessions_and_frees_replacement_cap(
+        self,
+    ) -> None:
+        self.service.set_operator_limits(
+            max_sessions=2,
+            min_idle_sessions=0,
+            target_projects=3,
+            projects_per_session=3,
+        )
+        pressured_allocation = self.add_dedicated_allocation(node="cpu-01")
+        replacement_allocation = self.db.create_allocation(
+            account_name="b",
+            partition="cpu",
+            node_name="cpu-02",
+            total_cpus=64,
+            total_memory_mb=512 * 1024,
+        )
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.db.update_allocation(
+            replacement_allocation,
+            state="active",
+            slurm_job_id="job-replacement",
+            drain_reason="AEDT pool project demand",
+            created_at=now,
+            started_at=now,
+        )
+        self.make_operational()
+        with self.db.connect() as conn:
+            for state in ("ready", "busy"):
+                conn.execute(
+                    """
+                    INSERT INTO aedt_sessions (
+                        session_key, allocation_id, account_name, node_name,
+                        slots_total, state, last_heartbeat_at, started_at,
+                        created_at, updated_at
+                    ) VALUES (?, ?, 'a', 'cpu-01', 3, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"pressure-{state}",
+                        pressured_allocation,
+                        state,
+                        now,
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+        self.request(
+            "replacement-b",
+            allocation_id=replacement_allocation,
+            node="cpu-02",
+        )
+
+        plan = self.service.reconcile(
+            execute=True,
+            excluded_start_accounts={"a"},
+            start_block_reasons={
+                "a": "AEDT session start blocked by the account storage guard"
+            },
+            storage_pressure_accounts={"a"},
+        )
+
+        with self.db.connect() as conn:
+            pressured = conn.execute(
+                """
+                SELECT state, failure_message, drain_requested_at
+                FROM aedt_sessions
+                WHERE allocation_id = ? ORDER BY id
+                """,
+                (pressured_allocation,),
+            ).fetchall()
+        self.assertEqual([row["state"] for row in pressured], ["draining", "busy"])
+        self.assertTrue(
+            all(
+                row["failure_message"] == STORAGE_PRESSURE_DRAIN_REASON
+                for row in pressured
+            )
+        )
+        self.assertTrue(all(row["drain_requested_at"] for row in pressured))
+        starts = self.service.starting_sessions()
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(
+            int(starts[0]["allocation_id"]), replacement_allocation
+        )
+        self.assertEqual(plan["hard_session_count"], 2)
+        self.assertEqual(plan["active_session_count"], 1)
+        self.assertEqual(plan["draining_session_count"], 1)
+        self.assertEqual(plan["storage_pressure_accounts"], ["a"])
+        self.assertEqual(
+            plan["storage_pressure_sessions_drain_requested_this_tick"], 2
+        )
+        self.assertEqual(plan["storage_pressure_draining_session_count"], 1)
+        self.assertEqual(plan["storage_pressure_finishing_session_count"], 1)
+
+    def test_probe_failure_blocks_starts_without_confirming_session_drain(self) -> None:
+        class StorageStatusScheduler(FakeRuntimeScheduler):
+            def __init__(self) -> None:
+                super().__init__()
+                self.accounts = [SimpleNamespace(name="a")]
+                self.confirmed = False
+
+            def account_storage_guard_status(
+                self, _account, *, for_fea: bool = False
+            ) -> tuple[bool, bool]:
+                self.assertTrue(for_fea)
+                return True, self.confirmed
+
+            @staticmethod
+            def assertTrue(value: bool) -> None:
+                if not value:
+                    raise AssertionError("FEA storage status was not requested")
+
+        scheduler = StorageStatusScheduler()
+        runtime = AedtPoolRuntime(self.service, scheduler, interval_seconds=30)
+
+        blocked, pressure = runtime._storage_start_admission()
+        self.assertEqual(set(blocked), {"a"})
+        self.assertEqual(pressure, set())
+
+        scheduler.confirmed = True
+        blocked, pressure = runtime._storage_start_admission()
+        self.assertEqual(set(blocked), {"a"})
+        self.assertEqual(pressure, {"a"})
+
 
 class AedtPreadmissionTests(AedtExactSessionReservationTests):
 
@@ -6090,6 +6215,120 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         final = self.service.get_lease(int(leases[owner_index]["id"]))
         self.assertEqual(final["state"], "active")
         self.assertTrue(final["solve_permit_granted"])
+
+    def test_storage_pressure_gracefully_drains_after_serial_cohort_finishes(
+        self,
+    ) -> None:
+        task_ids = [
+            self.create_pooled_task(f"pressure-serial-{index}")
+            for index in range(3)
+        ]
+        reservations = [
+            self.service.prepare_pooled_task_session(
+                task_id=task_id,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                workload_family="mft",
+                isolation_policy="family",
+            )
+            for task_id in task_ids
+        ]
+        self.assertTrue(all(reservations))
+        self.assertEqual(
+            len({int(item["session_id"]) for item in reservations}), 1
+        )
+
+        leases = []
+        tokens = []
+        for index, task_id in enumerate(task_ids):
+            lease, token = self.request_v2(
+                f"pressure-serial-{index}", task_id=task_id
+            )
+            self.service.accept_lease(int(lease["id"]), token)
+            self.service.activate_lease(int(lease["id"]), token)
+            leases.append(lease)
+            tokens.append(token)
+
+        current = [
+            self.service.get_lease(int(lease["id"])) for lease in leases
+        ]
+        permitted = [
+            index
+            for index, lease in enumerate(current)
+            if lease["solve_permit_granted"]
+        ]
+        waiting = [index for index in range(3) if index not in permitted]
+        self.assertEqual(len(permitted), 1)
+        session_id = int(reservations[0]["session_id"])
+
+        plan = self.service.reconcile(
+            execute=True,
+            excluded_start_accounts={"a"},
+            start_block_reasons={
+                "a": "AEDT session start blocked by the account storage guard"
+            },
+            storage_pressure_accounts={"a"},
+        )
+
+        draining_later = self.service.get_session(session_id)
+        self.assertEqual(draining_later["state"], "busy")
+        self.assertIsNotNone(draining_later["drain_requested_at"])
+        self.assertEqual(
+            draining_later["failure_message"], STORAGE_PRESSURE_DRAIN_REASON
+        )
+        self.assertEqual(plan["storage_pressure_finishing_session_count"], 1)
+        for index in waiting:
+            status = self.service.request_solve_permit(
+                int(leases[index]["id"]), tokens[index]
+            )
+            self.assertEqual(status["state"], "active")
+            self.assertFalse(status["solve_permit_granted"])
+        cohort = self.service.get_exact_session_reservation(
+            str(reservations[0]["reservation_key"])
+        )
+        self.assertEqual({slot["state"] for slot in cohort["slots"]}, {"consumed"})
+
+        owner_index = permitted[0]
+        for next_index in waiting:
+            owner = self.service.get_lease(int(leases[owner_index]["id"]))
+            generation = int(owner["solve_permit_generation"])
+            self.service.complete_native_pipeline(
+                int(owner["id"]),
+                tokens[owner_index],
+                solve_permit_generation=generation,
+            )
+            self.service.cancel_lease(int(owner["id"]), tokens[owner_index])
+            self.service.complete_release(
+                session_id,
+                self.session_tokens[session_id],
+                int(owner["id"]),
+                success=True,
+            )
+            next_owner = self.service.request_solve_permit(
+                int(leases[next_index]["id"]), tokens[next_index]
+            )
+            self.assertTrue(next_owner["solve_permit_granted"])
+            owner_index = next_index
+
+        final_owner = self.service.get_lease(int(leases[owner_index]["id"]))
+        final_generation = int(final_owner["solve_permit_generation"])
+        self.service.complete_native_pipeline(
+            int(final_owner["id"]),
+            tokens[owner_index],
+            solve_permit_generation=final_generation,
+        )
+        self.service.cancel_lease(
+            int(final_owner["id"]), tokens[owner_index]
+        )
+        self.service.complete_release(
+            session_id,
+            self.session_tokens[session_id],
+            int(final_owner["id"]),
+            success=True,
+        )
+
+        drained = self.service.get_session(session_id)
+        self.assertEqual(drained["state"], "draining")
+        self.assertIsNotNone(drained["drain_requested_at"])
 
     def test_unattached_exact_reservations_still_fail_on_parent_drain(self) -> None:
         _packing_session, target = self.sessions
