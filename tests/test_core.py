@@ -7808,6 +7808,344 @@ class SchedulerTests(unittest.TestCase):
             "allocation_state_changed",
         )
 
+    def test_fit_aware_scale_out_replays_plan_then_scans_appended_queue_tail(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=1,
+            total_memory_mb=1024,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="fit-plan-append",
+        )
+        planned_id = self.db.create_task(
+            TaskCreate(
+                "fit-plan-append-planned",
+                "~/case",
+                "run",
+                cpus=1,
+                memory_mb=1,
+                priority=5,
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+        plan_tasks = scheduler.queued_tasks_for_allocation_reservations()
+        reserve_before_append = scheduler.reserve_inflight_capacity_for_task
+        same_priority_id = 0
+        lower_priority_id = 0
+
+        def reserve_while_tasks_append(*args, **kwargs):
+            nonlocal same_priority_id, lower_priority_id
+            allocation = reserve_before_append(*args, **kwargs)
+            if not same_priority_id:
+                same_priority_id = self.db.create_task(
+                    TaskCreate(
+                        "fit-plan-append-same-priority",
+                        "~/case",
+                        "run",
+                        cpus=1,
+                        memory_mb=1,
+                        priority=5,
+                    )
+                )
+                lower_priority_id = self.db.create_task(
+                    TaskCreate(
+                        "fit-plan-append-lower-priority",
+                        "~/case",
+                        "run",
+                        cpus=1,
+                        memory_mb=1,
+                        priority=4,
+                    )
+                )
+            return allocation
+
+        with mock.patch.object(
+            scheduler,
+            "reserve_inflight_capacity_for_task",
+            side_effect=reserve_while_tasks_append,
+        ):
+            plan = scheduler.queued_task_allocation_reservation_plan(plan_tasks)
+        queued_tasks = scheduler.queued_demand_tasks()
+        self.assertEqual(
+            [task["id"] for task in queued_tasks],
+            [planned_id, same_priority_id, lower_priority_id],
+        )
+
+        with mock.patch.object(
+            scheduler,
+            "open_allocation_for_task_record",
+            return_value=None,
+        ), mock.patch.object(
+            scheduler,
+            "reserve_inflight_capacity_for_task",
+            wraps=scheduler.reserve_inflight_capacity_for_task,
+        ) as reserve:
+            opened, blocked = scheduler.open_fit_aware_demand_allocations(
+                queued_tasks,
+                reservation_plan=plan,
+            )
+
+        self.assertEqual(reserve.call_count, 2)
+        self.assertEqual((opened, blocked), (0, True))
+        diagnostics = scheduler.health_status()["demand_reservation_plan"]
+        self.assertEqual(diagnostics["mode"], "prefix")
+        self.assertEqual(diagnostics["replayed_tasks"], 1)
+        self.assertEqual(diagnostics["scanned_tasks"], 2)
+        self.assertEqual(diagnostics["reason"], "queued_tail_appended")
+
+    def test_reservation_plan_rejects_higher_priority_task_inserted_before_prefix(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=2,
+            total_memory_mb=2048,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="fit-plan-front-insert",
+        )
+        planned_id = self.db.create_task(
+            TaskCreate(
+                "fit-plan-front-insert-planned",
+                "~/case",
+                "run",
+                cpus=1,
+                memory_mb=1,
+                priority=5,
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        plan = scheduler.queued_task_allocation_reservation_plan(
+            scheduler.queued_tasks_for_allocation_reservations()
+        )
+        inserted_id = self.db.create_task(
+            TaskCreate(
+                "fit-plan-front-insert-new",
+                "~/case",
+                "run",
+                cpus=1,
+                memory_mb=1,
+                priority=6,
+            )
+        )
+        queued_tasks = scheduler.queued_demand_tasks()
+        self.assertEqual(
+            [task["id"] for task in queued_tasks],
+            [inserted_id, planned_id],
+        )
+        self.assertEqual(
+            scheduler.reservation_plan_state_matches(plan, queued_tasks),
+            (False, "queued_task_inserted_before_plan_prefix"),
+        )
+
+    def test_reservation_plan_rejects_new_task_inserted_inside_priority_order(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=3,
+            total_memory_mb=3072,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="fit-plan-middle-insert",
+        )
+        high_id = self.db.create_task(
+            TaskCreate(
+                "fit-plan-middle-high",
+                "~/case",
+                "run",
+                cpus=1,
+                memory_mb=1,
+                priority=10,
+            )
+        )
+        low_id = self.db.create_task(
+            TaskCreate(
+                "fit-plan-middle-low",
+                "~/case",
+                "run",
+                cpus=1,
+                memory_mb=1,
+                priority=0,
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        plan = scheduler.queued_task_allocation_reservation_plan(
+            scheduler.queued_tasks_for_allocation_reservations()
+        )
+        middle_id = self.db.create_task(
+            TaskCreate(
+                "fit-plan-middle-new",
+                "~/case",
+                "run",
+                cpus=1,
+                memory_mb=1,
+                priority=5,
+            )
+        )
+        queued_tasks = scheduler.queued_demand_tasks()
+        self.assertEqual(
+            [task["id"] for task in queued_tasks],
+            [high_id, middle_id, low_id],
+        )
+        self.assertEqual(
+            scheduler.reservation_plan_state_matches(plan, queued_tasks),
+            (False, "queued_task_inserted_before_plan_prefix"),
+        )
+
+    def test_reservation_plan_rejects_reprioritized_planned_tasks(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=2,
+            total_memory_mb=2048,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="fit-plan-reprioritized",
+        )
+        first_id = self.db.create_task(
+            TaskCreate(
+                "fit-plan-reprioritized-first",
+                "~/case",
+                "run",
+                cpus=1,
+                memory_mb=1,
+                priority=5,
+            )
+        )
+        second_id = self.db.create_task(
+            TaskCreate(
+                "fit-plan-reprioritized-second",
+                "~/case",
+                "run",
+                cpus=1,
+                memory_mb=1,
+                priority=4,
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        plan = scheduler.queued_task_allocation_reservation_plan(
+            scheduler.queued_tasks_for_allocation_reservations()
+        )
+        self.db.update_task(second_id, priority=6)
+        queued_tasks = scheduler.queued_demand_tasks()
+        self.assertEqual(
+            [task["id"] for task in queued_tasks],
+            [second_id, first_id],
+        )
+        self.assertEqual(
+            scheduler.reservation_plan_state_matches(plan, queued_tasks),
+            (False, "queued_task_order_changed"),
+        )
+
+    def test_reservation_plan_rejects_changed_or_removed_planned_prefix(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=2,
+            total_memory_mb=2048,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="fit-plan-prefix-mutation",
+        )
+        first_id = self.db.create_task(
+            TaskCreate("fit-plan-prefix-first", "~/case", "run", cpus=1, memory_mb=1)
+        )
+        second_id = self.db.create_task(
+            TaskCreate("fit-plan-prefix-second", "~/case", "run", cpus=1, memory_mb=1)
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        tasks = scheduler.queued_tasks_for_allocation_reservations()
+        changed_plan = scheduler.queued_task_allocation_reservation_plan(tasks)
+        self.db.update_task(first_id, cpus=2)
+        self.assertEqual(
+            scheduler.reservation_plan_state_matches(
+                changed_plan,
+                scheduler.queued_demand_tasks(),
+            ),
+            (False, "queued_task_changed"),
+        )
+
+        self.db.update_task(first_id, cpus=1)
+        removed_plan = scheduler.queued_task_allocation_reservation_plan(
+            scheduler.queued_tasks_for_allocation_reservations()
+        )
+        self.db.update_task(
+            second_id,
+            status=TaskStatus.CANCELLED.value,
+            finished_at="CURRENT_TIMESTAMP",
+        )
+        self.assertEqual(
+            scheduler.reservation_plan_state_matches(
+                removed_plan,
+                scheduler.queued_demand_tasks(),
+            ),
+            (False, "planned_queued_task_removed"),
+        )
+
+    def test_reservation_plan_rejects_unsorted_appended_input(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=2,
+            total_memory_mb=2048,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="fit-plan-unsorted-tail",
+        )
+        self.db.create_task(
+            TaskCreate(
+                "fit-plan-unsorted-planned",
+                "~/case",
+                "run",
+                cpus=1,
+                memory_mb=1,
+                priority=5,
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        plan = scheduler.queued_task_allocation_reservation_plan(
+            scheduler.queued_tasks_for_allocation_reservations()
+        )
+        self.db.create_task(
+            TaskCreate(
+                "fit-plan-unsorted-new",
+                "~/case",
+                "run",
+                cpus=1,
+                memory_mb=1,
+                priority=4,
+            )
+        )
+        queued_tasks = list(reversed(scheduler.queued_demand_tasks()))
+        self.assertEqual(
+            scheduler.reservation_plan_state_matches(plan, queued_tasks),
+            (False, "queued_task_order_changed"),
+        )
+
     def test_fit_aware_scale_out_replays_reserved_prefix_before_unreserved_tail(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",

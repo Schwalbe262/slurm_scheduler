@@ -123,6 +123,7 @@ class _QueuedTaskAllocationReservationPlan:
     reservations: dict[int, list[int]]
     reserved_task_ids: frozenset[int]
     task_signatures_by_id: dict[int, str]
+    planned_demand_task_ids: tuple[int, ...]
     allocation_signature: tuple[tuple[Any, ...], ...]
     fit_state_signature: tuple[Any, ...]
     steps: tuple[_QueuedTaskAllocationReservationStep, ...]
@@ -7350,13 +7351,22 @@ class Scheduler:
             [
                 task
                 for task in self.db.list_tasks(limit=5000)
-                if task["status"] == TaskStatus.QUEUED.value
-                and not int(task.get("exclusive_node") or 0)
-                and self.task_aedt_backend_admitted(task)
-                and self.task_aedt_backend(task) == AedtBackend.STANDALONE.value
+                if self.task_is_queued_demand(task)
             ],
-            key=lambda item: (-int(item.get("priority") or 0), int(item["id"])),
+            key=self.queued_task_order_key,
         )
+
+    def task_is_queued_demand(self, task: dict) -> bool:
+        return bool(
+            task["status"] == TaskStatus.QUEUED.value
+            and not int(task.get("exclusive_node") or 0)
+            and self.task_aedt_backend_admitted(task)
+            and self.task_aedt_backend(task) == AedtBackend.STANDALONE.value
+        )
+
+    @staticmethod
+    def queued_task_order_key(task: dict) -> tuple[int, int]:
+        return (-int(task.get("priority") or 0), int(task["id"]))
 
     def open_fit_aware_demand_allocations(
         self,
@@ -7532,7 +7542,7 @@ class Scheduler:
                 for task in self.db.list_tasks(limit=5000)
                 if task["status"] == TaskStatus.QUEUED.value
             ],
-            key=lambda item: (-int(item.get("priority") or 0), int(item["id"])),
+            key=self.queued_task_order_key,
         )
 
     def queued_task_allocation_reservation_plan(
@@ -7573,6 +7583,11 @@ class Scheduler:
             int(task["id"]): self._reservation_record_signature(task)
             for task in tasks
         }
+        planned_demand_task_ids = tuple(
+            int(task["id"])
+            for task in tasks
+            if self.task_is_queued_demand(task)
+        )
         return _QueuedTaskAllocationReservationPlan(
             reservations=reservations,
             reserved_task_ids=frozenset(
@@ -7581,6 +7596,7 @@ class Scheduler:
                 for task_id in task_ids
             ),
             task_signatures_by_id=task_signatures_by_id,
+            planned_demand_task_ids=planned_demand_task_ids,
             allocation_signature=allocation_signature,
             fit_state_signature=fit_state_before,
             steps=tuple(steps),
@@ -7588,27 +7604,64 @@ class Scheduler:
             reusable=not changed_while_built,
         )
 
+    def reservation_plan_replay_state(
+        self,
+        plan: _QueuedTaskAllocationReservationPlan,
+        queued_tasks: list[dict],
+    ) -> tuple[int | None, str]:
+        if not plan.reusable:
+            details = ",".join(plan.changed_while_built)
+            return None, f"plan_changed_while_built:{details}"
+        order_keys = [self.queued_task_order_key(task) for task in queued_tasks]
+        if any(left >= right for left, right in zip(order_keys, order_keys[1:])):
+            return None, "queued_task_order_changed"
+        planned_ids = plan.planned_demand_task_ids
+        if len(queued_tasks) < len(planned_ids):
+            return None, "planned_queued_task_removed"
+        for index, task_id in enumerate(planned_ids):
+            task = queued_tasks[index]
+            if int(task["id"]) != task_id:
+                if int(task["id"]) in plan.task_signatures_by_id:
+                    return None, "queued_task_order_changed"
+                return None, "queued_task_inserted_before_plan_prefix"
+            signature = plan.task_signatures_by_id[task_id]
+            if signature != self._reservation_record_signature(task):
+                return None, "queued_task_changed"
+        appended_tasks = queued_tasks[len(planned_ids) :]
+        if any(
+            int(task["id"]) in plan.task_signatures_by_id
+            for task in appended_tasks
+        ):
+            return None, "queued_task_order_changed"
+        if planned_ids and appended_tasks:
+            planned_last_key = self.queued_task_order_key(
+                queued_tasks[len(planned_ids) - 1]
+            )
+            if any(
+                self.queued_task_order_key(task) <= planned_last_key
+                for task in appended_tasks
+            ):
+                return None, "queued_task_inserted_before_plan_prefix"
+        current_allocations = self.current_reservation_allocations()
+        if plan.allocation_signature != self._reservation_allocation_signature(current_allocations):
+            return None, "allocation_state_changed"
+        if plan.fit_state_signature != self._reservation_fit_state_signature():
+            return None, "fit_state_changed"
+        return (
+            len(planned_ids),
+            "queued_tail_appended" if appended_tasks else "",
+        )
+
     def reservation_plan_state_matches(
         self,
         plan: _QueuedTaskAllocationReservationPlan,
         queued_tasks: list[dict],
     ) -> tuple[bool, str]:
-        if not plan.reusable:
-            details = ",".join(plan.changed_while_built)
-            return False, f"plan_changed_while_built:{details}"
-        for task in queued_tasks:
-            task_id = int(task["id"])
-            signature = plan.task_signatures_by_id.get(task_id)
-            if signature is None:
-                return False, "queued_task_not_in_plan"
-            if signature != self._reservation_record_signature(task):
-                return False, "queued_task_changed"
-        current_allocations = self.current_reservation_allocations()
-        if plan.allocation_signature != self._reservation_allocation_signature(current_allocations):
-            return False, "allocation_state_changed"
-        if plan.fit_state_signature != self._reservation_fit_state_signature():
-            return False, "fit_state_changed"
-        return True, ""
+        replayed_tasks, reason = self.reservation_plan_replay_state(
+            plan,
+            queued_tasks,
+        )
+        return replayed_tasks is not None, "" if replayed_tasks is not None else reason
 
     def replay_reservation_plan_prefix(
         self,
@@ -7619,8 +7672,11 @@ class Scheduler:
         # through validation and the cheap direct replay so the certificate
         # cannot be invalidated between its fingerprint check and application.
         with self._task_assignment_lock:
-            matches, reason = self.reservation_plan_state_matches(plan, queued_tasks)
-            if not matches:
+            certified_prefix_length, reason = self.reservation_plan_replay_state(
+                plan,
+                queued_tasks,
+            )
+            if certified_prefix_length is None:
                 return None, 0, reason
             remaining_allocations = self.current_reservation_allocations()
             self.annotate_fea_node_worker_counts(remaining_allocations)
@@ -7632,7 +7688,7 @@ class Scheduler:
             queued_index = 0
             stop_reason = ""
             for step in plan.steps:
-                if queued_index >= len(queued_tasks):
+                if queued_index >= certified_prefix_length:
                     break
                 expected_task_id = int(queued_tasks[queued_index]["id"])
                 if step.task_id != expected_task_id:
@@ -7650,7 +7706,7 @@ class Scheduler:
                     return None, 0, "reserved_allocation_missing"
                 self.apply_inflight_capacity_reservation(allocation, step.effective_task)
                 queued_index += 1
-            if not stop_reason and queued_index != len(queued_tasks):
+            if not stop_reason and queued_index != certified_prefix_length:
                 return None, 0, "reservation_trace_incomplete"
             # Pool leases can change through the control-plane web thread,
             # outside the scheduler assignment lock. Recheck the certificate
@@ -7665,7 +7721,7 @@ class Scheduler:
             return (
                 remaining_allocations,
                 queued_index,
-                stop_reason or "all_tasks_reserved",
+                stop_reason or reason or "all_tasks_reserved",
             )
 
     def reservation_plan_covers_tasks(
