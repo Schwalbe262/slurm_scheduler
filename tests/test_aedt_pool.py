@@ -2715,6 +2715,90 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(plan["hard_session_count"], 2)
         self.assertEqual(len(self.service.starting_sessions()), 1)
 
+    def test_ready_session_on_draining_allocation_is_unavailable_and_replaced(
+        self,
+    ) -> None:
+        self.service.set_operator_limits(
+            max_sessions=2,
+            min_idle_sessions=1,
+            target_projects=4,
+        )
+        session, _host_token = self.start_one_session(self.allocation_id)
+        replacement_allocation_id = self.add_dedicated_allocation(node="cpu-02")
+        self.db.update_allocation(
+            self.allocation_id,
+            state="draining",
+            drain_reason="operator maintenance",
+            drain_at=self.clock.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+        dry_plan = self.service.summary()["plan"]
+
+        self.assertEqual(dry_plan["idle_session_count"], 0)
+        self.assertEqual(dry_plan["unassignable_ready_session_count"], 1)
+        self.assertEqual(dry_plan["unavailable_session_count"], 1)
+        self.assertEqual(dry_plan["warm_spare_deficit"], 1)
+        self.assertEqual(dry_plan["start_needed"], 1)
+        self.assertEqual(
+            [item["allocation_id"] for item in dry_plan["placements"]],
+            [replacement_allocation_id],
+        )
+
+        self.service.reconcile(execute=True)
+
+        draining = self.service.get_session(int(session["id"]))
+        self.assertEqual(draining["state"], "draining")
+        self.assertIsNotNone(draining["drain_requested_at"])
+        starts = self.service.starting_sessions()
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(
+            int(starts[0]["allocation_id"]), replacement_allocation_id
+        )
+
+    def test_busy_session_on_draining_allocation_finishes_in_place(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=1,
+            min_idle_sessions=0,
+            target_projects=2,
+        )
+        lease, _lease_token = self.request(
+            "draining-allocation-busy-owner",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, _host_token = self.start_one_session(self.allocation_id)
+        self.assertEqual(
+            self.service.get_lease(int(lease["id"]))["session_id"],
+            session["id"],
+        )
+        self.assertEqual(
+            self.service.get_session(int(session["id"]))["state"], "busy"
+        )
+
+        self.service.set_operator_limits(
+            max_sessions=2,
+            min_idle_sessions=1,
+            target_projects=4,
+        )
+        replacement_allocation_id = self.add_dedicated_allocation(node="cpu-02")
+        self.db.update_allocation(
+            self.allocation_id,
+            state="draining",
+            drain_reason="operator maintenance",
+            drain_at=self.clock.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+        self.service.reconcile(execute=True)
+
+        preserved = self.service.get_session(int(session["id"]))
+        self.assertEqual(preserved["state"], "busy")
+        self.assertIsNone(preserved["drain_requested_at"])
+        starts = self.service.starting_sessions()
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(
+            int(starts[0]["allocation_id"]), replacement_allocation_id
+        )
+
     def test_reaps_stale_unhealthy_session_and_frees_its_allocation_claim(
         self,
     ) -> None:

@@ -4296,11 +4296,32 @@ class AedtPoolService:
             ).fetchall()
         }
         hard_count = sum(state_counts.get(state, 0) for state in SESSION_COUNTED_STATES)
-        idle_count = state_counts.get("ready", 0)
+        # A Desktop can remain healthy while its parent Slurm allocation is
+        # already draining.  It is not assignable (placement correctly joins
+        # allocations in warm/active), so it must not satisfy the idle-spare
+        # target.  Count it as unavailable until the host drains and a
+        # replacement starts on an assignable allocation.
+        idle_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM aedt_sessions s
+                JOIN allocations a ON a.id = s.allocation_id
+                WHERE s.state = 'ready'
+                  AND a.state IN ('warm','active')
+                  AND s.solve_batch_sealed_at IS NULL
+                  AND s.drain_requested_at IS NULL
+                """
+            ).fetchone()[0]
+        )
+        unassignable_ready_count = max(
+            0, state_counts.get("ready", 0) - idle_count
+        )
         busy_count = state_counts.get("busy", 0)
         unavailable_count = (
             state_counts.get("draining", 0)
             + state_counts.get("unhealthy", 0)
+            + unassignable_ready_count
         )
         live_projects = sum(lease_counts.get(state, 0) for state in LEASE_LIVE_STATES)
         desired_projects = min(config.target_projects, live_projects)
@@ -4408,12 +4429,16 @@ class AedtPoolService:
         idle_drainable = int(
             conn.execute(
                 """
-                SELECT COUNT(*) FROM aedt_sessions
-                WHERE state = 'ready'
-                  AND COALESCE(idle_since, created_at) <= ?
+                SELECT COUNT(*) FROM aedt_sessions s
+                JOIN allocations a ON a.id = s.allocation_id
+                WHERE s.state = 'ready'
+                  AND a.state IN ('warm','active')
+                  AND s.solve_batch_sealed_at IS NULL
+                  AND s.drain_requested_at IS NULL
+                  AND COALESCE(s.idle_since, s.created_at) <= ?
                   AND NOT EXISTS (
                       SELECT 1 FROM aedt_exact_session_reservations r
-                      WHERE r.session_id = aedt_sessions.id
+                      WHERE r.session_id = s.id
                         AND r.state IN ('reserved','claimed')
                   )
                 """,
@@ -4514,6 +4539,7 @@ class AedtPoolService:
             "demand_sessions": demand_sessions,
             "start_needed": start_needed,
             "idle_session_count": idle_count,
+            "unassignable_ready_session_count": unassignable_ready_count,
             "unavailable_session_count": unavailable_count,
             "min_idle_aedt_sessions": config.min_idle_sessions,
             "warm_spare_deficit": warm_spare_deficit,
@@ -5256,6 +5282,26 @@ class AedtPoolService:
                         """,
                         (now, allocation_id),
                     )
+            if execute:
+                # Never advertise an idle Desktop whose parent allocation can
+                # no longer accept scheduler tasks.  Busy owners are left
+                # untouched so in-flight q19/q20 solves finish naturally; the
+                # same rule catches them on a later pass after their final
+                # project releases and the session becomes ready.
+                conn.execute(
+                    """
+                    UPDATE aedt_sessions
+                    SET state = 'draining',
+                        drain_requested_at = COALESCE(drain_requested_at, ?),
+                        updated_at = ?
+                    WHERE state = 'ready'
+                      AND allocation_id IN (
+                          SELECT id FROM allocations
+                          WHERE state NOT IN ('warm','active')
+                      )
+                    """,
+                    (now, now),
+                )
             # Admission placement is deliberately short and shares the same
             # helper used by POST /leases.  Full expiry/scale reconciliation
             # stays on this background tick instead of every HTTP request.
