@@ -802,6 +802,78 @@ class AedtPoolGateTests(AedtPoolTestCase):
             ).fetchone()
         self.assertEqual(str(event["entity_id"]), str(task_id))
 
+    def test_account_selector_never_moves_explicit_or_reserved_demand(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=2,
+            min_idle_sessions=0,
+            target_projects=2,
+            projects_per_session=1,
+        )
+        pinned_task_id = self.db.create_task(
+            TaskCreate(
+                name="explicit-account",
+                remote_cwd="/work",
+                command="true",
+                account_name="pinned-account",
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                aedt_backend="pooled",
+                project="MFT_1MW_2026v1",
+            )
+        )
+        reserved_allocation_id = self.db.create_allocation(
+            account_name="reserved-account",
+            partition="cpu",
+            node_name="cpu-reserved",
+            total_cpus=64,
+            total_memory_mb=512 * 1024,
+        )
+        self.db.update_allocation(
+            reserved_allocation_id,
+            state="active",
+            slurm_job_id="reserved-job",
+            drain_reason="AEDT pool project demand",
+        )
+        reserved_task_id = self.db.create_task(
+            TaskCreate(
+                name="reserved-account",
+                remote_cwd="/work",
+                command="true",
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                aedt_backend="pooled",
+                project="MFT_1MW_2026v1",
+            )
+        )
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET allocation_id = ? WHERE id = ?",
+                (reserved_allocation_id, reserved_task_id),
+            )
+        self.request(
+            "reserved-account",
+            allocation_id=reserved_allocation_id,
+            node="cpu-reserved",
+            task_id=reserved_task_id,
+        )
+        selected_task_ids: list[int] = []
+
+        def selector(task: dict) -> str:
+            selected_task_ids.append(int(task["task_id"]))
+            return "moved-account"
+
+        self.service.set_task_account_selector(selector)
+        plan = self.service.dry_run()
+
+        self.assertEqual(selected_task_ids, [])
+        self.assertEqual(
+            plan["queued_pooled_task_backlog_by_account"],
+            {"pinned-account": 1},
+        )
+        self.assertEqual(
+            plan["demand_sessions_by_account"],
+            {"pinned-account": 1, "reserved-account": 1},
+        )
+        self.assertEqual(self.db.get_task(pinned_task_id)["requested_account_name"], "pinned-account")
+
     def test_reconcile_resolves_warm_admission_before_writer_transaction(
         self,
     ) -> None:
@@ -3577,6 +3649,59 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(history[0]["failure_message"], "failure-34")
         self.assertEqual(history[0]["quarantine_reason"], "solver_timeout-34")
         self.assertEqual(history[-1]["session_key"], "history-5")
+
+    def test_summary_uses_runtime_start_blocks_and_exposes_pending_drain(
+        self,
+    ) -> None:
+        self.service.set_operator_limits(
+            max_sessions=2,
+            min_idle_sessions=0,
+            target_projects=2,
+        )
+        allocation_id = self.add_dedicated_allocation(node="cpu-blocked")
+        self.db.create_task(
+            TaskCreate(
+                name="blocked-demand",
+                remote_cwd="/work",
+                command="true",
+                account_name="blocked-account",
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                aedt_backend="pooled",
+                project="MFT_1MW_2026v1",
+            )
+        )
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO aedt_sessions (
+                    session_key, allocation_id, account_name, node_name,
+                    slots_total, state, drain_requested_at,
+                    created_at, updated_at
+                ) VALUES (
+                    'finishing-storage-drain', ?, 'a', 'cpu-blocked',
+                    2, 'busy', ?, ?, ?
+                )
+                """,
+                (allocation_id, now, now, now),
+            )
+        reason = "AEDT session start blocked by projected storage headroom"
+        self.service.set_runtime_start_block_reasons({"blocked-account": reason})
+
+        summary = self.service.summary()
+
+        self.assertEqual(summary["draining_session_count"], 0)
+        self.assertEqual(summary["drain_requested_session_count"], 1)
+        self.assertEqual(summary["finishing_drain_session_count"], 1)
+        self.assertEqual(
+            summary["plan"]["blocked_start_needed_by_account"],
+            {"blocked-account": 1},
+        )
+        self.assertEqual(
+            summary["plan"]["start_block_reasons_by_account"],
+            {"blocked-account": reason},
+        )
+        self.assertEqual(summary["plan"]["placements"], [])
 
     def test_nonactive_lifecycle_states_are_visible_but_excluded_from_capacity(
         self,

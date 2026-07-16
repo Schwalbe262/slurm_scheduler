@@ -8344,6 +8344,7 @@ class Scheduler:
         env_profile: str = "",
         account_name: str = "",
         require_fea_storage_headroom: bool = False,
+        storage_additional_future_projects: int = 0,
     ) -> AccountConfig | None:
         snapshots_by_name = {snapshot.account_name: snapshot for snapshot in self.snapshots()}
         open_by_account: dict[str, int] = {}
@@ -8366,7 +8367,13 @@ class Scheduler:
                 continue
             if not self.account_supports(account, required_capability, env_profile):
                 continue
-            if require_fea_storage_headroom and self.account_storage_blocked(account, for_fea=True):
+            if require_fea_storage_headroom and self.account_storage_blocked(
+                account,
+                for_fea=True,
+                additional_future_projects=max(
+                    0, int(storage_additional_future_projects or 0)
+                ),
+            ):
                 continue
             snapshot = snapshots_by_name.get(account.name)
             if not snapshot:

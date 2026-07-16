@@ -740,6 +740,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             env_profile=pool_config.env_profile,
             account_name=scheduler.task_requested_account_name(normalized_task),
             require_fea_storage_headroom=True,
+            # Flexible queued demand must be routed only to an account that
+            # can safely reserve the complete Desktop cohort it would cause.
+            # Checking current usage alone can select an account that is safe
+            # for zero new projects but cannot admit the next 3-slot session.
+            storage_additional_future_projects=pool_config.projects_per_session,
         )
         return account.name if account else ""
 

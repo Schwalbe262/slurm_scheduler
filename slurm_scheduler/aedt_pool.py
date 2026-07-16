@@ -517,6 +517,11 @@ class AedtPoolService:
         self._config_cache: AedtPoolConfig | None = None
         self._config_cache_until = 0.0
         self._placement_cursor = 0
+        # The public summary is otherwise a topology-only dry run and can
+        # advertise placements that the runtime has already excluded on a
+        # fresh storage observation.  Cache only the runtime's fail-closed
+        # start exclusions; every adapter tick replaces (and can clear) them.
+        self._runtime_start_block_reasons: dict[str, str] = {}
 
     def set_task_account_selector(
         self, selector: Callable[[dict[str, Any]], str] | None
@@ -524,6 +529,27 @@ class AedtPoolService:
         """Install the scheduler's read-only account choice for pooled demand."""
 
         self._task_account_selector = selector
+
+    def set_runtime_start_block_reasons(
+        self, reasons: dict[str, str] | None
+    ) -> None:
+        """Publish the adapter's latest storage-aware start exclusions.
+
+        This is diagnostic state only.  Reconciliation still receives the
+        same exclusions explicitly and remains the sole mutation path.
+        """
+
+        normalized = {
+            str(account or "").strip(): str(reason or "").strip()
+            for account, reason in (reasons or {}).items()
+            if str(account or "").strip()
+        }
+        with self._config_lock:
+            self._runtime_start_block_reasons = normalized
+
+    def runtime_start_block_reasons(self) -> dict[str, str]:
+        with self._config_lock:
+            return dict(self._runtime_start_block_reasons)
 
     def init(self) -> None:
         with self.db.connect() as conn:
@@ -5878,6 +5904,24 @@ class AedtPoolService:
                 "SELECT state, COUNT(*) AS count FROM aedt_sessions GROUP BY state"
             ).fetchall()
         }
+        drain_requested_session_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM aedt_sessions
+                WHERE state IN ('starting','ready','busy','draining','unhealthy')
+                  AND drain_requested_at IS NOT NULL
+                """
+            ).fetchone()[0]
+        )
+        finishing_drain_session_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM aedt_sessions
+                WHERE state IN ('starting','ready','busy')
+                  AND drain_requested_at IS NOT NULL
+                """
+            ).fetchone()[0]
+        )
         lease_counts = {
             str(row["state"]): int(row["count"])
             for row in conn.execute(
@@ -6647,6 +6691,8 @@ class AedtPoolService:
             "starting_session_count": state_counts.get("starting", 0),
             "draining_session_count": state_counts.get("draining", 0),
             "unhealthy_session_count": state_counts.get("unhealthy", 0),
+            "drain_requested_session_count": drain_requested_session_count,
+            "finishing_drain_session_count": finishing_drain_session_count,
             "active_project_capacity": (
                 active_session_count * config.projects_per_session
             ),
@@ -8005,7 +8051,11 @@ class AedtPoolService:
 
     def summary(self) -> dict[str, Any]:
         config = self.config()
-        plan = self.dry_run()
+        runtime_start_block_reasons = self.runtime_start_block_reasons()
+        plan = self.dry_run(
+            excluded_start_accounts=set(runtime_start_block_reasons),
+            start_block_reasons=runtime_start_block_reasons,
+        )
         latest = self.latest_validation()
         live_state_placeholders = ", ".join("?" for _ in SESSION_VISIBLE_STATES)
         history_state_placeholders = ", ".join("?" for _ in SESSION_HISTORY_STATES)
@@ -8149,6 +8199,12 @@ class AedtPoolService:
             ),
             "unhealthy_session_count": int(
                 plan.get("unhealthy_session_count") or 0
+            ),
+            "drain_requested_session_count": int(
+                plan.get("drain_requested_session_count") or 0
+            ),
+            "finishing_drain_session_count": int(
+                plan.get("finishing_drain_session_count") or 0
             ),
             "latest_validation": latest,
             "sessions": sessions,
@@ -8420,6 +8476,7 @@ class AedtPoolRuntime:
             )
         else:
             start_block_reasons, storage_pressure_accounts = {}, set()
+        self.service.set_runtime_start_block_reasons(start_block_reasons)
         blocked_start_accounts = set(start_block_reasons)
         plan = self.service.reconcile(
             execute=True,

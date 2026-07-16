@@ -11013,6 +11013,36 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(fea_account.name, "b")
         self.assertEqual(standard_account.name, "a")
 
+    def test_flexible_pool_account_selection_reserves_future_session_projects(
+        self,
+    ) -> None:
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            storage_guard_min_free_gb=5.0,
+        )
+        checks: list[tuple[str, bool, int]] = []
+
+        def blocked(account, *, for_fea=False, additional_future_projects=0, **_):
+            checks.append(
+                (account.name, bool(for_fea), int(additional_future_projects))
+            )
+            return account.name == "a" and additional_future_projects == 3
+
+        with mock.patch.object(
+            scheduler, "account_storage_blocked", side_effect=blocked
+        ):
+            selected = scheduler.choose_account_for_allocation(
+                preferred_accounts=["a", "b"],
+                require_fea_storage_headroom=True,
+                storage_additional_future_projects=3,
+            )
+
+        self.assertEqual(selected.name, "b")
+        self.assertEqual(checks, [("a", True, 3), ("b", True, 3)])
+
     def test_fea_attach_capacity_excludes_gpfs_quota_blocked_allocation(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",
