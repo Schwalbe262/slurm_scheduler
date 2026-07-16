@@ -2610,7 +2610,9 @@ class Scheduler:
             return
         self.close_allocation(allocation, f"exclusive task {task['id']} finished")
 
-    def recalculate_allocation_capacity(self) -> None:
+    def recalculate_allocation_capacity(
+        self, allocation_ids: set[int] | None = None
+    ) -> None:
         tasks = self.db.list_tasks_by_statuses(
             [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
         )
@@ -2631,7 +2633,10 @@ class Scheduler:
             stats["reserved_cpus"] += int(task.get("cpus") or 0)
             stats["reserved_mem"] += int(task.get("memory_mb") or 0)
             stats["reserved_gpus"] += int(task.get("gpus") or 0)
+        capacity_rows: list[dict[str, Any]] = []
         for allocation in self.db.list_allocations(limit=500):
+            if allocation_ids is not None and int(allocation["id"]) not in allocation_ids:
+                continue
             if allocation["state"] not in {
                 AllocationStatus.WARM.value,
                 AllocationStatus.ACTIVE.value,
@@ -2648,14 +2653,17 @@ class Scheduler:
             state = allocation["state"]
             if state != AllocationStatus.DRAINING.value:
                 state = AllocationStatus.ACTIVE.value if stats["active_tasks"] else AllocationStatus.WARM.value
-            self.db.update_allocation(
-                allocation["id"],
-                state=state,
-                free_cpus=free_cpus,
-                free_memory_mb=free_mem,
-                free_gpus=free_gpus,
-                last_active_at="CURRENT_TIMESTAMP" if stats["active_tasks"] else allocation.get("last_active_at"),
+            capacity_rows.append(
+                {
+                    "id": int(allocation["id"]),
+                    "state": state,
+                    "free_cpus": free_cpus,
+                    "free_memory_mb": free_mem,
+                    "free_gpus": free_gpus,
+                    "active_tasks": int(stats["active_tasks"]),
+                }
             )
+        self.db.update_allocation_capacities(capacity_rows)
 
     def apply_allocation_lifecycle(self) -> None:
         for allocation in self.db.list_allocations(limit=500):
@@ -3420,7 +3428,7 @@ class Scheduler:
                 return None
             self._license_record_claim_locked(task, attach_token)
             self._record_attach_delta(allocation, task)
-            self.recalculate_allocation_capacity()
+            self.recalculate_allocation_capacity({int(allocation["id"])})
             return {
                 **task,
                 "status": TaskStatus.ATTACHING.value,
@@ -3457,7 +3465,7 @@ class Scheduler:
         ):
             LOGGER.info("attach claim for task %s is no longer active; skipping remote launch", task["id"])
             self._license_release_prelaunch_claim(task)
-            self.recalculate_allocation_capacity()
+            self.recalculate_allocation_capacity({int(allocation["id"])})
             return False
         self._license_mark_launch_started(task)
         try:
@@ -3474,7 +3482,7 @@ class Scheduler:
                 self.on_task_terminal(task, "attach failed")
             else:
                 LOGGER.info("attach failure for task %s ignored; task already transitioned", task["id"])
-            self.recalculate_allocation_capacity()
+            self.recalculate_allocation_capacity({int(allocation["id"])})
             return False
         except Exception as exc:
             if self.db.update_task_if_attach_claim(
@@ -3487,7 +3495,7 @@ class Scheduler:
                 self.on_task_terminal(task, "attach failed")
             else:
                 LOGGER.info("attach failure for task %s ignored; task already transitioned", task["id"])
-            self.recalculate_allocation_capacity()
+            self.recalculate_allocation_capacity({int(allocation["id"])})
             return False
         if not self.db.update_task_if_attach_claim(
             task["id"],
@@ -3505,7 +3513,7 @@ class Scheduler:
                 self._client(account).cancel_task({**task, **result}, self._task_allocation_job_id(task))
             except Exception as exc:
                 LOGGER.warning("failed to cancel raced attach for task %s: %s", task["id"], exc)
-            self.recalculate_allocation_capacity()
+            self.recalculate_allocation_capacity({int(allocation["id"])})
             return False
         self._license_mark_running(task)
         return True
