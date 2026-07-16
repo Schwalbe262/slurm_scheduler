@@ -22,6 +22,7 @@ from slurm_scheduler.aedt_attach_client import (
     AedtLeaseError,
     AedtPoolHttpClient,
     AedtProjectLease,
+    DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS as CLIENT_OUTAGE_SECONDS,
     _keepalive_delay,
     _lease_keepalive_worker,
     acquire_project_lease,
@@ -43,6 +44,7 @@ from slurm_scheduler.aedt_session_host import (
     AedtSessionHost,
     ControlPlaneUnavailable,
     ControlPlaneClient,
+    DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS as HOST_OUTAGE_SECONDS,
     EXPECTED_SESSION_PROFILE_JSON,
     LEGACY_DSO_PROFILE,
     NATIVE_PROBE_DEFERRED_BUSY,
@@ -3709,20 +3711,20 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             self.service.session_commands(int(session["id"]), host_token)["drain"]
         )
 
-    def test_default_liveness_windows_cover_five_minute_control_plane_outage(
+    def test_default_liveness_windows_cover_fifteen_minute_control_plane_outage(
         self,
     ) -> None:
         config = self.service.config()
-        self.assertGreaterEqual(config.lease_ttl_seconds, 360)
-        self.assertGreaterEqual(config.session_heartbeat_timeout_seconds, 360)
+        self.assertGreaterEqual(config.lease_ttl_seconds, 1200)
+        self.assertGreaterEqual(config.session_heartbeat_timeout_seconds, 1200)
         lease, lease_token = self.request(
-            "five-minute-live-work",
+            "fifteen-minute-live-work",
             allocation_id=self.allocation_id,
             node="cpu-01",
         )
         session, host_token = self.start_one_session(self.allocation_id)
 
-        self.clock.advance(300)
+        self.clock.advance(900)
         self.service.reconcile(execute=True)
 
         self.assertIn(
@@ -4766,6 +4768,303 @@ class AttachClientTests(unittest.TestCase):
         self.assertEqual(http.calls, 2)
         self.assertEqual(stop_event.wait_calls, 3)
 
+    def test_lease_create_request_survives_fifteen_minute_outage(self) -> None:
+        clock = RetryClock()
+        attempts = 0
+
+        def request(_method, _path, _payload=None, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            if clock.seconds < 900:
+                clock.seconds += 30
+                raise urllib.error.URLError("relay unavailable")
+            return {"lease": {"id": 1, "state": "queued"}}
+
+        client = AedtPoolHttpClient("http://scheduler")
+        client.request = request
+        with (
+            patch.dict(
+                os.environ,
+                {"AEDT_POOL_CONTROL_PLANE_OUTAGE_SECONDS": ""},
+            ),
+            patch(
+                "slurm_scheduler.aedt_attach_client.time.monotonic",
+                side_effect=clock.monotonic,
+            ),
+            patch(
+                "slurm_scheduler.aedt_attach_client.time.sleep",
+                side_effect=clock.sleep,
+            ),
+            patch(
+                "slurm_scheduler.aedt_attach_client.random.uniform",
+                return_value=0,
+            ),
+        ):
+            response = client.request_with_retry(
+                "POST",
+                "/api/aedt-pool/leases",
+                {"request_key": "mft-case"},
+            )
+
+        self.assertGreaterEqual(clock.seconds, 900)
+        self.assertGreater(attempts, 1)
+        self.assertEqual(response["lease"]["state"], "queued")
+
+    def test_queued_client_survives_fifteen_minute_relay_outage(self) -> None:
+        clock = RetryClock()
+
+        class Http:
+            def __init__(self) -> None:
+                self.attempts = 0
+                self.recovered_calls = 0
+
+            def request(self, _method, _path, _payload=None, **_kwargs):
+                self.attempts += 1
+                if clock.seconds < 900:
+                    # Include a real request's timeout in the outage budget.
+                    clock.seconds += 30
+                    raise urllib.error.URLError("relay unavailable")
+                self.recovered_calls += 1
+                state = "queued" if self.recovered_calls == 1 else "leased"
+                return {
+                    "id": 1,
+                    "state": state,
+                    "endpoint": "cpu-01:50001" if state == "leased" else "",
+                }
+
+        http = Http()
+        with patch.dict(
+            os.environ,
+            {"AEDT_POOL_CONTROL_PLANE_OUTAGE_SECONDS": ""},
+        ):
+            lease = AedtProjectLease(
+                http,
+                1,
+                "token",
+                "mft-project",
+            )
+        lease._keepalive_process = SimpleNamespace(is_alive=lambda: True)
+        with (
+            patch(
+                "slurm_scheduler.aedt_attach_client.time.monotonic",
+                side_effect=clock.monotonic,
+            ),
+            patch(
+                "slurm_scheduler.aedt_attach_client.time.sleep",
+                side_effect=clock.sleep,
+            ),
+            patch(
+                "slurm_scheduler.aedt_attach_client.random.uniform",
+                return_value=0,
+            ),
+        ):
+            status = lease.wait_until_leased(
+                timeout_seconds=1800,
+                heartbeat_seconds=20,
+            )
+        lease._keepalive_process = None
+
+        self.assertGreaterEqual(CLIENT_OUTAGE_SECONDS, 930)
+        self.assertGreaterEqual(clock.seconds, 900)
+        self.assertGreater(http.attempts, 1)
+        self.assertEqual(status["state"], "leased")
+
+    def test_attached_client_heartbeat_survives_fifteen_minute_outage(
+        self,
+    ) -> None:
+        clock = RetryClock()
+
+        class Http:
+            def __init__(self) -> None:
+                self.attempts = 0
+
+            def request(self, _method, _path, _payload=None, **_kwargs):
+                self.attempts += 1
+                if clock.seconds < 900:
+                    clock.seconds += 30
+                    raise http.client.RemoteDisconnected("relay disconnected")
+                return {
+                    "id": 2,
+                    "state": "active",
+                    "endpoint": "cpu-01:50001",
+                }
+
+        control = Http()
+        with patch.dict(
+            os.environ,
+            {"AEDT_POOL_CONTROL_PLANE_OUTAGE_SECONDS": ""},
+        ):
+            lease = AedtProjectLease(
+                control,
+                2,
+                "token",
+                "mft-project",
+                state="active",
+                endpoint="cpu-01:50001",
+            )
+        with (
+            patch(
+                "slurm_scheduler.aedt_attach_client.time.monotonic",
+                side_effect=clock.monotonic,
+            ),
+            patch(
+                "slurm_scheduler.aedt_attach_client.time.sleep",
+                side_effect=clock.sleep,
+            ),
+            patch(
+                "slurm_scheduler.aedt_attach_client.random.uniform",
+                return_value=0,
+            ),
+        ):
+            status = lease.heartbeat()
+
+        self.assertGreaterEqual(clock.seconds, 900)
+        self.assertGreater(control.attempts, 1)
+        self.assertEqual(status["state"], "active")
+        self.assertEqual(lease.heartbeat_error, "")
+
+    def test_client_terminal_http_and_lease_states_fail_without_retry(self) -> None:
+        class TerminalHttp:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def request(self, _method, path, _payload=None, **_kwargs):
+                self.calls += 1
+                raise urllib.error.HTTPError(
+                    path, 403, "Forbidden", None, None
+                )
+
+        terminal_http = TerminalHttp()
+        lease = AedtProjectLease(
+            terminal_http,
+            3,
+            "token",
+            "mft-project",
+            state="active",
+        )
+        with patch("slurm_scheduler.aedt_attach_client.time.sleep") as sleep:
+            with self.assertRaises(urllib.error.HTTPError):
+                lease.heartbeat()
+        self.assertEqual(terminal_http.calls, 1)
+        sleep.assert_not_called()
+
+        class TerminalLease:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def request(self, _method, _path, _payload=None, **_kwargs):
+                self.calls += 1
+                return {
+                    "id": 4,
+                    "state": "failed",
+                    "failure_message": "lease expired",
+                }
+
+        terminal_lease = TerminalLease()
+        lease = AedtProjectLease(
+            terminal_lease,
+            4,
+            "token",
+            "mft-project",
+        )
+        with patch("slurm_scheduler.aedt_attach_client.time.sleep") as sleep:
+            with self.assertRaisesRegex(AedtLeaseError, "lease expired"):
+                lease.wait_until_leased(timeout_seconds=1800)
+        self.assertEqual(terminal_lease.calls, 1)
+        sleep.assert_not_called()
+
+    def test_process_keepalive_spans_fifteen_minute_outage(self) -> None:
+        clock = RetryClock()
+
+        class Http:
+            def __init__(self) -> None:
+                self.attempts = 0
+                self.recovered = False
+
+            def request(self, *_args, **_kwargs):
+                self.attempts += 1
+                if clock.seconds < 900:
+                    clock.seconds += 30
+                    raise urllib.error.URLError("relay unavailable")
+                self.recovered = True
+                return {"state": "active"}
+
+        class StopEvent:
+            def __init__(self, control: Http) -> None:
+                self.control = control
+                self.wait_calls = 0
+
+            def wait(self, timeout) -> bool:
+                self.wait_calls += 1
+                clock.sleep(timeout)
+                return self.control.recovered
+
+            def is_set(self) -> bool:
+                return False
+
+        control = Http()
+        stop_event = StopEvent(control)
+        with (
+            patch(
+                "slurm_scheduler.aedt_attach_client.AedtPoolHttpClient",
+                return_value=control,
+            ),
+            patch(
+                "slurm_scheduler.aedt_attach_client._keepalive_delay",
+                return_value=20,
+            ),
+        ):
+            _lease_keepalive_worker(
+                "http://scheduler",
+                "bootstrap",
+                7,
+                "lease-token",
+                20,
+                stop_event,
+            )
+
+        self.assertTrue(control.recovered)
+        self.assertGreaterEqual(clock.seconds, 900)
+        self.assertGreater(control.attempts, 1)
+
+    def test_process_keepalive_stops_on_terminal_http_error(self) -> None:
+        class Http:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def request(self, _method, path, _payload=None, **_kwargs):
+                self.calls += 1
+                raise urllib.error.HTTPError(path, 410, "Gone", None, None)
+
+        class StopEvent:
+            def __init__(self) -> None:
+                self.wait_calls = 0
+
+            def wait(self, _timeout) -> bool:
+                self.wait_calls += 1
+                return False
+
+            def is_set(self) -> bool:
+                return False
+
+        control = Http()
+        stop_event = StopEvent()
+        with patch(
+            "slurm_scheduler.aedt_attach_client.AedtPoolHttpClient",
+            return_value=control,
+        ):
+            _lease_keepalive_worker(
+                "http://scheduler",
+                "bootstrap",
+                7,
+                "lease-token",
+                20,
+                stop_event,
+            )
+
+        self.assertEqual(control.calls, 1)
+        self.assertEqual(stop_event.wait_calls, 1)
+
     def test_connect_does_not_activate_until_project_is_bound(self) -> None:
         calls: list[tuple[str, str, dict | None]] = []
 
@@ -5687,17 +5986,24 @@ class RetryClock:
 
 
 class FiveMinuteOutageControlPlane(FakeHostControlPlane):
-    def __init__(self, events: list[str], clock: RetryClock) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        clock: RetryClock,
+        *,
+        outage_seconds: float = 300,
+    ) -> None:
         super().__init__(events)
         self.clock = clock
+        self.outage_seconds = float(outage_seconds)
         self.heartbeat_attempts = 0
 
     def request(self, method, path, payload=None, host_token=""):
         if path.endswith("/heartbeat"):
             self.heartbeat_attempts += 1
-            if self.clock.seconds < 300:
+            if self.clock.seconds < self.outage_seconds:
                 # Model the real client's 30-second request timeout, including
-                # a final failed call that straddles relay recovery at t=300.
+                # a final failed call that can straddle relay recovery.
                 self.clock.seconds += 30
                 self.events.append("heartbeat-503")
                 raise urllib.error.HTTPError(
@@ -7417,6 +7723,47 @@ $end 'DSOConfig'
         self.assertGreaterEqual(clock.seconds, 300)
         self.assertEqual(clock.sleeps[:6], [0.5, 1, 2, 4, 8, 10])
         jitter.assert_called()
+        self.assertLess(
+            events.index("heartbeat-recovered"), events.index("desktop-close")
+        )
+
+    def test_session_host_survives_fifteen_minute_relay_outage(self) -> None:
+        events: list[str] = []
+        clock = RetryClock()
+        control = FiveMinuteOutageControlPlane(
+            events,
+            clock,
+            outage_seconds=900,
+        )
+        host = AedtSessionHost(
+            control,
+            allocation_id=1,
+            node_name="cpu-01",
+            heartbeat_seconds=5,
+        )
+        host._start_desktop = lambda: FakeDesktop(events)
+        trust_fake_desktop_liveness(host)
+
+        with (
+            patch(
+                "slurm_scheduler.aedt_session_host.time.monotonic",
+                side_effect=clock.monotonic,
+            ),
+            patch(
+                "slurm_scheduler.aedt_session_host.time.sleep",
+                side_effect=clock.sleep,
+            ),
+            patch(
+                "slurm_scheduler.aedt_session_host.random.uniform",
+                return_value=0,
+            ),
+        ):
+            self.assertEqual(host.run(), 2)
+
+        self.assertGreaterEqual(HOST_OUTAGE_SECONDS, 930)
+        self.assertEqual(host.control_plane_outage_seconds, HOST_OUTAGE_SECONDS)
+        self.assertGreater(control.heartbeat_attempts, 1)
+        self.assertGreaterEqual(clock.seconds, 900)
         self.assertLess(
             events.index("heartbeat-recovered"), events.index("desktop-close")
         )

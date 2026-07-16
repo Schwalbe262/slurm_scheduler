@@ -22,7 +22,9 @@ from typing import Any
 
 from .aedt_automation_lock import SessionAutomationLock
 
-DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS = 360.0
+# Cover a full 15-minute relay outage plus one in-flight 30-second HTTP
+# timeout and bounded retry jitter after the relay becomes reachable again.
+DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS = 1200.0
 CONTROL_PLANE_OUTAGE_ENV = "AEDT_POOL_CONTROL_PLANE_OUTAGE_SECONDS"
 TRANSIENT_HTTP_STATUSES = {408, 425, 429}
 

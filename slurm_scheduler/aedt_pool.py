@@ -291,13 +291,13 @@ DEFAULT_SETTINGS: dict[str, str] = {
     # 32 GiB per project (64 GiB for the validated 1:2 host topology).
     "aedt_pool_project_memory_mb": "32768",
     "aedt_pool_node_cpu_factor": "1.0",
-    # Both defaults exceed the node/client six-minute retry budget so a
-    # five-minute control-plane outage cannot expire otherwise-live work.
-    "aedt_pool_lease_ttl_seconds": "600",
+    # Both defaults exceed the node/client 20-minute retry budget so a
+    # 15-minute control-plane outage cannot expire otherwise-live work.
+    "aedt_pool_lease_ttl_seconds": "1800",
     "aedt_pool_queued_stale_seconds": "90",
     "aedt_pool_offer_ack_seconds": "60",
     "aedt_pool_admission_deadline_seconds": "600",
-    "aedt_pool_session_heartbeat_timeout_seconds": "600",
+    "aedt_pool_session_heartbeat_timeout_seconds": "1800",
     "aedt_pool_unhealthy_recycle_grace_seconds": "180",
     "aedt_pool_session_start_timeout_seconds": "600",
     "aedt_pool_idle_ttl_seconds": "3600",
