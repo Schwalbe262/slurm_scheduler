@@ -8302,8 +8302,21 @@ class AedtPoolRuntime:
                 LOGGER.exception("AEDT pool reconciliation failed")
             self._stop.wait(self.interval_seconds)
 
-    def _storage_start_admission(self) -> tuple[dict[str, str], set[str]]:
-        """Return start blocks and accounts with confirmed quota pressure."""
+    def _storage_start_admission(
+        self,
+        *,
+        additional_future_projects: int = 0,
+    ) -> tuple[dict[str, str], set[str]]:
+        """Return start blocks and accounts with confirmed quota pressure.
+
+        A prospective session reserves all of its project slots only after the
+        reconciler inserts the ``starting`` row.  Check that prospective cost
+        before reconciliation as well, otherwise an account with enough space
+        for its current projects but not the next session is created and failed
+        on every adapter tick.  Only the baseline (already committed) state may
+        confirm pressure and drain healthy sessions; prospective-only pressure
+        blocks the new start without draining existing Desktops.
+        """
 
         status_checker = getattr(
             self.scheduler, "account_storage_guard_status", None
@@ -8322,10 +8335,24 @@ class AedtPoolRuntime:
                 continue
             try:
                 if callable(status_checker):
-                    result = status_checker(account, for_fea=True)
-                    is_blocked = bool(result[0])
-                    is_confirmed_pressure = bool(result[1])
+                    current = status_checker(
+                        account,
+                        for_fea=True,
+                        additional_future_projects=0,
+                    )
+                    prospective = status_checker(
+                        account,
+                        for_fea=True,
+                        additional_future_projects=max(
+                            0, int(additional_future_projects or 0)
+                        ),
+                    )
+                    is_blocked = bool(current[0]) or bool(prospective[0])
+                    is_confirmed_pressure = bool(current[1])
                 else:
+                    # Legacy/test schedulers expose only the boolean helper.
+                    # Production Scheduler exposes the richer status method
+                    # above, including prospective-project accounting.
                     is_blocked = bool(checker(account, for_fea=True))
                     is_confirmed_pressure = False
             except Exception as exc:
@@ -8346,10 +8373,14 @@ class AedtPoolRuntime:
                     confirmed_pressure.add(account_name)
         return blocked, confirmed_pressure
 
-    def _storage_start_block_reasons(self) -> dict[str, str]:
+    def _storage_start_block_reasons(
+        self, *, additional_future_projects: int = 0
+    ) -> dict[str, str]:
         """Compatibility helper returning only AEDT host-start blocks."""
 
-        return self._storage_start_admission()[0]
+        return self._storage_start_admission(
+            additional_future_projects=additional_future_projects
+        )[0]
 
     def tick(self) -> dict[str, Any]:
         config = self.service.config()
@@ -8383,7 +8414,9 @@ class AedtPoolRuntime:
             return plan
         if config.operational:
             start_block_reasons, storage_pressure_accounts = (
-                self._storage_start_admission()
+                self._storage_start_admission(
+                    additional_future_projects=config.projects_per_session
+                )
             )
         else:
             start_block_reasons, storage_pressure_accounts = {}, set()

@@ -5728,12 +5728,21 @@ class AedtRuntimeTests(AedtPoolTestCase):
                 super().__init__()
                 self.accounts = [SimpleNamespace(name="a")]
                 self.confirmed = False
+                self.prospective_checks: list[int] = []
 
             def account_storage_guard_status(
-                self, _account, *, for_fea: bool = False
+                self,
+                _account,
+                *,
+                for_fea: bool = False,
+                additional_future_projects: int = 0,
             ) -> tuple[bool, bool]:
                 self.assertTrue(for_fea)
-                return True, self.confirmed
+                self.prospective_checks.append(additional_future_projects)
+                return (
+                    self.confirmed or additional_future_projects >= 3,
+                    self.confirmed,
+                )
 
             @staticmethod
             def assertTrue(value: bool) -> None:
@@ -5743,14 +5752,21 @@ class AedtRuntimeTests(AedtPoolTestCase):
         scheduler = StorageStatusScheduler()
         runtime = AedtPoolRuntime(self.service, scheduler, interval_seconds=30)
 
-        blocked, pressure = runtime._storage_start_admission()
+        blocked, pressure = runtime._storage_start_admission(
+            additional_future_projects=3
+        )
         self.assertEqual(set(blocked), {"a"})
         self.assertEqual(pressure, set())
+        self.assertEqual(scheduler.prospective_checks, [0, 3])
 
         scheduler.confirmed = True
-        blocked, pressure = runtime._storage_start_admission()
+        scheduler.prospective_checks.clear()
+        blocked, pressure = runtime._storage_start_admission(
+            additional_future_projects=3
+        )
         self.assertEqual(set(blocked), {"a"})
         self.assertEqual(pressure, {"a"})
+        self.assertEqual(scheduler.prospective_checks, [0, 3])
 
 
 class AedtPreadmissionTests(AedtExactSessionReservationTests):
