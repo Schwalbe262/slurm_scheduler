@@ -4391,6 +4391,17 @@ class Scheduler:
                 # Solver load/footprint gates apply to project workers, not to
                 # the control-plane task that starts their Desktop.
                 return 1
+            if self.task_uses_reserved_aedt_pool_capacity(allocation, task):
+                # Exact pooled admission has already reserved one of the three
+                # project slots on a healthy Desktop in this allocation.  The
+                # Slurm allocation itself owns the matching 4-CPU/32-GiB
+                # footprint as part of the complete 13-CPU/96-GiB session
+                # shape.  Reapplying the generic FEA load/ramp gate here double
+                # counts that reservation and can strand ready Desktop slots.
+                # The final transactional claim still revalidates the exact
+                # session generation, profile, heartbeat, allocation and
+                # per-allocation density before any remote launch.
+                return 1
             if allocation.get("state") != AllocationStatus.PENDING.value and not self.fea_allocation_accepts_task(allocation):
                 return 0
             slots = self.fea_max_attach_per_loop
@@ -4578,6 +4589,22 @@ class Scheduler:
             task_id > 0
             and self.task_aedt_backend(task) == AedtBackend.POOLED.value
             and self.db.task_has_auto_aedt_reservation(task_id)
+        )
+
+    def task_uses_reserved_aedt_pool_capacity(
+        self, allocation: dict, task: dict
+    ) -> bool:
+        """Whether an exact pooled client consumes pre-reserved pool capacity.
+
+        This is deliberately narrower than merely using the pooled backend: an
+        automatic exact-session reservation, its requested allocation pin, and
+        a dedicated AEDT allocation must all agree.  The database's atomic
+        queued-to-attaching claim performs the authoritative live validation.
+        """
+
+        return bool(
+            self.allocation_is_dedicated_aedt_pool(allocation)
+            and self.task_can_share_dedicated_aedt_pool(allocation, task)
         )
 
     def task_can_relax_preferred_node(self, task: dict) -> bool:
@@ -5623,7 +5650,9 @@ class Scheduler:
         (total_cpus) * fea_node_requested_cpu_factor. Per-allocation, not
         per-node, so several cpu2 allocations sharing a node each stay bounded to
         their own reservation. None = no cap applicable."""
-        if self.task_is_fea_infra(task):
+        if self.task_is_fea_infra(task) or self.task_uses_reserved_aedt_pool_capacity(
+            allocation, task
+        ):
             return None
         if allocation.get("state") == AllocationStatus.PENDING.value:
             return None
@@ -6055,6 +6084,12 @@ class Scheduler:
                 # Exact AEDT host placement is capacity-controlled by the
                 # pool.  Do not let transient solver load, stale pestat, or a
                 # full project CPU baseline reject its infrastructure launch.
+                return True
+            if self.task_uses_reserved_aedt_pool_capacity(allocation, task):
+                # The exact Desktop/session reservation and complete Slurm
+                # session footprint are the capacity authority for this
+                # client. Generic FEA node pressure is already represented by
+                # the allocation reservation and must not be counted twice.
                 return True
             if include_pending:
                 return True

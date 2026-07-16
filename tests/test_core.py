@@ -8827,6 +8827,73 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(reserved["status"], TaskStatus.ATTACHING.value)
         self.assertEqual(int(reserved["allocation_id"]), allocation_id)
 
+    def test_exact_aedt_project_uses_pre_reserved_session_capacity(self) -> None:
+        allocation_id = self.create_fea_allocation("n-pooled", total_cpus=64)
+        self.db.update_allocation(
+            allocation_id,
+            drain_reason="AEDT pool project demand",
+        )
+        self.create_running_fea_tasks(allocation_id, count=16, cpus=4)
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n-pooled cpu1 mix 64 64 64.0 262144 200000 busy\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            fea_node_requested_cpu_factor=1.0,
+        )
+        task_id = self.db.create_task(
+            TaskCreate(
+                "exact-pooled-project-pressure-regression",
+                "~/pool",
+                "run",
+                account_name="a",
+                cpus=4,
+                memory_mb=6144,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                aedt_backend="pooled",
+                project="MFT_1MW_2026v1",
+                requested_allocation_id=allocation_id,
+            )
+        )
+        task = self.db.get_task(task_id)
+        allocation = self.db.get_allocation(allocation_id)
+
+        self.assertEqual(scheduler.fea_node_cpu_cap_remaining(allocation, task), 0)
+        self.assertEqual(scheduler.fit_slots_for_allocation(allocation, task), 0)
+        self.assertFalse(
+            scheduler.allocation_can_run_task(
+                allocation,
+                task,
+                include_pending=False,
+            )
+        )
+
+        with mock.patch.object(
+            self.db,
+            "task_has_auto_aedt_reservation",
+            return_value=True,
+        ):
+            self.assertTrue(
+                scheduler.task_uses_reserved_aedt_pool_capacity(allocation, task)
+            )
+            self.assertIsNone(
+                scheduler.fea_node_cpu_cap_remaining(allocation, task)
+            )
+            self.assertEqual(scheduler.fit_slots_for_allocation(allocation, task), 1)
+            self.assertTrue(
+                scheduler.allocation_can_run_task(
+                    allocation,
+                    task,
+                    include_pending=False,
+                )
+            )
+
     def test_gpu_fea_is_included_in_allocation_two_x_cpu_cap_and_rebalance(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",
