@@ -68,14 +68,16 @@ HOST_LAUNCH_STAGGER_ENV = "AEDT_POOL_HOST_LAUNCH_STAGGER_SECONDS"
 HEARTBEAT_PERSIST_MAX_SECONDS = 30
 RECONCILE_PLACEMENT_BATCH_SIZE = 32
 
-# A three-project MFT cohort has completed end-to-end on one Desktop while its
-# native Maxwell solves overlapped.  Other workload families have not proved
-# that same native-solver/gRPC concurrency contract.  A sealed Desktop may
-# still contain mixed projects, but the control plane admits their native
-# pipelines in deterministic waves: every MFT sibling can run together, while
-# an unproved family runs one project at a time after the preceding wave has
-# completed its AEDT work and released its projects.
+# Families for which a rolling build may enable concurrent native solves.  The
+# emergency ``serial`` mode ignores this allowlist; ``validated_parallel``
+# restores it without requiring another code rollout.
 PARALLEL_SAFE_NATIVE_SOLVE_FAMILIES = frozenset({"mft"})
+NATIVE_SOLVE_MODE_ENV = "SLURM_AEDT_POOL_NATIVE_SOLVE_MODE"
+NATIVE_SOLVE_MODE_SERIAL = "serial"
+NATIVE_SOLVE_MODE_VALIDATED_PARALLEL = "validated_parallel"
+NATIVE_SOLVE_MODES = frozenset(
+    {NATIVE_SOLVE_MODE_SERIAL, NATIVE_SOLVE_MODE_VALIDATED_PARALLEL}
+)
 
 
 AEDT_POOL_SCHEMA = """
@@ -468,11 +470,29 @@ class AedtPoolService:
         bootstrap_token: str = "",
         lease_client_token: str = "",
         now: Callable[[], datetime] = _utcnow,
+        native_solve_mode: str | None = None,
     ) -> None:
         self.db = db
         self.bootstrap_token = bootstrap_token
         self.lease_client_token = str(lease_client_token or "").strip()
         self._now = now
+        configured_native_solve_mode = str(
+            native_solve_mode
+            if native_solve_mode is not None
+            else os.environ.get(NATIVE_SOLVE_MODE_ENV, NATIVE_SOLVE_MODE_SERIAL)
+        ).strip().lower()
+        if configured_native_solve_mode not in NATIVE_SOLVE_MODES:
+            raise ValueError(
+                f"{NATIVE_SOLVE_MODE_ENV} must be one of "
+                f"{', '.join(sorted(NATIVE_SOLVE_MODES))}"
+            )
+        self.native_solve_mode = configured_native_solve_mode
+        self._parallel_safe_native_solve_families = (
+            PARALLEL_SAFE_NATIVE_SOLVE_FAMILIES
+            if configured_native_solve_mode
+            == NATIVE_SOLVE_MODE_VALIDATED_PARALLEL
+            else frozenset()
+        )
         self._lock = threading.RLock()
         # Reconcile intentionally holds _lock across one control-plane pass.
         # Config cache reads are independent and must not queue every HTTP
@@ -3354,13 +3374,12 @@ class AedtPoolService:
     ) -> bool:
         """Atomically seal one Desktop and grant its next safe solve wave.
 
-        Homogeneous, proven-parallel MFT projects retain the 1:3 concurrent
-        native-solve behavior.  A mixed or otherwise unproved family waits in
-        ``active`` without a permit until every member of the preceding wave
-        has both marked its native pipeline complete and released its project.
-        This prevents a long blocking Maxwell 2D Analyze call from invalidating
-        a sibling Maxwell 3D client's gRPC handle while preserving MFT/MFT
-        overlap on the same Desktop.
+        Every family currently runs one native pipeline at a time.  Remaining
+        leases wait in ``active`` without a permit until the predecessor has
+        both marked its native pipeline complete and released its project.
+        This prevents a long blocking Analyze call from invalidating a sibling
+        client's gRPC handle while retaining parallelism across Desktop
+        sessions.
         """
 
         if session_id <= 0:
@@ -3514,13 +3533,14 @@ class AedtPoolService:
         for row in waiting:
             family = str(row["workload_family"] or "").strip().lower()
             families.setdefault(family, []).append(row)
-        # Prefer the proven-parallel MFT wave so a mixed 2+1 canary preserves
-        # the useful two-way Maxwell 3D overlap before the exclusive motor run.
+        # Keep mixed cohorts deterministic: finish MFT predecessors before the
+        # motor family, but issue only one native permit unless a family is
+        # explicitly restored to the proven-parallel allowlist above.
         selected_family = (
             "mft" if "mft" in families else sorted(families)[0]
         )
         selected = families[selected_family]
-        if selected_family not in PARALLEL_SAFE_NATIVE_SOLVE_FAMILIES:
+        if selected_family not in self._parallel_safe_native_solve_families:
             selected = selected[:1]
 
         generation = int(
@@ -5266,6 +5286,11 @@ class AedtPoolService:
                 {"warm", "active"}, conn=conn
             )
             if str(row.get("node_name") or "").strip()
+            # A recycling/rotation reason can briefly coexist with an active
+            # allocation while state transitions are reconciled.  Never put a
+            # replacement Desktop into that allocation during the gap.
+            and str(row.get("drain_reason") or "")
+            == "AEDT pool project demand"
         ]
 
     @staticmethod
@@ -5316,7 +5341,24 @@ class AedtPoolService:
         )
         return max(0, min(cpu_capacity, memory_capacity))
 
-    def _plan(self, conn: Any, config: AedtPoolConfig) -> dict[str, Any]:
+    def _plan(
+        self,
+        conn: Any,
+        config: AedtPoolConfig,
+        *,
+        excluded_start_accounts: set[str] | None = None,
+        start_block_reasons: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        excluded_start_accounts = {
+            str(account or "").strip()
+            for account in (excluded_start_accounts or set())
+            if str(account or "").strip()
+        }
+        start_block_reasons = {
+            str(account or "").strip(): str(reason or "").strip()
+            for account, reason in (start_block_reasons or {}).items()
+            if str(account or "").strip()
+        }
         state_counts = {
             str(row["state"]): int(row["count"])
             for row in conn.execute(
@@ -5891,6 +5933,18 @@ class AedtPoolService:
         # allocation is already conclusively closed/failed.
         effective_hard_count = max(0, hard_count - dead_parent_session_count)
         global_start_budget = max(0, config.max_sessions - effective_hard_count)
+        blocked_start_needed_by_account = {
+            account: count
+            for account, count in start_needed_by_account.items()
+            if account in excluded_start_accounts and count > 0
+        }
+        if excluded_start_accounts:
+            start_needed_by_account = {
+                account: count
+                for account, count in start_needed_by_account.items()
+                if account not in excluded_start_accounts and count > 0
+            }
+            start_needed = sum(start_needed_by_account.values())
         if start_needed > global_start_budget:
             remaining = dict(start_needed_by_account)
             limited: dict[str, int] = {}
@@ -5927,8 +5981,36 @@ class AedtPoolService:
                 (idle_cutoff,),
             ).fetchone()[0]
         )
-        allocations = self._eligible_allocations(conn=conn)
-        pending_allocations = self._dedicated_allocations({"pending"}, conn=conn)
+        unsafe_allocation_ids = {
+            int(row["allocation_id"])
+            for row in conn.execute(
+                """
+                SELECT DISTINCT allocation_id
+                FROM aedt_sessions
+                WHERE state IN ('starting','ready','busy','draining','unhealthy')
+                  AND (
+                      state IN ('draining','unhealthy')
+                      OR drain_requested_at IS NOT NULL
+                      OR TRIM(COALESCE(quarantine_reason, '')) != ''
+                  )
+                """
+            ).fetchall()
+        }
+        allocations = [
+            allocation
+            for allocation in self._eligible_allocations(conn=conn)
+            if str(allocation.get("account_name") or "")
+            not in excluded_start_accounts
+            and int(allocation["id"]) not in unsafe_allocation_ids
+        ]
+        pending_allocations = [
+            allocation
+            for allocation in self._dedicated_allocations({"pending"}, conn=conn)
+            if str(allocation.get("drain_reason") or "")
+            == "AEDT pool project demand"
+            and str(allocation.get("account_name") or "")
+            not in excluded_start_accounts
+        ]
         current_by_allocation = {
             int(row["allocation_id"]): int(row["count"])
             for row in conn.execute(
@@ -6088,12 +6170,33 @@ class AedtPoolService:
             "active_sessions_by_account": active_sessions_by_account,
             "starting_sessions_by_account": starting_sessions_by_account,
             "start_needed_by_account": start_needed_by_account,
+            "blocked_start_needed": sum(
+                blocked_start_needed_by_account.values()
+            ),
+            "blocked_start_needed_by_account": blocked_start_needed_by_account,
+            "start_block_reasons_by_account": {
+                account: start_block_reasons.get(
+                    account,
+                    "AEDT session starts are temporarily blocked for this account",
+                )
+                for account in sorted(excluded_start_accounts)
+            },
         }
 
-    def dry_run(self) -> dict[str, Any]:
+    def dry_run(
+        self,
+        *,
+        excluded_start_accounts: set[str] | None = None,
+        start_block_reasons: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         config = self.config()
         with self.db.connect() as conn:
-            return self._plan(conn, config)
+            return self._plan(
+                conn,
+                config,
+                excluded_start_accounts=excluded_start_accounts,
+                start_block_reasons=start_block_reasons,
+            )
 
     @staticmethod
     def _lease_fits_session(
@@ -6483,7 +6586,13 @@ class AedtPoolService:
             placed += 1
         return placed
 
-    def reconcile(self, *, execute: bool) -> dict[str, Any]:
+    def reconcile(
+        self,
+        *,
+        execute: bool,
+        excluded_start_accounts: set[str] | None = None,
+        start_block_reasons: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         """Reap stale ownership, assign leases, and scale only when gated.
 
         `execute=True` still cannot open a session unless enabled, validated,
@@ -6491,11 +6600,91 @@ class AedtPoolService:
         before the pooled backend is approved.
         """
         config = self.config()
+        excluded_start_accounts = {
+            str(account or "").strip()
+            for account in (excluded_start_accounts or set())
+            if str(account or "").strip()
+        }
+        start_block_reasons = {
+            str(account or "").strip(): str(reason or "").strip()
+            for account, reason in (start_block_reasons or {}).items()
+            if str(account or "").strip()
+        }
         now_dt = self._now()
         now = _sql_time(now_dt)
         with self._lock, self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._refresh_exact_session_reservations(conn, now)
+
+            if execute and config.operational and excluded_start_accounts:
+                # A storage-blocked account cannot launch its host task.  Retire
+                # only starts that no host has acquired; otherwise every tick
+                # creates another starting row and another doomed host task.
+                # ATTACHING/RUNNING hosts are deliberately left alone so a
+                # transient quota probe never kills a Desktop already starting.
+                for account_name in sorted(excluded_start_accounts):
+                    blocked_starts = conn.execute(
+                        """
+                        SELECT s.id
+                        FROM aedt_sessions s
+                        JOIN allocations a ON a.id = s.allocation_id
+                        WHERE s.state = 'starting'
+                          AND s.host_id = ''
+                          AND a.account_name = ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM tasks active_host
+                              WHERE (
+                                  active_host.id = s.host_task_id
+                                  OR active_host.dedupe_key =
+                                     'aedt-session-host:' || s.id
+                              )
+                                AND active_host.status IN ('attaching','running')
+                          )
+                        ORDER BY s.id
+                        """,
+                        (account_name,),
+                    ).fetchall()
+                    reason = start_block_reasons.get(
+                        account_name,
+                        "AEDT session start blocked by account storage guard",
+                    )
+                    for row in blocked_starts:
+                        session_id = int(row["id"])
+                        conn.execute(
+                            """
+                            UPDATE tasks
+                            SET status = 'cancelled', failure_message = ?,
+                                finished_at = ?, updated_at = ?
+                            WHERE status = 'queued'
+                              AND project = '_aedt_pool_hosts'
+                              AND (
+                                  id = (
+                                      SELECT host_task_id FROM aedt_sessions
+                                      WHERE id = ?
+                                  )
+                                  OR dedupe_key = 'aedt-session-host:' || ?
+                              )
+                            """,
+                            (reason, now, now, session_id, session_id),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE aedt_sessions
+                            SET state = 'failed', failure_message = ?,
+                                closed_at = ?, updated_at = ?
+                            WHERE id = ? AND state = 'starting' AND host_id = ''
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM tasks active_host
+                                  WHERE (
+                                      active_host.id = aedt_sessions.host_task_id
+                                      OR active_host.dedupe_key =
+                                         'aedt-session-host:' || aedt_sessions.id
+                                  )
+                                    AND active_host.status IN ('attaching','running')
+                              )
+                            """,
+                            (reason, now, now, session_id),
+                        )
 
             if execute and config.allocation_max_age_seconds:
                 allocation_age_cutoff = _sql_time(
@@ -7037,7 +7226,12 @@ class AedtPoolService:
                     refresh_reservations=False,
                 )
 
-            plan = self._plan(conn, config)
+            plan = self._plan(
+                conn,
+                config,
+                excluded_start_accounts=excluded_start_accounts,
+                start_block_reasons=start_block_reasons,
+            )
             if execute and config.operational:
                 for account_name, count in sorted(
                     (plan.get("rebalance_drains_by_account") or {}).items()
@@ -7121,7 +7315,12 @@ class AedtPoolService:
                             now,
                         ),
                     )
-                plan = self._plan(conn, config)
+                plan = self._plan(
+                    conn,
+                    config,
+                    excluded_start_accounts=excluded_start_accounts,
+                    start_block_reasons=start_block_reasons,
+                )
             plan["operational"] = config.operational
             plan["executed"] = bool(execute and config.operational)
             return plan
@@ -7421,6 +7620,36 @@ class AedtPoolRuntime:
                 LOGGER.exception("AEDT pool reconciliation failed")
             self._stop.wait(self.interval_seconds)
 
+    def _storage_start_block_reasons(self) -> dict[str, str]:
+        """Return accounts on which a new AEDT host must not be launched."""
+
+        checker = getattr(self.scheduler, "account_storage_blocked", None)
+        accounts = list(getattr(self.scheduler, "accounts", ()) or ())
+        if not callable(checker) or not accounts:
+            return {}
+        blocked: dict[str, str] = {}
+        for account in accounts:
+            account_name = str(getattr(account, "name", "") or "").strip()
+            if not account_name:
+                continue
+            try:
+                is_blocked = bool(checker(account, for_fea=True))
+            except Exception as exc:
+                LOGGER.exception(
+                    "AEDT pool storage admission check failed for %s",
+                    account_name,
+                )
+                blocked[account_name] = (
+                    "AEDT session start blocked because the account storage "
+                    f"admission check failed: {exc}"
+                )
+                continue
+            if is_blocked:
+                blocked[account_name] = (
+                    "AEDT session start blocked by the account storage guard"
+                )
+        return blocked
+
     def tick(self) -> dict[str, Any]:
         config = self.service.config()
         control_plane_url = self._control_plane_url(config)
@@ -7451,7 +7680,15 @@ class AedtPoolRuntime:
                 }
             )
             return plan
-        plan = self.service.reconcile(execute=True)
+        start_block_reasons = (
+            self._storage_start_block_reasons() if config.operational else {}
+        )
+        blocked_start_accounts = set(start_block_reasons)
+        plan = self.service.reconcile(
+            execute=True,
+            excluded_start_accounts=blocked_start_accounts,
+            start_block_reasons=start_block_reasons,
+        )
         if self.require_published_control_plane_url:
             plan["control_plane_ready"] = True
             plan["control_plane_error"] = ""
@@ -7506,6 +7743,11 @@ class AedtPoolRuntime:
                 requested_cpus=(
                     1 + config.project_cpus * config.projects_per_session
                 ),
+                # cpu2 nodes expose 256 CPUs while each scheduler allocation
+                # owns 64. Allow four exact 64-CPU AEDT allocations to share
+                # such a physical node; aggregate Slurm/DB CPU reservations
+                # remain the hard capacity boundary.
+                aedt_pool_node_sharing=True,
                 require_fea_eligible_node=True,
                 # Desktop hosts are CPU-pool infrastructure.  Generic CPU work
                 # may borrow idle GPU nodes, but the long-lived AEDT pool must
@@ -7527,7 +7769,9 @@ class AedtPoolRuntime:
             plan["host_tasks_started"] = 0
         else:
             plan["host_tasks_started"] = self._ensure_session_hosts(
-                config, control_plane_url=control_plane_url
+                config,
+                control_plane_url=control_plane_url,
+                blocked_start_accounts=blocked_start_accounts,
             )
         plan["empty_allocations_closed"] = self._close_empty_dedicated_allocations()
         return plan
@@ -7594,6 +7838,7 @@ class AedtPoolRuntime:
         config: AedtPoolConfig,
         *,
         control_plane_url: str | None = None,
+        blocked_start_accounts: set[str] | None = None,
     ) -> int:
         scheduler_url = (
             self._control_plane_url(config)
@@ -7608,6 +7853,11 @@ class AedtPoolRuntime:
         ):
             return 0
         started = 0
+        blocked_start_accounts = {
+            str(account or "").strip()
+            for account in (blocked_start_accounts or set())
+            if str(account or "").strip()
+        }
         launches_by_allocation: dict[int, int] = {}
         for session in self.service.starting_sessions():
             if str(session.get("host_id") or ""):
@@ -7617,7 +7867,28 @@ class AedtPoolRuntime:
                 continue
             allocation_id = int(session["allocation_id"])
             allocation = self.service.db.get_allocation(allocation_id)
-            if not allocation or allocation.get("state") not in {"warm", "active"}:
+            if not allocation:
+                self.service.fail_unclaimed_session_start(
+                    int(session["id"]),
+                    "dedicated AEDT allocation no longer exists",
+                )
+                continue
+            allocation_account = str(allocation.get("account_name") or "")
+            if allocation_account in blocked_start_accounts:
+                self.service.fail_unclaimed_session_start(
+                    int(session["id"]),
+                    "AEDT session start blocked by the account storage guard",
+                )
+                continue
+            if (
+                allocation.get("state") not in {"warm", "active"}
+                or str(allocation.get("drain_reason") or "")
+                != "AEDT pool project demand"
+            ):
+                self.service.fail_unclaimed_session_start(
+                    int(session["id"]),
+                    "dedicated AEDT allocation is not eligible for a new host",
+                )
                 continue
             allocation_launch_index = launches_by_allocation.get(allocation_id, 0)
             launch_delay_seconds = (

@@ -587,6 +587,23 @@ class AedtPoolGateTests(AedtPoolTestCase):
         self.assertFalse(config.operational)
         self.assertEqual(self.service.summary()["sessions"], [])
 
+    def test_native_solve_serial_stop_loss_has_validated_parallel_mode(self) -> None:
+        self.assertEqual(self.service.native_solve_mode, "serial")
+        self.assertEqual(self.service._parallel_safe_native_solve_families, frozenset())
+
+        validated = AedtPoolService(
+            self.db,
+            bootstrap_token="secret",
+            native_solve_mode="validated_parallel",
+        )
+        self.assertEqual(validated.native_solve_mode, "validated_parallel")
+        self.assertEqual(
+            validated._parallel_safe_native_solve_families,
+            frozenset({"mft"}),
+        )
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            AedtPoolService(self.db, native_solve_mode="unsafe")
+
     def test_legacy_operator_limit_derives_project_target(self) -> None:
         config = self.service.set_operator_limit(250)
         self.assertEqual(config.max_sessions, 250)
@@ -1407,13 +1424,11 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
             tokens,
         )
 
-    def test_native_pipeline_barrier_waits_for_exact_sealed_cohort(self) -> None:
+    def test_native_pipeline_permits_are_serial_until_predecessor_release(self) -> None:
         leases, tokens = self.activate_exact_cohort()
         generation = int(leases[0]["solve_permit_generation"])
         self.assertGreater(generation, 0)
-        self.assertEqual(
-            int(leases[1]["solve_permit_generation"]), generation
-        )
+        self.assertFalse(leases[1]["solve_permit_granted"])
         self.assertFalse(leases[2]["solve_permit_granted"])
 
         first = self.service.complete_native_pipeline(
@@ -1423,8 +1438,8 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         )
         self.assertTrue(first["native_pipeline_completed"])
         self.assertEqual(first["native_pipeline_completed_count"], 1)
-        self.assertEqual(first["native_pipeline_expected_count"], 2)
-        self.assertFalse(first["native_pipeline_barrier_granted"])
+        self.assertEqual(first["native_pipeline_expected_count"], 1)
+        self.assertTrue(first["native_pipeline_barrier_granted"])
         first_completed_at = first["native_pipeline_completed_at"]
 
         self.clock.advance(5)
@@ -1436,22 +1451,12 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         self.assertEqual(
             replay["native_pipeline_completed_at"], first_completed_at
         )
-        second = self.service.complete_native_pipeline(
-            int(leases[1]["id"]),
-            tokens[1],
-            solve_permit_generation=generation,
+        waiting = self.service.request_solve_permit(
+            int(leases[1]["id"]), tokens[1]
         )
-        self.assertEqual(second["native_pipeline_completed_count"], 2)
-        self.assertTrue(second["native_pipeline_barrier_granted"])
-        self.assertTrue(
-            self.service.lease_status(
-                int(leases[0]["id"]), tokens[0]
-            )["native_pipeline_barrier_granted"]
-        )
+        self.assertFalse(waiting["solve_permit_granted"])
 
-        # The mixed IPMSM project remains active but cannot enter its native
-        # Analyze while either MFT project can still issue AEDT postprocessing
-        # calls.  Only two successful project-close ACKs open generation 2.
+        generations = [generation]
         for index in (0, 1):
             releasing = self.service.cancel_lease(
                 int(leases[index]["id"]), tokens[index]
@@ -1463,26 +1468,28 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
                 int(leases[index]["id"]),
                 success=True,
             )
-            waiting = self.service.request_solve_permit(
-                int(leases[2]["id"]), tokens[2]
+            next_index = index + 1
+            permitted = self.service.request_solve_permit(
+                int(leases[next_index]["id"]), tokens[next_index]
             )
-            if index == 0:
-                self.assertFalse(waiting["solve_permit_granted"])
+            self.assertTrue(permitted["solve_permit_granted"])
+            next_generation = int(permitted["solve_permit_generation"])
+            self.assertGreater(next_generation, generations[-1])
+            generations.append(next_generation)
+            completed = self.service.complete_native_pipeline(
+                int(leases[next_index]["id"]),
+                tokens[next_index],
+                solve_permit_generation=next_generation,
+            )
+            self.assertEqual(completed["native_pipeline_expected_count"], 1)
+            self.assertTrue(completed["native_pipeline_barrier_granted"])
 
         motor = self.service.request_solve_permit(
             int(leases[2]["id"]), tokens[2]
         )
         self.assertTrue(motor["solve_permit_granted"])
         motor_generation = int(motor["solve_permit_generation"])
-        self.assertGreater(motor_generation, generation)
-        third = self.service.complete_native_pipeline(
-            int(leases[2]["id"]),
-            tokens[2],
-            solve_permit_generation=motor_generation,
-        )
-        self.assertEqual(third["native_pipeline_completed_count"], 1)
-        self.assertEqual(third["native_pipeline_expected_count"], 1)
-        self.assertTrue(third["native_pipeline_barrier_granted"])
+        self.assertEqual(motor_generation, generations[-1])
 
         with self.assertRaisesRegex(ValueError, "generation mismatch"):
             self.service.complete_native_pipeline(
@@ -1494,14 +1501,9 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
     def test_native_pipeline_barrier_breaks_if_unmarked_member_exits(self) -> None:
         leases, tokens = self.activate_exact_cohort()
         generation = int(leases[0]["solve_permit_generation"])
-        self.service.complete_native_pipeline(
+        cancelled = self.service.cancel_lease(
             int(leases[0]["id"]),
             tokens[0],
-            solve_permit_generation=generation,
-        )
-        cancelled = self.service.cancel_lease(
-            int(leases[1]["id"]),
-            tokens[1],
             reason="native pipeline member failed",
         )
         self.assertEqual(cancelled["state"], "releasing")
@@ -1510,18 +1512,11 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         )
         self.assertFalse(waiting["native_pipeline_barrier_granted"])
         self.assertTrue(waiting["native_pipeline_barrier_broken"])
-        self.assertEqual(waiting["native_pipeline_expected_count"], 2)
+        self.assertEqual(waiting["native_pipeline_expected_count"], 1)
 
-        # Even after both MFT projects are physically closed, an unmarked
-        # predecessor must never authorize the waiting motor wave on a
+        # Even after the permitted MFT project is physically closed, an
+        # unmarked predecessor must never authorize the next waiting wave on a
         # potentially contaminated Desktop.
-        self.service.complete_release(
-            int(self.session["id"]),
-            self.host_token,
-            int(leases[1]["id"]),
-            success=True,
-        )
-        self.service.cancel_lease(int(leases[0]["id"]), tokens[0])
         self.service.complete_release(
             int(self.session["id"]),
             self.host_token,
@@ -1529,7 +1524,7 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
             success=True,
         )
         refused = self.service.request_solve_permit(
-            int(leases[2]["id"]), tokens[2]
+            int(leases[1]["id"]), tokens[1]
         )
         self.assertFalse(refused["solve_permit_granted"])
         self.assertEqual(refused["state"], "releasing")
@@ -1585,19 +1580,15 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         motor_waiting = [
             lease for lease in permitted if lease["workload_family"] == "ipmsm"
         ]
-        self.assertTrue(
-            all(lease["solve_permit_granted"] for lease in mft_permitted)
+        self.assertEqual(
+            sum(bool(lease["solve_permit_granted"]) for lease in mft_permitted),
+            1,
         )
         self.assertEqual(len(motor_waiting), 1)
         self.assertFalse(motor_waiting[0]["solve_permit_granted"])
         self.assertEqual(
-            len(
-                {
-                    int(lease["solve_permit_generation"])
-                    for lease in mft_permitted
-                }
-            ),
-            1,
+            sorted(int(lease["solve_permit_generation"]) for lease in mft_permitted),
+            [0, 1],
         )
         self.assertTrue(
             self.service.get_session(int(self.session["id"]))[
@@ -2624,7 +2615,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         )
         self.assertEqual(released["state"], "released")
 
-    def test_full_active_batch_gets_one_atomic_solve_permit_generation(self) -> None:
+    def test_full_active_batch_serializes_native_solve_permit_generations(self) -> None:
         # Exercise the production ceiling, not only the historical 1:2 default.
         self.service.set_enabled(False)
         self.service.set_operator_limits(projects_per_session=3)
@@ -2642,7 +2633,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             )
             for index in range(3)
         ]
-        session, _host_token = self.start_one_session(self.allocation_id)
+        session, host_token = self.start_one_session(self.allocation_id)
         self.assertEqual(int(session["slots_total"]), 3)
         active_statuses = []
         for index, (lease, token) in enumerate(leases):
@@ -2663,17 +2654,39 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             self.service.lease_status(int(lease["id"]), token)
             for lease, token in leases
         ]
-        self.assertTrue(all(item["solve_permit_granted"] for item in permitted))
-        generations = {
-            int(item["solve_permit_generation"])
-            for item in permitted
-        }
-        self.assertEqual(len(generations), 1)
-        self.assertGreater(next(iter(generations)), 0)
-        self.assertTrue(active_statuses[-1]["solve_permit_granted"])
+        self.assertEqual(
+            [bool(item["solve_permit_granted"]) for item in permitted],
+            [True, False, False],
+        )
+        self.assertFalse(active_statuses[-1]["solve_permit_granted"])
         self.assertTrue(
             self.service.get_session(int(session["id"]))["solve_batch_sealed_at"]
         )
+
+        generations = []
+        for index, (lease, token) in enumerate(leases):
+            current = self.service.request_solve_permit(int(lease["id"]), token)
+            self.assertTrue(current["solve_permit_granted"])
+            generation = int(current["solve_permit_generation"])
+            self.assertGreater(generation, generations[-1] if generations else 0)
+            generations.append(generation)
+            self.service.complete_native_pipeline(
+                int(lease["id"]),
+                token,
+                solve_permit_generation=generation,
+            )
+            self.service.cancel_lease(int(lease["id"]), token)
+            self.service.complete_release(
+                int(session["id"]),
+                host_token,
+                int(lease["id"]),
+                success=True,
+            )
+            if index + 1 < len(leases):
+                waiting = self.service.get_lease(int(leases[index + 1][0]["id"]))
+                self.assertFalse(waiting["solve_permit_granted"])
+
+        self.assertEqual(generations, [1, 2, 3])
 
     def test_underfilled_solve_permit_seals_session_against_late_attach(self) -> None:
         first, first_token = self.service.request_lease(
@@ -3420,7 +3433,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(plan["warm_spare_starts_authorized"], 0)
         self.assertIn("license capacity exhausted", plan["warm_spare_status_reason"])
 
-    def test_min_idle_session_replaces_unhealthy_owner_below_ceiling(self) -> None:
+    def test_min_idle_session_does_not_replace_on_unsafe_allocation(self) -> None:
         self.service.set_operator_limits(
             max_sessions=2,
             min_idle_sessions=1,
@@ -3441,8 +3454,9 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
 
         plan = self.service.summary()["plan"]
         self.assertEqual(plan["unavailable_session_count"], 1)
-        self.assertEqual(plan["hard_session_count"], 2)
-        self.assertEqual(len(self.service.starting_sessions()), 1)
+        self.assertEqual(plan["hard_session_count"], 1)
+        self.assertEqual(self.service.starting_sessions(), [])
+        self.assertEqual(plan["node_requests"], 1)
 
     def test_ready_session_on_draining_allocation_is_unavailable_and_replaced(
         self,
@@ -4937,7 +4951,7 @@ class AedtExactSessionReservationTests(AedtPoolTestCase):
         self.assertEqual(current["state"], "failed")
         self.assertIn("AEDT exited during cleanup", current["failure_message"])
 
-    def test_underfilled_solve_fallback_waits_for_every_exact_reserved_peer(
+    def test_underfilled_solve_fallback_waits_for_peers_then_grants_one_serial_permit(
         self,
     ) -> None:
         _packing_session, target = self.sessions
@@ -4960,10 +4974,12 @@ class AedtExactSessionReservationTests(AedtPoolTestCase):
             self.service.accept_lease(int(lease["id"]), token)
             self.service.activate_lease(int(lease["id"]), token)
 
+        granted = []
         for lease, _token in leases:
             current = self.service.get_lease(int(lease["id"]))
-            self.assertTrue(current["solve_permit_granted"])
+            granted.append(bool(current["solve_permit_granted"]))
             self.assertEqual(int(current["session_id"]), int(target["id"]))
+        self.assertEqual(granted, [True, False, False])
 
     def test_unconsumed_exact_reservation_protects_target_from_idle_drain(
         self,
@@ -5203,6 +5219,68 @@ class AedtRuntimeTests(AedtPoolTestCase):
             all(int(task["memory_mb"]) >= 64 * 1024 for task in scheduler.host_tasks)
         )
         self.assertTrue(all(int(task["priority"]) == 10 for task in scheduler.host_tasks))
+
+    def test_storage_blocked_account_retires_unclaimed_start_without_churn(
+        self,
+    ) -> None:
+        self.add_dedicated_allocation()
+        self.make_operational()
+        self.request("storage-blocked-start")
+        self.service.reconcile(execute=True)
+        self.assertEqual(len(self.service.starting_sessions()), 1)
+
+        class StorageBlockedScheduler(FakeHostLaunchScheduler):
+            def __init__(self) -> None:
+                super().__init__()
+                self.accounts = [SimpleNamespace(name="a")]
+
+            @staticmethod
+            def account_storage_blocked(_account, *, for_fea: bool = False) -> bool:
+                return bool(for_fea)
+
+            @staticmethod
+            def close_empty_aedt_pool_allocation(_allocation_id: int) -> bool:
+                return False
+
+        scheduler = StorageBlockedScheduler()
+        runtime = AedtPoolRuntime(
+            self.service,
+            scheduler,
+            interval_seconds=30,
+            scheduler_url="http://scheduler:8000",
+            host_remote_cwd="/work/aedt",
+            host_bootstrap_token_file="/shared/aedt-token",
+        )
+
+        first = runtime.tick()
+        second = runtime.tick()
+
+        self.assertEqual(first["blocked_start_needed_by_account"], {"a": 1})
+        self.assertEqual(first["node_requests"], 0)
+        self.assertEqual(second["node_requests"], 0)
+        self.assertEqual(self.service.starting_sessions(), [])
+        self.assertEqual(scheduler.open_calls, [])
+        self.assertEqual(scheduler.host_tasks, [])
+        with self.db.connect() as conn:
+            failed_starts = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM aedt_sessions
+                    WHERE state = 'failed'
+                      AND failure_message LIKE '%storage guard%'
+                    """
+                ).fetchone()[0]
+            )
+            host_tasks = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM tasks
+                    WHERE project = '_aedt_pool_hosts'
+                    """
+                ).fetchone()[0]
+            )
+        self.assertEqual(failed_starts, 1)
+        self.assertEqual(host_tasks, 0)
 
 
 class AedtPreadmissionTests(AedtExactSessionReservationTests):
@@ -5621,7 +5699,7 @@ class AedtRuntimeCapacityTests(AedtPoolTestCase):
         self.assertEqual(len(sessions), 3)
         self.assertTrue(all(int(session["slots_total"]) == 3 for session in sessions))
 
-    def test_node_request_uses_one_complete_session_as_scheduler_shape_floor(self) -> None:
+    def test_node_request_uses_complete_session_floor_and_aedt_node_sharing(self) -> None:
         self.service.set_operator_limits(projects_per_session=3)
         self.make_operational()
         self.request("needs-node")
@@ -5634,7 +5712,8 @@ class AedtRuntimeCapacityTests(AedtPoolTestCase):
             fake.open_calls[0]["requested_cpus"],
             1 + config.project_cpus * config.projects_per_session,
         )
-        self.assertEqual(fake.open_calls[0]["requested_cpus"], 13)
+        self.assertTrue(fake.open_calls[0]["aedt_pool_node_sharing"])
+        self.assertFalse(fake.open_calls[0].get("exclusive_node", False))
         self.assertTrue(fake.open_calls[0]["cpu_only_nodes"])
         self.assertLessEqual(self.service.config().node_cpu_factor, 2.0)
 
@@ -5677,7 +5756,12 @@ class AedtRuntimeCapacityTests(AedtPoolTestCase):
             def open_allocation_record(self, reason: str, **kwargs):
                 self.open_calls.append({"reason": reason, **kwargs})
                 allocation_id = self.db.create_allocation(
-                    "a", "cpu", "cpu-pending", kwargs["requested_cpus"], 512 * 1024
+                    "a",
+                    "cpu",
+                    "cpu-pending",
+                    kwargs["requested_cpus"],
+                    512 * 1024,
+                    exclusive_node=bool(kwargs.get("exclusive_node")),
                 )
                 self.db.update_allocation(
                     allocation_id,

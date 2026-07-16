@@ -4549,6 +4549,37 @@ class Scheduler:
         floor(64/4)=16 solver budget."""
         return str(task.get("project") or "").strip() == "_aedt_pool_hosts"
 
+    @staticmethod
+    def allocation_is_dedicated_aedt_pool(allocation: dict) -> bool:
+        """Return whether an allocation is logically owned by the AEDT pool.
+
+        Several 64-CPU allocations may share one 256-CPU physical node, but an
+        individual allocation is shared only by one or more Desktop hosts and
+        their exact-reserved pooled clients.  Unrelated scheduler work must use
+        another allocation even when it lands on the same physical node.
+        """
+
+        return str(allocation.get("drain_reason") or "").startswith("AEDT pool")
+
+    def task_can_share_dedicated_aedt_pool(
+        self, allocation: dict, task: dict
+    ) -> bool:
+        """Admit only pool-owned tasks to a dedicated AEDT allocation."""
+
+        allocation_id = int(allocation.get("id") or 0)
+        if allocation_id <= 0:
+            return False
+        if self.task_requested_allocation_id(task) != allocation_id:
+            return False
+        if self.task_is_fea_infra(task):
+            return True
+        task_id = int(task.get("id") or 0)
+        return bool(
+            task_id > 0
+            and self.task_aedt_backend(task) == AedtBackend.POOLED.value
+            and self.db.task_has_auto_aedt_reservation(task_id)
+        )
+
     def task_can_relax_preferred_node(self, task: dict) -> bool:
         return (
             self.fea_node_name_policy == "preferred"
@@ -5904,7 +5935,12 @@ class Scheduler:
         active_task_allocation_ids: set[int] | None = None,
         active_exclusive_allocation_ids: set[int] | None = None,
     ) -> bool:
-        if bool(int(allocation.get("exclusive_node") or 0)) != bool(int(task.get("exclusive_node") or 0)):
+        if self.allocation_is_dedicated_aedt_pool(allocation):
+            if not self.task_can_share_dedicated_aedt_pool(allocation, task):
+                return False
+        elif bool(int(allocation.get("exclusive_node") or 0)) != bool(
+            int(task.get("exclusive_node") or 0)
+        ):
             return False
         requested_allocation_id = self.task_requested_allocation_id(task)
         if requested_allocation_id and int(allocation.get("id") or 0) != requested_allocation_id:
@@ -6475,6 +6511,10 @@ class Scheduler:
                     for allocation in live
                     if not self.active_task_ids_for_allocation(int(allocation["id"]))
                     and allocation["state"] not in {AllocationStatus.DRAINING.value, AllocationStatus.CLOSING.value}
+                    # AEDT pools deliberately use up to floor(node CPUs / pool
+                    # CPUs) pinned allocations.  The generic cpu2 count limit
+                    # must not collapse four exact 64-CPU pools back to two.
+                    and not self.allocation_is_dedicated_aedt_pool(allocation)
                 ]
                 closable.sort(
                     key=lambda allocation: (
@@ -6638,6 +6678,7 @@ class Scheduler:
         requested_memory_mb: int = 0,
         require_fea_eligible_node: bool = False,
         cpu_only_nodes: bool = False,
+        aedt_pool_node_sharing: bool = False,
     ) -> bool:
         return self.open_allocation_record(
             reason=reason,
@@ -6653,6 +6694,7 @@ class Scheduler:
             requested_memory_mb=requested_memory_mb,
             require_fea_eligible_node=require_fea_eligible_node,
             cpu_only_nodes=cpu_only_nodes,
+            aedt_pool_node_sharing=aedt_pool_node_sharing,
         ) is not None
 
     def open_allocation_record(
@@ -6670,6 +6712,7 @@ class Scheduler:
         requested_memory_mb: int = 0,
         require_fea_eligible_node: bool = False,
         cpu_only_nodes: bool = False,
+        aedt_pool_node_sharing: bool = False,
     ) -> dict | None:
         account = self.choose_account_for_allocation(
             preferred_accounts=preferred_accounts,
@@ -6689,6 +6732,7 @@ class Scheduler:
             requested_memory_mb=requested_memory_mb,
             require_fea_eligible_node=require_fea_eligible_node,
             cpu_only_nodes=cpu_only_nodes,
+            aedt_pool_node_sharing=aedt_pool_node_sharing,
         )
         if not shape:
             return None
@@ -7104,6 +7148,7 @@ class Scheduler:
         requested_memory_mb: int = 0,
         require_fea_eligible_node: bool = False,
         cpu_only_nodes: bool = False,
+        aedt_pool_node_sharing: bool = False,
     ) -> dict | None:
         inventory_by_node = {row["node_name"]: row for row in self.db.list_node_inventory()}
         nodes = [
@@ -7136,6 +7181,33 @@ class Scheduler:
         candidates = []
         wants_gpu = resource_pool.startswith("gpu:") or int(gpus or 0) > 0
         wants_shared_cpu_pool = not wants_gpu and not exclusive_node
+        aedt_reserved_cpus_by_node: dict[str, int] = {}
+        aedt_pending_cpus_by_node: dict[str, int] = {}
+        if aedt_pool_node_sharing:
+            live_states = {
+                AllocationStatus.PENDING.value,
+                AllocationStatus.WARM.value,
+                AllocationStatus.ACTIVE.value,
+                AllocationStatus.DRAINING.value,
+                AllocationStatus.CLOSING.value,
+            }
+            for allocation in self.db.list_allocations_with_live(
+                limit=0, live_limit=10000
+            ):
+                if allocation.get("state") not in live_states:
+                    continue
+                node_name = str(allocation.get("node_name") or "")
+                if not node_name:
+                    continue
+                aedt_reserved_cpus_by_node[node_name] = (
+                    aedt_reserved_cpus_by_node.get(node_name, 0)
+                    + max(0, int(allocation.get("total_cpus") or 0))
+                )
+                if allocation.get("state") == AllocationStatus.PENDING.value:
+                    aedt_pending_cpus_by_node[node_name] = (
+                        aedt_pending_cpus_by_node.get(node_name, 0)
+                        + max(0, int(allocation.get("total_cpus") or 0))
+                    )
         dynamic_warm_gpu_count = wants_gpu and resource_pool.startswith("gpu:") and int(gpus or 0) <= 0
         target_gpu_count = max(1, int(gpus or self.gpu_prewarm_gpus_per_allocation))
         minimum_gpu_count = max(1, self.gpu_prewarm_min_gpus_per_allocation) if dynamic_warm_gpu_count else max(1, int(gpus or 1))
@@ -7156,11 +7228,35 @@ class Scheduler:
         reserved_nodes = self.reserved_allocation_nodes()
         for node in nodes:
             node_free_cpus_for_shape = node.sched_free_cpus if wants_gpu else node.effective_free_cpus
+            if aedt_pool_node_sharing:
+                # pestat already reflects running Slurm jobs, while the DB also
+                # includes pinned pending allocations not visible there yet.
+                # Taking the minimum avoids both stale over-placement and double
+                # subtraction, and naturally caps 256/64 at four allocations.
+                aggregate_free = max(
+                    0,
+                    int(node.cpu_total)
+                    - aedt_reserved_cpus_by_node.get(node.hostname, 0),
+                )
+                node_free_cpus_for_shape = min(
+                    max(
+                        0,
+                        node_free_cpus_for_shape
+                        - aedt_pending_cpus_by_node.get(node.hostname, 0),
+                    ),
+                    aggregate_free,
+                )
             if node.state not in {"idle", "mix"} or node_free_cpus_for_shape <= 0:
                 continue
             if require_fea_eligible_node and not self.fea_allocation_accepts_task({"node_name": node.hostname}):
                 continue
-            if not wants_gpu and self.cpu_partition_allocation_limit_reached(node.partition, node.hostname):
+            if (
+                not wants_gpu
+                and not aedt_pool_node_sharing
+                and self.cpu_partition_allocation_limit_reached(
+                    node.partition, node.hostname
+                )
+            ):
                 continue
             if preferred_full_gpu_partition_set and node.partition not in preferred_full_gpu_partition_set:
                 continue
@@ -7238,10 +7334,24 @@ class Scheduler:
                     cpus = available_cpus
                 else:
                     target_pool_cpus = min(max(1, int(self.allocation_cpus or cpu_capacity)), cpu_capacity)
-                    minimum_pool_cpus = max(requested_cpu_floor, target_pool_cpus)
-                    if available_cpus < minimum_pool_cpus:
-                        continue
-                    cpus = minimum_pool_cpus
+                    if aedt_pool_node_sharing and requested_cpu_floor > 0:
+                        # Prefer the normal 64-CPU pool, but use the largest
+                        # complete session multiple that fits a fragmented
+                        # node (52/39/26/13 for the current 13-CPU footprint).
+                        cpus = target_pool_cpus
+                        if available_cpus < target_pool_cpus:
+                            cpus = (
+                                available_cpus // requested_cpu_floor
+                            ) * requested_cpu_floor
+                        if cpus < requested_cpu_floor:
+                            continue
+                    else:
+                        minimum_pool_cpus = max(
+                            requested_cpu_floor, target_pool_cpus
+                        )
+                        if available_cpus < minimum_pool_cpus:
+                            continue
+                        cpus = minimum_pool_cpus
             elif wants_gpu or exclusive_node:
                 cpus = minimum_cpus or self.allocation_cpus or available_cpus
             else:
@@ -7347,9 +7457,13 @@ class Scheduler:
                     continue
                 return shape
             return None
-        if require_fea_eligible_node and nodes:
+        if require_fea_eligible_node and nodes and not aedt_pool_node_sharing:
             return None
-        if target_partition != "auto" and self.is_single_job_partition(target_partition):
+        if (
+            target_partition != "auto"
+            and self.is_single_job_partition(target_partition)
+            and not aedt_pool_node_sharing
+        ):
             return None
         partition_request = {
             "gpus": target_gpu_count if wants_gpu else 0,
@@ -7359,11 +7473,11 @@ class Scheduler:
         partition = target_partition if target_partition != "auto" else preferred_full_gpu_partition or self.choose_partition(partition_request)
         if not partition:
             return None
-        if not wants_gpu:
+        if not wants_gpu and not aedt_pool_node_sharing:
             partition_names = self.partition_spec_names(partition)
             if partition_names and all(self.cpu_partition_allocation_partition_saturated(item, nodes) for item in partition_names):
                 return None
-        if self.is_single_job_partition(partition):
+        if self.is_single_job_partition(partition) and not aedt_pool_node_sharing:
             return None
         fallback_cpu_limit = 0
         fallback_cpu_capacity = 0

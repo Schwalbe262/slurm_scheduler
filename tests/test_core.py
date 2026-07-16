@@ -2028,6 +2028,83 @@ class SchedulerTests(unittest.TestCase):
                             task_exclusive == allocation_exclusive,
                         )
 
+    def test_dedicated_aedt_allocation_only_admits_pool_owned_tasks(
+        self,
+    ) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        allocation = {
+            "id": 91,
+            "account_name": "a",
+            "partition": "cpu1",
+            "node_name": "n001",
+            "total_cpus": 64,
+            "free_cpus": 64,
+            "total_memory_mb": 512 * 1024,
+            "free_memory_mb": 512 * 1024,
+            "total_gpus": 0,
+            "free_gpus": 0,
+            "resource_pool": "cpu",
+            "exclusive_node": 0,
+            "drain_reason": "AEDT pool project demand",
+        }
+        host_id = self.db.create_task(
+            TaskCreate(
+                "aedt-session-host-1",
+                "~/pool",
+                "host",
+                project="_aedt_pool_hosts",
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                requested_allocation_id=91,
+            )
+        )
+        pooled_id = self.db.create_task(
+            TaskCreate(
+                "pooled-client",
+                "~/case",
+                "run",
+                cpus=4,
+                project="MFT_1MW_2026v1",
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                aedt_backend="pooled",
+                requested_allocation_id=91,
+            )
+        )
+        unrelated_id = self.db.create_task(
+            TaskCreate(
+                "unrelated",
+                "~/case",
+                "run",
+                exclusive_node=True,
+                requested_allocation_id=91,
+            )
+        )
+
+        self.assertTrue(
+            scheduler.allocation_matches_task_constraints(
+                allocation, self.db.get_task(host_id), include_pending=False
+            )
+        )
+        self.assertFalse(
+            scheduler.allocation_matches_task_constraints(
+                allocation, self.db.get_task(unrelated_id), include_pending=False
+            )
+        )
+        self.assertFalse(
+            scheduler.allocation_matches_task_constraints(
+                allocation, self.db.get_task(pooled_id), include_pending=False
+            )
+        )
+        with mock.patch.object(
+            self.db, "task_has_auto_aedt_reservation", return_value=True
+        ):
+            self.assertTrue(
+                scheduler.allocation_matches_task_constraints(
+                    allocation,
+                    self.db.get_task(pooled_id),
+                    include_pending=False,
+                )
+            )
+
     def test_legacy_projects_table_migrates_max_active_tasks_default_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = Database(f"{tmpdir}/legacy.db")
@@ -4685,6 +4762,147 @@ class SchedulerTests(unittest.TestCase):
         shape = scheduler.choose_allocation_shape(resource_pool="cpu")
         self.assertEqual(shape["partition"], "cpu2")
         self.assertIn(shape["node_name"], {"cpu2-a", "cpu2-b", "cpu2-c"})
+
+    def test_aedt_pool_bypasses_count_limit_but_obeys_aggregate_node_cpus(
+        self,
+    ) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "cpu2-a cpu2 mix 128 256 2.0 1031519 900000 pool_jobs\n"
+            )
+        )
+        allocation_ids: list[int] = []
+        for index in range(2):
+            allocation_id = self.db.create_allocation(
+                account_name="a",
+                partition="cpu2",
+                node_name="cpu2-a",
+                total_cpus=64,
+                total_memory_mb=98304,
+                resource_pool="cpu",
+            )
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.ACTIVE.value,
+                slurm_job_id=f"aedt-{index}",
+                drain_reason="AEDT pool project demand",
+            )
+            allocation_ids.append(allocation_id)
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            allocation_partition="cpu2",
+            allocation_cpus=64,
+            allocation_memory="96G",
+            cpu_partition_allocation_limits={"cpu2": 2},
+        )
+
+        shape = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            requested_cpus=13,
+            require_fea_eligible_node=True,
+            cpu_only_nodes=True,
+            aedt_pool_node_sharing=True,
+        )
+
+        self.assertEqual(shape["node_name"], "cpu2-a")
+        self.assertEqual(shape["cpus"], 64)
+
+        for index in range(2, 4):
+            allocation_id = self.db.create_allocation(
+                account_name="a",
+                partition="cpu2",
+                node_name="cpu2-a",
+                total_cpus=64,
+                total_memory_mb=98304,
+                resource_pool="cpu",
+            )
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.ACTIVE.value,
+                slurm_job_id=f"aedt-{index}",
+                drain_reason="AEDT pool project demand",
+            )
+            allocation_ids.append(allocation_id)
+
+        # Four 64-CPU allocations consume all 256 CPUs.  Current-fit placement
+        # is impossible, so the AEDT policy submits an unpinned 64-CPU request
+        # to wait in Slurm instead of violating aggregate capacity.
+        queued_shape = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            requested_cpus=13,
+            require_fea_eligible_node=True,
+            cpu_only_nodes=True,
+            aedt_pool_node_sharing=True,
+        )
+        self.assertEqual(queued_shape["partition"], "cpu2")
+        self.assertEqual(queued_shape["node_name"], "")
+        self.assertEqual(queued_shape["cpus"], 64)
+
+        scheduler.enforce_cpu_partition_allocation_limits()
+        self.assertTrue(
+            all(
+                self.db.get_allocation(allocation_id)["state"]
+                == AllocationStatus.ACTIVE.value
+                for allocation_id in allocation_ids
+            )
+        )
+
+    def test_aedt_pool_downshifts_to_complete_session_cpu_multiple(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "cpu2-fragment cpu2 mix 220 256 4.0 1031519 900000 busy\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            allocation_partition="cpu2",
+            allocation_cpus=64,
+            allocation_memory="96G",
+            cpu_partition_allocation_limits={"cpu2": 2},
+        )
+
+        shape = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            requested_cpus=13,
+            require_fea_eligible_node=True,
+            cpu_only_nodes=True,
+            aedt_pool_node_sharing=True,
+        )
+
+        self.assertEqual(shape["node_name"], "cpu2-fragment")
+        self.assertEqual(shape["cpus"], 26)
+
+        pending_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu2",
+            node_name="cpu2-fragment",
+            total_cpus=26,
+            total_memory_mb=98304,
+            resource_pool="cpu",
+        )
+        self.db.update_allocation(
+            pending_id,
+            state=AllocationStatus.PENDING.value,
+            slurm_job_id="aedt-downshift-pending",
+            drain_reason="AEDT pool project demand",
+        )
+        next_shape = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            requested_cpus=13,
+            require_fea_eligible_node=True,
+            cpu_only_nodes=True,
+            aedt_pool_node_sharing=True,
+        )
+        self.assertEqual(next_shape["node_name"], "")
+        self.assertEqual(next_shape["cpus"], 64)
 
     def test_cpu_pool_can_use_gpu_partition_when_no_cpu_candidate_exists(self) -> None:
         inventory = parse_scontrol_nodes(
