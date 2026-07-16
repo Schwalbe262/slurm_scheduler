@@ -5508,7 +5508,11 @@ class AedtRuntimeTests(AedtPoolTestCase):
                 self.account = SimpleNamespace(name="a")
 
             def account_storage_blocked(
-                self, account, *, for_fea: bool = False
+                self,
+                account,
+                *,
+                for_fea: bool = False,
+                refresh_reservations: bool = False,
             ) -> bool:
                 self.assert_account(account)
                 reservations = self.db.aedt_storage_growth_reservations_by_account(

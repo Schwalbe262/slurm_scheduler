@@ -385,6 +385,13 @@ class Scheduler:
         self.aedt_storage_reservation_maturity_seconds = max(
             0, int(aedt_storage_reservation_maturity_seconds)
         )
+        # Candidate placement can evaluate hundreds of allocations for each
+        # queued task.  Reuse the derived ledger briefly for those advisory
+        # checks; the two mutating admission points always force a fresh read.
+        self._aedt_storage_growth_cache: dict[
+            str, tuple[float, dict[str, dict[str, int]]]
+        ] = {}
+        self._aedt_storage_growth_cache_seconds = 1.0
         self._storage_guard_warned_at: dict[str, float] = {}
         self.license_monitor_enabled = license_monitor_enabled
         self.license_monitor_account = license_monitor_account
@@ -3307,6 +3314,8 @@ class Scheduler:
         account: AccountConfig,
         observation_at: float,
         additional_future_projects: int = 0,
+        *,
+        refresh_reservations: bool = False,
     ) -> tuple[int, float, dict[str, int]]:
         per_project_gb = self.aedt_storage_reservation_per_project_gb
         additional = max(0, int(additional_future_projects or 0))
@@ -3316,9 +3325,22 @@ class Scheduler:
         cutoff = observed - timedelta(
             seconds=self.aedt_storage_reservation_maturity_seconds
         )
-        reservations = self.db.aedt_storage_growth_reservations_by_account(
-            cutoff.strftime("%Y-%m-%d %H:%M:%S")
-        )
+        cutoff_text = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        now = time.monotonic()
+        cached = self._aedt_storage_growth_cache.get(cutoff_text)
+        if (
+            not refresh_reservations
+            and cached
+            and now - cached[0] < self._aedt_storage_growth_cache_seconds
+        ):
+            reservations = cached[1]
+        else:
+            reservations = self.db.aedt_storage_growth_reservations_by_account(
+                cutoff_text
+            )
+            if len(self._aedt_storage_growth_cache) >= 32:
+                self._aedt_storage_growth_cache.clear()
+            self._aedt_storage_growth_cache[cutoff_text] = (now, reservations)
         detail = dict(reservations.get(account.name) or {})
         projects = max(0, int(detail.get("total_projects") or 0)) + additional
         if additional:
@@ -3335,12 +3357,14 @@ class Scheduler:
         additional_future_projects: int,
         label: str,
         quota_context: str = "",
+        refresh_reservations: bool = False,
     ) -> bool:
         projects, reserved_gb, reservation_detail = (
             self._aedt_storage_growth_reservation(
                 account,
                 observation_at,
                 additional_future_projects,
+                refresh_reservations=refresh_reservations,
             )
         )
         effective_free_gb = float(observed_free_gb) - reserved_gb
@@ -3376,6 +3400,7 @@ class Scheduler:
         *,
         for_fea: bool = False,
         additional_future_projects: int = 0,
+        refresh_reservations: bool = False,
     ) -> bool:
         """Quota guard: hold new attaches when the account's storage headroom
         is below the threshold, instead of letting tasks start and cascade
@@ -3427,6 +3452,7 @@ class Scheduler:
                         f"used+in_doubt {probe.quota.effective_used_gb:.1f} / "
                         f"{probe.quota.block_limit_gb:.1f} GB"
                     ),
+                    refresh_reservations=refresh_reservations,
                 )
         if not account.storage_quota_gb:
             return False
@@ -3442,6 +3468,7 @@ class Scheduler:
             observation_at=observation_at,
             additional_future_projects=additional_future_projects,
             label="attaches held",
+            refresh_reservations=refresh_reservations,
         )
 
     def project_active_cap_reason(self, task: dict) -> str:
@@ -3560,6 +3587,7 @@ class Scheduler:
                     account,
                     for_fea=True,
                     additional_future_projects=1,
+                    refresh_reservations=True,
                 )
             ):
                 return None

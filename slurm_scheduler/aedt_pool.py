@@ -8500,7 +8500,11 @@ class AedtPoolRuntime:
             storage_failure = ""
             if account and callable(storage_checker):
                 try:
-                    if storage_checker(account, for_fea=True):
+                    if storage_checker(
+                        account,
+                        for_fea=True,
+                        refresh_reservations=True,
+                    ):
                         storage_failure = (
                             "AEDT session start blocked by the account storage "
                             "guard after reserving its project slots"
