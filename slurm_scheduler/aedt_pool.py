@@ -5386,11 +5386,122 @@ class AedtPoolService:
         )
         return max(0, min(cpu_capacity, memory_capacity))
 
+    @staticmethod
+    def _task_account_fingerprint(task: dict[str, Any]) -> tuple[str, ...]:
+        """Identity of the task routing fields consumed by account selection."""
+
+        return tuple(
+            str(task.get(field) or "")
+            for field in (
+                "name",
+                "project",
+                "requested_account_name",
+                "task_account_name",
+                "required_capability",
+                "env_profile",
+            )
+        )
+
+    def _preselect_task_accounts(
+        self,
+    ) -> dict[int, tuple[tuple[str, ...], str]]:
+        """Resolve scheduler-owned account choices outside a DB transaction.
+
+        The application callback may refresh Slurm snapshots and storage quota
+        state over SSH. It must never run while reconcile owns SQLite's writer
+        lock. First copy the bounded task inputs under a read connection, close
+        that connection, and only then invoke the callback. ``_plan`` compares
+        the routing fingerprint again so a task edit racing the probe falls back
+        to its explicit/fallback account instead of using a stale selection.
+        """
+
+        selector = self._task_account_selector
+        if selector is None:
+            return {}
+        with self.db.connect() as conn:
+            tasks = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT DISTINCT t.id AS task_id, t.name, t.project,
+                           t.requested_account_name,
+                           t.account_name AS task_account_name,
+                           t.required_capability, t.env_profile
+                    FROM aedt_project_leases l
+                    JOIN tasks t ON t.id = l.task_id
+                    LEFT JOIN aedt_sessions s ON s.id = l.session_id
+                    LEFT JOIN allocations sa ON sa.id = s.allocation_id
+                    LEFT JOIN allocations ra ON ra.id = l.requested_allocation_id
+                    WHERE l.state IN (
+                        'queued','offered','leased','attaching',
+                        'active','releasing'
+                    )
+                      AND TRIM(COALESCE(sa.account_name, ra.account_name, '')) = ''
+                    UNION
+                    SELECT DISTINCT t.id AS task_id, t.name, t.project,
+                           t.requested_account_name,
+                           t.account_name AS task_account_name,
+                           t.required_capability, t.env_profile
+                    FROM tasks t
+                    LEFT JOIN aedt_exact_session_reservations r
+                      ON r.task_id = t.id AND r.state IN ('reserved','claimed')
+                    LEFT JOIN aedt_sessions s ON s.id = r.session_id
+                    LEFT JOIN allocations a ON a.id = s.allocation_id
+                    WHERE t.status = 'queued'
+                      AND LOWER(TRIM(COALESCE(t.aedt_backend, ''))) = 'pooled'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM aedt_project_leases l
+                          WHERE l.task_id = t.id
+                            AND l.state IN (
+                                'queued','offered','leased','attaching',
+                                'active','releasing'
+                            )
+                      )
+                      AND TRIM(COALESCE(a.account_name, '')) = ''
+                    ORDER BY task_id
+                    """
+                ).fetchall()
+            ]
+
+        selections: dict[int, tuple[tuple[str, ...], str]] = {}
+        for task in tasks:
+            task_id = int(task.get("task_id") or 0)
+            if task_id <= 0:
+                continue
+            requested_value = task.get("requested_account_name")
+            if requested_value is None:
+                requested_value = task.get("task_account_name")
+            requested = [
+                item.strip()
+                for item in re.split(r"[\s,;/|]+", str(requested_value or ""))
+                if item.strip()
+            ]
+            if len(requested) == 1:
+                continue
+            try:
+                selected = str(selector(dict(task)) or "").strip()
+            except Exception:
+                LOGGER.exception(
+                    "AEDT pooled demand account selection failed for task %s",
+                    task_id,
+                )
+                continue
+            if selected:
+                selections[task_id] = (
+                    self._task_account_fingerprint(task),
+                    selected,
+                )
+        return selections
+
     def _plan(
         self,
         conn: Any,
         config: AedtPoolConfig,
         *,
+        task_account_selections: dict[
+            int, tuple[tuple[str, ...], str]
+        ] | None = None,
+        warm_spare_admission_result: tuple[int, str] | None = None,
         excluded_start_accounts: set[str] | None = None,
         start_block_reasons: dict[str, str] | None = None,
     ) -> dict[str, Any]:
@@ -5501,6 +5612,7 @@ class AedtPoolService:
             or (fallback_account_row["account_name"] if fallback_account_row else "")
             or ""
         )
+        resolved_task_accounts = task_account_selections or {}
 
         def planned_account(row: Any) -> str:
             reserved_account = str(row["reserved_account"] or "").strip()
@@ -5517,17 +5629,10 @@ class AedtPoolService:
             ]
             if len(requested) == 1:
                 return requested[0]
-            if self._task_account_selector is not None and int(
-                task.get("task_id") or task.get("id") or 0
-            ):
-                try:
-                    selected = str(self._task_account_selector(task) or "").strip()
-                except Exception:
-                    LOGGER.exception(
-                        "AEDT pooled demand account selection failed for task %s",
-                        task.get("task_id") or task.get("id"),
-                    )
-                    selected = ""
+            task_id = int(task.get("task_id") or task.get("id") or 0)
+            resolved = resolved_task_accounts.get(task_id)
+            if resolved and resolved[0] == self._task_account_fingerprint(task):
+                selected = str(resolved[1] or "").strip()
                 if selected:
                     return selected
             return requested[0] if requested else fallback_account
@@ -5847,22 +5952,25 @@ class AedtPoolService:
                 """
             ).fetchone()[0]
         )
+        warm_spare_admission_requested_sessions = (
+            unclaimed_starting_sessions
+            + demand_start_needed
+            + warm_spare_start_needed
+        )
         warm_spare_starts_authorized = warm_spare_start_needed
         warm_spare_status_reason = ""
         if warm_spare_start_needed and not config.operational:
             warm_spare_starts_authorized = 0
             warm_spare_status_reason = "AEDT pool is not operational; warm-spare start is gated"
         elif warm_spare_start_needed and self._warm_spare_admission_checker:
-            try:
-                allowed_total, warm_spare_status_reason = self._warm_spare_admission_checker(
-                    unclaimed_starting_sessions
-                    + demand_start_needed
-                    + warm_spare_start_needed
-                )
-            except Exception as exc:
-                LOGGER.exception("AEDT warm-spare license admission failed")
+            if warm_spare_admission_result is None:
                 allowed_total = 0
-                warm_spare_status_reason = f"license admission check failed: {exc}"
+                warm_spare_status_reason = (
+                    "warm-spare license admission was not resolved outside "
+                    "the planning transaction"
+                )
+            else:
+                allowed_total, warm_spare_status_reason = warm_spare_admission_result
             warm_spare_starts_authorized = max(
                 0,
                 min(
@@ -6187,6 +6295,9 @@ class AedtPoolService:
             "warm_spare_deficit": warm_spare_deficit,
             "warm_spare_start_needed": warm_spare_start_needed,
             "warm_spare_starts_authorized": warm_spare_starts_authorized,
+            "warm_spare_admission_requested_sessions": (
+                warm_spare_admission_requested_sessions
+            ),
             "unclaimed_starting_sessions": unclaimed_starting_sessions,
             "warm_spare_status_reason": warm_spare_status_reason,
             "drain_needed": max(
@@ -6228,6 +6339,47 @@ class AedtPoolService:
             },
         }
 
+    def _precheck_warm_spare_admission(
+        self,
+        config: AedtPoolConfig,
+        *,
+        task_account_selections: dict[int, tuple[tuple[str, ...], str]],
+        excluded_start_accounts: set[str] | None = None,
+        start_block_reasons: dict[str, str] | None = None,
+    ) -> tuple[int, str] | None:
+        """Run the scheduler admission callback with no DB transaction open."""
+
+        checker = self._warm_spare_admission_checker
+        if checker is None or not config.operational:
+            return None
+        # Compute the exact requested total from a read-only snapshot. The
+        # placeholder result prevents _plan from authorizing a speculative
+        # warm spare before the external admission callback has run.
+        with self.db.connect() as conn:
+            preview = self._plan(
+                conn,
+                config,
+                task_account_selections=task_account_selections,
+                warm_spare_admission_result=(
+                    0,
+                    "warm-spare license admission preflight is pending",
+                ),
+                excluded_start_accounts=excluded_start_accounts,
+                start_block_reasons=start_block_reasons,
+            )
+        requested_sessions = max(
+            0,
+            int(preview.get("warm_spare_admission_requested_sessions") or 0),
+        )
+        if requested_sessions <= 0:
+            return (0, "")
+        try:
+            allowed, reason = checker(requested_sessions)
+        except Exception as exc:
+            LOGGER.exception("AEDT warm-spare license admission failed")
+            return (0, f"license admission check failed: {exc}")
+        return (max(0, int(allowed)), str(reason or "").strip())
+
     def dry_run(
         self,
         *,
@@ -6235,10 +6387,19 @@ class AedtPoolService:
         start_block_reasons: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         config = self.config()
+        task_account_selections = self._preselect_task_accounts()
+        warm_spare_admission_result = self._precheck_warm_spare_admission(
+            config,
+            task_account_selections=task_account_selections,
+            excluded_start_accounts=excluded_start_accounts,
+            start_block_reasons=start_block_reasons,
+        )
         with self.db.connect() as conn:
             return self._plan(
                 conn,
                 config,
+                task_account_selections=task_account_selections,
+                warm_spare_admission_result=warm_spare_admission_result,
                 excluded_start_accounts=excluded_start_accounts,
                 start_block_reasons=start_block_reasons,
             )
@@ -6655,6 +6816,16 @@ class AedtPoolService:
             for account, reason in (start_block_reasons or {}).items()
             if str(account or "").strip()
         }
+        # Account selection can refresh remote Slurm/quota snapshots. Resolve
+        # it before BEGIN IMMEDIATE so a slow SSH probe cannot block every API,
+        # heartbeat, cancellation, and background attach writer.
+        task_account_selections = self._preselect_task_accounts()
+        warm_spare_admission_result = self._precheck_warm_spare_admission(
+            config,
+            task_account_selections=task_account_selections,
+            excluded_start_accounts=excluded_start_accounts,
+            start_block_reasons=start_block_reasons,
+        )
         now_dt = self._now()
         now = _sql_time(now_dt)
         with self._lock, self.db.connect() as conn:
@@ -7274,6 +7445,8 @@ class AedtPoolService:
             plan = self._plan(
                 conn,
                 config,
+                task_account_selections=task_account_selections,
+                warm_spare_admission_result=warm_spare_admission_result,
                 excluded_start_accounts=excluded_start_accounts,
                 start_block_reasons=start_block_reasons,
             )
@@ -7363,6 +7536,8 @@ class AedtPoolService:
                 plan = self._plan(
                     conn,
                     config,
+                    task_account_selections=task_account_selections,
+                    warm_spare_admission_result=warm_spare_admission_result,
                     excluded_start_accounts=excluded_start_accounts,
                     start_block_reasons=start_block_reasons,
                 )

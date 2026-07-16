@@ -734,6 +734,102 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 actual = future.result(timeout=1)
         self.assertEqual(actual, expected)
 
+    def test_reconcile_resolves_account_selector_before_writer_transaction(
+        self,
+    ) -> None:
+        self.service.set_operator_limits(
+            max_sessions=1,
+            min_idle_sessions=0,
+            target_projects=1,
+            projects_per_session=1,
+        )
+        self.make_operational()
+        task_id = self.db.create_task(
+            TaskCreate(
+                name="selector-lock-regression",
+                remote_cwd="/work",
+                command="true",
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                aedt_backend="pooled",
+                project="MFT_1MW_2026v1",
+            )
+        )
+        selected_task_ids: list[int] = []
+
+        def selector(task: dict) -> str:
+            selected_task_ids.append(int(task["task_id"]))
+            # This separate connection must be able to become a writer. Before
+            # the regression fix, reconcile invoked the callback underneath its
+            # BEGIN IMMEDIATE and this write failed with "database is locked".
+            with self.db.connect(busy_timeout_ms=50) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO scheduler_events(
+                        kind, entity_type, entity_id, message
+                    ) VALUES ('selector_independent_writer', 'task', ?, '')
+                    """,
+                    (str(task_id),),
+                )
+            return "selected-account"
+
+        self.service.set_task_account_selector(selector)
+        plan = self.service.reconcile(execute=True)
+
+        self.assertEqual(selected_task_ids, [task_id])
+        self.assertEqual(
+            plan["queued_pooled_task_backlog_by_account"],
+            {"selected-account": 1},
+        )
+        with self.db.connect() as conn:
+            event = conn.execute(
+                """
+                SELECT entity_id FROM scheduler_events
+                WHERE kind = 'selector_independent_writer'
+                """
+            ).fetchone()
+        self.assertEqual(str(event["entity_id"]), str(task_id))
+
+    def test_reconcile_resolves_warm_admission_before_writer_transaction(
+        self,
+    ) -> None:
+        self.service.set_operator_limits(
+            max_sessions=1,
+            min_idle_sessions=1,
+            target_projects=0,
+            projects_per_session=1,
+        )
+        self.make_operational()
+        requested_totals: list[int] = []
+
+        def checker(requested_sessions: int) -> tuple[int, str]:
+            requested_totals.append(int(requested_sessions))
+            # The production callback acquires Scheduler._task_assignment_lock,
+            # which another thread may hold across remote allocation probes.
+            # Prove reconcile invokes it without also owning SQLite's writer.
+            with self.db.connect(busy_timeout_ms=50) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO scheduler_events(kind, entity_type, message)
+                    VALUES ('warm_admission_independent_writer',
+                            'aedt_pool', '')
+                    """
+                )
+            return requested_sessions, ""
+
+        self.service.set_warm_spare_admission_checker(checker)
+        plan = self.service.reconcile(execute=True)
+
+        self.assertEqual(requested_totals, [1])
+        self.assertEqual(plan["warm_spare_starts_authorized"], 1)
+        with self.db.connect() as conn:
+            event = conn.execute(
+                """
+                SELECT 1 FROM scheduler_events
+                WHERE kind = 'warm_admission_independent_writer'
+                """
+            ).fetchone()
+        self.assertIsNotNone(event)
+
     def test_operator_timeouts_update_liveness_windows(self) -> None:
         config = self.service.set_operator_timeouts(
             lease_ttl_seconds=900,
