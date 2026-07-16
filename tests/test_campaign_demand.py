@@ -337,7 +337,7 @@ class CampaignDemandApiTests(unittest.TestCase):
             self.get_demand(PROJECT, Response())["total_simulations"], 500
         )
 
-    def test_mft_active_concurrency_remains_capped_at_30(self) -> None:
+    def test_mft_active_concurrency_supports_500(self) -> None:
         project = self.app.state.db.get_project_by_name(PROJECT)
         self.app.state.db.update_project(
             int(project["id"]),
@@ -346,9 +346,9 @@ class CampaignDemandApiTests(unittest.TestCase):
             validated_concurrency_limit=500,
         )
         policy = self.get_policy(PROJECT)
-        self.assertEqual(policy["desired_simulations"], 30)
-        self.assertEqual(policy["effective_simulations"], 30)
-        self.assertEqual(policy["max_desired_simulations"], 30)
+        self.assertEqual(policy["desired_simulations"], 500)
+        self.assertEqual(policy["effective_simulations"], 500)
+        self.assertEqual(policy["max_desired_simulations"], 500)
 
 
 class CampaignDemandUiContractTests(unittest.TestCase):
@@ -357,7 +357,7 @@ class CampaignDemandUiContractTests(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "templates" / "project_detail.html"
         ).read_text(encoding="utf-8")
         self.assertIn("Total simulations requested (campaign budget)", template)
-        self.assertIn("Active simulations at once (rolling concurrency, max 30)", template)
+        self.assertIn("Active simulations at once (rolling concurrency, max 500)", template)
         self.assertIn('id="campaign-total-simulations"', template)
         self.assertIn('id="desired-active-simulations"', template)
         self.assertNotIn('id="campaign-total-simulations" disabled', template)

@@ -43,7 +43,7 @@ from .web_read_guard import WebReadGuardMiddleware
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-MFT_ACTIVE_CONCURRENCY_CEILING = 30
+MFT_ACTIVE_CONCURRENCY_CEILING = 500
 MAX_CAMPAIGN_TOTAL_SIMULATIONS = 1_000_000
 
 def parse_aedt_backend(value: object) -> str:

@@ -561,9 +561,11 @@ Task states:
 
 ## Project Campaign Demand
 
-`MFT_1MW_2026v1` starts with a durable total demand of `500`. This is an
-absolute campaign budget, not active concurrency. MFT active concurrency is a
-separate simulation-policy value capped at 30 logical clients.
+`MFT_1MW_2026v1` supports up to `500` rolling active simulations through its
+simulation policy. A continuous feeder can ignore the legacy absolute campaign
+demand and refill completed work indefinitely. Setting desired concurrency to
+`0` is the durable stop control: it stops refill and lets existing work drain
+without cancellation.
 
 ### `GET /api/projects/{name}/campaign-demand`
 

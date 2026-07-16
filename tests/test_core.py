@@ -9121,13 +9121,13 @@ class ProjectApiTests(unittest.TestCase):
                 "MFT_1MW_2026v1",
                 self._request(
                     {
-                        "validated_concurrency_limit": 30,
+                        "validated_concurrency_limit": 500,
                         "expected_revision": initial["policy_revision"],
                     }
                 ),
             )
         )
-        self.assertEqual(validated["validated_concurrency_limit"], 30)
+        self.assertEqual(validated["validated_concurrency_limit"], 500)
         self.assertEqual(validated["desired_simulations"], 1)
         self.assertEqual(
             self.get_project("MFT_1MW_2026v1")["max_active_tasks"], 500
@@ -9138,15 +9138,15 @@ class ProjectApiTests(unittest.TestCase):
                 "MFT_1MW_2026v1",
                 self._request(
                     {
-                        "desired_simulations": 30,
+                        "desired_simulations": 500,
                         "expected_revision": validated["policy_revision"],
                         "scale_down_mode": "drain",
                     }
                 ),
             )
         )
-        self.assertEqual(updated["effective_simulations"], 30)
-        self.assertEqual(updated["max_desired_simulations"], 30)
+        self.assertEqual(updated["effective_simulations"], 500)
+        self.assertEqual(updated["max_desired_simulations"], 500)
         self.assertEqual(
             self.get_project("MFT_1MW_2026v1")["max_active_tasks"], 500
         )

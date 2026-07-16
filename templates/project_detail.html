@@ -91,13 +91,14 @@
         </div>
         <p class="full muted">
           Revision <span id="campaign-demand-revision">{{ project.campaign_demand.demand_revision }}</span>.
-          Accepted/remaining progress is owned by the feeder manifest.
+          This is a legacy bounded-feeder budget. The continuous 500-active
+          controller ignores it and is stopped by setting active concurrency to 0.
         </p>
       </form>
 
       <form id="active-concurrency-form" class="form-grid">
         <div class="full">
-          <label for="desired-active-simulations">Active simulations at once (rolling concurrency, max 30)</label>
+          <label for="desired-active-simulations">Active simulations at once (rolling concurrency, max 500)</label>
           <input
             id="desired-active-simulations"
             name="desired_simulations"
@@ -116,7 +117,8 @@
         <p class="full muted">
           Validated ceiling: {{ project.simulation_policy.validated_concurrency_limit }};
           effective now: <span id="effective-active-simulations">{{ project.simulation_policy.effective_simulations }}</span>.
-          Scale-down mode is drain.
+          Set this to 0 to stop new submissions. Scale-down mode is drain, so
+          existing simulations are never cancelled.
         </p>
       </form>
     </div>
@@ -220,7 +222,7 @@
     simulationPolicy = policy;
     const input = document.getElementById("desired-active-simulations");
     input.value = policy.desired_simulations;
-    input.max = Math.min(30, Number(policy.max_desired_simulations || 0));
+    input.max = Math.min(500, Number(policy.max_desired_simulations || 0));
     document.getElementById("effective-active-simulations").textContent =
       policy.effective_simulations;
   }
