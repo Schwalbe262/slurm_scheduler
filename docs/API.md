@@ -60,6 +60,25 @@ Lightweight aggregate used by the dashboard's live headline refresh: task activi
 curl -sS "$SCHEDULER_URL/api/dashboard-summary"
 ```
 
+### `GET /api/mft-pipeline/status`
+
+Read-only MFT continuous-design status used by the WEB dashboard. It reports
+the exact standalone `mft-camp-` population/target, quality-gated dataset rows
+and growth since the active surrogate, surrogate training/model state,
+parallel NSGA-II lanes and seeds, Standard FEA PASS/FAIL, and full-model PASS.
+
+```bash
+curl -sS "$SCHEDULER_URL/api/mft-pipeline/status"
+```
+
+The endpoint reads only a fixed list of JSON status files below
+`C:\Users\peets\slurm_scheduler_runtime`, with a per-file byte limit,
+last-good fallback, and short cache. Missing or partially replaced files are
+returned in `errors`; the endpoint remains HTTP 200 and other stages remain
+visible. Override the root for staging/tests with
+`SLURM_MFT_PIPELINE_RUNTIME_ROOT`. This endpoint never starts, stops, or edits
+pipeline work and is not called from `Scheduler.tick()`.
+
 ### `POST /api/placement/dry-run`
 
 Explains where a hypothetical task would land without creating any state: aggregate queue diagnostics plus per-account eligibility and per-allocation fit slots with rejection reasons.

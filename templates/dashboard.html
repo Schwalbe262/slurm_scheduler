@@ -492,6 +492,194 @@
     </script>
   </section>
 
+  <section class="panel" id="mft-continuous-pipeline" aria-labelledby="mft-pipeline-title">
+    <div class="title-row">
+      <h2 id="mft-pipeline-title">MFT 연속 설계 파이프라인</h2>
+      <span class="muted" id="mft-pipeline-updated" aria-live="polite">상태 불러오는 중…</span>
+    </div>
+    <p class="muted">데이터 수집 → surrogate 교체 → multi-seed NSGA-II → Standard FEA → full-model 검증을 읽기 전용으로 표시합니다.</p>
+    <div class="summary-row" aria-label="MFT continuous pipeline summary">
+      <div class="summary-item">
+        <span class="summary-label">유효 데이터</span>
+        <span class="summary-value" data-mft-pipeline="data">-</span>
+        <span class="muted" data-mft-pipeline-detail="data">모델 이후 증가량 -</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Standalone</span>
+        <span class="summary-value" data-mft-pipeline="standalone">- / -</span>
+        <span class="muted" data-mft-pipeline-detail="standalone">실행 AEDT - / -</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Surrogate</span>
+        <span class="summary-value" data-mft-pipeline="surrogate">-</span>
+        <span class="muted" data-mft-pipeline-detail="surrogate">model -</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">NSGA-II</span>
+        <span class="summary-value" data-mft-pipeline="nsga">- seeds</span>
+        <span class="muted" data-mft-pipeline-detail="nsga">완료 run -</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Standard FEA</span>
+        <span class="summary-value" data-mft-pipeline="standard-fea">- active</span>
+        <span class="muted" data-mft-pipeline-detail="standard-fea">PASS - / FAIL -</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Full model</span>
+        <span class="summary-value" data-mft-pipeline="full-model">- active</span>
+        <span class="muted" data-mft-pipeline-detail="full-model">PASS -</span>
+      </div>
+    </div>
+    <div class="table-scroll">
+      <table aria-label="NSGA-II parallel lanes">
+        <thead><tr><th>NSGA lane</th><th>State</th><th>Run</th><th>Active seeds</th><th>Model ID</th><th>Completed</th><th>Next seed</th></tr></thead>
+        <tbody id="mft-nsga-lanes">
+          <tr><td colspan="7" class="muted">상태 불러오는 중…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <details id="mft-pipeline-errors" class="section-gap" hidden>
+      <summary>일부 상태 소스를 읽지 못했습니다</summary>
+      <ul id="mft-pipeline-error-list"></ul>
+    </details>
+  </section>
+
+  <script>
+    (() => {
+      const panel = document.getElementById("mft-continuous-pipeline");
+      if (!panel) return;
+      const value = (key) => panel.querySelector(`[data-mft-pipeline="${key}"]`);
+      const detail = (key) => panel.querySelector(`[data-mft-pipeline-detail="${key}"]`);
+      const setText = (element, text) => { if (element) element.textContent = text; };
+      const number = (item) => (
+        item === null || item === undefined || item === ""
+          ? null
+          : (Number.isFinite(Number(item)) ? Number(item) : null)
+      );
+      const shown = (item) => number(item) === null ? "-" : String(number(item));
+      const compact = (item, limit = 34) => {
+        const text = String(item || "");
+        return text.length > limit ? `${text.slice(0, limit - 1)}…` : (text || "-");
+      };
+
+      function render(payload) {
+        const data = payload.data || {};
+        const delta = number(data.strict_delta_since_model);
+        setText(value("data"), shown(data.dataset_rows));
+        setText(
+          detail("data"),
+          delta === null ? "모델 이후 증가량 -" : `모델 이후 ${delta >= 0 ? "+" : ""}${delta}`,
+        );
+
+        const standalone = payload.standalone || {};
+        setText(value("standalone"), `${shown(standalone.active)} / ${shown(standalone.target)}`);
+        setText(
+          detail("standalone"),
+          `실행 AEDT ${shown(standalone.running)} / ${shown(standalone.running_target)} · queue ${shown(standalone.queued)}`,
+        );
+
+        const surrogate = payload.surrogate || {};
+        const surrogateState = surrogate.phase || surrogate.state || "unavailable";
+        setText(value("surrogate"), surrogateState);
+        setText(detail("surrogate"), `model ${compact(surrogate.model_id, 30)}`);
+        if (detail("surrogate")) detail("surrogate").title = String(surrogate.model_id || "");
+
+        const nsga = payload.nsga || {};
+        setText(value("nsga"), `${shown(nsga.active_seed_workers)} seed workers`);
+        setText(detail("nsga"), `완료 run ${shown(nsga.completed_runs)}`);
+
+        const standard = payload.standard_fea || {};
+        setText(value("standard-fea"), `${shown(standard.active)} active`);
+        setText(
+          detail("standard-fea"),
+          `run ${shown(standard.running)} · queue ${shown(standard.queued)} · PASS ${shown(standard.pass)} / FAIL ${shown(standard.fail)}`,
+        );
+
+        const full = payload.full_model || {};
+        setText(value("full-model"), `${shown(full.active)} active`);
+        setText(
+          detail("full-model"),
+          `PASS ${shown(full.pass)} · standard PASS 발견 ${shown(full.standard_pass_discovered)}`,
+        );
+
+        const laneBody = document.getElementById("mft-nsga-lanes");
+        if (laneBody) {
+          laneBody.textContent = "";
+          const lanes = Array.isArray(nsga.lanes) ? nsga.lanes : [];
+          if (!lanes.length) {
+            const row = laneBody.insertRow();
+            const cell = row.insertCell();
+            cell.colSpan = 7;
+            cell.className = "muted";
+            cell.textContent = "NSGA-II 상태 없음";
+          } else {
+            lanes.forEach((lane) => {
+              const row = laneBody.insertRow();
+              const fields = [
+                lane.name || "-",
+                lane.state || "unavailable",
+                lane.run_id || "-",
+                Array.isArray(lane.seeds) && lane.seeds.length ? lane.seeds.join(", ") : "-",
+                compact(lane.model_id, 42),
+                shown(lane.completed_runs),
+                shown(lane.next_seed_base),
+              ];
+              fields.forEach((field, index) => {
+                const cell = row.insertCell();
+                cell.textContent = String(field);
+                if (index === 3 || index === 4) cell.className = "mono-cell";
+                if (index === 4) cell.title = String(lane.model_id || "");
+              });
+            });
+          }
+        }
+
+        const errors = Array.isArray(payload.errors) ? payload.errors : [];
+        const errorPanel = document.getElementById("mft-pipeline-errors");
+        const errorList = document.getElementById("mft-pipeline-error-list");
+        if (errorPanel && errorList) {
+          errorList.textContent = "";
+          errors.forEach((error) => {
+            const item = document.createElement("li");
+            item.textContent = `${error.source || "source"}: ${error.message || "unavailable"}${error.stale ? " (last good value shown)" : ""}`;
+            errorList.appendChild(item);
+          });
+          errorPanel.hidden = errors.length === 0;
+        }
+        const generated = payload.generated_at ? new Date(payload.generated_at) : new Date();
+        setText(
+          document.getElementById("mft-pipeline-updated"),
+          `${generated.toLocaleTimeString()} 갱신${errors.length ? ` · source error ${errors.length}` : ""}`,
+        );
+      }
+
+      async function refresh() {
+        if (document.hidden) return;
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), 8000);
+        try {
+          const response = await fetch("/api/mft-pipeline/status", {
+            cache: "no-store",
+            signal: controller.signal,
+          });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          render(await response.json());
+        } catch (error) {
+          setText(
+            document.getElementById("mft-pipeline-updated"),
+            `상태 조회 실패 · 다음 주기에 재시도 (${error.name === "AbortError" ? "timeout" : error})`,
+          );
+        } finally {
+          window.clearTimeout(timeout);
+        }
+      }
+
+      refresh();
+      window.setInterval(refresh, 15000);
+      document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+    })();
+  </script>
+
   <section class="panel">
     <div class="mode-tabs" role="tablist" aria-label="환경 / 프로젝트" style="margin-bottom:14px;">
       <button type="button" class="env-tab" data-env-tab="conda" aria-selected="true">Anaconda 환경</button>

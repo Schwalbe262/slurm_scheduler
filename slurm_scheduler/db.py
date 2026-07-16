@@ -2600,6 +2600,56 @@ class Database:
             ).fetchone()
             return int(row[0]) if row else 0
 
+    def standalone_campaign_activity_summary(
+        self,
+        project: str,
+        *,
+        name_prefix: str = "mft-camp-",
+    ) -> dict[str, int]:
+        """Return the logical standalone campaign population in one query.
+
+        Validation jobs use the same MFT project but a different name prefix,
+        while the AEDT attach soak shares ``mft-camp-`` and is marked pooled.
+        Filtering both dimensions makes this the 100-AEDT/400-simulation lane
+        rather than a project-wide approximation.
+        """
+
+        normalized_project = str(project or "").strip()
+        normalized_prefix = str(name_prefix or "").strip()
+        if not normalized_project or not normalized_prefix:
+            return {"active": 0, "running": 0, "attaching": 0, "queued": 0}
+        escaped_prefix = (
+            normalized_prefix.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS active,
+                    COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running,
+                    COALESCE(SUM(CASE WHEN status = 'attaching' THEN 1 ELSE 0 END), 0) AS attaching,
+                    COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued
+                FROM tasks
+                WHERE project = ?
+                  AND name LIKE ? ESCAPE '\\'
+                  AND status IN ('queued', 'attaching', 'running')
+                  AND LOWER(TRIM(COALESCE(scheduling_profile, ''))) = ?
+                  AND LOWER(TRIM(COALESCE(aedt_backend, 'standalone')))
+                      IN ('', 'standalone')
+                """,
+                (
+                    normalized_project,
+                    f"{escaped_prefix}%",
+                    SchedulingProfile.FEA_BURSTY.value,
+                ),
+            ).fetchone()
+        return {
+            key: int(row[key] or 0)
+            for key in ("active", "running", "attaching", "queued")
+        }
+
     def list_projects(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute("SELECT * FROM projects ORDER BY name").fetchall()

@@ -38,6 +38,7 @@ from .db import Database
 from .git_auth import find_git_credential, git_task_payload
 from .models import AedtBackend, JobCreate, SchedulingProfile, TaskCreate, TaskStatus, normalize_aedt_backend, normalize_scheduling_profile
 from .inventory import partition_rank
+from .mft_pipeline_status import MftPipelineStatusReader
 from .pestat import PestatNode, plan_dynamic_allocations
 from .project_env import ProjectEnvManager, repo_dir_name
 from .scheduler import Scheduler
@@ -662,6 +663,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     app.state.config = config
     app.state.db = db
     app.state.scheduler = scheduler
+    # Read-only visibility is isolated from Scheduler.tick(): the WEB endpoint
+    # reads fixed, byte-bounded local JSON contracts through this short cache.
+    mft_pipeline_status_reader = MftPipelineStatusReader()
+    app.state.mft_pipeline_status_reader = mft_pipeline_status_reader
     aedt_pool_bootstrap_token = os.environ.get("SLURM_AEDT_POOL_BOOTSTRAP_TOKEN", "").strip()
     aedt_pool_client_token = os.environ.get(
         "SLURM_AEDT_POOL_CLIENT_TOKEN", ""
@@ -2492,6 +2497,54 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "allocations": allocation_usage_summary(allocated_rows, pending=pending_count),
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
+
+    @app.get("/api/mft-pipeline/status")
+    def api_mft_pipeline_status() -> dict:
+        result = mft_pipeline_status_reader.snapshot()
+        project_name = (
+            os.environ.get("SLURM_MFT_PIPELINE_PROJECT", "MFT_1MW_2026v1").strip()
+            or "MFT_1MW_2026v1"
+        )
+        try:
+            project = db.get_project_by_name(project_name)
+            counts = db.standalone_campaign_activity_summary(project_name)
+            target = int(project.get("desired_simulations") or 0) if project else 0
+            running_target = int(
+                config.standalone_aedt_max_running_by_project.get(project_name, 0)
+                or 0
+            )
+            result["standalone"] = {
+                "available": project is not None,
+                "project": project_name,
+                "active": counts["active"],
+                "target": target,
+                "running": counts["running"],
+                "running_target": running_target,
+                "attaching": counts["attaching"],
+                "queued": counts["queued"],
+            }
+        except Exception as exc:
+            result["standalone"] = {
+                "available": False,
+                "project": project_name,
+                "active": 0,
+                "target": 0,
+                "running": 0,
+                "running_target": 0,
+                "attaching": 0,
+                "queued": 0,
+            }
+            result.setdefault("errors", []).append(
+                {
+                    "source": "standalone_campaign",
+                    "message": f"{type(exc).__name__}: {exc}",
+                    "stale": False,
+                }
+            )
+        result["available"] = bool(
+            result.get("available") or result["standalone"]["available"]
+        )
+        return result
 
     @app.get("/api/task-count-history")
     def api_task_count_history(
