@@ -212,6 +212,7 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
                 "mft_pipeline/surrogate_status.json",
                 {
                     "state": "waiting_for_next_dataset_check",
+                    "raw_rows": 350,
                     "strict_full_rows": 137,
                     "updated_at": "2026-07-16T21:00:00+00:00",
                 },
@@ -220,6 +221,7 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
             payload = MftPipelineStatusReader(root, cache_seconds=0).snapshot()
 
         self.assertEqual(payload["data"]["dataset_rows"], 137)
+        self.assertEqual(payload["data"]["raw_rows"], 350)
         self.assertEqual(payload["data"]["strict_rows"], 137)
         self.assertEqual(payload["data"]["strict_delta_since_model"], 37)
         self.assertEqual(
