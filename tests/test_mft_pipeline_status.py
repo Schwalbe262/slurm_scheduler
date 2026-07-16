@@ -101,6 +101,11 @@ def write_complete_runtime(root: Path) -> None:
                 "tasks": [
                     {"task_id": 1, "status": "running"},
                     {"task_id": 2, "status": "queued"},
+                    {
+                        "task_id": 9,
+                        "name": "mft-nsgafea-f-full-model",
+                        "status": "running",
+                    },
                 ]
             },
             "active_tasks": [{"task_id": 1, "status": "running"}],
@@ -135,6 +140,11 @@ def write_complete_runtime(root: Path) -> None:
                 "tasks": [
                     {"task_id": 2, "status": "queued"},
                     {"task_id": 3, "status": "running"},
+                    {
+                        "task_id": 9,
+                        "name": "mft-nsgafea-f-full-model",
+                        "status": "running",
+                    },
                 ]
             },
             "active_tasks": [{"task_id": 3, "status": "running"}],

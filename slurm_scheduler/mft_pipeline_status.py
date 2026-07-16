@@ -214,7 +214,8 @@ class MftPipelineStatusReader:
 
     @staticmethod
     def _active_task_inventory(
-        statuses: Iterable[Mapping[str, Any]], *, include_global: bool = True
+        statuses: Iterable[Mapping[str, Any]], *, include_global: bool = True,
+        exclude_name_prefixes: tuple[str, ...] = (),
     ) -> dict[int | str, str]:
         tasks: dict[int | str, str] = {}
         for status in statuses:
@@ -223,8 +224,11 @@ class MftPipelineStatusReader:
             if include_global:
                 rows = [*_items(inventory.get("tasks")), *rows]
             for row in rows:
+                task_name = str(row.get("task_name") or row.get("name") or "")
+                if task_name.startswith(exclude_name_prefixes):
+                    continue
                 task_id = _integer(row.get("task_id"))
-                key: int | str = task_id if task_id is not None else str(row.get("task_name") or "")
+                key: int | str = task_id if task_id is not None else task_name
                 task_status = str(row.get("status") or row.get("task_status") or "").lower()
                 if key != "" and task_status in {"queued", "attaching", "running"}:
                     tasks[key] = task_status
@@ -383,7 +387,13 @@ class MftPipelineStatusReader:
             sources["standard_fea_main_state"][0],
             sources["standard_fea_fast_state"][0],
         ]
-        fea_tasks = self._active_task_inventory(fea_statuses)
+        # Standard controllers expose the entire shared validation lane in
+        # global_lane_inventory, including full-model task names.  Keep the
+        # shared inventory for cross-controller/stale-reader coverage, but do
+        # not count fine/full tasks twice in the Standard FEA card.
+        fea_tasks = self._active_task_inventory(
+            fea_statuses, exclude_name_prefixes=("mft-nsgafea-f-",)
+        )
         standard_pass, standard_fail, standard_valid = self._standard_results(fea_states)
 
         full_status, full_meta = sources["full_model"]
