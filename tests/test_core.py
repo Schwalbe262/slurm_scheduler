@@ -7903,6 +7903,50 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(diagnostics["scanned_tasks"], 2)
         self.assertEqual(diagnostics["reason"], "queued_tail_appended")
 
+    def test_queued_planning_inventory_filters_status_before_recent_limit(self) -> None:
+        queued_id = self.db.create_task(
+            TaskCreate(
+                "old-queued-demand",
+                "~/case",
+                "run",
+                cpus=1,
+                memory_mb=1,
+            )
+        )
+        # More than the generic recent-row limit becomes newer than the still
+        # queued task.  Filtering the latest 5,000 rows in Python used to hide
+        # this valid demand forever as completed history accumulated.
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                WITH RECURSIVE seq(value) AS (
+                    VALUES(1)
+                    UNION ALL
+                    SELECT value + 1 FROM seq WHERE value < 5001
+                )
+                INSERT INTO tasks(name, remote_cwd, command, status)
+                SELECT printf('newer-completed-%d', value), '~/case', 'run', ?
+                FROM seq
+                """,
+                (TaskStatus.COMPLETED.value,),
+            )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+
+        self.assertEqual(
+            [task["id"] for task in scheduler.queued_tasks_for_allocation_reservations()],
+            [queued_id],
+        )
+        self.assertEqual(
+            [task["id"] for task in scheduler.queued_demand_tasks()],
+            [queued_id],
+        )
+
     def test_reservation_plan_rejects_higher_priority_task_inserted_before_prefix(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",

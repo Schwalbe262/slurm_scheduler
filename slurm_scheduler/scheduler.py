@@ -3351,7 +3351,13 @@ class Scheduler:
 
     def assign_queued_tasks(self, include_fea: bool = True) -> None:
         queued_tasks = sorted(
-            [task for task in self.db.list_tasks(limit=5000) if task["status"] == TaskStatus.QUEUED.value],
+            [
+                task
+                for task in self.db.list_tasks(
+                    limit=5000, statuses=[TaskStatus.QUEUED.value]
+                )
+                if task["status"] == TaskStatus.QUEUED.value
+            ],
             key=lambda item: (
                 0 if self.task_requires_gpu(item) else 1,
                 -int(item.get("priority") or 0),
@@ -3372,7 +3378,9 @@ class Scheduler:
         for task in sorted(
             [
                 item
-                for item in self.db.list_tasks(limit=5000)
+                for item in self.db.list_tasks(
+                    limit=5000, statuses=[TaskStatus.QUEUED.value]
+                )
                 if item["status"] == TaskStatus.QUEUED.value and self.same_node_as_task_id(item)
             ],
             key=lambda item: (-int(item.get("priority") or 0), int(item["id"])),
@@ -3384,7 +3392,9 @@ class Scheduler:
         for task in sorted(
             [
                 item
-                for item in self.db.list_tasks(limit=5000)
+                for item in self.db.list_tasks(
+                    limit=5000, statuses=[TaskStatus.QUEUED.value]
+                )
                 if item["status"] == TaskStatus.QUEUED.value
                 and not self.same_node_as_task_id(item)
                 and not self.task_is_fea_bursty(item)
@@ -3402,7 +3412,9 @@ class Scheduler:
         for task in sorted(
             [
                 item
-                for item in self.db.list_tasks(limit=5000)
+                for item in self.db.list_tasks(
+                    limit=5000, statuses=[TaskStatus.QUEUED.value]
+                )
                 if item["status"] == TaskStatus.QUEUED.value
                 and not self.same_node_as_task_id(item)
                 and not self.task_is_fea_bursty(item)
@@ -3489,7 +3501,9 @@ class Scheduler:
         for task in self.project_fair_queue_order(
             [
                 item
-                for item in self.db.list_tasks(limit=5000)
+                for item in self.db.list_tasks(
+                    limit=5000, statuses=[TaskStatus.QUEUED.value]
+                )
                 if item["status"] == TaskStatus.QUEUED.value and self.task_is_fea_bursty(item)
             ],
             self._fea_project_last_claim,
@@ -5496,7 +5510,9 @@ class Scheduler:
         return sorted(
             [
                 task
-                for task in self.db.list_tasks(limit=5000)
+                for task in self.db.list_tasks(
+                    limit=5000, statuses=[TaskStatus.QUEUED.value]
+                )
                 if task["status"] == TaskStatus.QUEUED.value
                 and self.task_is_fea_bursty(task)
                 and not int(task.get("exclusive_node") or 0)
@@ -7350,7 +7366,9 @@ class Scheduler:
         return sorted(
             [
                 task
-                for task in self.db.list_tasks(limit=5000)
+                for task in self.db.list_tasks(
+                    limit=5000, statuses=[TaskStatus.QUEUED.value]
+                )
                 if self.task_is_queued_demand(task)
             ],
             key=self.queued_task_order_key,
@@ -7539,7 +7557,9 @@ class Scheduler:
         return sorted(
             [
                 task
-                for task in self.db.list_tasks(limit=5000)
+                for task in self.db.list_tasks(
+                    limit=5000, statuses=[TaskStatus.QUEUED.value]
+                )
                 if task["status"] == TaskStatus.QUEUED.value
             ],
             key=self.queued_task_order_key,
@@ -7773,7 +7793,9 @@ class Scheduler:
         queued_tasks = sorted(
             [
                 task
-                for task in self.db.list_tasks(limit=5000)
+                for task in self.db.list_tasks(
+                    limit=5000, statuses=[TaskStatus.QUEUED.value]
+                )
                 if task["status"] == TaskStatus.QUEUED.value
                 and self.task_aedt_backend_admitted(task)
                 and self.task_aedt_backend(task) == AedtBackend.STANDALONE.value
@@ -7870,7 +7892,9 @@ class Scheduler:
         queued_tasks = sorted(
             [
                 task
-                for task in self.db.list_tasks(limit=5000)
+                for task in self.db.list_tasks(
+                    limit=5000, statuses=[TaskStatus.QUEUED.value]
+                )
                 if task["status"] == TaskStatus.QUEUED.value
                 and int(task.get("exclusive_node") or 0)
                 and self.task_aedt_backend_admitted(task)
@@ -9269,7 +9293,9 @@ class Scheduler:
             item = summaries.setdefault(model, empty_summary(model))
             item["scheduler_owned_gpus"] += int(allocation.get("total_gpus") or 0)
             item["scheduler_free_gpus"] += int(allocation.get("free_gpus") or 0)
-        for task in self.db.list_tasks(limit=5000):
+        for task in self.db.list_tasks(
+            limit=5000, statuses=[TaskStatus.QUEUED.value]
+        ):
             if task["status"] != TaskStatus.QUEUED.value or int(task.get("gpus") or 0) <= 0:
                 continue
             model = normalize_gpu_model(str(task.get("gpu_model") or "")) or "unspecified"
