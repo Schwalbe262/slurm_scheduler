@@ -216,6 +216,86 @@ class AedtPoolTestCase(unittest.TestCase):
 
 
 class AedtPoolGateTests(AedtPoolTestCase):
+    def test_tokenless_app_factory_only_disables_adapter_with_service_authority(
+        self,
+    ) -> None:
+        allocation_id = self.add_dedicated_allocation()
+        self.service.set_operator_limits(
+            max_sessions=1,
+            min_idle_sessions=1,
+            target_projects=3,
+            projects_per_session=3,
+        )
+        self.make_operational()
+        session, _host_token = self.start_one_session(allocation_id)
+        self.assertEqual(session["state"], "ready")
+
+        root = Path(self.tmp.name)
+        accounts_path = root / "factory-accounts.yaml"
+        accounts_path.write_text(
+            "\n".join(
+                [
+                    "accounts:",
+                    "  - name: a",
+                    "    host: invalid",
+                    "    port: 22",
+                    "    username: a",
+                    "    private_key_path: key",
+                    "    remote_workspace: /work",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        config_path = root / "factory-app.yaml"
+        config_path.write_text(
+            "\n".join(
+                [
+                    f'database_path: "{Path(self.db.path).as_posix()}"',
+                    f'accounts_path: "{accounts_path.as_posix()}"',
+                    "min_warm_allocations: 0",
+                    "cluster_refresh_interval_seconds: 0",
+                    "reconcile_on_start: false",
+                    "backup_enabled: false",
+                    "web_listener_watchdog_enabled: false",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        diagnostic_environment = {
+            "SLURM_SCHEDULER_CONFIG": str(config_path),
+            "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN": "",
+            "SLURM_AEDT_POOL_CLIENT_TOKEN": "",
+            "SLURM_SCHEDULER_SERVICE_PROCESS": "",
+        }
+        with patch.dict(os.environ, diagnostic_environment, clear=False):
+            from slurm_scheduler.app import create_app
+
+            diagnostic_app = create_app(str(config_path))
+        diagnostic_app.router.on_startup.clear()
+        diagnostic_app.router.on_shutdown.clear()
+
+        self.assertFalse(diagnostic_app.state.scheduler_service_process)
+        self.assertTrue(diagnostic_app.state.aedt_pool.config().enabled)
+        self.assertTrue(diagnostic_app.state.aedt_pool.config().adapter_ready)
+        preserved = diagnostic_app.state.aedt_pool.get_session(int(session["id"]))
+        self.assertEqual(preserved["state"], "ready")
+        self.assertIsNone(preserved["drain_requested_at"])
+
+        with patch.dict(
+            os.environ,
+            {**diagnostic_environment, "SLURM_SCHEDULER_SERVICE_PROCESS": "1"},
+            clear=False,
+        ):
+            service_app = create_app(str(config_path))
+        service_app.router.on_startup.clear()
+        service_app.router.on_shutdown.clear()
+
+        self.assertTrue(service_app.state.scheduler_service_process)
+        self.assertFalse(service_app.state.aedt_pool.config().adapter_ready)
+        drained = service_app.state.aedt_pool.get_session(int(session["id"]))
+        self.assertEqual(drained["state"], "draining")
+        self.assertIsNotNone(drained["drain_requested_at"])
+
     def test_queued_pooled_backlog_plans_500_projects_plus_three_spares(self) -> None:
         self.service.set_operator_limits(
             max_sessions=170,

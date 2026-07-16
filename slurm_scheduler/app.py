@@ -49,6 +49,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 MFT_ACTIVE_CONCURRENCY_CEILING = 500
 MAX_CAMPAIGN_TOTAL_SIMULATIONS = 1_000_000
+SCHEDULER_SERVICE_PROCESS_ENV = "SLURM_SCHEDULER_SERVICE_PROCESS"
 
 def parse_aedt_backend(value: object) -> str:
     try:
@@ -782,9 +783,17 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         == SUPPORTED_DSO_PROFILE
         and is_expected_session_profile(config.aedt_pool_host_session_profile)
     )
-    # Recompute on every start so a stale DB flag cannot outlive a removed
-    # token file/launch configuration.
-    aedt_pool.set_adapter_ready(aedt_adapter_configured)
+    scheduler_service_process = (
+        os.environ.get(SCHEDULER_SERVICE_PROCESS_ENV, "").strip() == "1"
+    )
+    # A fully configured process may publish readiness.  Withdrawing durable
+    # readiness is destructive when the pool is enabled because it drains
+    # every live session, so only the explicitly marked service owner may do
+    # that.  Imports by diagnostics, tests, or CLI helpers commonly have no
+    # deployment tokens and must remain read-only with respect to live state.
+    if aedt_adapter_configured or scheduler_service_process:
+        aedt_pool.set_adapter_ready(aedt_adapter_configured)
+    app.state.scheduler_service_process = scheduler_service_process
     aedt_pool_runtime = AedtPoolRuntime(
         aedt_pool,
         scheduler,
