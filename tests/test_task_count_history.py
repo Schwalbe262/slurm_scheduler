@@ -427,6 +427,25 @@ class TaskCountHistoryRouteTests(unittest.TestCase):
         self.assertIn(f'data-id="{task_ids[0]}"', second_html)
         self.assertIn("Active page 1 / 2 (105 tasks, 100 per page)", first_html)
         self.assertIn("Active page 2 / 2 (105 tasks, 100 per page)", second_html)
+        marker = first_html.index("Active page 1 / 2")
+        self.assertGreater(marker, first_html.index('id="attached-tasks-table"'))
+        self.assertLess(marker, first_html.index("<summary>Finished tasks:"))
+
+    def test_dashboard_template_accepts_previous_generation_context_during_staging(self) -> None:
+        response = self.route_endpoint("/", "GET")(self.dashboard_request())
+        legacy_context = dict(response.context)
+        for key in (
+            "active_page",
+            "active_page_count",
+            "active_task_count",
+            "active_page_size",
+        ):
+            legacy_context.pop(key, None)
+
+        legacy_html = response.template.render(legacy_context)
+
+        self.assertIn("Active page 1 / 1", legacy_html)
+        self.assertIn("5000 per page", legacy_html)
 
 
 if __name__ == "__main__":

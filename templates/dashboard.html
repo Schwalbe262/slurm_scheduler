@@ -806,15 +806,6 @@
         </tbody>
       </table>
     </div>
-    <div class="section-gap" style="display: flex; gap: 10px; align-items: center;">
-      {% if active_page > 0 %}
-        <a class="button" href="/?active_page={{ active_page - 1 }}{% if finished_page > 0 %}&finished_page={{ finished_page }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">&laquo; Prev active</a>
-      {% endif %}
-      <span class="muted">Active page {{ active_page + 1 }} / {{ active_page_count }} ({{ active_task_count }} tasks, {{ active_page_size }} per page)</span>
-      {% if active_page + 1 < active_page_count %}
-        <a class="button" href="/?active_page={{ active_page + 1 }}{% if finished_page > 0 %}&finished_page={{ finished_page }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">Next active &raquo;</a>
-      {% endif %}
-    </div>
     <details class="section-gap">
       <summary>Closed allocations: recent {{ closed_allocations|length }}{% if closed_allocation_count > closed_allocations|length %} of {{ closed_allocation_count }}{% endif %}</summary>
       <div class="table-scroll section-gap">
@@ -944,6 +935,12 @@
   </section>
 
   <section class="panel">
+    {# Keep this template renderable by the previous in-memory app while a
+       reviewed checkout is staged ahead of the leaf-worker restart. #}
+    {% set active_page_value = active_page|default(0) %}
+    {% set active_page_count_value = active_page_count|default(1) %}
+    {% set active_task_count_value = active_task_count|default(tasks|length) %}
+    {% set active_page_size_value = active_page_size|default(5000) %}
     <div class="title-row">
       <h2>Attached Tasks</h2>
       <span class="muted" data-live-updated-at></span>
@@ -1102,6 +1099,15 @@
         </tbody>
       </table>
     </div>
+    <div class="section-gap" style="display: flex; gap: 10px; align-items: center;">
+      {% if active_page_value > 0 %}
+        <a class="button" href="/?active_page={{ active_page_value - 1 }}{% if finished_page > 0 %}&finished_page={{ finished_page }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">&laquo; Prev active</a>
+      {% endif %}
+      <span class="muted">Active page {{ active_page_value + 1 }} / {{ active_page_count_value }} ({{ active_task_count_value }} tasks, {{ active_page_size_value }} per page)</span>
+      {% if active_page_value + 1 < active_page_count_value %}
+        <a class="button" href="/?active_page={{ active_page_value + 1 }}{% if finished_page > 0 %}&finished_page={{ finished_page }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">Next active &raquo;</a>
+      {% endif %}
+    </div>
     <details class="section-gap">
       <summary>Finished tasks: {% if attached_task_name_filter %}matching{% else %}recent{% endif %} {{ finished_tasks|length }}{% if finished_task_count > finished_tasks|length %} of {{ finished_task_count }}{% endif %}{% if attached_task_name_filter %} for "{{ attached_task_name_filter }}"{% endif %}</summary>
       <div class="table-scroll section-gap">
@@ -1152,11 +1158,11 @@
       </div>
       <div class="section-gap" style="display: flex; gap: 10px; align-items: center;">
         {% if finished_page > 0 %}
-          <a class="button" href="/?finished_page={{ finished_page - 1 }}{% if active_page > 0 %}&active_page={{ active_page }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">&laquo; Prev</a>
+          <a class="button" href="/?finished_page={{ finished_page - 1 }}{% if active_page_value > 0 %}&active_page={{ active_page_value }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">&laquo; Prev</a>
         {% endif %}
         <span class="muted">Page {{ finished_page + 1 }} / {{ finished_page_count }} ({{ finished_task_count }} tasks)</span>
         {% if finished_page + 1 < finished_page_count %}
-          <a class="button" href="/?finished_page={{ finished_page + 1 }}{% if active_page > 0 %}&active_page={{ active_page }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">Next &raquo;</a>
+          <a class="button" href="/?finished_page={{ finished_page + 1 }}{% if active_page_value > 0 %}&active_page={{ active_page_value }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">Next &raquo;</a>
         {% endif %}
       </div>
     </details>
@@ -1178,7 +1184,7 @@
         const finishedRows = finishedTbody ? Array.from(finishedTbody.querySelectorAll("[data-finished-task-row]")) : [];
         const defaultState = { filter: "", sortKey: "id", direction: "desc" };
         const serverFilter = {{ attached_task_name_filter|tojson }};
-        const activePageCount = {{ active_page_count }};
+        const activePageCount = {{ active_page_count_value }};
 
         function loadState() {
           try {
