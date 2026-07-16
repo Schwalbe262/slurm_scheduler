@@ -24,6 +24,8 @@ Important fields:
 database_path: "data/slurm_scheduler.db"
 sqlite_journal_mode: "wal"
 accounts_path: "config/accounts.yaml"
+mft_campaign_mutation_lock_path: ""
+mft_campaign_mutation_lock_timeout_seconds: 900
 poll_interval_seconds: 30
 bind_host: "127.0.0.1"
 bind_port: 8000
@@ -89,6 +91,12 @@ Field meanings:
 - `sqlite_journal_mode`: SQLite journal mode applied to every connection. The default is `wal` for
   local-disk deployments. Use `delete` when `database_path` is on a network filesystem; WAL is not
   supported there.
+- `mft_campaign_mutation_lock_path`: optional override for the host-wide MFT feeder mutation lock.
+  Empty uses `%LOCALAPPDATA%/MFT_1MW_2026/campaign-mutation.lock`, the same path as the feeder and
+  monitoring UI. Do not point the scheduler at a different file: total-demand decreases must
+  serialize with feeder submissions.
+- `mft_campaign_mutation_lock_timeout_seconds`: maximum time a total-demand PATCH waits for an
+  in-flight feeder cycle before returning `503` without changing demand.
 - `cluster_refresh_interval_seconds`: how often the background loop refreshes Slurm node inventory and `pestat` data.
 - `web_remote_file_default_max_bytes`: default maximum bytes returned by web log/remote-file endpoints when the request does not specify `max_bytes`.
 - `web_remote_file_hard_max_bytes`: absolute response cap for web log/remote-file endpoints. Set to `0` to disable the hard cap.

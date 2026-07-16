@@ -2,6 +2,10 @@ database_path: "data/slurm_scheduler.db"
 # WARNING: use delete when database_path is on a network filesystem — WAL is unsupported there.
 sqlite_journal_mode: "wal"
 accounts_path: "config/accounts.yaml"
+# Empty uses %LOCALAPPDATA%/MFT_1MW_2026/campaign-mutation.lock, exactly the
+# same host-wide lock as the feeder and monitoring UI.
+mft_campaign_mutation_lock_path: ""
+mft_campaign_mutation_lock_timeout_seconds: 900
 poll_interval_seconds: 30
 # Administrative ceiling for each project's max_active_tasks setting. Raising
 # this does not bypass enabled license-admission feature headroom (including

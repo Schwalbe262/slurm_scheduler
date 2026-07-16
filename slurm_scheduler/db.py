@@ -276,6 +276,10 @@ CREATE TABLE IF NOT EXISTS projects (
     policy_revision INTEGER NOT NULL DEFAULT 1,
     validated_concurrency_limit INTEGER NOT NULL DEFAULT 0,
     scale_down_mode TEXT NOT NULL DEFAULT 'drain',
+    campaign_total_simulations INTEGER NOT NULL DEFAULT 0,
+    campaign_demand_revision INTEGER NOT NULL DEFAULT 1,
+    campaign_demand_updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    campaign_demand_updated_by TEXT NOT NULL DEFAULT 'system',
     aedt_backend TEXT NOT NULL DEFAULT 'standalone',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -542,14 +546,47 @@ class Database:
                 "policy_revision": "INTEGER NOT NULL DEFAULT 1",
                 "validated_concurrency_limit": "INTEGER NOT NULL DEFAULT 0",
                 "scale_down_mode": "TEXT NOT NULL DEFAULT 'drain'",
+                "campaign_total_simulations": "INTEGER NOT NULL DEFAULT 0",
+                "campaign_demand_revision": "INTEGER NOT NULL DEFAULT 1",
+                "campaign_demand_updated_at": "TEXT NOT NULL DEFAULT ''",
+                "campaign_demand_updated_by": "TEXT NOT NULL DEFAULT 'system'",
                 "aedt_backend": f"TEXT NOT NULL DEFAULT '{AedtBackend.STANDALONE.value}'",
             },
+        }
+        project_columns_before = {
+            row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()
         }
         for table, columns in table_columns.items():
             existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             for name, ddl in columns.items():
                 if name not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+        if "campaign_total_simulations" not in project_columns_before:
+            # Existing installations receive the requested q22 campaign
+            # default exactly once.  A later intentional decrease to zero is
+            # never overwritten by subsequent scheduler startups.
+            conn.execute(
+                """
+                UPDATE projects
+                SET campaign_total_simulations = 500,
+                    campaign_demand_revision = 1,
+                    campaign_demand_updated_at = CURRENT_TIMESTAMP,
+                    campaign_demand_updated_by = 'migration:q22-default'
+                WHERE name = 'MFT_1MW_2026v1'
+                """
+            )
+        conn.execute(
+            """
+            UPDATE projects
+            SET campaign_demand_revision = MAX(1, campaign_demand_revision),
+                campaign_demand_updated_at = CASE
+                    WHEN campaign_demand_updated_at = '' THEN CURRENT_TIMESTAMP
+                    ELSE campaign_demand_updated_at END,
+                campaign_demand_updated_by = CASE
+                    WHEN campaign_demand_updated_by = '' THEN 'system'
+                    ELSE campaign_demand_updated_by END
+            """
+        )
         conn.execute(
             """
             UPDATE projects
@@ -1430,6 +1467,7 @@ class Database:
     ) -> int:
         requested_limit = max(0, int(max_active_tasks))
         is_mft = str(name or "").strip().lower().startswith("mft")
+        initial_campaign_total = 500 if str(name or "").strip() == "MFT_1MW_2026v1" else 0
         hard_scheduler_limit = 500 if is_mft else requested_limit
         initial_policy_limit = 1 if is_mft else requested_limit
         with self.connect() as conn:
@@ -1438,8 +1476,12 @@ class Database:
                 INSERT INTO projects (
                     name, repos, setup, entrypoints, cleanup_globs, output_globs, sim_subdir, auto_pull,
                     max_active_tasks, desired_simulations, policy_revision,
-                    validated_concurrency_limit, scale_down_mode, aedt_backend
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'drain', ?)
+                    validated_concurrency_limit, scale_down_mode,
+                    campaign_total_simulations, campaign_demand_revision,
+                    campaign_demand_updated_at, campaign_demand_updated_by,
+                    aedt_backend
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'drain', ?, 1,
+                          CURRENT_TIMESTAMP, 'create-project', ?)
                 """,
                 (
                     name,
@@ -1453,6 +1495,7 @@ class Database:
                     hard_scheduler_limit,
                     initial_policy_limit,
                     initial_policy_limit,
+                    initial_campaign_total,
                     normalize_aedt_backend(aedt_backend),
                 ),
             )
@@ -1558,6 +1601,79 @@ class Database:
             updated = conn.execute(
                 "SELECT * FROM projects WHERE id = ?", (int(project["id"]),)
             ).fetchone()
+            return "updated", dict(updated)
+
+    def update_project_campaign_demand(
+        self,
+        name: str,
+        *,
+        total_simulations: int,
+        expected_revision: int,
+        updated_by: str,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """CAS-update an absolute feeder budget without touching any task row.
+
+        Setting the same value at the current revision is a true no-op.  This
+        gives clients an idempotent absolute-target operation while stale
+        revisions still fail closed.
+        """
+
+        total = max(0, int(total_simulations))
+        actor = str(updated_by or "api").strip()[:256] or "api"
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            project = conn.execute(
+                "SELECT * FROM projects WHERE name = ?", (name,)
+            ).fetchone()
+            if not project:
+                return "not_found", None
+            current_revision = int(project["campaign_demand_revision"] or 1)
+            if current_revision != int(expected_revision):
+                return "conflict", dict(project)
+            previous_total = max(0, int(project["campaign_total_simulations"] or 0))
+            if previous_total == total:
+                return "unchanged", dict(project)
+            cursor = conn.execute(
+                """
+                UPDATE projects
+                SET campaign_total_simulations = ?,
+                    campaign_demand_revision = campaign_demand_revision + 1,
+                    campaign_demand_updated_at = CURRENT_TIMESTAMP,
+                    campaign_demand_updated_by = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND campaign_demand_revision = ?
+                """,
+                (total, actor, int(project["id"]), int(expected_revision)),
+            )
+            if cursor.rowcount != 1:
+                current = conn.execute(
+                    "SELECT * FROM projects WHERE id = ?", (int(project["id"]),)
+                ).fetchone()
+                return "conflict", dict(current) if current else None
+            updated = conn.execute(
+                "SELECT * FROM projects WHERE id = ?", (int(project["id"]),)
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO scheduler_events(
+                    kind, entity_type, entity_id, message
+                ) VALUES('project_campaign_demand_updated', 'project', ?, ?)
+                """,
+                (
+                    str(project["id"]),
+                    json_dumps(
+                        {
+                            "project": name,
+                            "previous_total_simulations": previous_total,
+                            "total_simulations": total,
+                            "demand_revision": int(expected_revision) + 1,
+                            "updated_by": actor,
+                            "scale_down_mode": "drain",
+                            "tasks_cancelled": 0,
+                        }
+                    ),
+                ),
+            )
             return "updated", dict(updated)
 
     def count_tasks_by_project(self, project: str, statuses: list[str] | None = None) -> int:

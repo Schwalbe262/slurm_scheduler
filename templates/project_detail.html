@@ -62,6 +62,66 @@
     </div>
   </section>
 
+  <section class="panel" id="simulation-campaign-controls">
+    <h2>Simulation campaign controls</h2>
+    <p class="muted">
+      Total demand is the durable number of simulations the feeder may accept over time.
+      Active concurrency is a separate rolling limit and is capped at 30 logical clients
+      for MFT. Decreasing total demand stops only future submissions; queued, attaching,
+      and running tasks drain naturally and are never cancelled by this control.
+    </p>
+    <div class="two-column-grid section-gap">
+      <form id="campaign-demand-form" class="form-grid">
+        <div class="full">
+          <label for="campaign-total-simulations">Total simulations requested (campaign budget)</label>
+          <input
+            id="campaign-total-simulations"
+            name="total_simulations"
+            type="number"
+            min="0"
+            max="1000000"
+            step="1"
+            value="{{ project.campaign_demand.total_simulations }}"
+            required
+          >
+        </div>
+        <div class="full actions">
+          <button id="save-campaign-demand" type="submit">Save total demand</button>
+          <span id="campaign-demand-result" class="muted" role="status"></span>
+        </div>
+        <p class="full muted">
+          Revision <span id="campaign-demand-revision">{{ project.campaign_demand.demand_revision }}</span>.
+          Accepted/remaining progress is owned by the feeder manifest.
+        </p>
+      </form>
+
+      <form id="active-concurrency-form" class="form-grid">
+        <div class="full">
+          <label for="desired-active-simulations">Active simulations at once (rolling concurrency, max 30)</label>
+          <input
+            id="desired-active-simulations"
+            name="desired_simulations"
+            type="number"
+            min="0"
+            max="{{ project.simulation_policy.max_desired_simulations }}"
+            step="1"
+            value="{{ project.simulation_policy.desired_simulations }}"
+            required
+          >
+        </div>
+        <div class="full actions">
+          <button id="save-active-concurrency" type="submit">Save active concurrency</button>
+          <span id="active-concurrency-result" class="muted" role="status"></span>
+        </div>
+        <p class="full muted">
+          Validated ceiling: {{ project.simulation_policy.validated_concurrency_limit }};
+          effective now: <span id="effective-active-simulations">{{ project.simulation_policy.effective_simulations }}</span>.
+          Scale-down mode is drain.
+        </p>
+      </form>
+    </div>
+  </section>
+
   <section class="panel">
     <h2>배포 상태</h2>
     <div class="table-scroll">
@@ -127,4 +187,112 @@
     </form>
   </section>
 </div>
+
+<script>
+  const campaignProjectName = {{ project.name | tojson }};
+  let campaignDemand = {{ project.campaign_demand | tojson }};
+  let simulationPolicy = {{ project.simulation_policy | tojson }};
+
+  async function campaignResponsePayload(response) {
+    const text = await response.text();
+    if (!text) return {};
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      return {detail: text};
+    }
+  }
+
+  function campaignErrorMessage(response, payload) {
+    const detail = payload?.detail;
+    if (typeof detail === "string") return `HTTP ${response.status}: ${detail}`;
+    if (detail?.message) return `HTTP ${response.status}: ${detail.message}`;
+    return `HTTP ${response.status}`;
+  }
+
+  function renderCampaignDemand(demand) {
+    campaignDemand = demand;
+    document.getElementById("campaign-total-simulations").value = demand.total_simulations;
+    document.getElementById("campaign-demand-revision").textContent = demand.demand_revision;
+  }
+
+  function renderSimulationPolicy(policy) {
+    simulationPolicy = policy;
+    const input = document.getElementById("desired-active-simulations");
+    input.value = policy.desired_simulations;
+    input.max = Math.min(30, Number(policy.max_desired_simulations || 0));
+    document.getElementById("effective-active-simulations").textContent =
+      policy.effective_simulations;
+  }
+
+  document.getElementById("campaign-demand-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const result = document.getElementById("campaign-demand-result");
+    const total = Number(document.getElementById("campaign-total-simulations").value);
+    result.className = "muted";
+    result.textContent = "Saving total demand...";
+    try {
+      const response = await fetch(
+        `/api/projects/${encodeURIComponent(campaignProjectName)}/campaign-demand`,
+        {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Operator-Identity": "scheduler-web-ui"
+          },
+          body: JSON.stringify({
+            total_simulations: total,
+            expected_revision: campaignDemand.demand_revision
+          })
+        }
+      );
+      const payload = await campaignResponsePayload(response);
+      if (!response.ok) {
+        if (response.status === 409 && payload?.detail?.current) {
+          renderCampaignDemand(payload.detail.current);
+        }
+        throw new Error(campaignErrorMessage(response, payload));
+      }
+      renderCampaignDemand(payload);
+      result.textContent = `Saved total demand ${payload.total_simulations}. Existing active tasks continue.`;
+    } catch (error) {
+      result.className = "error";
+      result.textContent = error.message;
+    }
+  });
+
+  document.getElementById("active-concurrency-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const result = document.getElementById("active-concurrency-result");
+    const desired = Number(document.getElementById("desired-active-simulations").value);
+    result.className = "muted";
+    result.textContent = "Saving active concurrency...";
+    try {
+      const response = await fetch(
+        `/api/projects/${encodeURIComponent(campaignProjectName)}/simulation-policy`,
+        {
+          method: "PATCH",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            desired_simulations: desired,
+            expected_revision: simulationPolicy.policy_revision,
+            scale_down_mode: "drain"
+          })
+        }
+      );
+      const payload = await campaignResponsePayload(response);
+      if (!response.ok) {
+        if (response.status === 409 && payload?.detail?.current) {
+          renderSimulationPolicy(payload.detail.current);
+        }
+        throw new Error(campaignErrorMessage(response, payload));
+      }
+      renderSimulationPolicy(payload);
+      result.textContent = `Saved active concurrency ${payload.effective_simulations} (drain mode).`;
+    } catch (error) {
+      result.className = "error";
+      result.textContent = error.message;
+    }
+  });
+</script>
 {% endblock %}

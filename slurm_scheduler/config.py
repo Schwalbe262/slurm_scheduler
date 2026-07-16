@@ -43,6 +43,10 @@ class AppConfig:
     database_path: str = "data/slurm_scheduler.db"
     sqlite_journal_mode: str = "wal"
     accounts_path: str = "config/accounts.yaml"
+    # Empty uses the exact LOCALAPPDATA path shared by the MFT feeder and its
+    # monitoring UI.  Tests and unusual service accounts may override it.
+    mft_campaign_mutation_lock_path: str = ""
+    mft_campaign_mutation_lock_timeout_seconds: int = 900
     poll_interval_seconds: int = 30
     project_max_active_tasks_ceiling: int = 300
     bind_host: str = "127.0.0.1"
