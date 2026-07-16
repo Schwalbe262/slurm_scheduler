@@ -7386,6 +7386,10 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(reserve.call_count, 500)
         self.assertEqual(FakeClient.allocation_submits, [])
         self.assertEqual(self.db.get_allocation(allocation_id)["state"], AllocationStatus.WARM.value)
+        diagnostics = scheduler.health_status()["demand_reservation_plan"]
+        self.assertEqual(diagnostics["mode"], "complete")
+        self.assertEqual(diagnostics["replayed_tasks"], 500)
+        self.assertEqual(diagnostics["scanned_tasks"], 0)
 
     def test_fit_aware_scale_out_discards_plan_after_allocation_change(self) -> None:
         allocation_id = self.db.create_allocation(
@@ -7426,8 +7430,12 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertGreater(reserve.call_count, 0)
         self.assertNotEqual((opened, blocked), (0, False))
+        self.assertEqual(
+            scheduler.health_status()["demand_reservation_plan"]["reason"],
+            "allocation_state_changed",
+        )
 
-    def test_fit_aware_scale_out_discards_plan_when_any_task_was_unreserved(self) -> None:
+    def test_fit_aware_scale_out_replays_reserved_prefix_before_unreserved_tail(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",
             partition="cpu1",
@@ -7467,8 +7475,131 @@ class SchedulerTests(unittest.TestCase):
                 reservation_plan=plan,
             )
 
-        self.assertGreater(reserve.call_count, 0)
-        self.assertNotEqual((opened, blocked), (0, False))
+        self.assertEqual(reserve.call_count, 2)
+        self.assertEqual((opened, blocked), (1, False))
+        diagnostics = scheduler.health_status()["demand_reservation_plan"]
+        self.assertEqual(diagnostics["mode"], "prefix")
+        self.assertEqual(diagnostics["replayed_tasks"], 1)
+        self.assertEqual(diagnostics["scanned_tasks"], 1)
+        self.assertEqual(diagnostics["reason"], "unreserved_task")
+
+    def test_fit_aware_scale_out_skips_unreserved_non_demand_plan_steps(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=2,
+            total_memory_mb=2048,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="fit-plan-mixed",
+        )
+        first_id = self.db.create_task(
+            TaskCreate("fit-plan-mixed-first", "~/case", "run", cpus=1, memory_mb=1)
+        )
+        self.db.create_task(
+            TaskCreate(
+                "fit-plan-mixed-pooled",
+                "~/case",
+                "run",
+                cpus=1,
+                memory_mb=1,
+                required_capability="missing",
+                aedt_backend=AedtBackend.POOLED.value,
+            )
+        )
+        second_id = self.db.create_task(
+            TaskCreate("fit-plan-mixed-second", "~/case", "run", cpus=1, memory_mb=1)
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+        all_queued = scheduler.queued_tasks_for_allocation_reservations()
+        standalone = scheduler.queued_demand_tasks()
+        self.assertEqual([task["id"] for task in standalone], [first_id, second_id])
+        plan = scheduler.queued_task_allocation_reservation_plan(all_queued)
+
+        with mock.patch.object(
+            scheduler,
+            "reserve_inflight_capacity_for_task",
+            wraps=scheduler.reserve_inflight_capacity_for_task,
+        ) as reserve:
+            opened, blocked = scheduler.open_fit_aware_demand_allocations(
+                standalone,
+                reservation_plan=plan,
+            )
+
+        self.assertEqual(reserve.call_count, 0)
+        self.assertEqual((opened, blocked), (0, False))
+        diagnostics = scheduler.health_status()["demand_reservation_plan"]
+        self.assertEqual(diagnostics["mode"], "complete")
+        self.assertEqual(diagnostics["replayed_tasks"], 2)
+        self.assertEqual(diagnostics["scanned_tasks"], 0)
+
+    def test_fit_aware_scale_out_stops_replay_before_reserved_non_demand_step(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=2,
+            total_memory_mb=2048,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="fit-plan-mixed-reserved",
+        )
+        first_id = self.db.create_task(
+            TaskCreate("fit-plan-mixed-reserved-first", "~/case", "run", cpus=1, memory_mb=1)
+        )
+        self.db.create_task(
+            TaskCreate(
+                "fit-plan-mixed-reserved-pooled",
+                "~/case",
+                "run",
+                cpus=1,
+                memory_mb=1,
+                aedt_backend=AedtBackend.POOLED.value,
+            )
+        )
+        second_id = self.db.create_task(
+            TaskCreate("fit-plan-mixed-reserved-second", "~/case", "run", cpus=1, memory_mb=1)
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+        all_queued = scheduler.queued_tasks_for_allocation_reservations()
+        standalone = scheduler.queued_demand_tasks()
+        self.assertEqual([task["id"] for task in standalone], [first_id, second_id])
+        plan = scheduler.queued_task_allocation_reservation_plan(all_queued)
+
+        with mock.patch.object(
+            scheduler,
+            "reserve_inflight_capacity_for_task",
+            wraps=scheduler.reserve_inflight_capacity_for_task,
+        ) as reserve:
+            opened, blocked = scheduler.open_fit_aware_demand_allocations(
+                standalone,
+                reservation_plan=plan,
+            )
+
+        self.assertEqual(reserve.call_count, 1)
+        self.assertEqual((opened, blocked), (0, False))
+        diagnostics = scheduler.health_status()["demand_reservation_plan"]
+        self.assertEqual(diagnostics["mode"], "prefix")
+        self.assertEqual(diagnostics["replayed_tasks"], 1)
+        self.assertEqual(diagnostics["scanned_tasks"], 1)
+        self.assertEqual(diagnostics["reason"], "non_demand_reservation")
 
     def test_fea_bursty_ready_attach_respects_physical_node_worker_limit(self) -> None:
         first_id = self.db.create_allocation(

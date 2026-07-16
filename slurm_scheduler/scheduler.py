@@ -69,6 +69,13 @@ class AccountUnavailableThisTick(RuntimeError):
 
 
 @dataclass
+class _QueuedTaskAllocationReservationStep:
+    task_id: int
+    allocation_id: int | None
+    effective_task: dict | None
+
+
+@dataclass
 class _QueuedTaskAllocationReservationPlan:
     """Read-only certificate produced by one fit-aware queue scan.
 
@@ -85,6 +92,7 @@ class _QueuedTaskAllocationReservationPlan:
     task_signatures_by_id: dict[int, str]
     allocation_signature: tuple[str, ...]
     fit_state_signature: tuple[Any, ...]
+    steps: tuple[_QueuedTaskAllocationReservationStep, ...]
     reusable: bool
 
 
@@ -562,6 +570,7 @@ class Scheduler:
         self._last_tick_completed_at: str = ""
         self._last_tick_duration: float | None = None
         self._last_tick_stage_seconds: dict[str, float] = {}
+        self._last_demand_reservation_plan: dict[str, Any] = {}
         self._consecutive_tick_failures = 0
         self.watchdog_enabled = watchdog_enabled
         self.watchdog_stall_seconds = max(0, int(watchdog_stall_seconds))
@@ -710,6 +719,7 @@ class Scheduler:
             if self._last_tick_duration is not None
             else None,
             "last_tick_stage_seconds": dict(self._last_tick_stage_seconds),
+            "demand_reservation_plan": dict(self._last_demand_reservation_plan),
             "tick_in_progress_seconds": round(tick_in_progress_seconds, 1)
             if tick_in_progress_seconds is not None
             else None,
@@ -7140,26 +7150,30 @@ class Scheduler:
         reservation_plan: _QueuedTaskAllocationReservationPlan | None = None,
     ) -> tuple[int, bool]:
         if not queued_tasks:
-            return 0, False
-        if reservation_plan and self.reservation_plan_covers_tasks(
-            reservation_plan,
-            queued_tasks,
-        ):
-            return 0, False
-        remaining_allocations = [
-            dict(allocation)
-            for allocation in self.db.list_allocations(limit=500)
-            if allocation["state"]
-            in {
-                AllocationStatus.PENDING.value,
-                AllocationStatus.WARM.value,
-                AllocationStatus.ACTIVE.value,
+            self._last_demand_reservation_plan = {
+                "tick": self._tick_seq,
+                "mode": "empty",
+                "queued_tasks": 0,
+                "replayed_tasks": 0,
+                "scanned_tasks": 0,
+                "reason": "",
             }
-        ]
-        self.annotate_fea_node_worker_counts(remaining_allocations)
+            return 0, False
+        remaining_allocations: list[dict] | None = None
+        start_index = 0
+        replay_reason = "no_plan"
+        if reservation_plan is not None:
+            remaining_allocations, start_index, replay_reason = self.replay_reservation_plan_prefix(
+                reservation_plan,
+                queued_tasks,
+            )
+        if remaining_allocations is None:
+            remaining_allocations = self.current_reservation_allocations()
+            self.annotate_fea_node_worker_counts(remaining_allocations)
+            start_index = 0
         opened = 0
         blocked = False
-        for task in queued_tasks:
+        for task in queued_tasks[start_index:]:
             if self.reserve_inflight_capacity_for_task(remaining_allocations, task):
                 continue
             if opened >= self.allocation_max_new_per_loop:
@@ -7172,6 +7186,25 @@ class Scheduler:
             opened += 1
             remaining_allocations.append(dict(allocation))
             self.reserve_inflight_capacity_for_task(remaining_allocations, task)
+        self._last_demand_reservation_plan = {
+            "tick": self._tick_seq,
+            "mode": (
+                "complete"
+                if start_index == len(queued_tasks)
+                else "prefix"
+                if start_index > 0
+                else "fallback"
+            ),
+            "queued_tasks": len(queued_tasks),
+            "plan_reserved_tasks": len(reservation_plan.reserved_task_ids)
+            if reservation_plan is not None
+            else 0,
+            "replayed_tasks": start_index,
+            "scanned_tasks": len(queued_tasks) - start_index,
+            "reason": replay_reason,
+            "opened_allocations": opened,
+            "blocked": blocked,
+        }
         return opened, blocked
 
     @staticmethod
@@ -7183,6 +7216,18 @@ class Scheduler:
             self._reservation_record_signature(allocation)
             for allocation in sorted(allocations, key=lambda item: int(item.get("id") or 0))
         )
+
+    def current_reservation_allocations(self) -> list[dict]:
+        return [
+            dict(allocation)
+            for allocation in self.db.list_allocations(limit=500)
+            if allocation["state"]
+            in {
+                AllocationStatus.PENDING.value,
+                AllocationStatus.WARM.value,
+                AllocationStatus.ACTIVE.value,
+            }
+        ]
 
     def _reservation_fit_state_signature(self) -> tuple[Any, ...]:
         active_tasks = self.db.list_tasks_by_statuses(
@@ -7218,34 +7263,21 @@ class Scheduler:
     ) -> _QueuedTaskAllocationReservationPlan:
         tasks = queued_tasks if queued_tasks is not None else self.queued_demand_tasks()
         fit_state_before = self._reservation_fit_state_signature()
-        remaining_allocations = [
-            dict(allocation)
-            for allocation in self.db.list_allocations(limit=500)
-            if allocation["state"]
-            in {
-                AllocationStatus.PENDING.value,
-                AllocationStatus.WARM.value,
-                AllocationStatus.ACTIVE.value,
-            }
-        ]
+        remaining_allocations = self.current_reservation_allocations()
         allocation_signature = self._reservation_allocation_signature(remaining_allocations)
         self.annotate_fea_node_worker_counts(remaining_allocations)
         reservations: dict[int, list[int]] = {}
+        steps: list[_QueuedTaskAllocationReservationStep] = []
         for task in tasks:
-            allocation = self.reserve_inflight_capacity_for_task(remaining_allocations, task)
+            allocation = self.reserve_inflight_capacity_for_task(
+                remaining_allocations,
+                task,
+                reservation_steps=steps,
+            )
             if not allocation:
                 continue
             reservations.setdefault(int(allocation["id"]), []).append(int(task["id"]))
-        current_allocations = [
-            allocation
-            for allocation in self.db.list_allocations(limit=500)
-            if allocation["state"]
-            in {
-                AllocationStatus.PENDING.value,
-                AllocationStatus.WARM.value,
-                AllocationStatus.ACTIVE.value,
-            }
-        ]
+        current_allocations = self.current_reservation_allocations()
         fit_state_after = self._reservation_fit_state_signature()
         task_signatures_by_id = {
             int(task["id"]): self._reservation_record_signature(task)
@@ -7261,38 +7293,102 @@ class Scheduler:
             task_signatures_by_id=task_signatures_by_id,
             allocation_signature=allocation_signature,
             fit_state_signature=fit_state_before,
+            steps=tuple(steps),
             reusable=(
                 allocation_signature == self._reservation_allocation_signature(current_allocations)
                 and fit_state_before == fit_state_after
             ),
         )
 
+    def reservation_plan_state_matches(
+        self,
+        plan: _QueuedTaskAllocationReservationPlan,
+        queued_tasks: list[dict],
+    ) -> tuple[bool, str]:
+        if not plan.reusable:
+            return False, "plan_changed_while_built"
+        for task in queued_tasks:
+            task_id = int(task["id"])
+            signature = plan.task_signatures_by_id.get(task_id)
+            if signature is None:
+                return False, "queued_task_not_in_plan"
+            if signature != self._reservation_record_signature(task):
+                return False, "queued_task_changed"
+        current_allocations = self.current_reservation_allocations()
+        if plan.allocation_signature != self._reservation_allocation_signature(current_allocations):
+            return False, "allocation_state_changed"
+        if plan.fit_state_signature != self._reservation_fit_state_signature():
+            return False, "fit_state_changed"
+        return True, ""
+
+    def replay_reservation_plan_prefix(
+        self,
+        plan: _QueuedTaskAllocationReservationPlan,
+        queued_tasks: list[dict],
+    ) -> tuple[list[dict] | None, int, str]:
+        # Task assignment and allocation close both use this lock.  Hold it
+        # through validation and the cheap direct replay so the certificate
+        # cannot be invalidated between its fingerprint check and application.
+        with self._task_assignment_lock:
+            matches, reason = self.reservation_plan_state_matches(plan, queued_tasks)
+            if not matches:
+                return None, 0, reason
+            remaining_allocations = self.current_reservation_allocations()
+            self.annotate_fea_node_worker_counts(remaining_allocations)
+            allocations_by_id = {
+                int(allocation["id"]): allocation
+                for allocation in remaining_allocations
+            }
+            queued_ids = {int(task["id"]) for task in queued_tasks}
+            queued_index = 0
+            stop_reason = ""
+            for step in plan.steps:
+                if queued_index >= len(queued_tasks):
+                    break
+                expected_task_id = int(queued_tasks[queued_index]["id"])
+                if step.task_id != expected_task_id:
+                    if step.task_id in queued_ids:
+                        return None, 0, "queued_task_order_changed"
+                    if step.allocation_id is not None:
+                        stop_reason = "non_demand_reservation"
+                        break
+                    continue
+                if step.allocation_id is None or step.effective_task is None:
+                    stop_reason = "unreserved_task"
+                    break
+                allocation = allocations_by_id.get(step.allocation_id)
+                if allocation is None:
+                    return None, 0, "reserved_allocation_missing"
+                self.apply_inflight_capacity_reservation(allocation, step.effective_task)
+                queued_index += 1
+            if not stop_reason and queued_index != len(queued_tasks):
+                return None, 0, "reservation_trace_incomplete"
+            # Pool leases can change through the control-plane web thread,
+            # outside the scheduler assignment lock. Recheck the certificate
+            # after replay so that such a concurrent change falls back rather
+            # than using a stale prefix.
+            if plan.allocation_signature != self._reservation_allocation_signature(
+                self.current_reservation_allocations()
+            ):
+                return None, 0, "allocation_state_changed_during_replay"
+            if plan.fit_state_signature != self._reservation_fit_state_signature():
+                return None, 0, "fit_state_changed_during_replay"
+            return (
+                remaining_allocations,
+                queued_index,
+                stop_reason or "all_tasks_reserved",
+            )
+
     def reservation_plan_covers_tasks(
         self,
         plan: _QueuedTaskAllocationReservationPlan,
         queued_tasks: list[dict],
     ) -> bool:
-        if not plan.reusable:
-            return False
-        for task in queued_tasks:
-            task_id = int(task["id"])
-            if task_id not in plan.reserved_task_ids:
-                return False
-            if plan.task_signatures_by_id.get(task_id) != self._reservation_record_signature(task):
-                return False
-        current_allocations = [
-            allocation
-            for allocation in self.db.list_allocations(limit=500)
-            if allocation["state"]
-            in {
-                AllocationStatus.PENDING.value,
-                AllocationStatus.WARM.value,
-                AllocationStatus.ACTIVE.value,
-            }
-        ]
-        if plan.allocation_signature != self._reservation_allocation_signature(current_allocations):
-            return False
-        return plan.fit_state_signature == self._reservation_fit_state_signature()
+        allocations, replayed_tasks, _reason = self.replay_reservation_plan_prefix(
+            plan,
+            queued_tasks,
+        )
+        return allocations is not None and replayed_tasks == len(queued_tasks)
 
     def queued_task_allocation_reservations(
         self,
@@ -7357,7 +7453,13 @@ class Scheduler:
                 return task
         return None
 
-    def reserve_inflight_capacity_for_task(self, allocations: list[dict], task: dict) -> dict | None:
+    def reserve_inflight_capacity_for_task(
+        self,
+        allocations: list[dict],
+        task: dict,
+        *,
+        reservation_steps: list[_QueuedTaskAllocationReservationStep] | None = None,
+    ) -> dict | None:
         candidates = []
         effective_task = task
         for candidate_task, _relaxed in self.effective_task_variants(task):
@@ -7372,6 +7474,14 @@ class Scheduler:
                 effective_task = candidate_task
                 break
         if not candidates:
+            if reservation_steps is not None:
+                reservation_steps.append(
+                    _QueuedTaskAllocationReservationStep(
+                        task_id=int(task["id"]),
+                        allocation_id=None,
+                        effective_task=None,
+                    )
+                )
             return None
         allocation = max(
             candidates,
@@ -7382,6 +7492,18 @@ class Scheduler:
                 int(item.get("free_memory_mb") or 0),
             ),
         )
+        if reservation_steps is not None:
+            reservation_steps.append(
+                _QueuedTaskAllocationReservationStep(
+                    task_id=int(task["id"]),
+                    allocation_id=int(allocation["id"]),
+                    effective_task=dict(effective_task),
+                )
+            )
+        self.apply_inflight_capacity_reservation(allocation, effective_task)
+        return allocation
+
+    def apply_inflight_capacity_reservation(self, allocation: dict, effective_task: dict) -> None:
         allocation_profile = self.task_allocation_profile(effective_task)
         if allocation_profile:
             allocation["_reserved_scheduling_profile"] = allocation_profile
@@ -7393,12 +7515,11 @@ class Scheduler:
                 ) + 1
             if self.task_requires_gpu(effective_task):
                 allocation["free_gpus"] = max(0, int(allocation.get("free_gpus") or 0) - int(effective_task.get("gpus") or 0))
-            return allocation
+            return
         allocation["free_memory_mb"] = max(0, int(allocation.get("free_memory_mb") or 0) - int(effective_task.get("memory_mb") or 0))
         allocation["free_cpus"] = max(0, int(allocation.get("free_cpus") or 0) - int(effective_task.get("cpus") or 0))
         if self.task_requires_gpu(effective_task):
             allocation["free_gpus"] = max(0, int(allocation.get("free_gpus") or 0) - int(effective_task.get("gpus") or 0))
-        return allocation
 
     def prewarm_exclusive_demand(self) -> bool:
         queued_tasks = sorted(
