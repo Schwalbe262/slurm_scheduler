@@ -338,11 +338,12 @@ class Database:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
 
     @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.path, timeout=30)
+    def connect(self, *, busy_timeout_ms: int = 30000) -> Iterator[sqlite3.Connection]:
+        timeout_ms = max(1, int(busy_timeout_ms))
+        conn = sqlite3.connect(self.path, timeout=timeout_ms / 1000.0)
         try:
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute(f"PRAGMA busy_timeout = {timeout_ms}")
             conn.execute("PRAGMA foreign_keys = ON")
             yield conn
             conn.commit()
@@ -1239,14 +1240,25 @@ class Database:
                 values.append(value)
         values.extend((task_id, TaskStatus.ATTACHING.value, token))
         launch_guard = " AND launch_started_at IS NULL" if require_launch_not_started else ""
-        with self.connect() as conn:
-            cursor = conn.execute(
-                f"UPDATE tasks SET {', '.join(assignments)} "
-                "WHERE id = ? AND status = ? AND attach_token = ?"
-                f"{launch_guard}",
-                values,
-            )
-            return cursor.rowcount > 0
+        for attempt in range(4):
+            try:
+                # Attach completion is a durable launch boundary.  A transient
+                # writer convoy must not kill the background thread and strand
+                # a successfully launched remote process in ATTACHING.
+                with self.connect(busy_timeout_ms=5000) as conn:
+                    cursor = conn.execute(
+                        f"UPDATE tasks SET {', '.join(assignments)} "
+                        "WHERE id = ? AND status = ? AND attach_token = ?"
+                        f"{launch_guard}",
+                        values,
+                    )
+                    return cursor.rowcount > 0
+            except sqlite3.OperationalError as exc:
+                locked = "locked" in str(exc).lower() or "busy" in str(exc).lower()
+                if not locked or attempt >= 3:
+                    raise
+                time.sleep(0.05 * (2**attempt))
+        return False
 
     def create_allocation(
         self,
@@ -1356,6 +1368,33 @@ class Database:
 
     def update_allocation(self, allocation_id: int, **fields: Any) -> None:
         self._update_row("allocations", allocation_id, fields)
+
+    def update_allocation_capacities(self, rows: list[dict[str, Any]]) -> None:
+        """Persist one capacity snapshot batch under a single writer lock."""
+        if not rows:
+            return
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                UPDATE allocations
+                SET state = ?, free_cpus = ?, free_memory_mb = ?, free_gpus = ?,
+                    last_active_at = CASE
+                        WHEN ? THEN CURRENT_TIMESTAMP ELSE last_active_at END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    (
+                        str(row["state"]),
+                        int(row["free_cpus"]),
+                        int(row["free_memory_mb"]),
+                        int(row["free_gpus"]),
+                        int(bool(row.get("active_tasks"))),
+                        int(row["id"]),
+                    )
+                    for row in rows
+                ),
+            )
 
     def get_job(self, job_id: int) -> dict[str, Any] | None:
         with self.connect() as conn:

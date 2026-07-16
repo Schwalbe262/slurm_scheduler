@@ -64,6 +64,8 @@ UNHEALTHY_ALLOCATION_RECYCLE_REASON = (
 ALLOCATION_AGE_ROTATION_REASON = "AEDT pool allocation age rotation"
 DEFAULT_HOST_LAUNCH_STAGGER_SECONDS = 15
 HOST_LAUNCH_STAGGER_ENV = "AEDT_POOL_HOST_LAUNCH_STAGGER_SECONDS"
+HEARTBEAT_PERSIST_MAX_SECONDS = 30
+RECONCILE_PLACEMENT_BATCH_SIZE = 32
 
 # A three-project MFT cohort has completed end-to-end on one Desktop while its
 # native Maxwell solves overlapped.  Other workload families have not proved
@@ -335,6 +337,32 @@ def _parse_utc_time(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _heartbeat_persist_interval_seconds(
+    timeout_seconds: int, identity: int
+) -> int:
+    """Bound and spread durable heartbeats well inside their expiry window."""
+
+    ceiling = max(
+        1,
+        min(
+            HEARTBEAT_PERSIST_MAX_SECONDS,
+            max(1, int(timeout_seconds) // 3),
+        ),
+    )
+    spread = min(6, ceiling - 1)
+    return ceiling - (int(identity) % (spread + 1) if spread else 0)
+
+
+def _heartbeat_is_fresh(
+    value: str, now: datetime, interval_seconds: int
+) -> bool:
+    try:
+        elapsed = (now - _parse_utc_time(value)).total_seconds()
+    except ValueError:
+        return False
+    return 0 <= elapsed < max(1, int(interval_seconds))
+
+
 def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -431,12 +459,17 @@ class AedtPoolService:
         self.lease_client_token = str(lease_client_token or "").strip()
         self._now = now
         self._lock = threading.RLock()
+        # Reconcile intentionally holds _lock across one control-plane pass.
+        # Config cache reads are independent and must not queue every HTTP
+        # heartbeat behind that potentially long maintenance transaction.
+        self._config_lock = threading.RLock()
         self._warm_spare_admission_checker: Callable[[int], tuple[int, str]] | None = None
         self._dead_session_process_checker: (
             Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]] | None
         ) = None
         self._config_cache: AedtPoolConfig | None = None
         self._config_cache_until = 0.0
+        self._placement_cursor = 0
 
     def init(self) -> None:
         with self.db.connect() as conn:
@@ -581,7 +614,7 @@ class AedtPoolService:
         return DEFAULT_SETTINGS[key] if value is None else value
 
     def _invalidate_config(self) -> None:
-        with self._lock:
+        with self._config_lock:
             self._config_cache = None
             self._config_cache_until = 0.0
 
@@ -619,7 +652,7 @@ class AedtPoolService:
 
     def config(self) -> AedtPoolConfig:
         cache_now = time.monotonic()
-        with self._lock:
+        with self._config_lock:
             if self._config_cache is not None and cache_now < self._config_cache_until:
                 return self._config_cache
             with self.db.connect() as conn:
@@ -2310,7 +2343,11 @@ class AedtPoolService:
                         )
             if config.operational:
                 self._place_queued_leases(
-                    conn, now, lease_ids=(lease_id,), config=config
+                    conn,
+                    now,
+                    lease_ids=(lease_id,),
+                    config=config,
+                    refresh_reservations=False,
                 )
         return self.get_lease(lease_id), token
 
@@ -2452,6 +2489,45 @@ class AedtPoolService:
         now = self._now()
         now_sql = _sql_time(now)
         token_hash = _token_hash(token)
+        # Most pooled clients heartbeat far more often than the durable lease
+        # timeout requires.  Authenticate and validate from a read snapshot,
+        # then coalesce unchanged accepted-lease heartbeats so a large ramp
+        # does not turn every poll into a serialized SQLite writer.
+        with self.db.connect() as conn:
+            candidate_row = conn.execute(
+                "SELECT * FROM aedt_project_leases WHERE id = ?",
+                (int(lease_id),),
+            ).fetchone()
+        if not candidate_row:
+            raise KeyError(lease_id)
+        candidate = dict(candidate_row)
+        if not secrets.compare_digest(
+            str(candidate["client_token_hash"]), token_hash
+        ):
+            raise PermissionError("invalid lease token")
+        candidate_state = str(candidate["state"])
+        if candidate_state not in LEASE_LIVE_STATES:
+            raise ValueError(f"lease is {candidate_state}")
+        phase_unchanged = not normalized_phase or normalized_phase == str(
+            candidate.get("fault_phase") or ""
+        )
+        persist_interval = _heartbeat_persist_interval_seconds(
+            config.lease_ttl_seconds, int(lease_id)
+        )
+        if (
+            candidate_state in {"attaching", "active", "releasing"}
+            and phase_unchanged
+            and _heartbeat_is_fresh(
+                str(candidate.get("last_heartbeat_at") or ""),
+                now,
+                persist_interval,
+            )
+        ):
+            current = self.get_lease(lease_id, include_secret_hash=False)
+            current_state = str(current.get("state") or "")
+            if current_state not in LEASE_LIVE_STATES:
+                raise ValueError(f"lease is {current_state}")
+            return current
         with self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -3731,6 +3807,42 @@ class AedtPoolService:
             raise PermissionError("invalid session token")
         return session
 
+    @staticmethod
+    def _validate_session_heartbeat(
+        session: dict[str, Any],
+        token_hash: str,
+        *,
+        liveness_confirmed: bool,
+        process_id: str,
+        port: int,
+        native_probe: str,
+    ) -> None:
+        if not session.get("host_token_hash") or not secrets.compare_digest(
+            str(session["host_token_hash"]), token_hash
+        ):
+            raise PermissionError("invalid session token")
+        if session["state"] not in {"ready", "busy", "draining", "unhealthy"}:
+            raise ValueError(f"session is {session['state']}")
+        if not liveness_confirmed:
+            raise ValueError("host heartbeat requires fresh Desktop liveness proof")
+        if process_id and str(process_id).strip() != str(
+            session["process_id"] or ""
+        ):
+            raise ValueError(
+                "heartbeat Desktop process_id does not match registration"
+            )
+        if port:
+            try:
+                registered_port = int(
+                    str(session["endpoint"] or "").rsplit(":", 1)[1]
+                )
+            except (IndexError, ValueError):
+                registered_port = 0
+            if int(port) != registered_port:
+                raise ValueError("heartbeat Desktop port does not match registration")
+        if native_probe and str(native_probe) != "GetVersion":
+            raise ValueError("unsupported Desktop native liveness probe")
+
     def heartbeat_session(
         self,
         session_id: int,
@@ -3741,7 +3853,33 @@ class AedtPoolService:
         port: int = 0,
         native_probe: str = "",
     ) -> dict[str, Any]:
-        now = _sql_time(self._now())
+        now_dt = self._now()
+        now = _sql_time(now_dt)
+        token_hash = _token_hash(token)
+        candidate = self.get_session(session_id)
+        self._validate_session_heartbeat(
+            candidate,
+            token_hash,
+            liveness_confirmed=liveness_confirmed,
+            process_id=process_id,
+            port=port,
+            native_probe=native_probe,
+        )
+        persist_interval = _heartbeat_persist_interval_seconds(
+            self.config().session_heartbeat_timeout_seconds, int(session_id)
+        )
+        if (
+            candidate["state"] in {"ready", "busy"}
+            and not str(candidate.get("failure_message") or "")
+            and not str(candidate.get("quarantine_reason") or "")
+            and _heartbeat_is_fresh(
+                str(candidate.get("last_heartbeat_at") or ""),
+                now_dt,
+                persist_interval,
+            )
+        ):
+            candidate.pop("host_token_hash", None)
+            return candidate
         with self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -3750,25 +3888,14 @@ class AedtPoolService:
             if not row:
                 raise KeyError(session_id)
             session = dict(row)
-            if not session.get("host_token_hash") or not secrets.compare_digest(
-                str(session["host_token_hash"]), _token_hash(token)
-            ):
-                raise PermissionError("invalid session token")
-            if session["state"] not in {"ready", "busy", "draining", "unhealthy"}:
-                raise ValueError(f"session is {session['state']}")
-            if not liveness_confirmed:
-                raise ValueError("host heartbeat requires fresh Desktop liveness proof")
-            if process_id and str(process_id).strip() != str(session["process_id"] or ""):
-                raise ValueError("heartbeat Desktop process_id does not match registration")
-            if port:
-                try:
-                    registered_port = int(str(session["endpoint"] or "").rsplit(":", 1)[1])
-                except (IndexError, ValueError):
-                    registered_port = 0
-                if int(port) != registered_port:
-                    raise ValueError("heartbeat Desktop port does not match registration")
-            if native_probe and str(native_probe) != "GetVersion":
-                raise ValueError("unsupported Desktop native liveness probe")
+            self._validate_session_heartbeat(
+                session,
+                token_hash,
+                liveness_confirmed=liveness_confirmed,
+                process_id=process_id,
+                port=port,
+                native_probe=native_probe,
+            )
             setting_rows = {
                 str(item["key"]): str(item["value"])
                 for item in conn.execute(
@@ -4785,6 +4912,7 @@ class AedtPoolService:
         *,
         lease_ids: tuple[int, ...] | None = None,
         config: AedtPoolConfig | None = None,
+        refresh_reservations: bool = True,
     ) -> int:
         """Place only admission-ready leases in one short existing transaction."""
 
@@ -4792,23 +4920,40 @@ class AedtPoolService:
         if not config.operational:
             return 0
         self._refresh_mixed_canary_admissions(conn, now)
-        self._refresh_exact_session_reservations(conn, now)
+        if refresh_reservations:
+            self._refresh_exact_session_reservations(conn, now)
         ready_cutoff = _sql_time(
             _parse_utc_time(now) - timedelta(seconds=config.queued_stale_seconds)
         )
         params: tuple[Any, ...] = (ready_cutoff,)
         predicate = ""
+        order_by = "ORDER BY id ASC"
         if lease_ids:
             placeholders = ",".join("?" for _ in lease_ids)
             predicate = f" AND id IN ({placeholders})"
             params = (ready_cutoff, *(int(item) for item in lease_ids))
+        else:
+            # Generic reconcile/register placement is deliberately bounded.
+            # Continue after the preceding batch (wrapping to the oldest id)
+            # so pinned or incompatible requests at the head cannot starve
+            # later compatible leases forever.
+            order_by = "ORDER BY CASE WHEN id > ? THEN 0 ELSE 1 END, id ASC"
+            params = (ready_cutoff, int(self._placement_cursor))
+        placement_limit = (
+            max(1, len(lease_ids))
+            if lease_ids
+            else RECONCILE_PLACEMENT_BATCH_SIZE
+        )
+        params = (*params, placement_limit)
         queued = conn.execute(
             "SELECT * FROM aedt_project_leases "
             "WHERE state = 'queued' "
             "AND (protocol_version < 2 OR last_heartbeat_at >= ?) "
-            f"{predicate} ORDER BY id ASC",
+            f"{predicate} {order_by} LIMIT ?",
             params,
         ).fetchall()
+        if not lease_ids:
+            self._placement_cursor = int(queued[-1]["id"]) if queued else 0
         placed = 0
         offer_expires = _sql_time(
             self._now() + timedelta(seconds=config.offer_ack_seconds)
@@ -5473,7 +5618,12 @@ class AedtPoolService:
             # helper used by POST /leases.  Full expiry/scale reconciliation
             # stays on this background tick instead of every HTTP request.
             if execute and config.operational:
-                self._place_queued_leases(conn, now, config=config)
+                self._place_queued_leases(
+                    conn,
+                    now,
+                    config=config,
+                    refresh_reservations=False,
+                )
 
             plan = self._plan(conn, config)
             if execute and config.operational:

@@ -366,6 +366,14 @@ class AedtPoolGateTests(AedtPoolTestCase):
         reloaded = AedtPoolService(self.db, bootstrap_token="secret")
         self.assertEqual(reloaded.config().target_projects, 400)
 
+    def test_cached_config_does_not_wait_for_reconcile_lock(self) -> None:
+        expected = self.service.config()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with self.service._lock:
+                future = executor.submit(self.service.config)
+                actual = future.result(timeout=1)
+        self.assertEqual(actual, expected)
+
     def test_operator_timeouts_update_liveness_windows(self) -> None:
         config = self.service.set_operator_timeouts(
             lease_ttl_seconds=900,
@@ -1712,6 +1720,139 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         p95 = sorted(durations)[int(len(durations) * 0.95) - 1]
         self.assertLess(p95, 20)
         self.assertLess(max(durations), 30)
+
+    def test_healthy_heartbeats_coalesce_but_phase_and_deadline_still_persist(
+        self,
+    ) -> None:
+        lease, lease_token = self.request(
+            "heartbeat-coalesce",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        session, host_token = self.start_one_session(self.allocation_id)
+        lease_id = int(lease["id"])
+        session_id = int(session["id"])
+
+        active = self.service.heartbeat_lease(
+            lease_id, lease_token, phase="solving"
+        )
+        self.assertEqual(active["state"], "active")
+        lease_heartbeat = active["last_heartbeat_at"]
+        lease_expiry = active["expires_at"]
+        session_heartbeat = self.service.get_session(session_id)[
+            "last_heartbeat_at"
+        ]
+
+        self.clock.advance(5)
+        coalesced_lease = self.service.heartbeat_lease(
+            lease_id, lease_token, phase="solving"
+        )
+        self.assertEqual(coalesced_lease["last_heartbeat_at"], lease_heartbeat)
+        self.assertEqual(coalesced_lease["expires_at"], lease_expiry)
+        with self.assertRaisesRegex(ValueError, "process_id"):
+            self.service.heartbeat_session(
+                session_id, host_token, process_id="wrong-process"
+            )
+        coalesced_session = self.service.heartbeat_session(
+            session_id,
+            host_token,
+            process_id="123",
+            port=50001,
+            native_probe="GetVersion",
+        )
+        self.assertEqual(
+            coalesced_session["last_heartbeat_at"], session_heartbeat
+        )
+
+        # A phase transition is semantic state and must bypass coalescing.
+        self.clock.advance(1)
+        transitioned = self.service.heartbeat_lease(
+            lease_id, lease_token, phase="postprocess"
+        )
+        self.assertNotEqual(transitioned["last_heartbeat_at"], lease_heartbeat)
+        self.assertEqual(transitioned["fault_phase"], "postprocess")
+
+        # The bounded interval is at most 30 seconds, comfortably inside both
+        # expiry windows, so an unchanged heartbeat becomes durable again.
+        self.clock.advance(31)
+        due_lease = self.service.heartbeat_lease(
+            lease_id, lease_token, phase="postprocess"
+        )
+        due_session = self.service.heartbeat_session(
+            session_id,
+            host_token,
+            process_id="123",
+            port=50001,
+            native_probe="GetVersion",
+        )
+        self.assertNotEqual(
+            due_lease["last_heartbeat_at"], transitioned["last_heartbeat_at"]
+        )
+        self.assertNotEqual(due_session["last_heartbeat_at"], session_heartbeat)
+
+    def test_bounded_generic_placement_rotates_past_incompatible_head(self) -> None:
+        other_allocation_id = self.add_dedicated_allocation(node="cpu-02")
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.service.set_enabled(False)
+        blocked = [
+            self.request(
+                f"rotation-blocked-{index}",
+                allocation_id=other_allocation_id,
+                node="cpu-02",
+            )[0]
+            for index in range(2)
+        ]
+        compatible, _token = self.request(
+            "rotation-compatible",
+            allocation_id=self.allocation_id,
+            node="cpu-01",
+        )
+        self.service.set_enabled(True)
+        with self.db.connect() as conn:
+            session_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO aedt_sessions (
+                        session_key, allocation_id, node_name, slots_total,
+                        state, created_at, started_at, last_heartbeat_at,
+                        idle_since, updated_at
+                    ) VALUES ('placement-rotation', ?, 'cpu-01', 3,
+                              'ready', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self.allocation_id,
+                        now,
+                        now,
+                        now,
+                        now,
+                        now,
+                    ),
+                ).lastrowid
+            )
+
+        with patch(
+            "slurm_scheduler.aedt_pool.RECONCILE_PLACEMENT_BATCH_SIZE", 2
+        ):
+            with self.db.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                first = self.service._place_queued_leases(
+                    conn, now, config=self.service.config()
+                )
+            with self.db.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                second = self.service._place_queued_leases(
+                    conn, now, config=self.service.config()
+                )
+
+        self.assertEqual(first, 0)
+        self.assertEqual(second, 1)
+        placed = self.service.get_lease(int(compatible["id"]))
+        self.assertEqual(placed["state"], "leased")
+        self.assertEqual(placed["session_id"], session_id)
+        self.assertEqual(
+            {self.service.get_lease(int(item["id"]))["state"] for item in blocked},
+            {"queued"},
+        )
 
     def test_repeated_native_suspect_with_live_solver_owner_does_not_recycle(
         self,
