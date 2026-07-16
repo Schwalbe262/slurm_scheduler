@@ -20,7 +20,7 @@
   <div class="table-scroll">
     <table>
       <tbody>
-        <tr><th>Status</th><td>{{ task.status }}</td></tr>
+        <tr><th>Status</th><td id="task-live-status">{{ task.status }}</td></tr>
         <tr><th>Account</th><td>{{ task.account_name or "" }}</td></tr>
         <tr><th>Allocation</th><td>{{ task.allocation_id or "" }}</td></tr>
         <tr><th>Remote CWD</th><td class="mono-cell">{{ task.remote_cwd }}</td></tr>
@@ -41,8 +41,8 @@
         <tr><th>Remote dir</th><td class="mono-cell">{{ task.remote_dir or "" }}</td></tr>
         <tr><th>stdout</th><td class="mono-cell">{{ task.stdout_path or "" }}</td></tr>
         <tr><th>stderr</th><td class="mono-cell">{{ task.stderr_path or "" }}</td></tr>
-        <tr><th>Exit code</th><td>{{ task.exit_code if task.exit_code is not none else "" }}</td></tr>
-        <tr><th>Failure</th><td class="error">{{ task.failure_message or "" }}</td></tr>
+        <tr><th>Exit code</th><td id="task-live-exit-code">{{ task.exit_code if task.exit_code is not none else "" }}</td></tr>
+        <tr><th>Failure</th><td class="error" id="task-live-failure">{{ task.failure_message or "" }}</td></tr>
         <tr><th>Created / Started / Finished</th><td class="mono-cell">{{ task.created_at }} / {{ task.started_at or "" }} / {{ task.finished_at or "" }}</td></tr>
       </tbody>
     </table>
@@ -53,7 +53,7 @@
 <section class="panel">
   <div class="title-row">
     <h2>Logs</h2>
-    <span class="muted" id="log-updated-at"></span>
+    <span class="muted" id="log-updated-at">live tail: starting</span>
   </div>
   {% if task.stdout_path %}
     <h3>stdout (tail)</h3>
@@ -80,7 +80,7 @@
 <script>
   (() => {
     const taskId = {{ task.id }};
-    const isTerminal = {{ "true" if task.status in ["completed", "failed", "cancelled"] else "false" }};
+    let isTerminal = {{ "true" if task.status in ["completed", "failed", "cancelled"] else "false" }};
     const cloneButton = document.getElementById("clone-task-button");
     if (cloneButton) {
       cloneButton.addEventListener("click", () => {
@@ -98,6 +98,16 @@
     const stamp = document.getElementById("log-updated-at");
     let timer = null;
     const loaded = {};
+    let refreshing = false;
+    const terminalStates = new Set(["completed", "failed", "cancelled"]);
+    const statusTarget = document.getElementById("task-live-status");
+    const exitCodeTarget = document.getElementById("task-live-exit-code");
+    const failureTarget = document.getElementById("task-live-failure");
+
+    function stopPolling() {
+      if (timer) clearInterval(timer);
+      timer = null;
+    }
     async function refreshLogs() {
       let any = false;
       let failures = 0;
@@ -130,10 +140,72 @@
       }
       if (isTerminal && timer) clearInterval(timer);
     }
-    if (targets.some(([elementId]) => document.getElementById(elementId))) {
-      refreshLogs();
-      if (!isTerminal) timer = setInterval(refreshLogs, 10000);
+
+    async function refreshLiveLogs() {
+      if (refreshing || document.hidden) return;
+      refreshing = true;
+      let failures = 0;
+      const logRequests = targets.map(async ([elementId, url]) => {
+        const element = document.getElementById(elementId);
+        if (!element) return;
+        try {
+          const nearBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 48;
+          const response = await fetch(url, { cache: "no-store" });
+          if (response.ok) {
+            const body = await response.text();
+            element.textContent = body || "(empty)";
+            if (nearBottom || !loaded[elementId]) element.scrollTop = element.scrollHeight;
+            loaded[elementId] = true;
+          } else {
+            failures += 1;
+            if (!loaded[elementId]) element.textContent = "(log busy: HTTP " + response.status + ", retrying)";
+          }
+        } catch (err) {
+          failures += 1;
+          if (!loaded[elementId]) element.textContent = "(log fetch failed, retrying)";
+        }
+      });
+
+      const statusRequest = (async () => {
+        try {
+          const response = await fetch("/api/tasks/" + taskId, { cache: "no-store" });
+          if (!response.ok) {
+            failures += 1;
+            return;
+          }
+          const task = await response.json();
+          const state = task.status || task.state || "unknown";
+          if (statusTarget) statusTarget.textContent = state;
+          if (exitCodeTarget) exitCodeTarget.textContent = task.exit_code == null ? "" : task.exit_code;
+          if (failureTarget) failureTarget.textContent = task.failure_message || "";
+          isTerminal = terminalStates.has(state);
+        } catch (err) {
+          failures += 1;
+        }
+      })();
+
+      await Promise.all([...logRequests, statusRequest]);
+      if (stamp) {
+        stamp.textContent = failures
+          ? "live tail retrying; showing last good data - " + new Date().toLocaleTimeString()
+          : "live tail updated - " + new Date().toLocaleTimeString();
+      }
+      refreshing = false;
+      if (isTerminal) stopPolling();
     }
+
+    if (targets.some(([elementId]) => document.getElementById(elementId))) {
+      refreshLiveLogs();
+      if (!isTerminal) timer = setInterval(refreshLiveLogs, 5000);
+    }
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        stopPolling();
+      } else {
+        refreshLiveLogs();
+        if (!isTerminal && !timer) timer = setInterval(refreshLiveLogs, 5000);
+      }
+    });
   })();
 </script>
 {% endblock %}
