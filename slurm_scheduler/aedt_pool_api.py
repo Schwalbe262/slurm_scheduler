@@ -423,6 +423,29 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router.post(
+        "/api/aedt-pool/leases/{lease_id}/native-pipeline-complete",
+    )
+    def complete_aedt_native_pipeline(
+        lease_id: int,
+        payload: dict[str, Any] = Body(...),
+        x_aedt_lease_token: str = Header(""),
+    ) -> dict[str, Any]:
+        try:
+            return service.complete_native_pipeline(
+                lease_id,
+                x_aedt_lease_token,
+                solve_permit_generation=payload.get(
+                    "solve_permit_generation", 0
+                ),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="lease not found") from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router.post(
         "/api/aedt-pool/leases/{lease_id}/cancel",
     )
     def cancel_aedt_lease(

@@ -143,6 +143,9 @@ CREATE TABLE IF NOT EXISTS aedt_project_leases (
     activated_at TEXT,
     solve_permit_at TEXT,
     solve_permit_generation INTEGER NOT NULL DEFAULT 0,
+    native_pipeline_completed_at TEXT,
+    native_pipeline_session_id INTEGER NOT NULL DEFAULT 0,
+    native_pipeline_generation INTEGER NOT NULL DEFAULT 0,
     client_deadline_at TEXT,
     acquired_at TEXT,
     last_heartbeat_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -478,6 +481,9 @@ class AedtPoolService:
                 "activated_at": "TEXT",
                 "solve_permit_at": "TEXT",
                 "solve_permit_generation": "INTEGER NOT NULL DEFAULT 0",
+                "native_pipeline_completed_at": "TEXT",
+                "native_pipeline_session_id": "INTEGER NOT NULL DEFAULT 0",
+                "native_pipeline_generation": "INTEGER NOT NULL DEFAULT 0",
                 "client_deadline_at": "TEXT",
                 "fault_phase": "TEXT NOT NULL DEFAULT ''",
                 "fault_kind": "TEXT NOT NULL DEFAULT ''",
@@ -2349,6 +2355,66 @@ class AedtPoolService:
                 and str(item.get("state") or "") == "active"
                 and not item["solve_permit_granted"]
             )
+            session_id = int(item.get("session_id") or 0)
+            solve_generation = int(item.get("solve_permit_generation") or 0)
+            native_completed = bool(
+                session_id > 0
+                and solve_generation > 0
+                and str(item.get("native_pipeline_completed_at") or "")
+                and int(item.get("native_pipeline_session_id") or 0) == session_id
+                and int(item.get("native_pipeline_generation") or 0)
+                == solve_generation
+            )
+            expected_count = 0
+            completed_count = 0
+            broken_count = 0
+            if session_id > 0 and solve_generation > 0:
+                cohort = conn.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS expected_count,
+                        SUM(CASE
+                            WHEN native_pipeline_completed_at IS NOT NULL
+                             AND native_pipeline_session_id = ?
+                             AND native_pipeline_generation = ?
+                            THEN 1 ELSE 0 END
+                        ) AS completed_count,
+                        SUM(CASE
+                            WHEN NOT (
+                                native_pipeline_completed_at IS NOT NULL
+                                AND native_pipeline_session_id = ?
+                                AND native_pipeline_generation = ?
+                            ) AND state != 'active'
+                            THEN 1 ELSE 0 END
+                        ) AS broken_count
+                    FROM aedt_project_leases
+                    WHERE session_id = ? AND solve_permit_generation = ?
+                      AND solve_permit_at IS NOT NULL
+                    """,
+                    (
+                        session_id,
+                        solve_generation,
+                        session_id,
+                        solve_generation,
+                        session_id,
+                        solve_generation,
+                    ),
+                ).fetchone()
+                expected_count = int(cohort["expected_count"] or 0)
+                completed_count = int(cohort["completed_count"] or 0)
+                broken_count = int(cohort["broken_count"] or 0)
+            barrier_granted = bool(
+                native_completed
+                and expected_count > 0
+                and completed_count == expected_count
+            )
+            item["native_pipeline_completed"] = native_completed
+            item["native_pipeline_expected_count"] = expected_count
+            item["native_pipeline_completed_count"] = completed_count
+            item["native_pipeline_barrier_granted"] = barrier_granted
+            item["native_pipeline_barrier_broken"] = bool(
+                not barrier_granted and broken_count > 0
+            )
             if not include_secret_hash:
                 item.pop("client_token_hash", None)
             return item
@@ -2622,6 +2688,108 @@ class AedtPoolService:
                 now,
                 allow_underfilled=seal_underfilled,
             )
+        return self.get_lease(lease_id, include_secret_hash=False)
+
+    def complete_native_pipeline(
+        self,
+        lease_id: int,
+        token: str,
+        *,
+        solve_permit_generation: int,
+    ) -> dict[str, Any]:
+        """Mark one sealed-batch member safe for Desktop-global postprocess.
+
+        A project reaches this point only after its final blocking native
+        ``Analyze`` and terminal attestation have both completed.  The marker
+        is scoped to the server-authorized session and solve generation, so a
+        delayed client from a recycled/requeued lease cannot satisfy a later
+        cohort.  Callers must wait until every exact cohort member has marked
+        completion before entering long Desktop-global extraction.
+        """
+
+        if type(solve_permit_generation) is not int \
+                or solve_permit_generation <= 0:
+            raise ValueError("solve_permit_generation must be a positive integer")
+        token_hash = _token_hash(token)
+        now_dt = self._now()
+        now = _sql_time(now_dt)
+        config = self.config()
+        with self.db.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            lease = conn.execute(
+                "SELECT * FROM aedt_project_leases WHERE id = ?",
+                (int(lease_id),),
+            ).fetchone()
+            if not lease:
+                raise KeyError(lease_id)
+            if not secrets.compare_digest(
+                str(lease["client_token_hash"]), token_hash
+            ):
+                raise PermissionError("invalid lease token")
+            if str(lease["state"]) != "active":
+                raise ValueError(f"lease is {lease['state']}")
+            session_id = int(lease["session_id"] or 0)
+            authorized_generation = int(
+                lease["solve_permit_generation"] or 0
+            )
+            if not str(lease["solve_permit_at"] or "") \
+                    or session_id <= 0 or authorized_generation <= 0:
+                raise ValueError("lease has no sealed native solve permit")
+            if solve_permit_generation != authorized_generation:
+                raise ValueError(
+                    "native pipeline generation mismatch: "
+                    f"expected={authorized_generation}, "
+                    f"actual={solve_permit_generation}"
+                )
+            cohort_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM aedt_project_leases
+                    WHERE session_id = ? AND solve_permit_generation = ?
+                      AND solve_permit_at IS NOT NULL
+                    """,
+                    (session_id, authorized_generation),
+                ).fetchone()[0]
+            )
+            if cohort_count <= 0:
+                raise ValueError("sealed native solve cohort is unavailable")
+            cursor = conn.execute(
+                """
+                UPDATE aedt_project_leases
+                SET native_pipeline_completed_at = CASE
+                        WHEN native_pipeline_session_id = ?
+                         AND native_pipeline_generation = ?
+                         AND native_pipeline_completed_at IS NOT NULL
+                        THEN native_pipeline_completed_at ELSE ? END,
+                    native_pipeline_session_id = ?,
+                    native_pipeline_generation = ?,
+                    fault_phase = 'postprocess',
+                    last_heartbeat_at = ?, expires_at = ?, updated_at = ?
+                WHERE id = ? AND state = 'active'
+                  AND client_token_hash = ?
+                  AND session_id = ? AND solve_permit_generation = ?
+                """,
+                (
+                    session_id,
+                    authorized_generation,
+                    now,
+                    session_id,
+                    authorized_generation,
+                    now,
+                    _sql_time(
+                        now_dt + timedelta(seconds=config.lease_ttl_seconds)
+                    ),
+                    now,
+                    int(lease_id),
+                    token_hash,
+                    session_id,
+                    authorized_generation,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    "lease changed while completing its native pipeline"
+                )
         return self.get_lease(lease_id, include_secret_hash=False)
 
     def bind_lease_project_name(
