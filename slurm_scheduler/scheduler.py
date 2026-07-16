@@ -7449,7 +7449,15 @@ class Scheduler:
                             "exclusive_node": exclusive_node,
                         }
                         used_partition_spread = True
-                if self.allocation_shape_in_backoff(resource_pool, shape):
+                # AEDT pool demand is durable and already bounded by the
+                # reconciler's exact session deficit plus each account's
+                # Slurm pending-job ceiling.  A generic partition backoff from
+                # one old pending allocation must not suppress every other
+                # account's AEDT request; Slurm remains the placement authority.
+                if (
+                    not aedt_pool_node_sharing
+                    and self.allocation_shape_in_backoff(resource_pool, shape)
+                ):
                     if used_partition_spread and not self.allocation_shape_in_backoff(
                         resource_pool, single_partition_shape
                     ):
@@ -7548,7 +7556,10 @@ class Scheduler:
             "gpu_model": (target_models[0] if target_models else "") if wants_gpu else "",
             "exclusive_node": exclusive_node,
         }
-        if self.allocation_shape_in_backoff(resource_pool, fallback_shape):
+        if (
+            not aedt_pool_node_sharing
+            and self.allocation_shape_in_backoff(resource_pool, fallback_shape)
+        ):
             return None
         return fallback_shape
 

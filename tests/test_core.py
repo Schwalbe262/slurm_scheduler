@@ -4851,6 +4851,45 @@ class SchedulerTests(unittest.TestCase):
             )
         )
 
+    def test_aedt_pool_demand_ignores_generic_partition_backoff(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "cpu2-a cpu2 idle 0 256 0.0 1031519 900000\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            allocation_partition="cpu2",
+            allocation_cpus=64,
+            allocation_memory="96G",
+            cpu_partition_allocation_limits={"cpu2": 2},
+        )
+        key = scheduler.allocation_shape_backoff_key("cpu", "cpu2")
+        scheduler._allocation_shape_backoff_until[key] = time.monotonic() + 3600
+
+        normal_shape = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            requested_cpus=13,
+            require_fea_eligible_node=True,
+            cpu_only_nodes=True,
+        )
+        self.assertIsNone(normal_shape)
+
+        aedt_shape = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            requested_cpus=13,
+            require_fea_eligible_node=True,
+            cpu_only_nodes=True,
+            aedt_pool_node_sharing=True,
+        )
+        self.assertEqual(aedt_shape["partition"], "cpu2")
+        self.assertEqual(aedt_shape["node_name"], "cpu2-a")
+        self.assertEqual(aedt_shape["cpus"], 64)
+
     def test_aedt_pool_downshifts_to_complete_session_cpu_multiple(self) -> None:
         self.db.replace_pestat_nodes(
             parse_pestat(
