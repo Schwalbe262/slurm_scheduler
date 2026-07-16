@@ -547,7 +547,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
             for route in router.routes
             if set(getattr(route, "methods", set())) & {"POST", "PATCH", "PUT", "DELETE"}
         ]
-        self.assertEqual(len(mutating_routes), 23)
+        self.assertEqual(len(mutating_routes), 24)
         bootstrap_routes = []
         client_routes = []
         lease_scoped_routes = []
