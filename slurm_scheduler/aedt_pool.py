@@ -8013,53 +8013,81 @@ class AedtPoolService:
             if execute and config.operational and storage_pressure_accounts:
                 # A valid quota observation below the projected-growth floor
                 # is stronger evidence than an unavailable/failed probe. Stop
-                # assigning those Desktops immediately. READY sessions become
-                # draining now. BUSY sessions keep that state only while their
-                # current owners finish, but drain_requested_at blocks every
-                # new lease; their final release promotes them to draining.
-                # Actual draining rows are excluded from hard/active capacity,
-                # so safe replacement capacity opens without counting them.
-                placeholders = ",".join("?" for _ in storage_pressure_accounts)
-                ready_cursor = conn.execute(
-                    f"""
-                    UPDATE aedt_sessions
-                    SET state = 'draining', failure_message = ?,
-                        drain_requested_at = COALESCE(drain_requested_at, ?),
-                        updated_at = ?
-                    WHERE state = 'ready' AND drain_requested_at IS NULL
-                      AND allocation_id IN (
-                          SELECT id FROM allocations
-                          WHERE account_name IN ({placeholders})
-                      )
-                    """,
-                    (
-                        STORAGE_PRESSURE_DRAIN_REASON,
-                        now,
-                        now,
-                        *sorted(storage_pressure_accounts),
-                    ),
+                # assigning those Desktops immediately. Retire at most one
+                # visible session per pressured account, then re-evaluate the
+                # quota after that host has actually closed. A pre-existing
+                # drain (including one requested for another valid reason)
+                # already satisfies this bound and must not be cleared or
+                # joined by another session in the same account. READY is the
+                # least disruptive candidate; otherwise choose the BUSY
+                # session with the fewest live owners and let them finish.
+                visible_placeholders = ",".join(
+                    "?" for _ in SESSION_VISIBLE_STATES
                 )
-                busy_cursor = conn.execute(
-                    f"""
-                    UPDATE aedt_sessions
-                    SET failure_message = ?, drain_requested_at = ?,
-                        updated_at = ?
-                    WHERE state = 'busy' AND drain_requested_at IS NULL
-                      AND allocation_id IN (
-                          SELECT id FROM allocations
-                          WHERE account_name IN ({placeholders})
-                      )
-                    """,
-                    (
-                        STORAGE_PRESSURE_DRAIN_REASON,
-                        now,
-                        now,
-                        *sorted(storage_pressure_accounts),
-                    ),
+                live_lease_placeholders = ",".join(
+                    "?" for _ in LEASE_LIVE_STATES
                 )
-                storage_pressure_drain_requested_this_tick = max(
-                    0, int(ready_cursor.rowcount)
-                ) + max(0, int(busy_cursor.rowcount))
+                for account_name in sorted(storage_pressure_accounts):
+                    existing_drain = conn.execute(
+                        f"""
+                        SELECT 1
+                        FROM aedt_sessions s
+                        JOIN allocations a ON a.id = s.allocation_id
+                        WHERE a.account_name = ?
+                          AND s.state IN ({visible_placeholders})
+                          AND s.drain_requested_at IS NOT NULL
+                        LIMIT 1
+                        """,
+                        (account_name, *SESSION_VISIBLE_STATES),
+                    ).fetchone()
+                    if existing_drain:
+                        continue
+                    candidate = conn.execute(
+                        f"""
+                        SELECT s.id, s.state
+                        FROM aedt_sessions s
+                        JOIN allocations a ON a.id = s.allocation_id
+                        WHERE a.account_name = ?
+                          AND s.state IN ('ready','busy')
+                          AND s.drain_requested_at IS NULL
+                        ORDER BY CASE s.state WHEN 'ready' THEN 0 ELSE 1 END,
+                          (
+                              SELECT COUNT(*)
+                              FROM aedt_project_leases l
+                              WHERE l.session_id = s.id
+                                AND l.state IN ({live_lease_placeholders})
+                          ),
+                          s.id
+                        LIMIT 1
+                        """,
+                        (account_name, *LEASE_LIVE_STATES),
+                    ).fetchone()
+                    if not candidate:
+                        continue
+                    cursor = conn.execute(
+                        """
+                        UPDATE aedt_sessions
+                        SET state = CASE
+                                WHEN state = 'ready' THEN 'draining'
+                                ELSE state
+                            END,
+                            failure_message = ?,
+                            drain_requested_at = COALESCE(drain_requested_at, ?),
+                            updated_at = ?
+                        WHERE id = ?
+                          AND state IN ('ready','busy')
+                          AND drain_requested_at IS NULL
+                        """,
+                        (
+                            STORAGE_PRESSURE_DRAIN_REASON,
+                            now,
+                            now,
+                            int(candidate["id"]),
+                        ),
+                    )
+                    storage_pressure_drain_requested_this_tick += max(
+                        0, int(cursor.rowcount)
+                    )
                 if storage_pressure_drain_requested_this_tick:
                     # Pending exact-session reservations must not pin a newly
                     # draining target. A fully attached busy cohort retains its

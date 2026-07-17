@@ -6722,7 +6722,7 @@ class AedtRuntimeTests(AedtPoolTestCase):
         self.assertEqual(failed_starts, 1)
         self.assertEqual(host_tasks, 0)
 
-    def test_confirmed_storage_pressure_drains_sessions_and_frees_replacement_cap(
+    def test_confirmed_storage_pressure_concurrently_drains_one_session_per_account(
         self,
     ) -> None:
         self.service.set_operator_limits(
@@ -6775,14 +6775,19 @@ class AedtRuntimeTests(AedtPoolTestCase):
             node="cpu-02",
         )
 
-        plan = self.service.reconcile(
-            execute=True,
-            excluded_start_accounts={"a"},
-            start_block_reasons={
-                "a": "AEDT session start blocked by the account storage guard"
-            },
-            storage_pressure_accounts={"a"},
-        )
+        def reconcile_pressure() -> dict:
+            return self.service.reconcile(
+                execute=True,
+                excluded_start_accounts={"a"},
+                start_block_reasons={
+                    "a": "AEDT session start blocked by the account storage guard"
+                },
+                storage_pressure_accounts={"a"},
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            plans = list(executor.map(lambda _index: reconcile_pressure(), range(2)))
+        plan = plans[0]
 
         with self.db.connect() as conn:
             pressured = conn.execute(
@@ -6794,31 +6799,63 @@ class AedtRuntimeTests(AedtPoolTestCase):
                 (pressured_allocation,),
             ).fetchall()
         self.assertEqual(
-            [row["state"] for row in pressured], ["draining", "draining"]
+            [row["state"] for row in pressured], ["draining", "busy"]
         )
-        self.assertTrue(
-            all(
-                row["failure_message"] == STORAGE_PRESSURE_DRAIN_REASON
-                for row in pressured
-            )
+        self.assertEqual(
+            pressured[0]["failure_message"], STORAGE_PRESSURE_DRAIN_REASON
         )
-        self.assertTrue(all(row["drain_requested_at"] for row in pressured))
+        self.assertTrue(pressured[0]["drain_requested_at"])
+        self.assertFalse(pressured[1]["drain_requested_at"])
         starts = self.service.starting_sessions()
         self.assertEqual(len(starts), 1)
         self.assertEqual(
             int(starts[0]["allocation_id"]), replacement_allocation
         )
-        self.assertEqual(plan["hard_session_count"], 1)
-        self.assertEqual(plan["active_session_count"], 0)
-        self.assertEqual(plan["active_project_capacity"], 0)
-        self.assertEqual(plan["unavailable_busy_session_count"], 0)
-        self.assertEqual(plan["draining_session_count"], 2)
+        self.assertEqual(plan["hard_session_count"], 2)
+        self.assertEqual(plan["active_session_count"], 1)
+        self.assertEqual(plan["active_project_capacity"], 3)
+        self.assertEqual(plan["draining_session_count"], 1)
         self.assertEqual(plan["storage_pressure_accounts"], ["a"])
         self.assertEqual(
-            plan["storage_pressure_sessions_drain_requested_this_tick"], 2
+            sorted(
+                item["storage_pressure_sessions_drain_requested_this_tick"]
+                for item in plans
+            ),
+            [0, 1],
         )
-        self.assertEqual(plan["storage_pressure_draining_session_count"], 2)
+        self.assertEqual(plan["storage_pressure_draining_session_count"], 1)
         self.assertEqual(plan["storage_pressure_finishing_session_count"], 0)
+
+        repeated = reconcile_pressure()
+        self.assertEqual(
+            repeated["storage_pressure_sessions_drain_requested_this_tick"], 0
+        )
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE aedt_sessions
+                SET state = 'closed', closed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE allocation_id = ? AND state = 'draining'
+                """,
+                (pressured_allocation,),
+            )
+
+        after_close = reconcile_pressure()
+        self.assertEqual(
+            after_close["storage_pressure_sessions_drain_requested_this_tick"], 1
+        )
+        with self.db.connect() as conn:
+            remaining = conn.execute(
+                """
+                SELECT state, drain_requested_at
+                FROM aedt_sessions
+                WHERE allocation_id = ? AND state != 'closed'
+                """,
+                (pressured_allocation,),
+            ).fetchone()
+        self.assertEqual(remaining["state"], "draining")
+        self.assertTrue(remaining["drain_requested_at"])
 
     def test_probe_failure_blocks_starts_without_confirming_session_drain(self) -> None:
         class StorageStatusScheduler(FakeRuntimeScheduler):
@@ -7599,6 +7636,18 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         waiting = [index for index in range(3) if index not in permitted]
         self.assertEqual(len(permitted), 1)
         session_id = int(reservations[0]["session_id"])
+        # Exercise the BUSY fallback specifically. Under the bounded policy an
+        # idle READY sibling is intentionally the first drain candidate.
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE aedt_sessions
+                SET state = 'closed', closed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id != ? AND state = 'ready'
+                """,
+                (session_id,),
+            )
 
         plan = self.service.reconcile(
             execute=True,
@@ -7698,6 +7747,18 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         self.service.accept_lease(int(lease["id"]), token)
         self.service.activate_lease(int(lease["id"]), token)
         self.assertEqual(self.service.get_session(session_id)["state"], "busy")
+        # Exercise the BUSY fallback specifically. Under the bounded policy an
+        # idle READY sibling is intentionally the first drain candidate.
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE aedt_sessions
+                SET state = 'closed', closed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id != ? AND state = 'ready'
+                """,
+                (session_id,),
+            )
 
         plan = self.service.reconcile(
             execute=True,
