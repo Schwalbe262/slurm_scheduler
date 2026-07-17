@@ -3185,9 +3185,30 @@ class Scheduler:
     def recalculate_allocation_capacity(
         self, allocation_ids: set[int] | None = None
     ) -> None:
-        tasks = self.db.list_tasks_by_statuses(
-            [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
-        )
+        if allocation_ids is None:
+            tasks = self.db.list_tasks_by_statuses(
+                [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value],
+                limit=5000,
+            )
+            allocation_rows = self.db.list_allocations(limit=500)
+        else:
+            scoped_ids = sorted({int(item) for item in allocation_ids if int(item) > 0})
+            # The hot attach path nearly always updates one allocation. Use
+            # the indexed allocation_id lookup instead of rescanning every
+            # active task and every allocation after each accepted claim.
+            tasks = [
+                task
+                for allocation_id in scoped_ids
+                for task in self.db.list_live_task_claims_for_allocation(
+                    allocation_id
+                )
+            ]
+            allocation_rows = [
+                allocation
+                for allocation_id in scoped_ids
+                if (allocation := self.db.get_allocation(allocation_id))
+                is not None
+            ]
         running_by_allocation: dict[int, dict[str, int]] = {}
         for task in tasks:
             if task["status"] not in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}:
@@ -3206,9 +3227,7 @@ class Scheduler:
             stats["reserved_mem"] += int(task.get("memory_mb") or 0)
             stats["reserved_gpus"] += int(task.get("gpus") or 0)
         capacity_rows: list[dict[str, Any]] = []
-        for allocation in self.db.list_allocations(limit=500):
-            if allocation_ids is not None and int(allocation["id"]) not in allocation_ids:
-                continue
+        for allocation in allocation_rows:
             if allocation["state"] not in {
                 AllocationStatus.WARM.value,
                 AllocationStatus.ACTIVE.value,
@@ -3817,18 +3836,28 @@ class Scheduler:
         # recovery across many underfilled allocations.
         attached_overcommit = 0
         attached_baseline = 0
-        for task in self.project_fair_queue_order(
+        queued_fea_tasks = self.project_fair_queue_order(
             [
                 item
                 for item in self.db.list_tasks(
                     limit=5000, statuses=[TaskStatus.QUEUED.value]
                 )
-                if item["status"] == TaskStatus.QUEUED.value and self.task_is_fea_bursty(item)
+                if item["status"] == TaskStatus.QUEUED.value
+                and self.task_is_fea_bursty(item)
             ],
             self._fea_project_last_claim,
-        ):
+        )
+        eligible_storage_accounts = self.fea_storage_accounts_for_tasks(
+            queued_fea_tasks
+        )
+        for task in queued_fea_tasks:
             if attached_baseline >= self.fea_baseline_max_attach_per_loop:
                 return
+            # Quota observations expire during a large 400-worker refill.
+            # Refresh every stale account together so the assignment loop does
+            # not pay one serial SSH round trip when it first reaches each
+            # account after the 30-second boundary.
+            self.prefetch_fea_storage_quotas(eligible_storage_accounts)
             baseline_only = attached_overcommit >= self.fea_max_attach_per_loop
             self._fea_last_attach_baseline = False
             if self.assign_queued_task(
@@ -4058,6 +4087,87 @@ class Scheduler:
         )
         return blocked
 
+    def fea_storage_accounts_for_tasks(
+        self, tasks: list[dict]
+    ) -> list[AccountConfig]:
+        """Accounts that may receive at least one queued FEA task."""
+        if self.storage_guard_min_free_gb <= 0 or not tasks:
+            return []
+        eligible: list[AccountConfig] = []
+        for account in self.accounts:
+            for task in tasks:
+                requested = self.requested_accounts(
+                    self.task_requested_account_name(task)
+                )
+                if requested and account.name not in requested:
+                    continue
+                if self.account_supports(
+                    account,
+                    str(task.get("required_capability") or ""),
+                    str(task.get("env_profile") or ""),
+                ):
+                    eligible.append(account)
+                    break
+        return eligible
+
+    def prefetch_fea_storage_quotas(
+        self, accounts: list[AccountConfig]
+    ) -> None:
+        """Refresh stale FEA quota probes concurrently by account.
+
+        The ordinary lazy guard remains authoritative. This helper only fills
+        the same short-lived cache before a large assignment/planning loop so
+        reaching several accounts after cache expiry costs one parallel SSH
+        round trip rather than one serial round trip per account.
+        """
+        if self.storage_guard_min_free_gb <= 0 or not accounts:
+            return
+        now = time.time()
+        stale = [
+            account
+            for account in accounts
+            if not self._storage_quota_cache.get(account.name)
+            or now - self._storage_quota_cache[account.name][0]
+            >= self._storage_quota_refresh_interval_seconds
+        ]
+        if not stale:
+            return
+        accounts_by_name = {account.name: account for account in stale}
+
+        def probe(account_name: str, _items: list) -> StorageQuotaProbe:
+            account = accounts_by_name[account_name]
+            client = self._client(account)
+            probe_method = getattr(client, "storage_quota_probe", None)
+            if not callable(probe_method):
+                return StorageQuotaProbe(filesystem_type="unsupported")
+            try:
+                return probe_method()
+            except Exception as exc:
+                return StorageQuotaProbe(
+                    filesystem_type="",
+                    error=str(exc) or type(exc).__name__,
+                )
+
+        outcomes = self._fan_out_by_account(
+            {account.name: [] for account in stale}, probe
+        )
+        observed_at = time.time()
+        for account in stale:
+            outcome = outcomes.get(account.name)
+            if isinstance(outcome, StorageQuotaProbe):
+                value = outcome
+            elif isinstance(outcome, Exception):
+                value = StorageQuotaProbe(
+                    filesystem_type="",
+                    error=str(outcome) or type(outcome).__name__,
+                )
+            else:
+                value = StorageQuotaProbe(
+                    filesystem_type="",
+                    error="storage quota prefetch returned no result",
+                )
+            self._storage_quota_cache[account.name] = (observed_at, value)
+
     def project_active_cap_reason(self, task: dict) -> str:
         project_name = str(task.get("project") or "").strip()
         if not project_name:
@@ -4232,6 +4342,11 @@ class Scheduler:
             ):
                 return None
             if self.task_is_fea_bursty(task):
+                # The reloaded row does not carry the selection snapshot's
+                # transient annotation. Rebuild the node count once for this
+                # final transactional claim instead of letting fit_slots do a
+                # separate implicit global scan from each helper path.
+                self.annotate_fea_node_worker_counts([allocation])
                 if self.fit_slots_for_allocation(allocation, task) <= 0:
                     return None
 
@@ -4413,7 +4528,14 @@ class Scheduler:
         gpu_candidates = []
         is_fea = self.task_is_fea_bursty(task)
         active_task_allocation_ids, active_exclusive_allocation_ids = self.active_task_allocation_sets()
-        for allocation in self.db.list_allocations(limit=500):
+        allocation_rows = self.db.list_allocations(limit=500)
+        if is_fea:
+            # fit_slots_for_allocation needs the physical-node worker count.
+            # Annotate the whole candidate set once. Without this, every
+            # allocation independently rebuilt the same global task/node map,
+            # turning a 64-task refill into thousands of identical DB scans.
+            self.annotate_fea_node_worker_counts(allocation_rows)
+        for allocation in allocation_rows:
             if allocation["state"] not in {AllocationStatus.WARM.value, AllocationStatus.ACTIVE.value}:
                 continue
             if not self.allocation_accepts_new_tasks(allocation):
@@ -4455,7 +4577,6 @@ class Scheduler:
         if not candidates:
             return None
         if self.task_is_fea_bursty(task):
-            self.annotate_fea_node_worker_counts(candidates)
             # A healthy instantaneous pestat row is necessary but not
             # sufficient: fit_slots also discounts young workers' declared
             # footprint and the per-tick attach ledger.  A zero-fit candidate
@@ -7745,6 +7866,9 @@ class Scheduler:
             start_index = 0
         reserved_submissions: list[dict] = []
         blocked = False
+        self.prefetch_fea_storage_quotas(
+            self.fea_storage_accounts_for_tasks(queued_tasks[start_index:])
+        )
         # Fix account limits, allocation shapes, and queue capacity in durable
         # PENDING rows before any worker may enter remote sbatch. Sequential
         # planning means each later choice observes every earlier reservation.
@@ -8941,7 +9065,7 @@ class Scheduler:
                 open_by_account[allocation["account_name"]] = open_by_account.get(allocation["account_name"], 0) + 1
             if allocation["state"] == AllocationStatus.PENDING.value:
                 pending_by_account[allocation["account_name"]] = pending_by_account.get(allocation["account_name"], 0) + 1
-        candidates = []
+        candidates: list[tuple[AccountConfig, int, int, int]] = []
         requested_accounts = self.requested_accounts(account_name)
         for account in self.accounts:
             if requested_accounts and account.name not in requested_accounts:
@@ -8968,19 +9092,28 @@ class Scheduler:
                 continue
             if current_pending >= account.max_pending_jobs:
                 continue
-            candidates.append(account)
+            candidates.append(
+                (account, current_total, snapshot.running, current_pending)
+            )
         if not candidates:
             return None
         ordered_preferences = preferred_accounts or self.requested_accounts(account_name)
         preferred_index = {name: index for index, name in enumerate(ordered_preferences)}
         return min(
             candidates,
-            key=lambda account: (
-                0 if account.name in preferred_index else 1,
-                preferred_index.get(account.name, len(preferred_index)),
-                snapshots_by_name[account.name].score,
+            key=lambda candidate: (
+                0 if candidate[0].name in preferred_index else 1,
+                preferred_index.get(candidate[0].name, len(preferred_index)),
+                # Include durable reservations made earlier in this planning
+                # pass. Snapshot.score alone is stale until the next Slurm
+                # poll and concentrates an entire batch on one account,
+                # defeating cross-account submission fan-out.
+                candidate[1],
+                candidate[2],
+                candidate[3],
+                candidate[0].name,
             ),
-        )
+        )[0]
 
     def live_gpu_allocations(self) -> list[dict]:
         return [

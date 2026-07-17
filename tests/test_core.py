@@ -4541,6 +4541,33 @@ class SchedulerTests(unittest.TestCase):
         )
         self.assertEqual(len(self.db.list_allocations(limit=100)), 4)
 
+    def test_allocation_account_selection_includes_durable_batch_reservations(self) -> None:
+        FakeClient.snapshots = {
+            "a": AccountSnapshot("a", 0, 0, 4, 10, 10),
+            "b": AccountSnapshot("b", 0, 0, 4, 10, 10),
+        }
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+
+        self.assertEqual(scheduler.choose_account_for_allocation().name, "a")
+        self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=48,
+            total_memory_mb=65536,
+            pending_reason=ALLOCATION_SUBMISSION_RESERVED,
+        )
+
+        # Slurm's cached score is still tied at 0/0. The durable reservation
+        # from this planning pass must move the next unpinned allocation to b.
+        self.assertEqual(scheduler.choose_account_for_allocation().name, "b")
+
     def test_demand_allocation_fanout_isolates_partial_safe_failure(self) -> None:
         FakeClient.snapshots = {
             "a": AccountSnapshot("a", 0, 0, 4, 10, 10),
@@ -7628,6 +7655,96 @@ class SchedulerTests(unittest.TestCase):
         capacity = scheduler.task_fit_capacity(fea)
         self.assertEqual(capacity["fit_slots"], 2)
         self.assertEqual(capacity["memory_pressure_state"], "ok")
+
+    def test_fea_best_allocation_builds_node_worker_map_once(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="alloc-node-map",
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 8 64 1.0 262144 240000 busy\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            fea_max_attach_per_loop=8,
+        )
+        task = {
+            "cpus": 4,
+            "memory_mb": 32768,
+            "gpus": 0,
+            "partition": "auto",
+            "node_name": "",
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+            "aedt_backend": AedtBackend.STANDALONE.value,
+        }
+
+        with mock.patch.object(
+            scheduler,
+            "node_fea_worker_counts",
+            wraps=scheduler.node_fea_worker_counts,
+        ) as worker_counts:
+            chosen = scheduler.best_allocation_for_task(task)
+
+        self.assertEqual(chosen["id"], allocation_id)
+        self.assertEqual(worker_counts.call_count, 1)
+
+    def test_scoped_capacity_recalculation_uses_allocation_index(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="alloc-scoped-capacity",
+        )
+        task_id = self.db.create_task(
+            TaskCreate(
+                "scoped-capacity-task",
+                "~/case",
+                "run",
+                cpus=8,
+                memory_mb=10000,
+            )
+        )
+        self.db.update_task(
+            task_id,
+            status=TaskStatus.ATTACHING.value,
+            allocation_id=allocation_id,
+            account_name="a",
+        )
+        scheduler = Scheduler(
+            self.db, self.accounts, 30, client_factory=FakeClient
+        )
+
+        with mock.patch.object(
+            self.db,
+            "list_tasks_by_statuses",
+            side_effect=AssertionError("global task scan is not allowed"),
+        ):
+            scheduler.recalculate_allocation_capacity({allocation_id})
+
+        allocation = self.db.get_allocation(allocation_id)
+        self.assertEqual(allocation["state"], AllocationStatus.ACTIVE.value)
+        self.assertEqual(allocation["free_cpus"], 56)
+        self.assertEqual(allocation["free_memory_mb"], 90000)
 
     def test_allocation_rejects_fea_standard_profile_mixing_for_running_and_attaching_tasks(self) -> None:
         allocation_id = self.db.create_allocation(
@@ -11662,6 +11779,25 @@ class SchedulerTests(unittest.TestCase):
             cached_probe,
         )
         self.assertFalse(scheduler.account_storage_blocked(account, for_fea=True))
+        self.assertEqual(QuotaProbeClient.quota_probe_calls, 2)
+
+    def test_fea_storage_quota_prefetch_populates_all_accounts_once_per_ttl(self) -> None:
+        QuotaProbeClient.quota_probe_calls = 0
+        QuotaProbeClient.quota_probe_value = StorageQuotaProbe("ext2/ext3")
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=QuotaProbeClient,
+            storage_guard_min_free_gb=5.0,
+            ssh_parallelism=2,
+        )
+
+        scheduler.prefetch_fea_storage_quotas(self.accounts)
+        self.assertEqual(QuotaProbeClient.quota_probe_calls, 2)
+        self.assertEqual(set(scheduler._storage_quota_cache), {"a", "b"})
+
+        scheduler.prefetch_fea_storage_quotas(self.accounts)
         self.assertEqual(QuotaProbeClient.quota_probe_calls, 2)
 
     def test_fea_allocation_account_skips_gpfs_quota_block(self) -> None:
