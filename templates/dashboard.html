@@ -530,13 +530,45 @@
         <span class="muted" data-mft-pipeline-detail="full-model">PASS -</span>
       </div>
     </div>
-    <div class="table-scroll">
+    <div id="mft-surrogate-live-results" class="section-gap" aria-live="polite">
+      <div class="title-row">
+        <h3>Surrogate 학습 결과</h3>
+        <span class="muted" id="mft-surrogate-freshness">-</span>
+      </div>
+      <p id="mft-surrogate-wave" class="muted">active wave - · HPO - / - · next strict rows -</p>
+      <p id="mft-surrogate-model" class="muted">active model - · training rows -</p>
+      <p id="mft-surrogate-decision" class="muted">최근 모델 판정 없음</p>
+      <div class="table-scroll">
+        <table aria-label="Surrogate HPO target progress">
+          <thead><tr><th>HPO target</th><th>Status</th><th>Ready</th><th>Threads</th><th>Trials</th><th>CPU seconds</th></tr></thead>
+          <tbody id="mft-surrogate-hpo-targets">
+            <tr><td colspan="6" class="muted">상태 불러오는 중…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="table-scroll section-gap">
       <table aria-label="NSGA-II parallel lanes">
-        <thead><tr><th>NSGA lane</th><th>State</th><th>Run</th><th>Active seeds</th><th>Model ID</th><th>Completed</th><th>Next seed</th></tr></thead>
+        <thead><tr><th>NSGA lane</th><th>State</th><th>Run</th><th>Active seeds</th><th>Model ID</th><th>Completed</th><th>Feasible / Infeasible / Pareto</th><th>Latest LV</th><th>Freshness</th></tr></thead>
         <tbody id="mft-nsga-lanes">
-          <tr><td colspan="7" class="muted">상태 불러오는 중…</td></tr>
+          <tr><td colspan="9" class="muted">상태 불러오는 중…</td></tr>
         </tbody>
       </table>
+    </div>
+    <div id="mft-nsga-live-results" class="section-gap" aria-live="polite">
+      <div class="title-row">
+        <h3>실제 Standard FEA 비지배 목적값 / Full 검증</h3>
+        <span class="muted" id="mft-design-counts">-</span>
+      </div>
+      <p class="muted">Standard/Full PASS는 검증 evidence이며 최종 설계 승인(final approval)이 아닙니다.</p>
+      <div class="table-scroll">
+        <table aria-label="NSGA nondominated objectives and validation lineage">
+          <thead><tr><th>Candidate</th><th>Actual volume (L)</th><th>Actual loss (W)</th><th>Front</th><th>Standard</th><th>Full model</th><th>Run / model</th></tr></thead>
+          <tbody id="mft-validated-designs">
+            <tr><td colspan="7" class="muted">상태 불러오는 중…</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
     <details id="mft-pipeline-errors" class="section-gap" hidden>
       <summary>일부 상태 소스를 읽지 못했습니다</summary>
@@ -561,6 +593,39 @@
         const text = String(item || "");
         return text.length > limit ? `${text.slice(0, limit - 1)}…` : (text || "-");
       };
+      const decimal = (item, digits = 3) => {
+        const parsed = number(item);
+        return parsed === null ? "-" : parsed.toFixed(digits);
+      };
+      const freshnessText = (freshness) => {
+        if (!freshness || freshness.available === false) return "unavailable";
+        const age = number(freshness.age_seconds);
+        const suffix = age === null ? "" : ` · ${Math.round(age)}s`;
+        const state = freshness.last_good_fallback
+          ? "stale / last good"
+          : (freshness.stale ? "stale" : "fresh");
+        return `${state}${suffix}`;
+      };
+      const safeTaskId = (item) => {
+        const parsed = Number(item);
+        return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+      };
+      function appendTaskLink(cell, taskId, label) {
+        const id = safeTaskId(taskId);
+        if (id === null) {
+          cell.textContent = label || "-";
+          return;
+        }
+        const link = document.createElement("a");
+        link.href = `/tasks/${id}`;
+        link.textContent = label || `#${id}`;
+        cell.appendChild(link);
+      }
+      const validationLabel = (result) => (
+        result && result.pass === true
+          ? "PASS"
+          : (result && result.pass === false ? "FAIL" : String((result && result.status) || "-"))
+      );
 
       function render(payload) {
         const data = payload.data || {};
@@ -584,9 +649,71 @@
         setText(detail("surrogate"), `model ${compact(surrogate.model_id, 30)}`);
         if (detail("surrogate")) detail("surrogate").title = String(surrogate.model_id || "");
 
+        const hpo = surrogate.hpo || {};
+        setText(
+          document.getElementById("mft-surrogate-freshness"),
+          freshnessText(surrogate.freshness),
+        );
+        setText(
+          document.getElementById("mft-surrogate-wave"),
+          `wave ${compact(surrogate.wave, 26)} · HPO ${shown(hpo.ready)} / ${shown(hpo.total)} · strict rows ${shown(data.strict_rows)} · model rows ${shown(surrogate.model_rows)} · next ${shown(surrogate.next_refresh_strict_rows)}`,
+        );
+        const activeModel = surrogate.active_model || {};
+        const activeMetrics = activeModel.metrics || {};
+        setText(
+          document.getElementById("mft-surrogate-model"),
+          `active model ${compact(activeModel.model_id || surrogate.model_id, 52)} · training rows ${shown(activeModel.rows)} · generation ${compact(activeModel.generation_id, 24)} · dataset ${compact(activeModel.dataset_sha256, 13)} · report ${compact(activeModel.generation_report_sha256, 13)} · aggregate ratio ${decimal(activeMetrics.aggregate_loss_ratio, 4)} · worst target ratio ${decimal(activeMetrics.worst_target_loss_ratio, 4)}`,
+        );
+        const activeModelLine = document.getElementById("mft-surrogate-model");
+        if (activeModelLine) {
+          activeModelLine.title = `model=${String(activeModel.model_id || surrogate.model_id || "")} dataset=${String(activeModel.dataset_sha256 || "")} generation=${String(activeModel.generation_id || "")} report=${String(activeModel.generation_report_sha256 || "")} solver=${String(activeModel.solver_revision || "")} library=${String(activeModel.library_revision || "")}`;
+        }
+        const decision = surrogate.last_decision || {};
+        const reasons = Array.isArray(decision.reasons) ? decision.reasons : [];
+        const blocked = Array.isArray(decision.blocked_targets) ? decision.blocked_targets : [];
+        const metrics = Array.isArray(decision.metrics) ? decision.metrics : [];
+        const metricText = metrics.map((metric) => `${metric.name || "metric"}=${String(metric.value)}`).join(", ");
+        setText(
+          document.getElementById("mft-surrogate-decision"),
+          decision.available
+            ? `최근 ${decision.outcome || decision.phase || "판정"}: ${compact(decision.candidate_model_id, 34)}${reasons.length ? ` · ${reasons.join(", ")}` : ""}${blocked.length ? ` · blocked ${blocked.join(", ")}` : ""}${metricText ? ` · ${metricText}` : ""}`
+            : "최근 모델 판정 없음",
+        );
+
+        const hpoBody = document.getElementById("mft-surrogate-hpo-targets");
+        if (hpoBody) {
+          hpoBody.textContent = "";
+          const targets = Array.isArray(hpo.targets) ? hpo.targets : [];
+          if (!targets.length) {
+            const row = hpoBody.insertRow();
+            const cell = row.insertCell();
+            cell.colSpan = 6;
+            cell.className = "muted";
+            cell.textContent = "active HPO target 없음";
+          } else {
+            targets.forEach((target) => {
+              const row = hpoBody.insertRow();
+              [
+                target.target || "-",
+                target.status || "unknown",
+                target.result_ready ? "ready" : "pending",
+                shown(target.model_threads),
+                shown(target.trials),
+                decimal(target.cpu_seconds, 1),
+              ].forEach((field) => {
+                const cell = row.insertCell();
+                cell.textContent = String(field);
+              });
+            });
+          }
+        }
+
         const nsga = payload.nsga || {};
         setText(value("nsga"), `${shown(nsga.active_seed_workers)} seed workers`);
-        setText(detail("nsga"), `완료 run ${shown(nsga.completed_runs)}`);
+        setText(
+          detail("nsga"),
+          `완료 ${shown(nsga.completed_runs)} · feasible ${shown(nsga.feasible_runs)} · Pareto ${shown(nsga.pareto_runs)}`,
+        );
 
         const standard = payload.standard_fea || {};
         setText(value("standard-fea"), `${shown(standard.active)} active`);
@@ -609,11 +736,12 @@
           if (!lanes.length) {
             const row = laneBody.insertRow();
             const cell = row.insertCell();
-            cell.colSpan = 7;
+            cell.colSpan = 9;
             cell.className = "muted";
             cell.textContent = "NSGA-II 상태 없음";
           } else {
             lanes.forEach((lane) => {
+              const leastViolation = lane.least_violation || {};
               const row = laneBody.insertRow();
               const fields = [
                 lane.name || "-",
@@ -622,14 +750,80 @@
                 Array.isArray(lane.seeds) && lane.seeds.length ? lane.seeds.join(", ") : "-",
                 compact(lane.model_id, 42),
                 shown(lane.completed_runs),
-                shown(lane.next_seed_base),
+                `${shown(lane.feasible_runs)} / ${shown(lane.infeasible_runs)} / ${shown(lane.pareto_runs)}`,
+                leastViolation.best_total_positive_violation === null || leastViolation.best_total_positive_violation === undefined
+                  ? "-"
+                  : `${decimal(leastViolation.best_total_positive_violation, 4)} (${shown(leastViolation.candidate_count)})`,
+                freshnessText(lane.freshness),
               ];
               fields.forEach((field, index) => {
                 const cell = row.insertCell();
                 cell.textContent = String(field);
                 if (index === 3 || index === 4) cell.className = "mono-cell";
                 if (index === 4) cell.title = String(lane.model_id || "");
+                if (index === 7) {
+                  const constraints = Array.isArray(leastViolation.zero_pass_constraints)
+                    ? leastViolation.zero_pass_constraints
+                    : [];
+                  cell.title = constraints.length ? `zero-pass: ${constraints.join(", ")}` : "";
+                }
+                if (index === 8 && lane.freshness && lane.freshness.stale) {
+                  cell.className = "muted";
+                }
               });
+            });
+          }
+        }
+
+        const designs = nsga.designs || {};
+        const designItems = Array.isArray(designs.items) ? designs.items : [];
+        setText(
+          document.getElementById("mft-design-counts"),
+          `nondominated ${shown(designs.nondominated_count)} · active Full ${shown(designs.active_full_count)}${designs.truncated ? ` · first ${shown(designs.limit)}` : ""}`,
+        );
+        const designBody = document.getElementById("mft-validated-designs");
+        if (designBody) {
+          designBody.textContent = "";
+          if (!designItems.length) {
+            const row = designBody.insertRow();
+            const cell = row.insertCell();
+            cell.colSpan = 7;
+            cell.className = "muted";
+            cell.textContent = "actual Standard FEA objective / validation lineage 없음";
+          } else {
+            designItems.forEach((design) => {
+              const objectives = design.objectives || {};
+              const standardResult = design.standard || {};
+              const fullResult = design.full || {};
+              const row = designBody.insertRow();
+              const digestCell = row.insertCell();
+              digestCell.textContent = compact(design.candidate_digest, 18);
+              digestCell.title = String(design.candidate_digest || "");
+              digestCell.className = "mono-cell";
+              const volumeCell = row.insertCell();
+              volumeCell.textContent = decimal(objectives.volume_L, 3);
+              const lossCell = row.insertCell();
+              lossCell.textContent = decimal(objectives.total_loss_W, 3);
+              const frontCell = row.insertCell();
+              frontCell.textContent = `${design.nondominated ? "Pareto" : "dominated"}${design.active_full ? " · active Full" : ""}`;
+              const standardCell = row.insertCell();
+              const standardId = safeTaskId(standardResult.task_id);
+              appendTaskLink(
+                standardCell,
+                standardId,
+                standardId === null ? validationLabel(standardResult) : `#${standardId} ${validationLabel(standardResult)}`,
+              );
+              const fullCell = row.insertCell();
+              const fullId = safeTaskId(fullResult.task_id);
+              appendTaskLink(
+                fullCell,
+                fullId,
+                fullId === null ? validationLabel(fullResult) : `#${fullId} ${validationLabel(fullResult)}`,
+              );
+              const lineageCell = row.insertCell();
+              lineageCell.textContent = `${compact(design.run_id, 26)} · ${compact(design.model_id, 30)}`;
+              lineageCell.title = `${String(design.run_id || "")} · ${String(design.model_id || "")}`;
+              lineageCell.className = "mono-cell";
             });
           }
         }
@@ -647,9 +841,10 @@
           errorPanel.hidden = errors.length === 0;
         }
         const generated = payload.generated_at ? new Date(payload.generated_at) : new Date();
+        const staleSources = Array.isArray(payload.stale_sources) ? payload.stale_sources : [];
         setText(
           document.getElementById("mft-pipeline-updated"),
-          `${generated.toLocaleTimeString()} 갱신${errors.length ? ` · source error ${errors.length}` : ""}`,
+          `${generated.toLocaleTimeString()} 갱신${staleSources.length ? ` · stale ${staleSources.length}` : ""}${errors.length ? ` · source error ${errors.length}` : ""}`,
         );
       }
 
