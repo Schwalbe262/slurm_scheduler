@@ -894,10 +894,12 @@ class Database:
         """Return projected AEDT disk-growth units by account.
 
         Every hard-cap session (``starting``, ``ready`` or ``busy``) reserves
-        its complete future project capacity.  Attaching/running pooled tasks
-        that no longer occupy one of those slots remain separately reserved
-        until terminal.  A running task must not age out merely because an
-        older quota sample may already include some of its writes:
+        its complete future project capacity.  Pending exact reservations
+        keep attaching/running clients represented by that capacity before a
+        lease exists.  Clients that no longer occupy one of those slots remain
+        separately reserved until terminal.  A running task must not age out
+        merely because an older quota sample may already include some of its
+        writes:
         Maxwell/Icepak projects can keep growing through later solve stages.
         This DB-derived ledger still releases terminal tasks and closed
         sessions automatically, so a scheduler restart cannot leak
@@ -1040,20 +1042,42 @@ class Database:
 
                     represented_rows = conn.execute(
                         """
-                        SELECT a.account_name,
-                               COUNT(DISTINCT t.id) AS active_session_projects
-                        FROM tasks AS t
-                        JOIN aedt_project_leases AS l ON l.task_id = t.id
-                        JOIN aedt_sessions AS s ON s.id = l.session_id
-                        JOIN allocations AS a ON a.id = s.allocation_id
-                        WHERE LOWER(TRIM(COALESCE(t.aedt_backend, ''))) = 'pooled'
-                          AND t.status IN ('attaching', 'running')
-                          AND l.state IN (
-                              'offered', 'leased', 'attaching', 'active', 'releasing'
-                          )
-                          AND s.state IN ('starting', 'ready', 'busy')
-                          AND TRIM(COALESCE(a.account_name, '')) != ''
-                        GROUP BY a.account_name
+                        SELECT represented.account_name,
+                               COUNT(DISTINCT represented.task_id)
+                                   AS active_session_projects
+                        FROM (
+                            SELECT t.id AS task_id, a.account_name
+                            FROM tasks AS t
+                            JOIN aedt_project_leases AS l ON l.task_id = t.id
+                            JOIN aedt_sessions AS s ON s.id = l.session_id
+                            JOIN allocations AS a ON a.id = s.allocation_id
+                            WHERE LOWER(TRIM(COALESCE(t.aedt_backend, '')))
+                                      = 'pooled'
+                              AND t.status IN ('attaching', 'running')
+                              AND l.state IN (
+                                  'offered', 'leased', 'attaching',
+                                  'active', 'releasing'
+                              )
+                              AND s.state IN ('starting', 'ready', 'busy')
+                              AND TRIM(COALESCE(a.account_name, '')) != ''
+
+                            UNION
+
+                            SELECT t.id AS task_id, a.account_name
+                            FROM tasks AS t
+                            JOIN aedt_exact_session_reservations AS r
+                              ON r.task_id = t.id
+                            JOIN aedt_sessions AS s ON s.id = r.session_id
+                            JOIN allocations AS a ON a.id = s.allocation_id
+                            WHERE LOWER(TRIM(COALESCE(t.aedt_backend, '')))
+                                      = 'pooled'
+                              AND t.status IN ('attaching', 'running')
+                              AND r.state IN ('reserved', 'claimed')
+                              AND r.session_generation = s.generation
+                              AND s.state IN ('starting', 'ready', 'busy')
+                              AND TRIM(COALESCE(a.account_name, '')) != ''
+                        ) AS represented
+                        GROUP BY represented.account_name
                         """
                     ).fetchall()
                     for row in represented_rows:

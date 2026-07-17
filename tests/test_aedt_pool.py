@@ -6009,6 +6009,49 @@ class AedtExactSessionReservationTests(AedtPoolTestCase):
             self.service.get_session(int(other["id"]))["state"], "draining"
         )
 
+    def test_pending_exact_tasks_are_not_detached_from_hard_session_capacity(
+        self,
+    ) -> None:
+        _other, target = self.sessions
+        reserved_task = self.create_pooled_task("storage-reserved")
+        claimed_task = self.create_pooled_task("storage-claimed")
+        detached_task = self.create_pooled_task("storage-detached")
+        self.reserve(
+            "storage-pending-exact",
+            target,
+            [reserved_task, claimed_task],
+        )
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE aedt_exact_session_reservations
+                SET state = 'claimed', claimed_at = CURRENT_TIMESTAMP
+                WHERE reservation_key = ? AND task_id = ?
+                """,
+                ("storage-pending-exact", claimed_task),
+            )
+        for task_id, status in (
+            (reserved_task, TaskStatus.RUNNING.value),
+            (claimed_task, TaskStatus.ATTACHING.value),
+            (detached_task, TaskStatus.RUNNING.value),
+        ):
+            self.db.update_task(
+                task_id,
+                status=status,
+                account_name="a",
+                allocation_id=self.allocation_id,
+                requested_allocation_id=self.allocation_id,
+            )
+
+        reservations = self.db.aedt_storage_growth_reservations_by_account(
+            "2000-01-01 00:00:00"
+        )["a"]
+
+        self.assertEqual(reservations["hard_session_project_slots"], 6)
+        self.assertEqual(reservations["active_session_projects"], 2)
+        self.assertEqual(reservations["detached_active_projects"], 1)
+        self.assertEqual(reservations["total_projects"], 7)
+
 
 class FakeRuntimeScheduler:
     allocation_cpus = 64
