@@ -2277,6 +2277,53 @@ class SchedulerTests(unittest.TestCase):
         self.assertIsNotNone(scheduler.best_allocation_for_task(self.db.get_task(task_id)))
         self.assertEqual(snapshot_calls, 1)
 
+    def test_scheduler_keeps_live_allocation_visible_beyond_recent_history_limit(self) -> None:
+        live_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=8,
+            total_memory_mb=65536,
+        )
+        self.db.update_allocation(
+            live_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="old-live",
+        )
+        for index in range(501):
+            allocation_id = self.db.create_allocation(
+                account_name="a",
+                partition="cpu1",
+                node_name="",
+                total_cpus=8,
+                total_memory_mb=65536,
+            )
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.CLOSED.value,
+                slurm_job_id=f"closed-{index}",
+            )
+
+        self.assertNotIn(
+            live_id,
+            {int(item["id"]) for item in self.db.list_allocations(limit=500)},
+        )
+        task_id = self.db.create_task(
+            TaskCreate("standard", "~/case", "run", cpus=1, memory_mb=1024)
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        task = self.db.get_task(task_id)
+
+        self.assertEqual(scheduler.best_allocation_for_task(task)["id"], live_id)
+        self.assertEqual(
+            [item["allocation_id"] for item in scheduler.task_fit_capacity(task)["allocations"]],
+            [live_id],
+        )
+        self.assertIn(
+            live_id,
+            {int(item["id"]) for item in scheduler.current_reservation_allocations()},
+        )
+
     def test_task_and_allocation_exclusive_flags_must_match_exactly(self) -> None:
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
         task = {

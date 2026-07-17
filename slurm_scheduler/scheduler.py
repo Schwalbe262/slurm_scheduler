@@ -1090,7 +1090,7 @@ class Scheduler:
         }
         live_allocations = [
             allocation
-            for allocation in self.db.list_allocations(limit=1000)
+            for allocation in self.db.list_allocations_with_live(limit=1000)
             if allocation["state"] in live_states
         ]
         known_ids = {
@@ -1977,7 +1977,7 @@ class Scheduler:
         }
         allocations = [
             allocation
-            for allocation in self.db.list_allocations(limit=500)
+            for allocation in self.db.list_allocations_with_live(limit=500)
             if str(allocation.get("node_name") or "") == node_name and allocation["state"] in live_states
         ]
         utils = self.allocation_utilizations()
@@ -2036,7 +2036,7 @@ class Scheduler:
         }
         by_account: dict[str, list[dict]] = {}
         live_job_ids: set[str] = set()
-        for allocation in self.db.list_allocations(limit=500):
+        for allocation in self.db.list_allocations_with_live(limit=500):
             if allocation["state"] not in live_states or not allocation.get("slurm_job_id"):
                 continue
             if allocation["account_name"] not in accounts_by_name:
@@ -3190,7 +3190,7 @@ class Scheduler:
                 [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value],
                 limit=5000,
             )
-            allocation_rows = self.db.list_allocations(limit=500)
+            allocation_rows = self.db.list_allocations_with_live(limit=500)
         else:
             scoped_ids = sorted({int(item) for item in allocation_ids if int(item) > 0})
             # The hot attach path nearly always updates one allocation. Use
@@ -3257,7 +3257,7 @@ class Scheduler:
         self.db.update_allocation_capacities(capacity_rows)
 
     def apply_allocation_lifecycle(self) -> None:
-        for allocation in self.db.list_allocations(limit=500):
+        for allocation in self.db.list_allocations_with_live(limit=500):
             if allocation["state"] == AllocationStatus.PENDING.value:
                 self.expire_pending_allocation_if_stale(allocation)
                 continue
@@ -3694,7 +3694,7 @@ class Scheduler:
         }
         return {
             str(allocation.get("node_name") or "")
-            for allocation in self.db.list_allocations(limit=1000)
+            for allocation in self.db.list_allocations_with_live(limit=1000)
             if allocation.get("state") in live_states and str(allocation.get("node_name") or "")
         }
 
@@ -4539,7 +4539,7 @@ class Scheduler:
         gpu_candidates = []
         is_fea = self.task_is_fea_bursty(task)
         active_task_allocation_ids, active_exclusive_allocation_ids = self.active_task_allocation_sets()
-        allocation_rows = self.db.list_allocations(limit=500)
+        allocation_rows = self.db.list_allocations_with_live(limit=500)
         if is_fea:
             # fit_slots_for_allocation needs the physical-node worker count.
             # Annotate the whole candidate set once. Without this, every
@@ -4662,7 +4662,7 @@ class Scheduler:
     def node_worker_counts(self) -> dict[str, int]:
         allocation_node_by_id = {
             int(allocation["id"]): str(allocation.get("node_name") or "")
-            for allocation in self.db.list_allocations(limit=500)
+            for allocation in self.db.list_allocations_with_live(limit=500)
             if allocation["state"]
             in {
                 AllocationStatus.PENDING.value,
@@ -4687,7 +4687,7 @@ class Scheduler:
     def node_fea_worker_counts(self) -> dict[str, int]:
         allocation_node_by_id = {
             int(allocation["id"]): str(allocation.get("node_name") or "")
-            for allocation in self.db.list_allocations(limit=500)
+            for allocation in self.db.list_allocations_with_live(limit=500)
             if allocation["state"]
             in {
                 AllocationStatus.PENDING.value,
@@ -4760,7 +4760,7 @@ class Scheduler:
         if active_task_allocation_ids is None or active_exclusive_allocation_ids is None:
             active_task_allocation_ids, active_exclusive_allocation_ids = self.active_task_allocation_sets()
         if self.task_is_fea_bursty(task) and allocation_rows is None:
-            allocation_rows = self.db.list_allocations(limit=500)
+            allocation_rows = self.db.list_allocations_with_live(limit=500)
         if self.task_is_fea_bursty(task) and allocation_rows is not None:
             has_node_rows = any(str(allocation.get("node_name") or "") for allocation in allocation_rows)
             already_annotated = any("_node_worker_count" in allocation for allocation in allocation_rows)
@@ -4795,7 +4795,7 @@ class Scheduler:
         ready_slots = 0
         pending_slots = 0
         pressure_states: list[str] = []
-        for allocation in allocation_rows if allocation_rows is not None else self.db.list_allocations(limit=500):
+        for allocation in allocation_rows if allocation_rows is not None else self.db.list_allocations_with_live(limit=500):
             if allocation["state"] not in {AllocationStatus.PENDING.value, AllocationStatus.WARM.value, AllocationStatus.ACTIVE.value}:
                 continue
             is_pending = allocation["state"] == AllocationStatus.PENDING.value
@@ -5215,7 +5215,7 @@ class Scheduler:
             return ""
         if active_task_allocation_ids is None or active_exclusive_allocation_ids is None:
             active_task_allocation_ids, active_exclusive_allocation_ids = self.active_task_allocation_sets()
-        rows = allocation_rows if allocation_rows is not None else self.db.list_allocations(limit=500)
+        rows = allocation_rows if allocation_rows is not None else self.db.list_allocations_with_live(limit=500)
         if any(str(allocation.get("node_name") or "") for allocation in rows) and not any(
             "_node_worker_count" in allocation for allocation in rows
         ):
@@ -5267,7 +5267,7 @@ class Scheduler:
         snapshots_by_name = {snapshot.account_name: snapshot for snapshot in cached_snapshots}
         open_by_account: dict[str, int] = {}
         pending_by_account: dict[str, int] = {}
-        for allocation in allocation_rows if allocation_rows is not None else self.db.list_allocations(limit=500):
+        for allocation in allocation_rows if allocation_rows is not None else self.db.list_allocations_with_live(limit=500):
             if allocation["state"] in {
                 AllocationStatus.PENDING.value,
                 AllocationStatus.WARM.value,
@@ -5480,7 +5480,7 @@ class Scheduler:
         return self._age_seconds(allocation) < cutoff
 
     def has_inflight_capacity_for_task(self, task: dict) -> bool:
-        for allocation in self.db.list_allocations(limit=500):
+        for allocation in self.db.list_allocations_with_live(limit=500):
             if allocation["state"] not in {
                 AllocationStatus.PENDING.value,
                 AllocationStatus.WARM.value,
@@ -5790,7 +5790,7 @@ class Scheduler:
     def _compute_fea_owned_node_pressures(self) -> dict[str, dict[str, int]]:
         allocation_node_by_id: dict[int, str] = {}
         owned_cpus_by_node: dict[str, int] = {}
-        for allocation in self.db.list_allocations(limit=500):
+        for allocation in self.db.list_allocations_with_live(limit=500):
             if allocation["state"] not in {
                 AllocationStatus.WARM.value,
                 AllocationStatus.ACTIVE.value,
@@ -5875,7 +5875,7 @@ class Scheduler:
         # node (n allocations -> owned = n*64), letting FEA overshoot a single
         # allocation's reservation.
         owned_by_alloc: dict[int, int] = {}
-        for allocation in self.db.list_allocations(limit=500):
+        for allocation in self.db.list_allocations_with_live(limit=500):
             if allocation["state"] not in {
                 AllocationStatus.WARM.value,
                 AllocationStatus.ACTIVE.value,
@@ -6058,7 +6058,7 @@ class Scheduler:
         }
         node_by_allocation_id = {
             int(allocation["id"]): str(allocation.get("node_name") or "")
-            for allocation in self.db.list_allocations(limit=500)
+            for allocation in self.db.list_allocations_with_live(limit=500)
             if allocation["state"] in live_states
         }
         now = self._now()
@@ -6455,7 +6455,7 @@ class Scheduler:
             AllocationStatus.WARM.value: 1,
             AllocationStatus.DRAINING.value: 2,
         }
-        for allocation in self.db.list_allocations(limit=500):
+        for allocation in self.db.list_allocations_with_live(limit=500):
             if allocation["state"] not in live_states:
                 continue
             node = str(allocation.get("node_name") or "").strip()
@@ -6551,7 +6551,7 @@ class Scheduler:
         }
         allocation_by_id = {
             int(allocation["id"]): allocation
-            for allocation in self.db.list_allocations(limit=500)
+            for allocation in self.db.list_allocations_with_live(limit=500)
             if allocation["state"] in live_states
         }
         tasks_by_alloc: dict[int, list[dict]] = {}
@@ -7083,7 +7083,7 @@ class Scheduler:
         }
         allocation_node_by_id: dict[int, str] = {}
         resources: dict[str, dict[str, int]] = {}
-        for live_allocation in self.db.list_allocations(limit=500):
+        for live_allocation in self.db.list_allocations_with_live(limit=500):
             if live_allocation["state"] not in live_states:
                 continue
             node_name = str(live_allocation.get("node_name") or "").strip()
@@ -7220,7 +7220,7 @@ class Scheduler:
     def handle_fea_memory_pressure(self) -> None:
         reclaimed = False
         pressured_allocations_by_node: dict[str, list[dict]] = {}
-        for allocation in self.db.list_allocations(limit=500):
+        for allocation in self.db.list_allocations_with_live(limit=500):
             if allocation["state"] not in {
                 AllocationStatus.WARM.value,
                 AllocationStatus.ACTIVE.value,
@@ -7716,7 +7716,7 @@ class Scheduler:
     def prewarm_cpu_for_minimum(self) -> None:
         live_count = sum(
             1
-            for allocation in self.db.list_allocations(limit=500)
+            for allocation in self.db.list_allocations_with_live(limit=500)
             if allocation["state"]
             in {
                 AllocationStatus.PENDING.value,
@@ -7983,7 +7983,7 @@ class Scheduler:
     def current_reservation_allocations(self) -> list[dict]:
         return [
             dict(allocation)
-            for allocation in self.db.list_allocations(limit=500)
+            for allocation in self.db.list_allocations_with_live(limit=500)
             if allocation["state"]
             in {
                 AllocationStatus.PENDING.value,
@@ -8249,7 +8249,7 @@ class Scheduler:
     def prewarm_for_high_utilization(self) -> None:
         allocations = [
             item
-            for item in self.db.list_allocations(limit=500)
+            for item in self.db.list_allocations_with_live(limit=500)
             if item["state"] in {AllocationStatus.PENDING.value, AllocationStatus.WARM.value, AllocationStatus.ACTIVE.value}
         ]
         if not allocations:
@@ -8289,7 +8289,7 @@ class Scheduler:
         )
         remaining_allocations = [
             dict(allocation)
-            for allocation in self.db.list_allocations(limit=500)
+            for allocation in self.db.list_allocations_with_live(limit=500)
             if allocation["state"]
             in {
                 AllocationStatus.PENDING.value,
@@ -8412,7 +8412,7 @@ class Scheduler:
         return opened
 
     def find_unreserved_exclusive_capacity(self, task: dict, reserved_allocation_ids: set[int]) -> dict | None:
-        for allocation in self.db.list_allocations(limit=500):
+        for allocation in self.db.list_allocations_with_live(limit=500):
             if int(allocation["id"]) in reserved_allocation_ids:
                 continue
             if allocation["state"] not in {
@@ -8482,7 +8482,7 @@ class Scheduler:
         self.enforce_cpu_partition_allocation_limits()
         warm_allocations = [
             item
-            for item in self.db.list_allocations(limit=500)
+            for item in self.db.list_allocations_with_live(limit=500)
             if item["state"] == AllocationStatus.WARM.value
         ]
         self.scale_in_pool(
@@ -8582,7 +8582,7 @@ class Scheduler:
         desired_cpu_pool_cpus = int(desired_cpu_shape.get("cpus") or 0) if desired_cpu_shape else 0
         demand_allocations = [
             allocation
-            for allocation in self.db.list_allocations(limit=500)
+            for allocation in self.db.list_allocations_with_live(limit=500)
             if allocation["state"] in {AllocationStatus.PENDING.value, AllocationStatus.WARM.value}
             and (
                 str(allocation.get("drain_reason") or "").startswith("queued ")
@@ -9065,7 +9065,7 @@ class Scheduler:
         snapshots_by_name = {snapshot.account_name: snapshot for snapshot in self.snapshots()}
         open_by_account: dict[str, int] = {}
         pending_by_account: dict[str, int] = {}
-        for allocation in self.db.list_allocations(limit=500):
+        for allocation in self.db.list_allocations_with_live(limit=500):
             if allocation["state"] in {
                 AllocationStatus.PENDING.value,
                 AllocationStatus.WARM.value,
@@ -9129,7 +9129,7 @@ class Scheduler:
     def live_gpu_allocations(self) -> list[dict]:
         return [
             allocation
-            for allocation in self.db.list_allocations(limit=500)
+            for allocation in self.db.list_allocations_with_live(limit=500)
             if allocation["state"]
             in {
                 AllocationStatus.PENDING.value,
