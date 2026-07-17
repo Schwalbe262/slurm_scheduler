@@ -3606,6 +3606,11 @@ class Scheduler:
                 "starting/active pooled project(s)"
             )
             starting = int(reservation_detail.get("starting_project_slots") or 0)
+            ready = int(reservation_detail.get("ready_project_slots") or 0)
+            busy = int(reservation_detail.get("busy_project_slots") or 0)
+            detached = int(
+                reservation_detail.get("detached_active_projects") or 0
+            )
             attaching = int(reservation_detail.get("attaching_projects") or 0)
             running = int(reservation_detail.get("running_projects") or 0)
             young = int(reservation_detail.get("young_running_projects") or 0)
@@ -3614,7 +3619,9 @@ class Scheduler:
             )
             prospective = int(reservation_detail.get("prospective_projects") or 0)
             reservation_context += (
-                f" [starting slots {starting}, attaching {attaching}, "
+                f" [session slots starting {starting}, ready {ready}, "
+                f"busy {busy}; detached active {detached}; "
+                f"attaching {attaching}, "
                 f"running {running} (young {young}, mature {mature}), "
                 f"prospective {prospective}]"
             )

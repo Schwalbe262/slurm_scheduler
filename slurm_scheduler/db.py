@@ -893,14 +893,15 @@ class Database:
     ) -> dict[str, dict[str, int]]:
         """Return projected AEDT disk-growth units by account.
 
-        A claimed ``starting`` session reserves all of its future project
-        slots.  Once the session is usable, every attaching or running pooled
-        task carries its own reservation until the task becomes terminal.  A
-        running task must not age out merely because an older quota sample may
-        already include some of its writes: Maxwell/Icepak projects can keep
-        growing through later solve stages.  This DB-derived ledger still
-        releases terminal tasks automatically, so a scheduler restart cannot
-        leak reservations.
+        Every hard-cap session (``starting``, ``ready`` or ``busy``) reserves
+        its complete future project capacity.  Attaching/running pooled tasks
+        that no longer occupy one of those slots remain separately reserved
+        until terminal.  A running task must not age out merely because an
+        older quota sample may already include some of its writes:
+        Maxwell/Icepak projects can keep growing through later solve stages.
+        This DB-derived ledger still releases terminal tasks and closed
+        sessions automatically, so a scheduler restart cannot leak
+        reservations.
 
         ``maturity_cutoff`` is deliberately derived from the quota probe's
         observation timestamp rather than wall-clock now.  It now classifies
@@ -915,6 +916,11 @@ class Database:
                 account_name,
                 {
                     "starting_project_slots": 0,
+                    "ready_project_slots": 0,
+                    "busy_project_slots": 0,
+                    "hard_session_project_slots": 0,
+                    "active_session_projects": 0,
+                    "detached_active_projects": 0,
                     "attaching_projects": 0,
                     "running_projects": 0,
                     "young_running_projects": 0,
@@ -983,13 +989,31 @@ class Database:
                     session_rows = conn.execute(
                         """
                         SELECT a.account_name,
-                               SUM(CASE WHEN s.slots_total > 0
-                                        THEN s.slots_total ELSE 1 END)
-                                   AS starting_project_slots
+                               SUM(CASE
+                                       WHEN s.state = 'starting'
+                                        AND s.host_task_id > 0
+                                       THEN CASE WHEN s.slots_total > 0
+                                                 THEN s.slots_total ELSE 1 END
+                                       ELSE 0
+                                   END) AS starting_project_slots,
+                               SUM(CASE
+                                       WHEN s.state = 'ready'
+                                       THEN CASE WHEN s.slots_total > 0
+                                                 THEN s.slots_total ELSE 1 END
+                                       ELSE 0
+                                   END) AS ready_project_slots,
+                               SUM(CASE
+                                       WHEN s.state = 'busy'
+                                       THEN CASE WHEN s.slots_total > 0
+                                                 THEN s.slots_total ELSE 1 END
+                                       ELSE 0
+                                   END) AS busy_project_slots
                         FROM aedt_sessions AS s
                         JOIN allocations AS a ON a.id = s.allocation_id
-                        WHERE s.state = 'starting'
-                          AND s.host_task_id > 0
+                        WHERE (
+                                (s.state = 'starting' AND s.host_task_id > 0)
+                                OR s.state IN ('ready', 'busy')
+                              )
                           AND TRIM(COALESCE(a.account_name, '')) != ''
                         GROUP BY a.account_name
                         """
@@ -998,15 +1022,67 @@ class Database:
                         account_name = str(row["account_name"] or "").strip()
                         if not account_name:
                             continue
-                        item_for(account_name)["starting_project_slots"] = int(
-                            row["starting_project_slots"] or 0
+                        item = item_for(account_name)
+                        for key in (
+                            "starting_project_slots",
+                            "ready_project_slots",
+                            "busy_project_slots",
+                        ):
+                            item[key] = int(row[key] or 0)
+                        item["hard_session_project_slots"] = sum(
+                            int(item[key])
+                            for key in (
+                                "starting_project_slots",
+                                "ready_project_slots",
+                                "busy_project_slots",
+                            )
+                        )
+
+                    represented_rows = conn.execute(
+                        """
+                        SELECT a.account_name,
+                               COUNT(DISTINCT t.id) AS active_session_projects
+                        FROM tasks AS t
+                        JOIN aedt_project_leases AS l ON l.task_id = t.id
+                        JOIN aedt_sessions AS s ON s.id = l.session_id
+                        JOIN allocations AS a ON a.id = s.allocation_id
+                        WHERE LOWER(TRIM(COALESCE(t.aedt_backend, ''))) = 'pooled'
+                          AND t.status IN ('attaching', 'running')
+                          AND l.state IN (
+                              'offered', 'leased', 'attaching', 'active', 'releasing'
+                          )
+                          AND s.state IN ('starting', 'ready', 'busy')
+                          AND TRIM(COALESCE(a.account_name, '')) != ''
+                        GROUP BY a.account_name
+                        """
+                    ).fetchall()
+                    for row in represented_rows:
+                        account_name = str(row["account_name"] or "").strip()
+                        if not account_name:
+                            continue
+                        item_for(account_name)["active_session_projects"] = int(
+                            row["active_session_projects"] or 0
                         )
 
         for item in reservations.values():
-            item["total_projects"] = (
-                int(item["starting_project_slots"])
-                + int(item["attaching_projects"])
+            active_projects = (
+                int(item["attaching_projects"])
                 + int(item["running_projects"])
+            )
+            item["detached_active_projects"] = max(
+                0,
+                active_projects - int(item["active_session_projects"]),
+            )
+            # A usable Desktop's idle slots are real future disk-growth
+            # commitments.  Keep reserving the whole hard-session capacity
+            # after ``starting`` becomes ``ready``/``busy``; otherwise every
+            # new reconciliation tick can spend the same cached GPFS
+            # headroom again.  Active tasks whose lease was already released
+            # (for example during downstream post-processing) remain an
+            # additional detached reservation until terminal.
+            item["total_projects"] = (
+                int(item["hard_session_project_slots"])
+                + int(item["detached_active_projects"])
             )
         return reservations
     def active_pooled_aedt_tasks_by_allocation(self) -> dict[int, int]:

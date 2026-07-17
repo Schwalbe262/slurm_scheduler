@@ -5691,6 +5691,86 @@ class AedtRuntimeTests(AedtPoolTestCase):
         )
         self.assertEqual(reservations["a"]["starting_project_slots"], 3)
 
+    def test_ready_session_keeps_whole_cohort_storage_reservation(self) -> None:
+        self.service.set_operator_limits(
+            max_sessions=2,
+            min_idle_sessions=2,
+            target_projects=0,
+            projects_per_session=3,
+        )
+        self.add_dedicated_allocation()
+        self.make_operational()
+        self.service.reconcile(execute=True)
+
+        class CohortStorageScheduler(FakeHostLaunchScheduler):
+            def __init__(self, db: Database) -> None:
+                super().__init__()
+                self.db = db
+                self.account = SimpleNamespace(name="a")
+
+            def account_storage_blocked(
+                self,
+                account,
+                *,
+                for_fea: bool = False,
+                refresh_reservations: bool = False,
+            ) -> bool:
+                if getattr(account, "name", "") != "a" or not for_fea:
+                    raise AssertionError("wrong storage admission scope")
+                reservations = self.db.aedt_storage_growth_reservations_by_account(
+                    "2000-01-01 00:00:00"
+                )
+                return int(
+                    (reservations.get("a") or {}).get("total_projects") or 0
+                ) > 3
+
+        scheduler = CohortStorageScheduler(self.db)
+        runtime = AedtPoolRuntime(
+            self.service,
+            scheduler,
+            interval_seconds=30,
+            scheduler_url="http://scheduler:8000",
+            host_remote_cwd="/work/aedt",
+            host_bootstrap_token_file="/shared/aedt-token",
+        )
+
+        # The first batch has room for exactly one three-project cohort.
+        self.assertEqual(runtime._ensure_session_hosts(self.service.config()), 1)
+        first = self.service.starting_sessions()[0]
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE aedt_sessions
+                SET state = 'ready', started_at = ?, last_heartbeat_at = ?,
+                    idle_since = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, now, now, int(first["id"])),
+            )
+
+        reservations = self.db.aedt_storage_growth_reservations_by_account(
+            "2000-01-01 00:00:00"
+        )["a"]
+        self.assertEqual(reservations["starting_project_slots"], 0)
+        self.assertEqual(reservations["ready_project_slots"], 3)
+        self.assertEqual(reservations["hard_session_project_slots"], 3)
+        self.assertEqual(reservations["total_projects"], 3)
+
+        # Reconciliation replaces the failed sibling.  Its host must remain
+        # blocked: the ready cohort still owns the cached headroom.
+        self.service.reconcile(execute=True)
+        self.assertEqual(len(self.service.starting_sessions()), 1)
+        self.assertEqual(runtime._ensure_session_hosts(self.service.config()), 0)
+        with self.db.connect() as conn:
+            failure = conn.execute(
+                """
+                SELECT failure_message FROM aedt_sessions
+                WHERE state = 'failed' ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()[0]
+        self.assertIn("storage guard after reserving", failure)
+
     def test_storage_blocked_account_retires_unclaimed_start_without_churn(
         self,
     ) -> None:
