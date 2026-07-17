@@ -75,6 +75,72 @@ DEFAULT_HOST_LAUNCH_STAGGER_SECONDS = 15
 HOST_LAUNCH_STAGGER_ENV = "AEDT_POOL_HOST_LAUNCH_STAGGER_SECONDS"
 HEARTBEAT_PERSIST_MAX_SECONDS = 30
 RECONCILE_PLACEMENT_BATCH_SIZE = 32
+DEFAULT_HARD_PENDING_REPLAN_SECONDS = 1800
+
+
+def _normalized_slurm_pending_reason(value: object) -> str:
+    """Return a punctuation-insensitive Slurm pending reason token."""
+
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def aedt_pool_hard_pending_reason(value: object) -> bool:
+    """Whether a pending reason needs bounded pool-level replanning.
+
+    Resource and priority waits may legitimately benefit from accumulated
+    Slurm queue age.  Association job ceilings and QOS policy rejects do not
+    provide usable near-term AEDT capacity under a continuously full campaign;
+    after a bounded grace they must stop suppressing an alternative route.
+    """
+
+    normalized = _normalized_slurm_pending_reason(value)
+    return normalized.startswith("assocmax") or normalized.startswith("qos")
+
+
+def aedt_pool_pending_replan_reason(
+    allocation: dict[str, Any],
+    *,
+    now: datetime,
+    timeout_seconds: int = DEFAULT_HARD_PENDING_REPLAN_SECONDS,
+) -> str:
+    """Return the stale hard reason for an unused pool request, else blank.
+
+    This helper is intentionally read-only.  The runtime still delegates any
+    cancellation to Scheduler.close_empty_aedt_pool_allocation(), whose exact
+    owner checks protect sessions and live task claims that may race this
+    snapshot.
+    """
+
+    if str(allocation.get("state") or "") != "pending":
+        return ""
+    if (
+        str(allocation.get("drain_reason") or "")
+        != "AEDT pool project demand"
+    ):
+        return ""
+    reason = str(allocation.get("pending_reason") or "").strip()
+    if not aedt_pool_hard_pending_reason(reason):
+        return ""
+    try:
+        configured_timeout = int(timeout_seconds)
+    except (TypeError, ValueError):
+        configured_timeout = DEFAULT_HARD_PENDING_REPLAN_SECONDS
+    if configured_timeout <= 0:
+        return ""
+    submitted = str(
+        allocation.get("submitted_at")
+        or allocation.get("created_at")
+        or ""
+    ).strip()
+    try:
+        age_seconds = (
+            now.astimezone(timezone.utc) - _parse_utc_time(submitted)
+        ).total_seconds()
+    except (TypeError, ValueError):
+        # Missing/ambiguous age is not authority to cancel a Slurm request.
+        return ""
+    grace_seconds = max(60, configured_timeout)
+    return reason if age_seconds >= grace_seconds else ""
 
 # Families for which a rolling build may enable concurrent native solves.  The
 # emergency ``serial`` mode ignores this allowlist; ``validated_parallel``
@@ -545,6 +611,9 @@ class AedtPoolService:
         self._config_cache: AedtPoolConfig | None = None
         self._config_cache_until = 0.0
         self._placement_cursor = 0
+        self._pending_allocation_replan_seconds = (
+            DEFAULT_HARD_PENDING_REPLAN_SECONDS
+        )
         # The public summary is otherwise a topology-only dry run and can
         # advertise placements that the runtime has already excluded on a
         # fresh storage observation.  Cache only the runtime's fail-closed
@@ -604,6 +673,22 @@ class AedtPoolService:
         }
         with self._config_lock:
             self._runtime_start_block_reasons = normalized
+
+    def set_pending_allocation_replan_seconds(self, seconds: int) -> None:
+        """Share the scheduler's bounded pending timeout with pool planning."""
+
+        try:
+            value = int(seconds)
+        except (TypeError, ValueError):
+            value = DEFAULT_HARD_PENDING_REPLAN_SECONDS
+        with self._config_lock:
+            self._pending_allocation_replan_seconds = (
+                0 if value <= 0 else max(60, value)
+            )
+
+    def pending_allocation_replan_seconds(self) -> int:
+        with self._config_lock:
+            return int(self._pending_allocation_replan_seconds)
 
     def runtime_start_block_reasons(self) -> dict[str, str]:
         with self._config_lock:
@@ -7110,14 +7195,41 @@ class AedtPoolService:
             not in excluded_start_accounts
             and int(allocation["id"]) not in unsafe_allocation_ids
         ]
-        pending_allocations = [
+        all_pending_allocations = [
             allocation
             for allocation in self._dedicated_allocations({"pending"}, conn=conn)
             if str(allocation.get("drain_reason") or "")
             == "AEDT pool project demand"
+        ]
+        pending_replan_reasons_by_id = {
+            int(allocation["id"]): reason
+            for allocation in all_pending_allocations
+            if (
+                reason := aedt_pool_pending_replan_reason(
+                    allocation,
+                    now=self._now(),
+                    timeout_seconds=self.pending_allocation_replan_seconds(),
+                )
+            )
+        }
+        # A stale association/QOS reject is not future capacity.  Keeping it
+        # in this ledger suppresses every alternative node request forever.
+        # Mutation remains a separate exact-owner runtime step below.
+        pending_allocations = [
+            allocation
+            for allocation in all_pending_allocations
+            if int(allocation["id"]) not in pending_replan_reasons_by_id
             and str(allocation.get("account_name") or "")
             not in excluded_start_accounts
         ]
+        pending_replan_by_account: dict[str, int] = {}
+        for allocation in all_pending_allocations:
+            if int(allocation["id"]) not in pending_replan_reasons_by_id:
+                continue
+            account_name = str(allocation.get("account_name") or "")
+            pending_replan_by_account[account_name] = (
+                pending_replan_by_account.get(account_name, 0) + 1
+            )
         current_by_allocation = {
             int(row["allocation_id"]): int(row["count"])
             for row in conn.execute(
@@ -7276,6 +7388,19 @@ class AedtPoolService:
             "unplaced_sessions_by_account": unplaced_by_account,
             "pending_node_session_capacity": pending_capacity,
             "pending_node_session_capacity_by_account": pending_capacity_by_account,
+            "pending_replan_allocation_ids": sorted(
+                pending_replan_reasons_by_id
+            ),
+            "pending_replan_allocation_count": len(
+                pending_replan_reasons_by_id
+            ),
+            "pending_replan_allocations_by_account": pending_replan_by_account,
+            "pending_replan_reasons_by_allocation": {
+                str(allocation_id): reason
+                for allocation_id, reason in sorted(
+                    pending_replan_reasons_by_id.items()
+                )
+            },
             "node_requests": node_requests,
             "node_requests_by_account": node_requests_by_account,
             "node_request_session_counts_by_account": (
@@ -8845,6 +8970,13 @@ class AedtPoolRuntime:
         self.service = service
         self.scheduler = scheduler
         self.interval_seconds = max(5, int(interval_seconds))
+        self.service.set_pending_allocation_replan_seconds(
+            getattr(
+                scheduler,
+                "allocation_pending_timeout_seconds",
+                DEFAULT_HARD_PENDING_REPLAN_SECONDS,
+            )
+        )
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.scheduler_url = scheduler_url.strip().rstrip("/")
@@ -9050,17 +9182,60 @@ class AedtPoolRuntime:
             plan["control_plane_error"] = ""
         if not config.operational:
             return plan
-        request_budget = min(
-            int(plan.get("node_requests") or 0), config.scale_step_nodes
+        pending_replan = (
+            self._replan_stale_hard_pending_dedicated_allocations(config)
+        )
+        plan["hard_pending_replan_eligible_ids"] = pending_replan[
+            "eligible_ids"
+        ]
+        plan["hard_pending_replan_closed_ids"] = pending_replan["closed_ids"]
+        plan["hard_pending_replan_protected_ids"] = pending_replan[
+            "protected_ids"
+        ]
+        plan["hard_pending_replan_refused_ids"] = pending_replan[
+            "refused_ids"
+        ]
+        plan["hard_pending_replan_deferred_ids"] = pending_replan[
+            "deferred_ids"
+        ]
+        plan["hard_pending_replan_reasons_by_allocation"] = pending_replan[
+            "reasons_by_allocation"
+        ]
+        plan["hard_pending_replan_closed_count"] = len(
+            pending_replan["closed_ids"]
         )
         raw_requests_by_account = plan.get("node_requests_by_account") or {
-            config.account_name: request_budget
+            config.account_name: int(plan.get("node_requests") or 0)
         }
         request_counts = {
             str(account_name or ""): max(0, int(count))
             for account_name, count in raw_requests_by_account.items()
             if int(count) > 0
         }
+        # Never cancel and immediately recreate the same hard-pending account
+        # request in one tick. Flexible cohorts have already been rerouted by
+        # the batch planner; explicit pinned demand gets a fresh Slurm snapshot
+        # on the next tick instead of entering a cancel/resubmit loop.
+        suppressed_accounts = set(pending_replan["accounts"])
+        suppressed_accounts.update(
+            str(account or "")
+            for account in (
+                plan.get("pending_replan_allocations_by_account") or {}
+            )
+            if str(account or "")
+        )
+        suppressed_request_counts = {
+            account: request_counts.pop(account)
+            for account in sorted(set(request_counts) & suppressed_accounts)
+        }
+        plan["hard_pending_replan_suppressed_node_requests_by_account"] = (
+            suppressed_request_counts
+        )
+        request_budget = min(
+            sum(request_counts.values()),
+            int(plan.get("node_requests") or 0),
+            config.scale_step_nodes,
+        )
         raw_session_counts = plan.get("node_request_session_counts_by_account") or {}
         session_counts_by_account = {
             str(account_name or ""): [max(1, int(item)) for item in counts]
@@ -9417,6 +9592,79 @@ class AedtPoolRuntime:
             if self.scheduler.close_empty_aedt_pool_allocation(allocation_id):
                 closed += 1
         return closed
+
+    def _replan_stale_hard_pending_dedicated_allocations(
+        self,
+        config: AedtPoolConfig,
+    ) -> dict[str, Any]:
+        """Cancel a bounded set of unused hard-pending pool requests.
+
+        The read-only planner has already stopped crediting these rows as
+        future capacity.  This exact-owner phase releases their Slurm submit
+        slots before replacement capacity is opened.  Both the precheck and
+        Scheduler.close_empty_aedt_pool_allocation() fail closed if a session
+        or live task acquired the allocation between snapshots.
+        """
+
+        close_pending = getattr(
+            self.scheduler, "close_empty_aedt_pool_allocation", None
+        )
+        result: dict[str, Any] = {
+            "eligible_ids": [],
+            "closed_ids": [],
+            "protected_ids": [],
+            "refused_ids": [],
+            "deferred_ids": [],
+            "accounts": [],
+            "reasons_by_allocation": {},
+        }
+        if not callable(close_pending):
+            return result
+        now = self.service._now()
+        timeout_seconds = self.service.pending_allocation_replan_seconds()
+        candidates: list[dict[str, Any]] = []
+        for allocation in self.service._dedicated_allocations({"pending"}):
+            reason = aedt_pool_pending_replan_reason(
+                allocation,
+                now=now,
+                timeout_seconds=timeout_seconds,
+            )
+            if not reason:
+                continue
+            allocation_id = int(allocation["id"])
+            result["eligible_ids"].append(allocation_id)
+            result["reasons_by_allocation"][str(allocation_id)] = reason
+            candidates.append(allocation)
+
+        candidates.sort(
+            key=lambda row: (
+                str(row.get("submitted_at") or row.get("created_at") or ""),
+                int(row["id"]),
+            )
+        )
+        close_budget = max(1, int(config.scale_step_nodes or 1))
+        attempted = 0
+        accounts: set[str] = set()
+        for allocation in candidates:
+            allocation_id = int(allocation["id"])
+            account_name = str(allocation.get("account_name") or "")
+            accounts.add(account_name)
+            if attempted >= close_budget:
+                result["deferred_ids"].append(allocation_id)
+                continue
+            if self.service.allocation_has_counted_session(allocation_id):
+                result["protected_ids"].append(allocation_id)
+                continue
+            if self.service.db.list_live_task_claims_for_allocation(allocation_id):
+                result["protected_ids"].append(allocation_id)
+                continue
+            attempted += 1
+            if close_pending(allocation_id, expected_state="pending"):
+                result["closed_ids"].append(allocation_id)
+            else:
+                result["refused_ids"].append(allocation_id)
+        result["accounts"] = sorted(account for account in accounts if account)
+        return result
 
     def _close_excess_pending_dedicated_allocations(
         self,

@@ -22,6 +22,8 @@ from .allocation_metrics import annotate_allocation_fea_pressure, annotate_alloc
 from .aedt_pool import (
     AedtPoolRuntime,
     AedtPoolService,
+    DEFAULT_HARD_PENDING_REPLAN_SECONDS,
+    aedt_pool_pending_replan_reason,
     canonical_workload_family,
 )
 from .aedt_pool_api import create_aedt_pool_router
@@ -169,6 +171,18 @@ def _plan_aedt_pool_demand_accounts(
     }
     open_by_account: dict[str, int] = {}
     pending_by_account: dict[str, int] = {}
+    hard_pending_accounts: set[str] = set()
+    try:
+        pending_timeout_seconds = int(
+            getattr(
+                scheduler,
+                "allocation_pending_timeout_seconds",
+                DEFAULT_HARD_PENDING_REPLAN_SECONDS,
+            )
+        )
+    except (TypeError, ValueError):
+        pending_timeout_seconds = DEFAULT_HARD_PENDING_REPLAN_SECONDS
+    now = datetime.now(timezone.utc)
     for allocation in scheduler.db.list_allocations(limit=500):
         account_name = str(allocation.get("account_name") or "")
         if allocation.get("state") in {
@@ -183,6 +197,12 @@ def _plan_aedt_pool_demand_accounts(
             pending_by_account[account_name] = (
                 pending_by_account.get(account_name, 0) + 1
             )
+            if aedt_pool_pending_replan_reason(
+                allocation,
+                now=now,
+                timeout_seconds=pending_timeout_seconds,
+            ):
+                hard_pending_accounts.add(account_name)
     accounts_by_name = {
         str(account.name): account for account in scheduler.accounts
     }
@@ -242,6 +262,8 @@ def _plan_aedt_pool_demand_accounts(
     def account_can_open_cohort(account_name: str, task: dict) -> bool:
         if not account_supports_task(account_name, task):
             return False
+        if account_name in hard_pending_accounts:
+            return False
         account = accounts_by_name[account_name]
         snapshot = snapshots_by_name[account_name]
         max_total = max(
@@ -257,7 +279,8 @@ def _plan_aedt_pool_demand_accounts(
             int(snapshot.pending), pending_by_account.get(account_name, 0)
         )
         return bool(
-            current_total < max_total
+            int(snapshot.running) < int(account.max_running_jobs)
+            and current_total < max_total
             and current_pending < int(account.max_pending_jobs)
         )
 

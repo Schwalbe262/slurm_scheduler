@@ -3556,10 +3556,21 @@ class Scheduler:
             )
             return True
 
-    def close_empty_aedt_pool_allocation(self, allocation_id: int) -> bool:
-        """Pool-runtime-only lifecycle path for a dedicated empty allocation."""
+    def close_empty_aedt_pool_allocation(
+        self,
+        allocation_id: int,
+        *,
+        expected_state: str = "",
+    ) -> bool:
+        """Pool-runtime-only lifecycle path for a dedicated empty allocation.
+
+        ``expected_state`` lets a caller that observed a pending request fail
+        closed if the allocation became live before the exact-owner close.
+        """
         allocation = self.db.get_allocation(int(allocation_id))
         if not allocation:
+            return False
+        if expected_state and str(allocation.get("state") or "") != expected_state:
             return False
         if not str(allocation.get("drain_reason") or "").startswith("AEDT pool"):
             return False

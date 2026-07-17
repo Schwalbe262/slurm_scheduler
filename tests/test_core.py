@@ -2741,6 +2741,39 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.db.get_task(task_id)["status"], TaskStatus.RUNNING.value)
         self.assertEqual(FakeClient.cancelled, [])
 
+    def test_pool_exact_close_refuses_pending_request_that_became_live(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu2",
+            node_name="n001",
+            total_cpus=13,
+            total_memory_mb=98304,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="pool-became-live",
+            drain_reason="AEDT pool project demand",
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+        )
+
+        closed = scheduler.close_empty_aedt_pool_allocation(
+            allocation_id,
+            expected_state=AllocationStatus.PENDING.value,
+        )
+
+        self.assertFalse(closed)
+        self.assertEqual(
+            self.db.get_allocation(allocation_id)["state"],
+            AllocationStatus.WARM.value,
+        )
+        self.assertEqual(FakeClient.cancelled, [])
+
     def test_request_close_allocation_force_fails_active_tasks(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",

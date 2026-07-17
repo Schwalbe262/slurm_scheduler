@@ -134,7 +134,13 @@ class Clock:
 
 
 class FakeBatchRoutingScheduler:
-    def __init__(self, db: Database, status, supports=None) -> None:
+    def __init__(
+        self,
+        db: Database,
+        status,
+        supports=None,
+        snapshots=None,
+    ) -> None:
         self.db = db
         self.accounts = [
             AccountConfig(
@@ -151,15 +157,19 @@ class FakeBatchRoutingScheduler:
             for name in ("dhj02", "r1jae262")
         ]
         self.allocation_reserved_job_slots = 0
+        self.allocation_pending_timeout_seconds = 1800
         self.status = status
         self.supports = supports or (
             lambda _account, _capability, _profile: True
         )
         self.snapshot_calls = 0
         self.storage_calls: list[tuple[str, int]] = []
+        self.snapshot_rows = snapshots
 
     def snapshots(self):
         self.snapshot_calls += 1
+        if self.snapshot_rows is not None:
+            return list(self.snapshot_rows)
         return [
             SimpleNamespace(
                 account_name="dhj02",
@@ -1469,6 +1479,107 @@ class AedtPoolGateTests(AedtPoolTestCase):
         )
         self.assertEqual(capable, {101: "r1jae262"})
         self.assertEqual(capable_hints, {101: "r1jae262"})
+
+    def test_batch_route_moves_only_unbound_cold_cohort_off_hard_pending_account(
+        self,
+    ) -> None:
+        _plan_aedt_pool_demand_accounts = load_batch_routing_planner(
+            Path(self.tmp.name)
+        )
+        allocation_id = self.db.create_allocation(
+            "dhj02", "cpu", "", 13, 96 * 1024
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state="pending",
+            slurm_job_id="hard-pending-dhj",
+            drain_reason="AEDT pool project demand",
+            pending_reason="(AssocMaxJobsLimit)",
+            submitted_at="2020-01-01 00:00:00",
+        )
+        snapshots = [
+            SimpleNamespace(
+                account_name="dhj02",
+                running=20,
+                pending=1,
+                score=(20, 20, 1),
+            ),
+            SimpleNamespace(
+                account_name="r1jae262",
+                running=2,
+                pending=0,
+                score=(2, 2, 0),
+            ),
+        ]
+        scheduler = FakeBatchRoutingScheduler(
+            self.db,
+            lambda _account, _future: (False, False),
+            snapshots=snapshots,
+        )
+        env_setup = "\n".join(
+            (
+                "export MFT_AEDT_SESSION_PROFILE="
+                + shlex.quote(EXPECTED_SESSION_PROFILE_JSON),
+                "export MFT_AEDT_WORKLOAD_FAMILY=mft",
+                "export MFT_AEDT_ISOLATION_POLICY=family",
+            )
+        )
+        flexible = {
+            "task_id": 201,
+            "name": "hard-pending-flexible",
+            "project": "MFT_1MW_2026v1",
+            "requested_account_name": "",
+            "task_account_name": "",
+            "required_capability": "",
+            "env_profile": "",
+            "env_setup": env_setup,
+            "command": "true",
+        }
+
+        moved, moved_hints = _plan_aedt_pool_demand_accounts(
+            scheduler,
+            [flexible],
+            {201: "dhj02"},
+            [],
+            3,
+        )
+
+        self.assertEqual(moved, {201: "r1jae262"})
+        self.assertEqual(moved_hints, {201: "r1jae262"})
+
+        # A paid compatible slot remains usable even though that account
+        # cannot open another Slurm job; no live cohort is migrated.
+        paid, paid_hints = _plan_aedt_pool_demand_accounts(
+            scheduler,
+            [flexible],
+            {201: "dhj02"},
+            [
+                {
+                    "session_id": 301,
+                    "account_name": "dhj02",
+                    "state": "ready",
+                    "session_profile": EXPECTED_SESSION_PROFILE_JSON,
+                    "free_slots": 3,
+                    "occupants": [],
+                    "reservations": [],
+                }
+            ],
+            3,
+        )
+        self.assertEqual(paid, {201: "dhj02"})
+        self.assertEqual(paid_hints, {201: "dhj02"})
+
+        # An explicit operator pin is fail-closed, never rerouted to r1jae262.
+        pinned = {**flexible, "task_id": 202, "requested_account_name": "dhj02"}
+        pinned_routes, pinned_hints = _plan_aedt_pool_demand_accounts(
+            scheduler,
+            [pinned],
+            {},
+            [],
+            3,
+        )
+        self.assertEqual(pinned_routes, {})
+        self.assertEqual(pinned_hints, {})
 
     def test_reconcile_resolves_warm_admission_before_writer_transaction(
         self,
@@ -8040,6 +8151,68 @@ class AedtRuntimeCapacityTests(AedtPoolTestCase):
         )
         return allocation_id
 
+    def test_stale_hard_pending_pool_request_stops_counting_as_capacity(
+        self,
+    ) -> None:
+        allocation_id = self._pending_pool_allocation(
+            cpus=13,
+            memory_mb=3 * 32 * 1024,
+            submitted_at="2026-07-12 00:00:00",
+        )
+        self.db.update_allocation(
+            allocation_id,
+            pending_reason="(AssocMaxJobsLimit)",
+        )
+        self.service.set_operator_limits(
+            max_sessions=10,
+            target_projects=3,
+            projects_per_session=3,
+        )
+        self.make_operational()
+        self.request("stale-hard-pending")
+
+        plan = self.service.dry_run()
+
+        self.assertEqual(plan["pending_node_session_capacity"], 0)
+        self.assertEqual(plan["pending_replan_allocation_ids"], [allocation_id])
+        self.assertEqual(
+            plan["pending_replan_allocations_by_account"], {"a": 1}
+        )
+        self.assertEqual(plan["node_requests_by_account"], {"a": 1})
+
+    def test_fresh_hard_and_old_resource_pending_requests_keep_queue_age(self) -> None:
+        fresh_hard = self._pending_pool_allocation(
+            cpus=13,
+            memory_mb=3 * 32 * 1024,
+            submitted_at=self.clock.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        old_resource = self._pending_pool_allocation(
+            cpus=13,
+            memory_mb=3 * 32 * 1024,
+            submitted_at="2026-07-12 00:00:00",
+        )
+        self.db.update_allocation(
+            fresh_hard,
+            pending_reason="(AssocMaxJobsLimit)",
+        )
+        self.db.update_allocation(
+            old_resource,
+            pending_reason="(Resources)",
+        )
+        self.service.set_operator_limits(
+            max_sessions=10,
+            target_projects=3,
+            projects_per_session=3,
+        )
+        self.make_operational()
+        self.request("pending-queue-age")
+
+        plan = self.service.dry_run()
+
+        self.assertEqual(plan["pending_node_session_capacity"], 2)
+        self.assertEqual(plan["pending_replan_allocation_ids"], [])
+        self.assertEqual(plan["node_requests"], 0)
+
     def _pending_cleanup_runtime(self):
         class ExactCloseScheduler(FakeRuntimeScheduler):
             def __init__(self, db: Database) -> None:
@@ -8047,7 +8220,18 @@ class AedtRuntimeCapacityTests(AedtPoolTestCase):
                 self.db = db
                 self.close_calls: list[int] = []
 
-            def close_empty_aedt_pool_allocation(self, allocation_id: int) -> bool:
+            def close_empty_aedt_pool_allocation(
+                self,
+                allocation_id: int,
+                *,
+                expected_state: str = "",
+            ) -> bool:
+                if (
+                    expected_state
+                    and self.db.get_allocation(allocation_id)["state"]
+                    != expected_state
+                ):
+                    return False
                 self.close_calls.append(allocation_id)
                 self.db.update_allocation(
                     allocation_id,
@@ -8059,6 +8243,91 @@ class AedtRuntimeCapacityTests(AedtPoolTestCase):
 
         scheduler = ExactCloseScheduler(self.db)
         return AedtPoolRuntime(self.service, scheduler), scheduler
+
+    def test_hard_pending_replan_closes_only_unused_stale_pool_request(self) -> None:
+        stale = self._pending_pool_allocation(
+            cpus=13,
+            memory_mb=3 * 32 * 1024,
+            submitted_at="2026-07-12 00:00:00",
+        )
+        fresh = self._pending_pool_allocation(
+            cpus=13,
+            memory_mb=3 * 32 * 1024,
+            submitted_at=self.clock.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        resource_wait = self._pending_pool_allocation(
+            cpus=13,
+            memory_mb=3 * 32 * 1024,
+            submitted_at="2026-07-12 00:00:00",
+        )
+        protected = self._pending_pool_allocation(
+            cpus=13,
+            memory_mb=3 * 32 * 1024,
+            submitted_at="2026-07-12 00:00:00",
+        )
+        for allocation_id, reason in (
+            (stale, "(AssocMaxJobsLimit)"),
+            (fresh, "(AssocMaxJobsLimit)"),
+            (resource_wait, "(Resources)"),
+            (protected, "(QOSMaxJobsPerUserLimit)"),
+        ):
+            self.db.update_allocation(allocation_id, pending_reason=reason)
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO aedt_sessions (
+                    session_key, allocation_id, account_name, node_name,
+                    slots_total, state, created_at, updated_at
+                ) VALUES ('protected-hard-pending', ?, 'a', '', 3,
+                          'starting', ?, ?)
+                """,
+                (protected, now, now),
+            )
+        runtime, scheduler = self._pending_cleanup_runtime()
+
+        result = runtime._replan_stale_hard_pending_dedicated_allocations(
+            self.service.config()
+        )
+
+        self.assertEqual(result["closed_ids"], [stale])
+        self.assertEqual(result["protected_ids"], [protected])
+        self.assertEqual(scheduler.close_calls, [stale])
+        self.assertEqual(self.db.get_allocation(stale)["state"], "closed")
+        self.assertEqual(self.db.get_allocation(fresh)["state"], "pending")
+        self.assertEqual(
+            self.db.get_allocation(resource_wait)["state"], "pending"
+        )
+        self.assertEqual(self.db.get_allocation(protected)["state"], "pending")
+
+    def test_tick_replans_stale_pending_without_same_tick_resubmit(self) -> None:
+        stale = self._pending_pool_allocation(
+            cpus=13,
+            memory_mb=3 * 32 * 1024,
+            submitted_at="2026-07-12 00:00:00",
+        )
+        self.db.update_allocation(
+            stale,
+            pending_reason="(AssocMaxJobsLimit)",
+        )
+        self.service.set_operator_limits(
+            max_sessions=10,
+            target_projects=3,
+            projects_per_session=3,
+        )
+        self.make_operational()
+        self.request("stale-hard-pending-tick")
+        runtime, scheduler = self._pending_cleanup_runtime()
+
+        plan = runtime.tick()
+
+        self.assertEqual(plan["hard_pending_replan_closed_ids"], [stale])
+        self.assertEqual(
+            plan["hard_pending_replan_suppressed_node_requests_by_account"],
+            {"a": 1},
+        )
+        self.assertEqual(plan["node_allocations_opened"], 0)
+        self.assertEqual(scheduler.open_calls, [])
 
     def test_pending_downscale_keeps_oldest_whole_capacity_per_account(self) -> None:
         oldest = self._pending_pool_allocation(
