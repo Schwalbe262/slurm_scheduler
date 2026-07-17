@@ -1257,6 +1257,164 @@ class SchedulerTests(unittest.TestCase):
             )
         )
 
+    def test_task_failure_message_prefers_47262_workload_error_over_srun_epilogue(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        client = mock.Mock()
+        client.read_text_file.return_value = (
+            "/work/run.py:10: PerformanceWarning: DataFrame is fragmented\n"
+            "  frame['column'] = value\n"
+            "WARNING:root:thermal residual monitor needed another read\n"
+            "ERROR:root:[thermal] solve rejected before extraction: "
+            "reason=residual_threshold\n"
+            "srun: error: n114: task 0: Exited with exit code 1\n"
+        )
+
+        message = scheduler.task_stderr_failure_message(
+            {"stderr_path": "/remote/stderr.log"}, client
+        )
+
+        self.assertEqual(
+            message,
+            "ERROR:root:[thermal] solve rejected before extraction: "
+            "reason=residual_threshold",
+        )
+
+    def test_task_result_failure_message_uses_canonical_result_json_reason(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        client = mock.Mock()
+        client.read_text_file.return_value = (
+            "noise\n"
+            'RESULT_JSON {"result_valid_em": 1, "result_valid_thermal": 0, '
+            '"thermal_extraction_failure_reason": '
+            '"solve_not_converged:residual_threshold"}\n'
+            "release complete\n"
+        )
+
+        message = scheduler.task_result_failure_message(
+            {"stdout_path": "/remote/stdout.log"}, client
+        )
+
+        self.assertEqual(
+            message,
+            "RESULT_JSON: thermal_extraction_failure_reason="
+            "solve_not_converged:residual_threshold",
+        )
+        client.read_text_file.assert_called_once_with(
+            "/remote/stdout.log", tail_lines=200
+        )
+
+    def test_task_result_failure_message_ignores_success_result(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        client = mock.Mock()
+        client.read_text_file.return_value = (
+            'RESULT_JSON {"result_valid_em": 1, "result_valid_thermal": 1, '
+            '"thermal_extraction_failure_reason": ""}\n'
+        )
+
+        message = scheduler.task_result_failure_message(
+            {"stdout_path": "/remote/stdout.log"}, client
+        )
+
+        self.assertEqual(message, "")
+
+    def test_task_result_failure_message_falls_back_for_path_only_client(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+
+        class PathOnlyClient:
+            def read_text_file(self, path: str) -> str:
+                self.path = path
+                return (
+                    'RESULT_JSON {"thermal_extraction_failure_reason": '
+                    '"solve_not_converged:residual_threshold"}\n'
+                )
+
+        client = PathOnlyClient()
+        message = scheduler.task_result_failure_message(
+            {"stdout_path": "/remote/stdout.log"}, client
+        )
+
+        self.assertEqual(
+            message,
+            "RESULT_JSON: thermal_extraction_failure_reason="
+            "solve_not_converged:residual_threshold",
+        )
+        self.assertEqual(client.path, "/remote/stdout.log")
+
+    def test_failed_probe_persists_result_json_reason_before_stderr_wrapper(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        task_id = self.db.create_task(TaskCreate("failed-result", "~/case", "run"))
+        self.db.update_task(
+            task_id,
+            status=TaskStatus.RUNNING.value,
+            account_name="a",
+            stdout_path="/remote/stdout.log",
+            stderr_path="/remote/stderr.log",
+        )
+        task = self.db.get_task(task_id)
+        client = mock.Mock()
+
+        def read_text_file(path: str, **kwargs) -> str:
+            if path.endswith("stdout.log"):
+                self.assertEqual(kwargs, {"tail_lines": 200})
+                return (
+                    'RESULT_JSON {"result_valid_thermal": 0, '
+                    '"thermal_extraction_failure_reason": '
+                    '"solve_not_converged:residual_threshold"}\n'
+                )
+            return (
+                "PerformanceWarning: DataFrame is fragmented\n"
+                "srun: error: n114: task 0: Exited with exit code 1\n"
+            )
+
+        client.read_text_file.side_effect = read_text_file
+        with (
+            mock.patch.object(scheduler, "on_task_terminal"),
+            mock.patch.object(scheduler, "close_allocation_after_exclusive_task"),
+        ):
+            scheduler._apply_task_probe(
+                task, TaskProbe(status=JobStatus.FAILED, exit_code=1), client
+            )
+
+        stored = self.db.get_task(task_id)
+        self.assertEqual(stored["status"], TaskStatus.FAILED.value)
+        self.assertEqual(stored["exit_code"], 1)
+        self.assertEqual(
+            stored["failure_message"],
+            "RESULT_JSON: thermal_extraction_failure_reason="
+            "solve_not_converged:residual_threshold",
+        )
+        client.read_text_file.assert_called_once_with(
+            "/remote/stdout.log", tail_lines=200
+        )
+
+    def test_task_failure_message_recognizes_python_exception_line(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        client = mock.Mock()
+        client.read_text_file.return_value = (
+            "Traceback (most recent call last):\n"
+            "  File '/work/run.py', line 10, in main\n"
+            "RuntimeError: native solve failed\n"
+        )
+
+        message = scheduler.task_stderr_failure_message(
+            {"stderr_path": "/remote/stderr.log"}, client
+        )
+
+        self.assertEqual(message, "RuntimeError: native solve failed")
+
+    def test_task_failure_message_preserves_warning_only_fallback(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        client = mock.Mock()
+        client.read_text_file.return_value = (
+            "warning one\nwarning two\nwarning three\nwarning four\n"
+        )
+
+        message = scheduler.task_stderr_failure_message(
+            {"stderr_path": "/remote/stderr.log"}, client
+        )
+
+        self.assertEqual(message, "warning one\nwarning two\nwarning three")
+
     def test_database_backup_is_async_single_flight_and_rotates(self) -> None:
         backup_dir = Path(self.tmp.name) / "backups"
         backup_dir.mkdir()

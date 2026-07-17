@@ -48,6 +48,35 @@ TERMINAL_AEDT_WORKSPACE_SCAN_LIMIT = 1000
 TERMINAL_AEDT_WORKSPACE_SUBMIT_LIMIT = 128
 TERMINAL_AEDT_WORKSPACE_DELETED_MARKER = "SLURM_AEDT_WORKSPACE_DELETED"
 TERMINAL_AEDT_WORKSPACE_ABSENT_MARKER = "SLURM_AEDT_WORKSPACE_ABSENT"
+_STDERR_FAILURE_SIGNAL_RE = re.compile(
+    r"(?:^|[\s\[])(?:error|critical|fatal)(?=[:\]\s-])"
+    r"|(?:^|\s)(?:[A-Za-z_][\w.]*?(?:Error|Exception)):",
+    re.IGNORECASE,
+)
+_STDERR_WORKLOAD_FAILURE_SIGNAL_RE = re.compile(
+    r"^(?:error|critical|fatal)(?=[:\s-])"
+    r"|^(?:[A-Za-z_][\w.]*?(?:Error|Exception)):",
+    re.IGNORECASE,
+)
+_RESULT_JSON_PREFIX = "RESULT_JSON "
+_RESULT_FAILURE_KEYS = (
+    "failure_message",
+    "failure_reason",
+    "error",
+    "error_message",
+)
+_RESULT_FAILURE_KEY_SUFFIXES = (
+    "_failure_reason",
+    "_error_message",
+)
+
+
+def _stderr_failure_signal_score(line: str) -> int:
+    if _STDERR_WORKLOAD_FAILURE_SIGNAL_RE.search(line):
+        return 2
+    if _STDERR_FAILURE_SIGNAL_RE.search(line):
+        return 1
+    return 0
 
 # Only fields that can change queued-task placement or fit belong in the
 # reservation certificate.  Allocation/task heartbeat writers update
@@ -2714,7 +2743,11 @@ class Scheduler:
             self.close_allocation_after_exclusive_task(task)
         elif status == JobStatus.FAILED:
             try:
-                failure_message = task.get("failure_message") or self.task_stderr_failure_message(task, client)
+                failure_message = (
+                    task.get("failure_message")
+                    or self.task_result_failure_message(task, client)
+                    or self.task_stderr_failure_message(task, client)
+                )
             except Exception:
                 failure_message = task.get("failure_message") or ""
             self.db.update_task(
@@ -2759,6 +2792,50 @@ class Scheduler:
             self._fea_task_refresh_cursor_id = int(fea_selected[-1].get("id") or 0)
         return selected + fea_selected
 
+    def task_result_failure_message(
+        self, task: dict, client: SlurmAccountClient
+    ) -> str:
+        stdout_path = task.get("stdout_path") or ""
+        if not stdout_path:
+            return ""
+        try:
+            try:
+                text = client.read_text_file(stdout_path, tail_lines=200)
+            except TypeError:
+                # Lightweight test/adapter clients may only accept ``path``.
+                text = client.read_text_file(stdout_path)
+        except Exception:
+            return ""
+        for line in reversed(text.splitlines()):
+            marker = line.find(_RESULT_JSON_PREFIX)
+            if marker < 0:
+                continue
+            try:
+                payload = json.loads(line[marker + len(_RESULT_JSON_PREFIX) :])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            ordered_keys = list(_RESULT_FAILURE_KEYS)
+            ordered_keys.extend(
+                str(key)
+                for key in payload
+                if str(key) not in _RESULT_FAILURE_KEYS
+                and str(key).lower().endswith(_RESULT_FAILURE_KEY_SUFFIXES)
+            )
+            reasons: list[str] = []
+            for key in ordered_keys:
+                value = payload.get(key)
+                if value is None or value is False:
+                    continue
+                rendered = str(value).strip()
+                if not rendered:
+                    continue
+                reasons.append(f"{key}={rendered}")
+            if reasons:
+                return ("RESULT_JSON: " + "; ".join(reasons))[:2000]
+        return ""
+
     def task_stderr_failure_message(self, task: dict, client: SlurmAccountClient) -> str:
         stderr_path = task.get("stderr_path") or ""
         if not stderr_path:
@@ -2768,6 +2845,16 @@ class Scheduler:
         except Exception:
             return ""
         lines = [line.strip() for line in text.splitlines() if line.strip()]
+        failure_signals = [
+            (_stderr_failure_signal_score(line), index, line)
+            for index, line in enumerate(lines)
+            if _stderr_failure_signal_score(line) > 0
+        ]
+        if failure_signals:
+            # Workload logger/exception lines outrank generic launcher errors
+            # such as ``srun: error: ... exit code 1``; among equal-strength
+            # signals, retain the latest line.
+            return max(failure_signals, key=lambda item: (item[0], item[1]))[2]
         return "\n".join(lines[:3])
 
     def task_timed_out(self, task: dict) -> bool:
