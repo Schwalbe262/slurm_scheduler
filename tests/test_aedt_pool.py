@@ -6682,7 +6682,9 @@ class AedtRuntimeTests(AedtPoolTestCase):
                 """,
                 (pressured_allocation,),
             ).fetchall()
-        self.assertEqual([row["state"] for row in pressured], ["draining", "busy"])
+        self.assertEqual(
+            [row["state"] for row in pressured], ["draining", "draining"]
+        )
         self.assertTrue(
             all(
                 row["failure_message"] == STORAGE_PRESSURE_DRAIN_REASON
@@ -6695,20 +6697,17 @@ class AedtRuntimeTests(AedtPoolTestCase):
         self.assertEqual(
             int(starts[0]["allocation_id"]), replacement_allocation
         )
-        self.assertEqual(plan["hard_session_count"], 2)
-        # The finishing BUSY host still occupies the hard/license cap until
-        # its client exits, but a requested drain makes it unavailable for
-        # active capacity and replacement-demand accounting immediately.
+        self.assertEqual(plan["hard_session_count"], 1)
         self.assertEqual(plan["active_session_count"], 0)
         self.assertEqual(plan["active_project_capacity"], 0)
-        self.assertEqual(plan["unavailable_busy_session_count"], 1)
-        self.assertEqual(plan["draining_session_count"], 1)
+        self.assertEqual(plan["unavailable_busy_session_count"], 0)
+        self.assertEqual(plan["draining_session_count"], 2)
         self.assertEqual(plan["storage_pressure_accounts"], ["a"])
         self.assertEqual(
             plan["storage_pressure_sessions_drain_requested_this_tick"], 2
         )
-        self.assertEqual(plan["storage_pressure_draining_session_count"], 1)
-        self.assertEqual(plan["storage_pressure_finishing_session_count"], 1)
+        self.assertEqual(plan["storage_pressure_draining_session_count"], 2)
+        self.assertEqual(plan["storage_pressure_finishing_session_count"], 0)
 
     def test_probe_failure_blocks_starts_without_confirming_session_drain(self) -> None:
         class StorageStatusScheduler(FakeRuntimeScheduler):

@@ -172,11 +172,19 @@ class TaskCountSamplerTests(unittest.TestCase):
                     ("session-starting", "starting", allocation_id),
                     ("session-ready", "ready", allocation_id),
                     ("session-busy", "busy", allocation_id),
+                    ("session-busy-drain-requested", "busy", allocation_id),
                     ("session-draining", "draining", allocation_id),
                     ("session-unhealthy", "unhealthy", allocation_id),
                     ("session-closed", "closed", allocation_id),
                     ("session-failed", "failed", allocation_id),
                 ],
+            )
+            conn.execute(
+                """
+                UPDATE aedt_sessions
+                SET drain_requested_at = CURRENT_TIMESTAMP
+                WHERE session_key = 'session-busy-drain-requested'
+                """
             )
 
         task_specs = (

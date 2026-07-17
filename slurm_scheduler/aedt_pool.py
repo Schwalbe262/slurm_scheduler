@@ -5825,6 +5825,35 @@ class AedtPoolService:
             ),
         )
 
+    def _refresh_zero_owner_draining_sessions(self, conn: Any, now: str) -> None:
+        """Repair BUSY drain rows after their final owner became terminal.
+
+        Cohort invalidation and recovery paths can terminalize leases without
+        going through the ordinary release endpoint. Reconcile this invariant
+        from durable DB state so both pre-existing and newly-created zero-owner
+        BUSY rows become DRAINING and the host receives its close command.
+        """
+
+        rows = conn.execute(
+            """
+            SELECT s.id
+            FROM aedt_sessions s
+            WHERE s.state = 'busy'
+              AND s.drain_requested_at IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM aedt_project_leases l
+                  WHERE l.session_id = s.id
+                    AND l.state IN (
+                        'offered','leased','attaching','active','releasing'
+                    )
+              )
+            ORDER BY s.id
+            """
+        ).fetchall()
+        for row in rows:
+            self._refresh_session_state(conn, int(row["id"]), now)
+
     def _dedicated_allocations(
         self, states: set[str], *, conn: Any | None = None
     ) -> list[dict[str, Any]]:
@@ -7782,7 +7811,9 @@ class AedtPoolService:
         storage_pressure_drain_requested_this_tick = 0
         with self._lock, self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._refresh_zero_owner_draining_sessions(conn, now)
             self._refresh_exact_session_reservations(conn, now)
+            self._refresh_zero_owner_draining_sessions(conn, now)
 
             if execute and config.operational and excluded_start_accounts:
                 # A storage-blocked account cannot launch its host task.  Retire
@@ -7909,6 +7940,7 @@ class AedtPoolService:
                     # draining target. A fully attached busy cohort retains its
                     # normal serialized solve-permit/completion/release path.
                     self._refresh_exact_session_reservations(conn, now)
+                    self._refresh_zero_owner_draining_sessions(conn, now)
 
             if execute and config.allocation_max_age_seconds:
                 allocation_age_cutoff = _sql_time(

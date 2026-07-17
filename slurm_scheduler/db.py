@@ -1805,6 +1805,7 @@ class Database:
                         JOIN allocations a ON a.id = s.allocation_id
                         WHERE s.state = 'busy'
                           AND a.state IN ('warm','active','draining')
+                          AND s.drain_requested_at IS NULL
                         """
                     ).fetchone()[0]
                 )
