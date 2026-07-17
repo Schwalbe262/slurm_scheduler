@@ -5831,6 +5831,138 @@ class AedtExactSessionReservationTests(AedtPoolTestCase):
         self.assertEqual(expired["slots"][0]["state"], "expired")
         self.assertIn("cohort expired", expired["slots"][0]["failure_message"])
 
+    def test_permitted_reservation_releases_after_deadline_without_false_expiry(
+        self,
+    ) -> None:
+        _packing_session, target = self.sessions
+        task_id = self.create_pooled_task("permitted-after-deadline")
+        self.reserve(
+            "permitted-after-deadline",
+            target,
+            [task_id],
+            ttl_seconds=60,
+        )
+        lease, token = self.request_v2(
+            "permitted-after-deadline",
+            task_id=task_id,
+        )
+        self.service.accept_lease(int(lease["id"]), token)
+        self.service.activate_lease(int(lease["id"]), token)
+        permitted = self.service.request_solve_permit(
+            int(lease["id"]),
+            token,
+            seal_underfilled=True,
+        )
+        self.assertTrue(permitted["solve_permit_granted"])
+
+        # The reservation deadline gates admission to native solve.  It must
+        # not overwrite the successful release outcome after a permit was
+        # already granted, even when the release barrier clears the seal after
+        # that original deadline.
+        self.clock.advance(61)
+        self.service.complete_native_pipeline(
+            int(lease["id"]),
+            token,
+            solve_permit_generation=int(permitted["solve_permit_generation"]),
+        )
+        self.service.cancel_lease(int(lease["id"]), token)
+        self.service.complete_release(
+            int(target["id"]),
+            self.session_tokens[int(target["id"])],
+            int(lease["id"]),
+            success=True,
+        )
+
+        slot = self.service.get_exact_session_reservation(
+            "permitted-after-deadline"
+        )["slots"][0]
+        self.assertEqual(slot["state"], "released")
+        self.assertEqual(slot["failure_message"], "")
+
+    def test_expiry_preserves_permitted_member_while_expiring_waiters(
+        self,
+    ) -> None:
+        _packing_session, target = self.sessions
+        task_ids = [
+            self.create_pooled_task(f"mixed-expiry-{index}")
+            for index in range(3)
+        ]
+        self.reserve(
+            "mixed-permit-expiry",
+            target,
+            task_ids,
+            ttl_seconds=60,
+        )
+        leases = []
+        tokens = []
+        for index, task_id in enumerate(task_ids):
+            lease, token = self.request_v2(
+                f"mixed-expiry-{index}",
+                task_id=task_id,
+            )
+            self.service.accept_lease(int(lease["id"]), token)
+            self.service.activate_lease(int(lease["id"]), token)
+            leases.append(lease)
+            tokens.append(token)
+
+        current = [
+            self.service.get_lease(int(lease["id"])) for lease in leases
+        ]
+        permitted_indexes = [
+            index
+            for index, lease in enumerate(current)
+            if lease["solve_permit_granted"]
+        ]
+        self.assertEqual(len(permitted_indexes), 1)
+        permitted_index = permitted_indexes[0]
+        waiting_indexes = [
+            index for index in range(3) if index != permitted_index
+        ]
+
+        # Model waiting exact members returned to the queue before the native
+        # owner crosses its release barrier.  Once the last live project makes
+        # the session unsealed, the overdue waiters should expire, but the
+        # already-permitted owner still has a successful release outcome.
+        waiting_ids = [int(leases[index]["id"]) for index in waiting_indexes]
+        placeholders = ",".join("?" for _ in waiting_ids)
+        with self.db.connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE aedt_project_leases
+                SET state = 'queued', session_id = NULL, slot_index = NULL,
+                    solve_permit_at = NULL, solve_permit_generation = 0
+                WHERE id IN ({placeholders})
+                """,
+                tuple(waiting_ids),
+            )
+
+        self.clock.advance(61)
+        owner = current[permitted_index]
+        self.service.complete_native_pipeline(
+            int(owner["id"]),
+            tokens[permitted_index],
+            solve_permit_generation=int(owner["solve_permit_generation"]),
+        )
+        self.service.cancel_lease(
+            int(owner["id"]), tokens[permitted_index]
+        )
+        self.service.complete_release(
+            int(target["id"]),
+            self.session_tokens[int(target["id"])],
+            int(owner["id"]),
+            success=True,
+        )
+
+        cohort = self.service.get_exact_session_reservation(
+            "mixed-permit-expiry"
+        )
+        states_by_task = {
+            int(slot["task_id"]): slot["state"] for slot in cohort["slots"]
+        }
+        self.assertEqual(states_by_task[task_ids[permitted_index]], "released")
+        for index in waiting_indexes:
+            self.assertEqual(states_by_task[task_ids[index]], "expired")
+
     def test_target_failure_fails_entire_exact_cohort_instead_of_stuck_requeue(
         self,
     ) -> None:

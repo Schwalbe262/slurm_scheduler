@@ -2103,7 +2103,7 @@ class AedtPoolService:
         reservation_key: str,
         now: str,
     ) -> None:
-        """Expire every unsealed member at the cohort's shared deadline."""
+        """Expire every unsealed, still-unpermitted member at the deadline."""
 
         reason = "exact-session reservation cohort expired before solve permit"
         conn.execute(
@@ -2158,6 +2158,13 @@ class AedtPoolService:
             SET state = 'expired', failure_message = ?, finished_at = ?, updated_at = ?
             WHERE reservation_key = ?
               AND state IN ('reserved','claimed','consumed')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM aedt_project_leases permitted_lease
+                  WHERE permitted_lease.id =
+                        aedt_exact_session_reservations.lease_id
+                    AND TRIM(COALESCE(permitted_lease.solve_permit_at, '')) != ''
+              )
             """,
             (reason, now, now, reservation_key),
         )
@@ -2243,6 +2250,12 @@ class AedtPoolService:
             WHERE r.state IN ('reserved','claimed','consumed')
               AND r.expires_at <= ?
               AND (s.id IS NULL OR s.solve_batch_sealed_at IS NULL)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM aedt_project_leases permitted_lease
+                  WHERE permitted_lease.id = r.lease_id
+                    AND TRIM(COALESCE(permitted_lease.solve_permit_at, '')) != ''
+              )
             ORDER BY r.reservation_key
             """,
             (now,),
