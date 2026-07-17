@@ -2201,8 +2201,7 @@ class AedtPoolService:
                 failure_message=failure_message,
             )
 
-    @staticmethod
-    def _refresh_exact_session_reservations(conn: Any, now: str) -> None:
+    def _refresh_exact_session_reservations(self, conn: Any, now: str) -> None:
         """Release capacity after task/lease terminal state and expire admissions."""
 
         terminal_siblings = conn.execute(
@@ -2400,15 +2399,33 @@ class AedtPoolService:
             """
         ).fetchall()
         for row in invalid_targets:
-            AedtPoolService._fail_exact_session_reservation_cohort(
+            reservation_key = str(row["reservation_key"])
+            affected_session_ids = {
+                int(item["session_id"])
+                for item in conn.execute(
+                    """
+                    SELECT DISTINCT session_id
+                    FROM aedt_exact_session_reservations
+                    WHERE reservation_key = ? AND session_id IS NOT NULL
+                    """,
+                    (reservation_key,),
+                ).fetchall()
+            }
+            self._fail_exact_session_reservation_cohort(
                 conn,
-                reservation_key=str(row["reservation_key"]),
+                reservation_key=reservation_key,
                 now=now,
                 failure_message=(
                     "exact-session reservation target became unavailable "
                     "before solve permit"
                 ),
             )
+            # Failing a partial exact cohort can terminalize its last live
+            # lease. Refresh every affected Desktop immediately so a
+            # drain-requested BUSY host with zero owners transitions to
+            # DRAINING instead of occupying active capacity indefinitely.
+            for session_id in affected_session_ids:
+                self._refresh_session_state(conn, session_id, now)
     @staticmethod
     def _authorize_exact_session_reservation(
         conn: Any,
@@ -6358,6 +6375,7 @@ class AedtPoolService:
                 JOIN allocations a ON a.id = s.allocation_id
                 WHERE s.state = 'busy'
                   AND a.state IN ('warm','active','draining')
+                  AND s.drain_requested_at IS NULL
                 """
             ).fetchone()[0]
         )
@@ -6624,6 +6642,7 @@ class AedtPoolService:
             WHERE (
                 s.state = 'busy'
                 AND a.state IN ('warm','active','draining')
+                AND s.drain_requested_at IS NULL
             ) OR (
                 s.state = 'ready'
                 AND a.state IN ('warm','active')
@@ -6750,6 +6769,7 @@ class AedtPoolService:
                     JOIN allocations a ON a.id = s.allocation_id
                     WHERE s.state = 'busy'
                       AND a.state IN ('warm','active','draining')
+                      AND s.drain_requested_at IS NULL
                 )
                 GROUP BY account_name
                 """,
@@ -6765,6 +6785,7 @@ class AedtPoolService:
                 JOIN allocations a ON a.id = s.allocation_id
                 WHERE s.state = 'starting'
                   AND a.state IN ('warm','active')
+                  AND s.drain_requested_at IS NULL
                 GROUP BY a.account_name
                 """
             ).fetchall()

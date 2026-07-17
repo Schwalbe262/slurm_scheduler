@@ -4289,6 +4289,13 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(summary["draining_session_count"], 0)
         self.assertEqual(summary["drain_requested_session_count"], 1)
         self.assertEqual(summary["finishing_drain_session_count"], 1)
+        # A busy Desktop may need to finish its current clients before the
+        # host can close, but once drain is requested it is no longer usable
+        # capacity and must not hide replacement demand.
+        self.assertEqual(summary["plan"]["hard_session_count"], 1)
+        self.assertEqual(summary["plan"]["active_session_count"], 0)
+        self.assertEqual(summary["plan"]["active_project_capacity"], 0)
+        self.assertEqual(summary["plan"]["unavailable_busy_session_count"], 1)
         self.assertEqual(
             summary["plan"]["blocked_start_needed_by_account"],
             {"blocked-account": 1},
@@ -6689,7 +6696,12 @@ class AedtRuntimeTests(AedtPoolTestCase):
             int(starts[0]["allocation_id"]), replacement_allocation
         )
         self.assertEqual(plan["hard_session_count"], 2)
-        self.assertEqual(plan["active_session_count"], 1)
+        # The finishing BUSY host still occupies the hard/license cap until
+        # its client exits, but a requested drain makes it unavailable for
+        # active capacity and replacement-demand accounting immediately.
+        self.assertEqual(plan["active_session_count"], 0)
+        self.assertEqual(plan["active_project_capacity"], 0)
+        self.assertEqual(plan["unavailable_busy_session_count"], 1)
         self.assertEqual(plan["draining_session_count"], 1)
         self.assertEqual(plan["storage_pressure_accounts"], ["a"])
         self.assertEqual(
@@ -7547,6 +7559,57 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         drained = self.service.get_session(session_id)
         self.assertEqual(drained["state"], "draining")
         self.assertIsNotNone(drained["drain_requested_at"])
+
+    def test_partial_exact_cohort_failure_refreshes_zero_owner_busy_drain(
+        self,
+    ) -> None:
+        task_ids = [
+            self.create_pooled_task(f"pressure-partial-{index}")
+            for index in range(3)
+        ]
+        reservations = [
+            self.service.prepare_pooled_task_session(
+                task_id=task_id,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                workload_family="mft",
+                isolation_policy="family",
+            )
+            for task_id in task_ids
+        ]
+        self.assertTrue(all(reservations))
+        self.assertEqual(
+            len({int(item["session_id"]) for item in reservations}), 1
+        )
+        session_id = int(reservations[0]["session_id"])
+
+        lease, token = self.request_v2(
+            "pressure-partial-0", task_id=task_ids[0]
+        )
+        self.service.accept_lease(int(lease["id"]), token)
+        self.service.activate_lease(int(lease["id"]), token)
+        self.assertEqual(self.service.get_session(session_id)["state"], "busy")
+
+        plan = self.service.reconcile(
+            execute=True,
+            excluded_start_accounts={"a"},
+            start_block_reasons={
+                "a": "AEDT session start blocked by the account storage guard"
+            },
+            storage_pressure_accounts={"a"},
+        )
+
+        cohort = self.service.get_exact_session_reservation(
+            str(reservations[0]["reservation_key"])
+        )
+        self.assertEqual({slot["state"] for slot in cohort["slots"]}, {"failed"})
+        self.assertEqual(
+            self.service.get_lease(int(lease["id"]))["state"], "failed"
+        )
+        drained = self.service.get_session(session_id)
+        self.assertEqual(drained["state"], "draining")
+        self.assertIsNotNone(drained["drain_requested_at"])
+        self.assertEqual(plan["active_session_count"], 0)
+        self.assertEqual(plan["finishing_drain_session_count"], 0)
 
     def test_unattached_exact_reservations_still_fail_on_parent_drain(self) -> None:
         _packing_session, target = self.sessions

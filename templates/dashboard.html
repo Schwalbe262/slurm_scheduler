@@ -1050,10 +1050,10 @@
         );
 
         const full = payload.full_model || {};
-        setText(value("full-model"), `${shown(full.active)} active`);
+        setText(value("full-model"), `${shown(full.running)} running`);
         setText(
           detail("full-model"),
-          `PASS ${shown(full.pass)} · standard PASS 발견 ${shown(full.standard_pass_discovered)}`,
+          `run ${shown(full.running)} · queue ${shown(full.queued)} · PASS ${shown(full.pass)} / FAIL ${shown(full.fail)} · standard PASS 발견 ${shown(full.standard_pass_discovered)}`,
         );
 
         const laneBody = document.getElementById("mft-nsga-lanes");
