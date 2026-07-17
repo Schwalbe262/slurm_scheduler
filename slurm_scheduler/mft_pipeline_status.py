@@ -26,7 +26,28 @@ MAX_VALIDATED_DESIGNS = 12
 MAX_COMPLETED_HPO_STATUS_BYTES = 32_768
 TARGETED_HPO_STATUS_SCHEMA = "mft-targeted-hpo-batch-v1"
 ISOLATED_NSGA_STATUS_SCHEMA = "mft-isolated-nsga-live-v1"
+POST_TARGETED_FULL25_STATUS_SCHEMA = "mft-post-targeted-full25-v1"
+APPROVED_NSGA_STATUS_SCHEMA = "mft-continuous-nsga-v1"
 MAX_DYNAMIC_STATUS_FILES = 16
+POST_TARGETED_FULL25_PHASES = frozenset({
+    "waiting_targeted_hpo",
+    "targeted_hpo_authenticated",
+    "candidate_training",
+    "candidate_quality_gate",
+    "candidate_pass24_replay",
+    "candidate_quality_failed_closed",
+    "candidate_atomic_activation",
+    "approved_nsga_launch",
+    "approved_model_active_nsga_running",
+    "candidate_failed_closed",
+    "activation_committed_nsga_launch_failed_closed",
+})
+POST_TARGETED_FULL25_TERMINAL_PHASES = frozenset({
+    "candidate_quality_failed_closed",
+    "approved_model_active_nsga_running",
+    "candidate_failed_closed",
+    "activation_committed_nsga_launch_failed_closed",
+})
 CHECKPOINT_METRIC_KEYS = (
     "n_train",
     "n_calibration",
@@ -203,6 +224,7 @@ CHECKPOINT_PARTIAL_EVIDENCE = frozenset({
     "state_metrics_and_candidate",
 })
 _HEX_64_RE = re.compile(r"[0-9a-f]{64}")
+_HEX_40_RE = re.compile(r"[0-9a-f]{40}")
 _HPO_TARGET_RE = re.compile(r"[A-Za-z0-9_]{1,128}")
 _HPO_RUN_RE = re.compile(r"[A-Za-z0-9._-]{1,160}")
 _HPO_WAVE_RE = re.compile(r"wave-[0-9a-f]{16}")
@@ -215,6 +237,8 @@ STALE_AFTER_SECONDS = {
     "validation": 90.0,
     "targeted_hpo": 75.0,
     "isolated_nsga": 75.0,
+    "post_targeted_full25": 75.0,
+    "approved_nsga": 75.0,
 }
 
 
@@ -627,6 +651,7 @@ class MftPipelineStatusReader:
                     "targets": [],
                 },
                 "last_decision": {"available": False},
+                "post_targeted_full25": {"available": False},
             },
             "nsga": {
                 "available": False,
@@ -981,6 +1006,330 @@ class MftPipelineStatusReader:
         }
 
     @classmethod
+    def _post_targeted_full25(
+        cls,
+        status: Mapping[str, Any],
+        meta: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Normalize the isolated full-25 train/gate/replay/activation watcher."""
+
+        phase = _bounded_text(status.get("phase"), limit=80)
+        lane = _bounded_text(status.get("lane"), limit=80)
+        eligibility = _bounded_text(status.get("eligibility"), limit=120)
+        code = _mapping(status.get("code"))
+        cpu = _mapping(status.get("cpu_budget"))
+        publication = _mapping(status.get("publication"))
+        deployment_commit = str(code.get("deployment_commit") or "").lower()
+        code_root = _bounded_text(code.get("root"), limit=500)
+        code_root_name = code_root.replace("\\", "/").rstrip("/").split("/")[-1].lower()
+        allowed_eligibility = {
+            "NO-POINTER-NO-FEA-NO-NSGA-SEARCH",
+            "APPROVED-MODEL-ACTIVE-NSGA-LAUNCH-PENDING",
+            "APPROVED-MODEL-ACTIVE-NSGA-SEARCH-FEA-DISABLED",
+            "APPROVED-MODEL-ACTIVE-NSGA-LAUNCH-FAILED-CLOSED",
+        }
+        base_valid = bool(
+            meta.get("available")
+            and status.get("schema_version") == POST_TARGETED_FULL25_STATUS_SCHEMA
+            and phase in POST_TARGETED_FULL25_PHASES
+            and lane in {"isolated_candidate", "approved_model"}
+            and eligibility in allowed_eligibility
+            and _positive_integer(status.get("watcher_pid")) is not None
+            and _HEX_40_RE.fullmatch(deployment_commit)
+            and code_root_name == deployment_commit
+            and _exact_sha256(code.get("watcher_sha256")) is not None
+            and _exact_sha256(code.get("continuous_nsga_sha256")) is not None
+            and _positive_integer(cpu.get("target_workers")) == 8
+            and _positive_integer(cpu.get("model_threads_per_target")) == 1
+            and _positive_integer(cpu.get("maximum_total_model_threads")) == 8
+            and isinstance(publication.get("attempted"), bool)
+            and isinstance(publication.get("allowed"), bool)
+            and isinstance(publication.get("pointer_mutation_performed"), bool)
+        )
+
+        targeted = _mapping(status.get("targeted"))
+        targeted_authenticated = bool(
+            _nonnegative_integer(targeted.get("target_count")) == 14
+            and _exact_sha256(targeted.get("targeted_status_sha256")) is not None
+            and _exact_sha256(targeted.get("launch_manifest_sha256")) is not None
+            and _exact_sha256(targeted.get("dataset_sha256")) is not None
+            and _exact_sha256(targeted.get("merged_params_sha256")) is not None
+            and _positive_integer(targeted.get("strict_full_rows")) is not None
+        )
+        candidate = _mapping(status.get("candidate"))
+        candidate_available = bool(
+            _bounded_text(candidate.get("training_run_id"), limit=160)
+            and _exact_sha256(candidate.get("generation_report_sha256")) is not None
+            and _exact_sha256(candidate.get("dataset_sha256")) is not None
+            and _positive_integer(candidate.get("strict_full_rows")) is not None
+        )
+        candidate_full25_attested = bool(
+            candidate_available
+            and _positive_integer(candidate.get("full_target_count")) == 25
+        )
+        quality = _mapping(status.get("quality"))
+        quality_available = bool(
+            isinstance(quality.get("passed"), bool)
+            and _exact_sha256(quality.get("status_sha256")) is not None
+        )
+        replay = _mapping(status.get("pass24_replay"))
+        replay_available = bool(
+            replay.get("passed") is True
+            and _positive_integer(replay.get("required_model_count")) == 24
+            and _exact_sha256(replay.get("status_sha256")) is not None
+        )
+        activation = _mapping(status.get("activation"))
+        activation_available = bool(
+            activation.get("schema_version") == "mft-full25-atomic-activation-v1"
+            and activation.get("production_quality_passed") is True
+            and activation.get("pointer_mutation_performed") is True
+            and _exact_sha256(activation.get("pointer_sha256")) is not None
+            and _exact_sha256(activation.get("generation_report_sha256")) is not None
+            and _exact_sha256(activation.get("quality_gate_sha256")) is not None
+            and _exact_sha256(activation.get("pass24_replay_sha256")) is not None
+        )
+        launch = _mapping(status.get("nsga_launch"))
+        launch_seeds = [
+            seed
+            for seed in (_nonnegative_integer(item) for item in launch.get("seeds") or [])
+            if seed is not None
+        ]
+        launch_available = bool(
+            launch.get("schema_version") == "mft-full25-approved-nsga-launch-v1"
+            and launch.get("model_lane") == "approved"
+            and launch.get("fea_submission_enabled") is False
+            and _positive_integer(launch.get("parallel_seed_workers")) == 4
+            and launch_seeds == [51000, 51001, 51002, 51003]
+            and _positive_integer(launch.get("controller_pid")) is not None
+            and _positive_integer(launch.get("child_pid")) is not None
+            and _bounded_text(launch.get("runtime_root"), limit=500)
+            and _bounded_text(launch.get("manifest"), limit=500)
+            and _bounded_text(launch.get("status"), limit=500)
+            and _bounded_text(launch.get("state"), limit=500)
+            and _bounded_text(launch.get("training_run_id"), limit=160)
+            and _exact_sha256(launch.get("command_sha256")) is not None
+            and _exact_sha256(launch.get("manifest_sha256")) is not None
+            and _exact_sha256(launch.get("status_sha256")) is not None
+            and _exact_sha256(launch.get("state_sha256")) is not None
+            and _exact_sha256(launch.get("dataset_sha256")) is not None
+            and _exact_sha256(launch.get("activation_pointer_sha256")) is not None
+            and _exact_sha256(launch.get("activation_evidence_sha256")) is not None
+        )
+
+        evidence_errors: list[str] = []
+        authenticated_phases = POST_TARGETED_FULL25_PHASES.difference({
+            "waiting_targeted_hpo",
+            "candidate_failed_closed",
+            "activation_committed_nsga_launch_failed_closed",
+        })
+        if phase in authenticated_phases and not targeted_authenticated:
+            evidence_errors.append("invalid targeted-HPO authentication")
+        if phase in {
+            "candidate_quality_gate",
+            "candidate_pass24_replay",
+            "candidate_quality_failed_closed",
+            "candidate_atomic_activation",
+            "approved_nsga_launch",
+            "approved_model_active_nsga_running",
+        } and not candidate_available:
+            evidence_errors.append("invalid full-25 candidate evidence")
+        if phase in {
+            "candidate_quality_failed_closed",
+            "candidate_atomic_activation",
+            "approved_nsga_launch",
+            "approved_model_active_nsga_running",
+        } and not candidate_full25_attested:
+            evidence_errors.append("full-25 target inventory is not attested")
+        if phase in {
+            "candidate_pass24_replay",
+            "candidate_quality_failed_closed",
+            "candidate_atomic_activation",
+            "approved_nsga_launch",
+            "approved_model_active_nsga_running",
+        } and not quality_available:
+            evidence_errors.append("invalid production quality evidence")
+        if phase in {
+            "candidate_quality_failed_closed",
+            "candidate_atomic_activation",
+            "approved_nsga_launch",
+            "approved_model_active_nsga_running",
+        } and not replay_available:
+            evidence_errors.append("invalid PASS24 replay evidence")
+        if phase in {
+            "approved_nsga_launch",
+            "approved_model_active_nsga_running",
+        } and not activation_available:
+            evidence_errors.append("invalid approved activation evidence")
+        if phase == "approved_model_active_nsga_running" and not launch_available:
+            evidence_errors.append("invalid approved NSGA launch evidence")
+        activation_failure_evidence = _mapping(
+            status.get("activation_evidence")
+        )
+        activation_failure_authenticated = bool(
+            status.get("activation_committed") is True
+            and _exact_sha256(activation_failure_evidence.get("sha256")) is not None
+        )
+        if (
+            phase == "activation_committed_nsga_launch_failed_closed"
+            and not activation_failure_authenticated
+        ):
+            evidence_errors.append("invalid committed activation failure evidence")
+
+        terminal = phase in POST_TARGETED_FULL25_TERMINAL_PHASES
+        freshness = cls._freshness(
+            status,
+            meta,
+            stale_after_seconds=(
+                None if terminal else STALE_AFTER_SECONDS["post_targeted_full25"]
+            ),
+        )
+        if (
+            not terminal
+            and meta.get("available")
+            and freshness.get("age_seconds") is None
+        ):
+            freshness["stale"] = True
+        valid = base_valid and not evidence_errors
+        error_payload = _mapping(status.get("error"))
+        error_message = _bounded_text(error_payload.get("message"), limit=500)
+        if not base_valid:
+            evidence_errors.insert(0, "invalid post-targeted full-25 status contract")
+        return {
+            "available": valid,
+            "phase": phase or "unavailable",
+            "terminal": terminal,
+            "lane": lane,
+            "eligibility": eligibility,
+            "watcher_pid": _positive_integer(status.get("watcher_pid")),
+            "training_active": phase == "candidate_training",
+            "worker_pid": _positive_integer(status.get("worker_pid")),
+            "cpu_budget": {
+                "target_workers": _positive_integer(cpu.get("target_workers")),
+                "model_threads_per_target": _positive_integer(
+                    cpu.get("model_threads_per_target")
+                ),
+                "maximum_total_model_threads": _positive_integer(
+                    cpu.get("maximum_total_model_threads")
+                ),
+            },
+            "code": {
+                "root": code_root,
+                "deployment_commit": deployment_commit,
+                "watcher_sha256": _exact_sha256(code.get("watcher_sha256")) or "",
+                "continuous_nsga_sha256": (
+                    _exact_sha256(code.get("continuous_nsga_sha256")) or ""
+                ),
+            },
+            "targeted": {
+                "authenticated": targeted_authenticated,
+                "wave": _bounded_text(targeted.get("wave"), limit=160),
+                "target_count": _nonnegative_integer(targeted.get("target_count")),
+                "strict_full_rows": _nonnegative_integer(
+                    targeted.get("strict_full_rows")
+                ),
+                "dataset_sha256": _exact_sha256(targeted.get("dataset_sha256")) or "",
+                "merged_params_sha256": (
+                    _exact_sha256(targeted.get("merged_params_sha256")) or ""
+                ),
+            },
+            "candidate": {
+                "available": candidate_available,
+                "training_run_id": _bounded_text(
+                    candidate.get("training_run_id"), limit=160
+                ),
+                "generation": _bounded_text(candidate.get("generation"), limit=500),
+                "generation_report_sha256": (
+                    _exact_sha256(candidate.get("generation_report_sha256")) or ""
+                ),
+                "dataset_sha256": _exact_sha256(candidate.get("dataset_sha256")) or "",
+                "strict_full_rows": _nonnegative_integer(
+                    candidate.get("strict_full_rows")
+                ),
+                "full_target_count": _nonnegative_integer(
+                    candidate.get("full_target_count")
+                ),
+            },
+            "quality": {
+                "available": quality_available,
+                "passed": quality.get("passed") if isinstance(quality.get("passed"), bool) else None,
+                "reason_count": _nonnegative_integer(
+                    quality.get("reason_count", quality.get("failed_target_count"))
+                ),
+                "status_sha256": _exact_sha256(quality.get("status_sha256")) or "",
+            },
+            "pass24_replay": {
+                "available": replay_available,
+                "passed": replay.get("passed") if isinstance(replay.get("passed"), bool) else None,
+                "required_model_count": _nonnegative_integer(
+                    replay.get("required_model_count")
+                ),
+                "status_sha256": _exact_sha256(replay.get("status_sha256")) or "",
+            },
+            "publication": {
+                "attempted": publication.get("attempted") is True,
+                "allowed": publication.get("allowed") is True,
+                "pointer_mutation_performed": (
+                    publication.get("pointer_mutation_performed") is True
+                ),
+                "reason": _bounded_text(publication.get("reason"), limit=240),
+            },
+            "activation": {
+                "available": (
+                    activation_available or activation_failure_authenticated
+                ),
+                "committed": (
+                    activation.get("pointer_mutation_performed") is True
+                    or activation_failure_authenticated
+                ),
+                "pointer_sha256": _exact_sha256(activation.get("pointer_sha256")) or "",
+                "pointer_path": _bounded_text(
+                    activation.get("pointer_path"), limit=500
+                ),
+                "generation_report_sha256": (
+                    _exact_sha256(activation.get("generation_report_sha256")) or ""
+                ),
+                "evidence_sha256": (
+                    _exact_sha256(activation.get("evidence_sha256"))
+                    or _exact_sha256(activation_failure_evidence.get("sha256"))
+                    or ""
+                ),
+            },
+            "nsga_launch": {
+                "available": launch_available,
+                "controller_pid": _positive_integer(launch.get("controller_pid")),
+                "child_pid": _positive_integer(launch.get("child_pid")),
+                "run_id": _bounded_text(launch.get("run_id"), limit=80),
+                "model_id": _bounded_text(launch.get("model_id"), limit=180),
+                "model_lane": _bounded_text(launch.get("model_lane"), limit=40),
+                "training_run_id": _bounded_text(
+                    launch.get("training_run_id"), limit=160
+                ),
+                "runtime_root": _bounded_text(
+                    launch.get("runtime_root"), limit=500
+                ),
+                "manifest": _bounded_text(launch.get("manifest"), limit=500),
+                "status": _bounded_text(launch.get("status"), limit=500),
+                "state": _bounded_text(launch.get("state"), limit=500),
+                "seeds": launch_seeds,
+                "parallel_seed_workers": _positive_integer(
+                    launch.get("parallel_seed_workers")
+                ),
+                "fea_submission_enabled": launch.get("fea_submission_enabled") is True,
+                "manifest_sha256": _exact_sha256(launch.get("manifest_sha256")) or "",
+                "status_sha256": _exact_sha256(launch.get("status_sha256")) or "",
+                "state_sha256": _exact_sha256(launch.get("state_sha256")) or "",
+                "activation_pointer_sha256": (
+                    _exact_sha256(launch.get("activation_pointer_sha256")) or ""
+                ),
+                "evidence_sha256": _exact_sha256(launch.get("evidence_sha256")) or "",
+            },
+            "error": error_message,
+            "contract_errors": evidence_errors[:8],
+            "freshness": freshness,
+            "updated_at": status.get("updated_at"),
+        }
+
+    @classmethod
     def _isolated_nsga_lane(
         cls,
         status: Mapping[str, Any],
@@ -1037,6 +1386,8 @@ class MftPipelineStatusReader:
             meta,
             stale_after_seconds=STALE_AFTER_SECONDS["isolated_nsga"],
         )
+        if meta.get("available") and freshness.get("age_seconds") is None:
+            freshness["stale"] = True
         if not valid:
             return {
                 "name": lane_name or "isolated-invalid",
@@ -1312,6 +1663,140 @@ class MftPipelineStatusReader:
             ),
             "updated_at": status.get("updated_at"),
         }
+
+    @classmethod
+    def _approved_nsga_lane(
+        cls,
+        name: str,
+        status: Mapping[str, Any],
+        meta: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+        manifest_meta: Mapping[str, Any],
+        state: Mapping[str, Any],
+        state_meta: Mapping[str, Any],
+        post_targeted: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Expose only an authenticated approved-model full-25 NSGA lane."""
+
+        active_run = _mapping(status.get("active_run"))
+        state_active_run = _mapping(state.get("active_run"))
+        parallelism = _mapping(status.get("parallelism"))
+        seeds = [
+            seed
+            for seed in (
+                _nonnegative_integer(item) for item in active_run.get("seeds") or []
+            )
+            if seed is not None
+        ]
+        manifest_seed_start = _nonnegative_integer(manifest.get("seed_start"))
+        consecutive_seed_batch = bool(
+            manifest_seed_start is not None
+            and len(seeds) == 4
+            and seeds == list(range(seeds[0], seeds[0] + 4))
+            and seeds[0] >= manifest_seed_start
+            and (seeds[0] - manifest_seed_start) % 4 == 0
+        )
+        post_launch = _mapping(post_targeted.get("nsga_launch"))
+        post_activation = _mapping(post_targeted.get("activation"))
+
+        def normalized_path(value: object) -> str:
+            return str(value or "").replace("\\", "/").rstrip("/").lower()
+
+        relative_status = normalized_path(meta.get("relative_path"))
+        launch_status = normalized_path(post_launch.get("status"))
+        launch_manifest = normalized_path(post_launch.get("manifest"))
+        launch_state = normalized_path(post_launch.get("state"))
+        launch_root = normalized_path(post_launch.get("runtime_root"))
+        pointer_path = normalized_path(post_activation.get("pointer_path"))
+        parent_bound = bool(
+            post_targeted.get("available") is True
+            and post_launch.get("available") is True
+            and post_activation.get("available") is True
+            and relative_status
+            and launch_status.endswith("/" + relative_status)
+            and launch_manifest == launch_status.rsplit("/", 1)[0] + "/manifest.json"
+            and launch_state == launch_status.rsplit("/", 1)[0] + "/state.json"
+            and launch_root == launch_status.rsplit("/", 1)[0]
+            and normalized_path(manifest.get("code_root"))
+            == normalized_path(_mapping(post_targeted.get("code")).get("root"))
+            and normalized_path(manifest.get("approved_registry"))
+            == pointer_path.rsplit("/", 1)[0]
+            and post_launch.get("activation_pointer_sha256")
+            == post_activation.get("pointer_sha256")
+            and _positive_integer(status.get("controller_pid"))
+            == _positive_integer(post_launch.get("controller_pid"))
+            and str(active_run.get("model_id") or "").startswith(
+                f"approved:{post_launch.get('training_run_id')}:"
+            )
+        )
+        contract_valid = bool(
+            meta.get("available")
+            and manifest_meta.get("available")
+            and state_meta.get("available")
+            and status.get("schema_version") == APPROVED_NSGA_STATUS_SCHEMA
+            and manifest.get("schema_version") == APPROVED_NSGA_STATUS_SCHEMA
+            and state.get("schema_version") == APPROVED_NSGA_STATUS_SCHEMA
+            and status.get("require_approved") is True
+            and status.get("approved_pointer_present") is True
+            and status.get("approved_source_error") is None
+            and status.get("fea_submission_enabled") is False
+            and _positive_integer(status.get("controller_pid")) is not None
+            and active_run.get("model_lane") == "approved"
+            and str(active_run.get("model_id") or "").startswith("approved:")
+            and _positive_integer(active_run.get("pid")) is not None
+            and state_active_run.get("run_id") == active_run.get("run_id")
+            and state_active_run.get("model_id") == active_run.get("model_id")
+            and consecutive_seed_batch
+            and _positive_integer(parallelism.get("parallel_seed_workers")) == 4
+            and manifest.get("require_approved") is True
+            and _bounded_text(manifest.get("approved_registry"), limit=500)
+            and _positive_integer(manifest.get("restarts")) == 4
+            and _positive_integer(manifest.get("workers")) == 4
+            and _positive_integer(manifest.get("population")) == 120
+            and _positive_integer(manifest.get("max_generations")) == 600
+            and manifest_seed_start == 51000
+            and parent_bound
+        )
+        normalized_meta = dict(meta)
+        normalized_meta["available"] = contract_valid
+        lane = cls._nsga_lane(name, status, normalized_meta)
+        freshness = cls._freshness(
+            status,
+            meta,
+            stale_after_seconds=STALE_AFTER_SECONDS["approved_nsga"],
+        )
+        if meta.get("available") and freshness.get("age_seconds") is None:
+            freshness["stale"] = True
+        lane.update({
+            "available": contract_valid,
+            "stale": bool(freshness.get("stale")),
+            "source_type": "post_targeted_full25_approved",
+            "seed_workers": (
+                4
+                if contract_valid
+                and not freshness.get("stale")
+                and _positive_integer(active_run.get("pid")) is not None
+                else 0
+            ),
+            "fea_submission_enabled": False,
+            "approval": {
+                "require_approved": status.get("require_approved") is True,
+                "approved_pointer_present": (
+                    status.get("approved_pointer_present") is True
+                ),
+                "manifest_bound": bool(manifest_meta.get("available")),
+                "state_bound": bool(state_meta.get("available")),
+                "parent_activation_bound": parent_bound,
+                "approved_registry": _bounded_text(
+                    manifest.get("approved_registry"), limit=500
+                ),
+            },
+            "freshness": freshness,
+            "error": (
+                "" if contract_valid else "invalid approved full-25 NSGA contract"
+            ),
+        })
+        return lane
 
     @staticmethod
     def _nsga_pareto(value: object, *, scope: str) -> dict[str, Any]:
@@ -2315,12 +2800,53 @@ class MftPipelineStatusReader:
             if targeted_sources
             else ({}, {"source": "targeted_hpo", "available": False, "stale": False})
         )
+        post_targeted_sources = self._dynamic_json_sources(
+            "post_targeted_full25",
+            "mft_pipeline/post_targeted_full25/*/status.json",
+        )
+        sources["post_targeted_full25"] = (
+            post_targeted_sources[0]
+            if post_targeted_sources
+            else ({}, {
+                "source": "post_targeted_full25",
+                "available": False,
+                "stale": False,
+            })
+        )
         isolated_sources = self._dynamic_json_sources(
             "isolated_nsga",
             "mft_nsga_transition_audit/*/isolated_nsga/*/ui_status.json",
         )
         for index, source in enumerate(isolated_sources):
             sources[f"isolated_nsga_{index}"] = source
+        approved_status_sources = self._dynamic_json_sources(
+            "approved_nsga",
+            "mft_pipeline/post_targeted_full25/*/approved_nsga_continuous/status.json",
+        )
+        approved_sources: list[tuple[
+            tuple[dict[str, Any], dict[str, Any]],
+            tuple[dict[str, Any], dict[str, Any]],
+            tuple[dict[str, Any], dict[str, Any]],
+        ]] = []
+        for index, status_source in enumerate(approved_status_sources):
+            approved_status, approved_meta = status_source
+            relative_status = Path(str(approved_meta.get("relative_path") or ""))
+            relative_parent = relative_status.parent
+            manifest_source = self._read_json(
+                f"approved_nsga_manifest_{index}",
+                (relative_parent / "manifest.json").as_posix(),
+            )
+            state_source = self._read_json(
+                f"approved_nsga_state_{index}",
+                (relative_parent / "state.json").as_posix(),
+            )
+            sources[f"approved_nsga_{index}"] = (
+                approved_status,
+                approved_meta,
+            )
+            sources[f"approved_nsga_manifest_{index}"] = manifest_source
+            sources[f"approved_nsga_state_{index}"] = state_source
+            approved_sources.append((status_source, manifest_source, state_source))
         canonical_status, canonical_meta = sources["canonical_surrogate_status"]
         if canonical_meta.get("available"):
             contract_errors = _canonical_contract_errors(canonical_status)
@@ -2357,6 +2883,21 @@ class MftPipelineStatusReader:
                 "source": targeted_meta.get("source"),
                 "message": targeted_hpo.get("error"),
                 "stale": bool(targeted_meta.get("stale")),
+            })
+        post_targeted_status, post_targeted_meta = sources["post_targeted_full25"]
+        post_targeted_full25 = self._post_targeted_full25(
+            post_targeted_status, post_targeted_meta
+        )
+        if (
+            post_targeted_status
+            and post_targeted_full25.get("available") is not True
+        ):
+            errors.append({
+                "source": post_targeted_meta.get("source"),
+                "message": "; ".join(
+                    post_targeted_full25.get("contract_errors") or []
+                ) or "invalid post-targeted full-25 status contract",
+                "stale": bool(post_targeted_meta.get("stale")),
             })
         wave_detail = _mapping(surrogate_status.get("active_wave_detail"))
         strict_snapshot = _mapping(wave_detail.get("strict_snapshot"))
@@ -2445,14 +2986,41 @@ class MftPipelineStatusReader:
             self._nsga_lane("main", nsga_main, main_meta),
             self._nsga_lane("new-model-fast", nsga_fast, fast_meta),
         ]
+        isolated_lanes: list[dict[str, Any]] = []
         for isolated_status, isolated_meta in isolated_sources:
             lane = self._isolated_nsga_lane(isolated_status, isolated_meta)
             nsga_lanes.append(lane)
+            isolated_lanes.append(lane)
             if lane.get("error"):
                 errors.append({
                     "source": isolated_meta.get("source"),
                     "message": lane.get("error"),
                     "stale": bool(isolated_meta.get("stale")),
+                })
+        approved_lanes: list[dict[str, Any]] = []
+        for index, (status_source, manifest_source, state_source) in enumerate(
+            approved_sources
+        ):
+            approved_status, approved_meta = status_source
+            approved_manifest, approved_manifest_meta = manifest_source
+            approved_state, approved_state_meta = state_source
+            lane = self._approved_nsga_lane(
+                "approved-full25" if index == 0 else f"approved-full25-{index + 1}",
+                approved_status,
+                approved_meta,
+                approved_manifest,
+                approved_manifest_meta,
+                approved_state,
+                approved_state_meta,
+                post_targeted_full25,
+            )
+            nsga_lanes.append(lane)
+            approved_lanes.append(lane)
+            if lane.get("error"):
+                errors.append({
+                    "source": approved_meta.get("source"),
+                    "message": lane.get("error"),
+                    "stale": bool(approved_meta.get("stale")),
                 })
         active_nsga_lanes = [
             lane
@@ -2574,6 +3142,9 @@ class MftPipelineStatusReader:
                 surrogate_state, surrogate_state_meta, stale_after_seconds=None
             ),
             "targeted_hpo": _mapping(targeted_hpo.get("freshness")),
+            "post_targeted_full25": _mapping(
+                post_targeted_full25.get("freshness")
+            ),
             "nsga_main": nsga_lanes[0]["freshness"],
             "nsga_fast": nsga_lanes[1]["freshness"],
             "standard_fea_main": self._freshness(
@@ -2592,8 +3163,12 @@ class MftPipelineStatusReader:
                 stale_after_seconds=STALE_AFTER_SECONDS["validation"],
             ),
         }
-        for index, lane in enumerate(nsga_lanes[2:]):
+        for index, lane in enumerate(isolated_lanes):
             source_freshness[f"isolated_nsga_{index}"] = _mapping(
+                lane.get("freshness")
+            )
+        for index, lane in enumerate(approved_lanes):
+            source_freshness[f"approved_nsga_{index}"] = _mapping(
                 lane.get("freshness")
             )
         stale_sources = sorted(
@@ -2729,6 +3304,7 @@ class MftPipelineStatusReader:
                     surrogate_meta.get("available")
                     or surrogate_state_meta.get("available")
                     or pointer_meta.get("available")
+                    or post_targeted_meta.get("available")
                 ),
                 "state": (
                     phase
@@ -2787,6 +3363,7 @@ class MftPipelineStatusReader:
                 },
                 "hpo": surrogate_hpo,
                 "targeted_hpo": targeted_hpo,
+                "post_targeted_full25": post_targeted_full25,
                 "last_completed_hpo_results": completed_hpo_results,
                 "last_decision": surrogate_decision,
                 "next_refresh_strict_rows": (

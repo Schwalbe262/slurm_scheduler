@@ -560,6 +560,15 @@
       </div>
       <p id="mft-surrogate-wave" class="muted">active wave - · HPO - / - · next strict rows -</p>
       <p id="mft-targeted-hpo-result" class="muted">targeted HPO -</p>
+      <div id="mft-post-targeted-full25" class="section-gap" aria-live="polite">
+        <div class="title-row">
+          <h3>Post-HPO full-25 model</h3>
+          <span class="muted" id="mft-post-targeted-full25-freshness">-</span>
+        </div>
+        <p id="mft-post-targeted-full25-state" class="muted">full-25 watcher unavailable</p>
+        <p id="mft-post-targeted-full25-gate" class="muted">quality gate - · PASS24 replay -</p>
+        <p id="mft-post-targeted-full25-activation" class="muted">isolated activation - · approved NSGA -</p>
+      </div>
       <p id="mft-surrogate-model" class="muted">active model - · training rows -</p>
       <p id="mft-surrogate-target-metrics-count" class="muted">active model target metrics -</p>
       <div class="table-scroll">
@@ -958,6 +967,47 @@
           targetedHpo.available === true
             ? `targeted HPO ${targetedHpo.phase || "-"} · ${shown(hpo.ready)} / ${shown(hpo.total)} complete · running ${shown(hpo.running)} · budget ${shown(hpo.thread_budget)} threads · merged ${compact(targetedResult.merged_params_sha256, 13)} · ${freshnessText(targetedHpo.freshness)}`
             : "targeted HPO unavailable",
+        );
+        const postTargeted = surrogate.post_targeted_full25 || {};
+        const postCandidate = postTargeted.candidate || {};
+        const postQuality = postTargeted.quality || {};
+        const postReplay = postTargeted.pass24_replay || {};
+        const postPublication = postTargeted.publication || {};
+        const postActivation = postTargeted.activation || {};
+        const postNsga = postTargeted.nsga_launch || {};
+        const postNsgaSeeds = Array.isArray(postNsga.seeds)
+          ? postNsga.seeds.join(", ")
+          : "";
+        const postCpu = postTargeted.cpu_budget || {};
+        const postCode = postTargeted.code || {};
+        const postContractErrors = Array.isArray(postTargeted.contract_errors)
+          ? postTargeted.contract_errors
+          : [];
+        setText(
+          document.getElementById("mft-post-targeted-full25-freshness"),
+          freshnessText(postTargeted.freshness),
+        );
+        setText(
+          document.getElementById("mft-post-targeted-full25-state"),
+          postTargeted.available === true
+            ? `phase ${postTargeted.phase || "-"} · lane ${postTargeted.lane || "-"} · watcher ${shown(postTargeted.watcher_pid)} · worker ${shown(postTargeted.worker_pid)} · CPU ${shown(postCpu.maximum_total_model_threads)} max · commit ${compact(postCode.deployment_commit, 13)}`
+            : (postTargeted.phase && postTargeted.phase !== "unavailable"
+              ? `INVALID ${postTargeted.phase} · ${postContractErrors.join("; ") || postTargeted.error || "status contract failed"}`
+              : "full-25 watcher unavailable"),
+        );
+        const qualityLabel = postQuality.available
+          ? (postQuality.passed === true ? "PASS" : "FAIL")
+          : "pending";
+        const replayLabel = postReplay.available
+          ? (postReplay.passed === true ? "PASS" : "FAIL")
+          : "pending";
+        setText(
+          document.getElementById("mft-post-targeted-full25-gate"),
+          `candidate ${compact(postCandidate.training_run_id, 34)} · rows ${shown(postCandidate.strict_full_rows)} · targets ${shown(postCandidate.full_target_count)} · quality ${qualityLabel} (${shown(postQuality.reason_count)} reasons) · PASS24 replay ${replayLabel} (${shown(postReplay.required_model_count)} models)`,
+        );
+        setText(
+          document.getElementById("mft-post-targeted-full25-activation"),
+          `publication ${postPublication.allowed ? "allowed" : "blocked"} · pointer ${postPublication.pointer_mutation_performed ? "activated" : "untouched"} · activation ${postActivation.available ? compact(postActivation.pointer_sha256, 13) : "pending"} · approved NSGA ${postNsga.available ? `launch attested · ${shown(postNsga.parallel_seed_workers)} seeds [${postNsgaSeeds}] · live state below` : "pending"}${postTargeted.error ? ` · error ${postTargeted.error}` : ""}`,
         );
         const activeModel = surrogate.active_model || {};
         const activeMetrics = activeModel.metrics || {};

@@ -292,6 +292,187 @@ def isolated_nsga_live_fixture(lane: str, seed_base: int) -> dict:
     }
 
 
+def post_targeted_full25_fixture(*, phase: str = "waiting_targeted_hpo") -> dict:
+    commit = "a" * 40
+    return {
+        "schema_version": "mft-post-targeted-full25-v1",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "phase": phase,
+        "lane": "isolated_candidate",
+        "eligibility": "NO-POINTER-NO-FEA-NO-NSGA-SEARCH",
+        "watcher_pid": 48204,
+        "code": {
+            "root": rf"C:\deployments\{commit}",
+            "deployment_commit": commit,
+            "watcher_sha256": "b" * 64,
+            "continuous_nsga_sha256": "c" * 64,
+        },
+        "cpu_budget": {
+            "target_workers": 8,
+            "model_threads_per_target": 1,
+            "maximum_total_model_threads": 8,
+        },
+        "publication": {
+            "attempted": False,
+            "allowed": False,
+            "pointer_mutation_performed": False,
+            "reason": "isolated candidate evidence only",
+        },
+        "targeted": {"runtime": r"C:\runtime\targeted14"},
+        "targeted_phase": "hpo_running",
+    }
+
+
+def approved_nsga_fixture(*, seed_base: int = 51000) -> tuple[dict, dict, dict]:
+    active_run = {
+        "run_id": "run-000001",
+        "model_id": "approved:full25-test:model",
+        "model_lane": "approved",
+        "seeds": list(range(seed_base, seed_base + 4)),
+        "pid": 51001,
+    }
+    status = {
+        "schema_version": "mft-continuous-nsga-v1",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "state": "running",
+        "controller_pid": 51000,
+        "require_approved": True,
+        "approved_pointer_present": True,
+        "approved_source_error": None,
+        "fea_submission_enabled": False,
+        "active_run": active_run,
+        "parallelism": {"parallel_seed_workers": 4},
+        "completed_outcomes": {
+            "feasible_complete": 0,
+            "infeasible_complete": 0,
+            "failed": 0,
+        },
+        "completed_run_count": 0,
+        "current_model_id": active_run["model_id"],
+        "current_model_completed_run_count": 0,
+        "current_model_completed_outcomes": {
+            "feasible_complete": 0,
+            "infeasible_complete": 0,
+            "failed": 0,
+        },
+        "model_switch_policy": "approved-only",
+        "next_seed_base": 51004,
+    }
+    manifest = {
+        "schema_version": "mft-continuous-nsga-v1",
+        "approved_registry": r"C:\runtime\isolated_registry",
+        "require_approved": True,
+        "restarts": 4,
+        "workers": 4,
+        "population": 120,
+        "max_generations": 600,
+        "seed_start": 51000,
+    }
+    state = {
+        "schema_version": "mft-continuous-nsga-v1",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "active_run": active_run,
+    }
+    return status, manifest, state
+
+
+def approved_post_status_fixture(
+    root: Path,
+    lane_root: str,
+    *,
+    controller_pid: int = 51000,
+) -> dict:
+    commit = "a" * 40
+    code_root = str((root / "deployments" / commit).resolve())
+    runtime_root = (root / lane_root).resolve()
+    pointer_path = (
+        root
+        / "mft_pipeline/post_targeted_full25/run-001/isolated_registry/current.json"
+    ).resolve()
+    value = post_targeted_full25_fixture(
+        phase="approved_model_active_nsga_running"
+    )
+    value.update({
+        "lane": "approved_model",
+        "eligibility": "APPROVED-MODEL-ACTIVE-NSGA-SEARCH-FEA-DISABLED",
+        "code": {
+            "root": code_root,
+            "deployment_commit": commit,
+            "watcher_sha256": "b" * 64,
+            "continuous_nsga_sha256": "c" * 64,
+        },
+        "targeted": {
+            "wave": "targeted14-test",
+            "target_count": 14,
+            "targeted_status_sha256": "1" * 64,
+            "launch_manifest_sha256": "2" * 64,
+            "dataset_sha256": "3" * 64,
+            "merged_params_sha256": "4" * 64,
+            "strict_full_rows": 3733,
+        },
+        "candidate": {
+            "training_run_id": "full25-test",
+            "generation": "generations/full25-test",
+            "generation_report_sha256": "5" * 64,
+            "dataset_sha256": "3" * 64,
+            "strict_full_rows": 3733,
+            "full_target_count": 25,
+        },
+        "quality": {
+            "passed": True,
+            "status_sha256": "6" * 64,
+            "reason_count": 0,
+        },
+        "pass24_replay": {
+            "passed": True,
+            "required_model_count": 24,
+            "status_sha256": "7" * 64,
+        },
+        "publication": {
+            "attempted": True,
+            "allowed": True,
+            "pointer_mutation_performed": True,
+            "reason": "quality and replay passed",
+        },
+        "activation": {
+            "schema_version": "mft-full25-atomic-activation-v1",
+            "production_quality_passed": True,
+            "pointer_mutation_performed": True,
+            "pointer_path": str(pointer_path),
+            "pointer_sha256": "8" * 64,
+            "generation_report_sha256": "5" * 64,
+            "quality_gate_sha256": "9" * 64,
+            "pass24_replay_sha256": "a" * 64,
+            "evidence_sha256": "b" * 64,
+        },
+        "nsga_launch": {
+            "schema_version": "mft-full25-approved-nsga-launch-v1",
+            "controller_pid": controller_pid,
+            "child_pid": 51001,
+            "command_sha256": "c" * 64,
+            "runtime_root": str(runtime_root),
+            "manifest": str(runtime_root / "manifest.json"),
+            "manifest_sha256": "d" * 64,
+            "status": str(runtime_root / "status.json"),
+            "status_sha256": "e" * 64,
+            "state": str(runtime_root / "state.json"),
+            "state_sha256": "f" * 64,
+            "run_id": "run-000001",
+            "model_id": "approved:full25-test:model",
+            "model_lane": "approved",
+            "seeds": [51000, 51001, 51002, 51003],
+            "parallel_seed_workers": 4,
+            "training_run_id": "full25-test",
+            "dataset_sha256": "3" * 64,
+            "activation_pointer_sha256": "8" * 64,
+            "activation_evidence_sha256": "b" * 64,
+            "fea_submission_enabled": False,
+            "evidence_sha256": "c" * 64,
+        },
+    })
+    return value
+
+
 def write_complete_runtime(root: Path) -> None:
     write_json(
         root,
@@ -1032,6 +1213,84 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
         )
         self.assertGreaterEqual(payload["nsga"]["active_seed_workers"], 4)
 
+    def test_post_targeted_full25_watcher_is_discovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_complete_runtime(root)
+            write_json(
+                root,
+                "mft_pipeline/post_targeted_full25/run-001/status.json",
+                post_targeted_full25_fixture(),
+            )
+
+            payload = MftPipelineStatusReader(root, cache_seconds=0).snapshot()
+
+        post = payload["surrogate"]["post_targeted_full25"]
+        self.assertTrue(post["available"])
+        self.assertEqual(post["phase"], "waiting_targeted_hpo")
+        self.assertEqual(post["watcher_pid"], 48204)
+        self.assertEqual(post["cpu_budget"]["maximum_total_model_threads"], 8)
+        self.assertFalse(post["publication"]["pointer_mutation_performed"])
+        self.assertIn("post_targeted_full25", payload["sources"])
+
+    def test_post_targeted_full25_invalid_code_root_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_complete_runtime(root)
+            status = post_targeted_full25_fixture()
+            status["code"]["root"] = r"C:\deployments\different"
+            write_json(
+                root,
+                "mft_pipeline/post_targeted_full25/run-001/status.json",
+                status,
+            )
+
+            payload = MftPipelineStatusReader(root, cache_seconds=0).snapshot()
+
+        self.assertFalse(
+            payload["surrogate"]["post_targeted_full25"]["available"]
+        )
+        self.assertTrue(any(
+            error["source"].startswith("post_targeted_full25_")
+            and "invalid post-targeted" in error["message"]
+            for error in payload["errors"]
+        ))
+
+    def test_approved_full25_nsga_lane_is_discovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_complete_runtime(root)
+            status, manifest, state = approved_nsga_fixture(seed_base=51004)
+            lane_root = (
+                "mft_pipeline/post_targeted_full25/run-001/"
+                "approved_nsga_continuous"
+            )
+            post_status = approved_post_status_fixture(root, lane_root)
+            manifest["code_root"] = post_status["code"]["root"]
+            manifest["approved_registry"] = str(
+                Path(post_status["activation"]["pointer_path"]).parent
+            )
+            write_json(
+                root,
+                "mft_pipeline/post_targeted_full25/run-001/status.json",
+                post_status,
+            )
+            write_json(root, f"{lane_root}/status.json", status)
+            write_json(root, f"{lane_root}/manifest.json", manifest)
+            write_json(root, f"{lane_root}/state.json", state)
+
+            payload = MftPipelineStatusReader(root, cache_seconds=0).snapshot()
+
+        lanes = {lane["name"]: lane for lane in payload["nsga"]["lanes"]}
+        approved = lanes["approved-full25"]
+        self.assertTrue(approved["available"])
+        self.assertEqual(approved["source_type"], "post_targeted_full25_approved")
+        self.assertEqual(approved["model_lane"], "approved")
+        self.assertEqual(approved["seeds"], [51004, 51005, 51006, 51007])
+        self.assertEqual(approved["seed_workers"], 4)
+        self.assertFalse(approved["fea_submission_enabled"])
+        self.assertTrue(approved["approval"]["state_bound"])
+
     def test_completed_hpo_result_fingerprint_tamper_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -1630,6 +1889,10 @@ class MftPipelineStatusRouteTests(unittest.TestCase):
         self.assertIn('id="mft-nsga-live-results"', html)
         self.assertIn('id="mft-surrogate-hpo-targets"', html)
         self.assertIn('id="mft-targeted-hpo-result"', html)
+        self.assertIn('id="mft-post-targeted-full25"', html)
+        self.assertIn('id="mft-post-targeted-full25-state"', html)
+        self.assertIn('id="mft-post-targeted-full25-gate"', html)
+        self.assertIn('id="mft-post-targeted-full25-activation"', html)
         self.assertIn('id="mft-completed-hpo-summary"', html)
         self.assertIn('id="mft-completed-hpo-targets"', html)
         self.assertIn('id="mft-surrogate-target-metrics"', html)
@@ -1676,6 +1939,9 @@ class MftPipelineStatusRouteTests(unittest.TestCase):
         self.assertIn("actual FEA diamonds", html)
         self.assertIn('lane.source_type === "isolated_transition_audit"', html)
         self.assertIn("surrogate.targeted_hpo", html)
+        self.assertIn("surrogate.post_targeted_full25", html)
+        self.assertIn("postTargeted.pass24_replay", html)
+        self.assertIn("postTargeted.nsga_launch", html)
         self.assertIn("point.candidate_index", html)
         self.assertIn("zero-pass:", html)
         panel = html[
