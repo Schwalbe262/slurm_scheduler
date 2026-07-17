@@ -22,11 +22,16 @@ from slurm_scheduler.conda_sync import conda_bootstrap, env_prefix_lookup_comman
 from slurm_scheduler.db import Database
 from slurm_scheduler.git_auth import find_git_credential, git_task_payload
 from slurm_scheduler.models import AedtBackend, AccountSnapshot, AllocationStatus, JobCreate, JobStatus, SchedulingProfile, TaskCreate, TaskStatus
-from slurm_scheduler.scheduler import Scheduler
+from slurm_scheduler.scheduler import (
+    ALLOCATION_SUBMISSION_IN_PROGRESS,
+    ALLOCATION_SUBMISSION_RESERVED,
+    Scheduler,
+)
 from slurm_scheduler.inventory import parse_scontrol_nodes, parse_sinfo_nodes, partition_rank
 from slurm_scheduler.pestat import parse_pestat, plan_dynamic_allocations
 from slurm_scheduler.task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, TASK_ID_PLACEHOLDER, build_git_task_command
 from slurm_scheduler.slurm import (
+    AllocationSubmissionNotCreated,
     CommandResult,
     GpfsBlockQuota,
     JobStateInfo,
@@ -654,14 +659,58 @@ class SlurmParsingTests(unittest.TestCase):
             "node_name": "n100",
         }
         script = build_allocation_script(allocation, "48:00:00")
-        self.assertIn("#SBATCH --job-name=pool", script)
-        self.assertNotIn("pool-12", script)
+        self.assertIn("#SBATCH --job-name=pool-12", script)
         self.assertIn("#SBATCH --nodes=1", script)
         self.assertIn("#SBATCH --ntasks=1", script)
         self.assertIn("#SBATCH --cpus-per-task=32", script)
         self.assertIn("#SBATCH --nodelist=n100", script)
         self.assertNotIn("#SBATCH --exclusive", script)
         self.assertIn("while true; do sleep 60", script)
+
+    def test_find_allocation_submissions_requires_exact_name_and_deduplicates_sources(self) -> None:
+        account = AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)
+        client = SlurmAccountClient(account)
+
+        class RecoverySession:
+            def __init__(self):
+                self.commands: list[str] = []
+                self.responses = deque(
+                    [
+                        CommandResult(
+                            "321|pool-12|RUNNING\n322|pool-120|RUNNING\n",
+                            "",
+                            0,
+                        ),
+                        CommandResult(
+                            "321|pool-12|RUNNING\n"
+                            "321.batch|pool-12|RUNNING\n"
+                            "323|pool-120|COMPLETED\n",
+                            "",
+                            0,
+                        ),
+                    ]
+                )
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def run(self, command: str):
+                self.commands.append(command)
+                return self.responses.popleft()
+
+        session = RecoverySession()
+        with mock.patch.object(client, "_open_session", return_value=session):
+            matches = client.find_allocation_submissions({"id": 12})
+
+        self.assertEqual(
+            matches,
+            [{"slurm_job_id": "321", "state": "RUNNING", "source": "squeue"}],
+        )
+        self.assertIn("-n pool-12", session.commands[0])
+        self.assertIn("--name=pool-12", session.commands[1])
 
     def test_allocation_script_can_request_gpu_model(self) -> None:
         allocation = {
@@ -1020,6 +1069,7 @@ class FakeClient:
     cancelled_tasks: list[int] = []
     live_steps: dict[str, list[str]] = {}
     removed: list[str] = []
+    allocation_submission_matches: dict[int, list[dict[str, str]] | Exception] = {}
 
     def __init__(self, account: AccountConfig):
         self.account = account
@@ -1049,6 +1099,12 @@ class FakeClient:
             "stdout_path": f"/remote/allocation-{allocation['id']}/out",
             "stderr_path": f"/remote/allocation-{allocation['id']}/err",
         }
+
+    def find_allocation_submissions(self, allocation: dict) -> list[dict[str, str]]:
+        outcome = self.allocation_submission_matches.get(int(allocation["id"]), [])
+        if isinstance(outcome, Exception):
+            raise outcome
+        return [dict(match) for match in outcome]
 
     def attach_task(self, task: dict, allocation: dict) -> dict[str, str]:
         self.attached_tasks.append(int(task["id"]))
@@ -1198,6 +1254,7 @@ class SchedulerTests(unittest.TestCase):
         FakeClient.cancelled_tasks = []
         FakeClient.live_steps = {}
         FakeClient.removed = []
+        FakeClient.allocation_submission_matches = {}
         FakeClient.snapshots = {
             "a": AccountSnapshot("a", running=3, pending=0, max_running=4, max_pending=10, max_total=10),
             "b": AccountSnapshot("b", running=1, pending=1, max_running=4, max_pending=10, max_total=10),
@@ -4330,6 +4387,461 @@ class SchedulerTests(unittest.TestCase):
         ]
         self.assertEqual(len(demand_allocations), 8)
         self.assertTrue(all(int(allocation["total_cpus"]) >= 48 for allocation in demand_allocations))
+
+    def test_demand_allocation_submissions_fix_plan_then_fan_out_by_account(self) -> None:
+        FakeClient.snapshots = {
+            "a": AccountSnapshot("a", 0, 0, 4, 10, 10),
+            "b": AccountSnapshot("b", 0, 0, 4, 10, 10),
+        }
+        db = self.db
+
+        class ObservedFanoutClient(FakeClient):
+            lock = threading.Lock()
+            cross_account_overlap = threading.Event()
+            active_by_account: dict[str, int] = {}
+            max_active_by_account: dict[str, int] = {}
+            submit_ids_by_account: dict[str, list[int]] = {}
+            submit_client_ids_by_account: dict[str, set[int]] = {}
+            all_rows_fixed_before_submit: list[bool] = []
+            next_client_id = 0
+
+            def __init__(self, account: AccountConfig):
+                super().__init__(account)
+                with self.lock:
+                    type(self).next_client_id += 1
+                    self.client_id = type(self).next_client_id
+
+            def submit_allocation(self, allocation: dict, time_limit: str) -> dict[str, str]:
+                rows = db.list_allocations(limit=100)
+                with self.lock:
+                    phases = {
+                        str(row.get("pending_reason") or "") for row in rows
+                    }
+                    self.all_rows_fixed_before_submit.append(
+                        len(rows) == 4
+                        and phases
+                        <= {
+                            ALLOCATION_SUBMISSION_RESERVED,
+                            ALLOCATION_SUBMISSION_IN_PROGRESS,
+                        }
+                    )
+                    account_name = self.account.name
+                    self.submit_ids_by_account.setdefault(account_name, []).append(
+                        int(allocation["id"])
+                    )
+                    self.submit_client_ids_by_account.setdefault(
+                        account_name, set()
+                    ).add(self.client_id)
+                    active = self.active_by_account.get(account_name, 0) + 1
+                    self.active_by_account[account_name] = active
+                    self.max_active_by_account[account_name] = max(
+                        active,
+                        self.max_active_by_account.get(account_name, 0),
+                    )
+                    if sum(self.active_by_account.values()) >= 2:
+                        self.cross_account_overlap.set()
+                self.cross_account_overlap.wait(timeout=2)
+                time.sleep(0.02)
+                with self.lock:
+                    self.active_by_account[account_name] -= 1
+                return super().submit_allocation(allocation, time_limit)
+
+        for index, account_name in enumerate(("a", "b", "a", "b")):
+            self.db.create_task(
+                TaskCreate(
+                    f"fanout-{index}",
+                    "~/case",
+                    "run",
+                    account_name=account_name,
+                    cpus=48,
+                    memory_mb=1,
+                )
+            )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=ObservedFanoutClient,
+            min_warm_allocations=0,
+            allocation_cpus=48,
+            allocation_max_new_per_loop=8,
+            ssh_parallelism=4,
+        )
+        queued = scheduler.queued_demand_tasks()
+        main_thread_id = threading.get_ident()
+        claim_thread_ids: list[int] = []
+        update_claim = self.db.update_allocation_if_submission_claim
+
+        def record_claim_thread(*args, **kwargs):
+            claim_thread_ids.append(threading.get_ident())
+            return update_claim(*args, **kwargs)
+
+        with mock.patch.object(
+            self.db,
+            "update_allocation_if_submission_claim",
+            side_effect=record_claim_thread,
+        ):
+            opened, blocked = scheduler.open_fit_aware_demand_allocations(queued)
+
+        self.assertEqual((opened, blocked), (4, False))
+        self.assertEqual(set(claim_thread_ids), {main_thread_id})
+        self.assertTrue(ObservedFanoutClient.cross_account_overlap.is_set())
+        self.assertEqual(
+            ObservedFanoutClient.max_active_by_account,
+            {"a": 1, "b": 1},
+        )
+        self.assertTrue(all(ObservedFanoutClient.all_rows_fixed_before_submit))
+        rows = sorted(self.db.list_allocations(limit=100), key=lambda row: int(row["id"]))
+        ids_by_account = {
+            account_name: [
+                int(row["id"])
+                for row in rows
+                if row["account_name"] == account_name
+            ]
+            for account_name in ("a", "b")
+        }
+        self.assertEqual(
+            ObservedFanoutClient.submit_ids_by_account,
+            ids_by_account,
+        )
+        self.assertEqual(
+            {
+                account_name: len(client_ids)
+                for account_name, client_ids in (
+                    ObservedFanoutClient.submit_client_ids_by_account.items()
+                )
+            },
+            {"a": 1, "b": 1},
+        )
+        opened_events = list(
+            reversed(
+                [
+                    event
+                    for event in self.db.list_events(limit=100)
+                    if event["kind"] == "allocation_opened"
+                ]
+            )
+        )
+        self.assertEqual(
+            [int(event["entity_id"]) for event in opened_events],
+            [int(row["id"]) for row in rows],
+        )
+
+        submitted_before_replay = {
+            account: list(ids)
+            for account, ids in ObservedFanoutClient.submit_ids_by_account.items()
+        }
+        self.assertEqual(
+            scheduler.open_fit_aware_demand_allocations(queued),
+            (0, False),
+        )
+        self.assertEqual(
+            ObservedFanoutClient.submit_ids_by_account,
+            submitted_before_replay,
+        )
+        self.assertEqual(len(self.db.list_allocations(limit=100)), 4)
+
+    def test_demand_allocation_fanout_isolates_partial_safe_failure(self) -> None:
+        FakeClient.snapshots = {
+            "a": AccountSnapshot("a", 0, 0, 4, 10, 10),
+            "b": AccountSnapshot("b", 0, 0, 4, 10, 10),
+        }
+
+        class PartialAllocationClient(FakeClient):
+            attempts_by_account: dict[str, list[int]] = {}
+
+            def submit_allocation(self, allocation: dict, time_limit: str) -> dict[str, str]:
+                attempts = self.attempts_by_account.setdefault(
+                    self.account.name, []
+                )
+                attempts.append(int(allocation["id"]))
+                if self.account.name == "a" and len(attempts) == 1:
+                    raise AllocationSubmissionNotCreated("synthetic sbatch rejection")
+                return super().submit_allocation(allocation, time_limit)
+
+        for index, account_name in enumerate(("a", "a", "b")):
+            self.db.create_task(
+                TaskCreate(
+                    f"partial-{index}",
+                    "~/case",
+                    "run",
+                    account_name=account_name,
+                    cpus=48,
+                    memory_mb=1,
+                )
+            )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=PartialAllocationClient,
+            min_warm_allocations=0,
+            allocation_cpus=48,
+            allocation_max_new_per_loop=8,
+        )
+
+        opened, blocked = scheduler.open_fit_aware_demand_allocations(
+            scheduler.queued_demand_tasks()
+        )
+
+        self.assertEqual((opened, blocked), (2, True))
+        rows = sorted(self.db.list_allocations(limit=100), key=lambda row: int(row["id"]))
+        self.assertEqual(
+            [row["state"] for row in rows],
+            [
+                AllocationStatus.FAILED.value,
+                AllocationStatus.PENDING.value,
+                AllocationStatus.PENDING.value,
+            ],
+        )
+        self.assertEqual(
+            PartialAllocationClient.attempts_by_account["a"],
+            [int(rows[0]["id"]), int(rows[1]["id"])],
+        )
+        self.assertIn("synthetic sbatch rejection", rows[0]["failure_message"])
+        self.assertEqual(rows[0]["pending_reason"], "")
+
+    def test_demand_allocation_reservations_enforce_account_pending_limit(self) -> None:
+        account = AccountConfig("a", "host", 22, "a", "key", "/work", 4, 2, 10)
+        FakeClient.snapshots = {
+            "a": AccountSnapshot("a", 0, 0, 4, 2, 10),
+        }
+        for index in range(4):
+            self.db.create_task(
+                TaskCreate(
+                    f"account-limit-{index}",
+                    "~/case",
+                    "run",
+                    account_name="a",
+                    cpus=48,
+                    memory_mb=1,
+                )
+            )
+        scheduler = Scheduler(
+            self.db,
+            [account],
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            allocation_cpus=48,
+            allocation_max_new_per_loop=8,
+        )
+
+        opened, blocked = scheduler.open_fit_aware_demand_allocations(
+            scheduler.queued_demand_tasks()
+        )
+
+        self.assertEqual((opened, blocked), (2, True))
+        self.assertEqual(len(self.db.list_allocations(limit=100)), 2)
+        self.assertEqual(FakeClient.allocation_submits, ["a", "a"])
+
+    def test_demand_allocation_plan_preserves_priority_shape_and_submit_order(self) -> None:
+        account = AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)
+        FakeClient.snapshots = {
+            "a": AccountSnapshot("a", 0, 0, 4, 10, 10),
+        }
+
+        class OrderedShapeClient(FakeClient):
+            submitted_ids: list[int] = []
+
+            def submit_allocation(self, allocation: dict, time_limit: str) -> dict[str, str]:
+                self.submitted_ids.append(int(allocation["id"]))
+                return super().submit_allocation(allocation, time_limit)
+
+        self.db.create_task(
+            TaskCreate(
+                "low-priority-narrow",
+                "~/case",
+                "run",
+                account_name="a",
+                cpus=16,
+                memory_mb=1,
+                priority=0,
+            )
+        )
+        self.db.create_task(
+            TaskCreate(
+                "high-priority-wide",
+                "~/case",
+                "run",
+                account_name="a",
+                cpus=48,
+                memory_mb=1,
+                priority=10,
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            [account],
+            30,
+            client_factory=OrderedShapeClient,
+            min_warm_allocations=0,
+            allocation_cpus=32,
+            allocation_max_new_per_loop=8,
+        )
+
+        self.assertEqual(
+            scheduler.open_fit_aware_demand_allocations(
+                scheduler.queued_demand_tasks()
+            ),
+            (2, False),
+        )
+        rows = sorted(self.db.list_allocations(limit=100), key=lambda row: int(row["id"]))
+        self.assertEqual([int(row["total_cpus"]) for row in rows], [48, 16])
+        self.assertEqual(
+            OrderedShapeClient.submitted_ids,
+            [int(row["id"]) for row in rows],
+        )
+
+    def test_recovery_fails_reserved_allocation_before_remote_submit(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="",
+            total_cpus=48,
+            total_memory_mb=65536,
+            drain_reason="queued CPU demand",
+            pending_reason=ALLOCATION_SUBMISSION_RESERVED,
+            remote_dir="/remote/reserved",
+            stdout_path="/remote/reserved/allocation-%j.out",
+            stderr_path="/remote/reserved/allocation-%j.err",
+        )
+        restarted = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+
+        restarted.recover_transient_states()
+
+        allocation = self.db.get_allocation(allocation_id)
+        self.assertEqual(allocation["state"], AllocationStatus.FAILED.value)
+        self.assertEqual(allocation["pending_reason"], "")
+        self.assertIn("safe to retry", allocation["failure_message"])
+        self.assertEqual(FakeClient.allocation_submits, [])
+
+    def test_recovery_adopts_exact_in_progress_allocation_job(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="",
+            total_cpus=48,
+            total_memory_mb=65536,
+            drain_reason="queued CPU demand",
+            pending_reason=ALLOCATION_SUBMISSION_IN_PROGRESS,
+            remote_dir="/remote/in-progress",
+            stdout_path="/remote/in-progress/allocation-%j.out",
+            stderr_path="/remote/in-progress/allocation-%j.err",
+        )
+        self.db.update_allocation(allocation_id, submitted_at="CURRENT_TIMESTAMP")
+        FakeClient.allocation_submission_matches[allocation_id] = [
+            {"slurm_job_id": "adopt-123", "state": "RUNNING", "source": "squeue"}
+        ]
+        restarted = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+
+        restarted.recover_transient_states()
+
+        allocation = self.db.get_allocation(allocation_id)
+        self.assertEqual(allocation["state"], AllocationStatus.PENDING.value)
+        self.assertEqual(allocation["slurm_job_id"], "adopt-123")
+        self.assertEqual(allocation["pending_reason"], "")
+        self.assertEqual(
+            allocation["stdout_path"],
+            "/remote/in-progress/allocation-adopt-123.out",
+        )
+        self.assertFalse(
+            restarted.health_status()["allocation_submission_recovery"]["blocked"]
+        )
+        self.assertEqual(FakeClient.allocation_submits, [])
+
+    def test_in_progress_zero_match_is_retried_by_tick_then_failed_after_grace(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="",
+            total_cpus=48,
+            total_memory_mb=65536,
+            drain_reason="queued CPU demand",
+            pending_reason=ALLOCATION_SUBMISSION_IN_PROGRESS,
+            remote_dir="/remote/zero-match",
+            stdout_path="/remote/zero-match/allocation-%j.out",
+            stderr_path="/remote/zero-match/allocation-%j.err",
+        )
+        self.db.update_allocation(allocation_id, submitted_at="CURRENT_TIMESTAMP")
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+
+        scheduler.recover_transient_states()
+
+        self.assertEqual(
+            self.db.get_allocation(allocation_id)["state"],
+            AllocationStatus.PENDING.value,
+        )
+        self.assertTrue(
+            scheduler.health_status()["allocation_submission_recovery"]["blocked"]
+        )
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE allocations SET submitted_at = datetime('now', '-121 seconds') WHERE id = ?",
+                (allocation_id,),
+            )
+
+        scheduler.maintain_allocation_pool()
+
+        allocation = self.db.get_allocation(allocation_id)
+        self.assertEqual(allocation["state"], AllocationStatus.FAILED.value)
+        self.assertIn("safe to retry", allocation["failure_message"])
+        self.assertFalse(
+            scheduler.health_status()["allocation_submission_recovery"]["blocked"]
+        )
+
+    def test_in_progress_recovery_query_failure_holds_capacity_and_reports_health(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="",
+            total_cpus=48,
+            total_memory_mb=65536,
+            drain_reason="queued CPU demand",
+            pending_reason=ALLOCATION_SUBMISSION_IN_PROGRESS,
+        )
+        self.db.update_allocation(allocation_id, submitted_at="CURRENT_TIMESTAMP")
+        FakeClient.allocation_submission_matches[allocation_id] = RuntimeError(
+            "synthetic sacct outage"
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+
+        scheduler.recover_transient_states()
+
+        allocation = self.db.get_allocation(allocation_id)
+        self.assertEqual(allocation["state"], AllocationStatus.PENDING.value)
+        self.assertEqual(
+            allocation["pending_reason"],
+            ALLOCATION_SUBMISSION_IN_PROGRESS,
+        )
+        recovery = scheduler.health_status()["allocation_submission_recovery"]
+        self.assertTrue(recovery["blocked"])
+        self.assertEqual(recovery["blockers"][0]["allocation_id"], allocation_id)
+        self.assertIn("synthetic sacct outage", recovery["blockers"][0]["reason"])
 
     def test_pending_wide_cpu_pool_reserves_slot_without_duplicate_pool(self) -> None:
         allocation_id = self.db.create_allocation(

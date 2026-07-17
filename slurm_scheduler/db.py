@@ -2148,6 +2148,11 @@ class Database:
         gpu_model: str = "",
         resource_pool: str = "cpu",
         exclusive_node: bool = False,
+        remote_dir: str = "",
+        stdout_path: str = "",
+        stderr_path: str = "",
+        drain_reason: str = "",
+        pending_reason: str = "",
     ) -> int:
         with self.connect() as conn:
             cursor = conn.execute(
@@ -2155,8 +2160,9 @@ class Database:
                 INSERT INTO allocations (
                     account_name, partition, node_name, state, total_cpus, free_cpus,
                     total_memory_mb, free_memory_mb, total_gpus, free_gpus,
-                    gpu_model, resource_pool, exclusive_node
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    gpu_model, resource_pool, exclusive_node, remote_dir,
+                    stdout_path, stderr_path, drain_reason, pending_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     account_name,
@@ -2172,6 +2178,11 @@ class Database:
                     gpu_model,
                     resource_pool,
                     int(exclusive_node),
+                    remote_dir,
+                    stdout_path,
+                    stderr_path,
+                    drain_reason,
+                    pending_reason,
                 ),
             )
             return int(cursor.lastrowid)
@@ -2245,6 +2256,40 @@ class Database:
 
     def update_allocation(self, allocation_id: int, **fields: Any) -> None:
         self._update_row("allocations", allocation_id, fields)
+
+    def update_allocation_if_submission_claim(
+        self,
+        allocation_id: int,
+        expected_pending_reason: str,
+        **fields: Any,
+    ) -> bool:
+        """CAS one allocation submission phase without reviving a closed row."""
+        if not expected_pending_reason or not fields:
+            return False
+        fields["updated_at"] = fields.get("updated_at", "CURRENT_TIMESTAMP")
+        assignments = []
+        values: list[Any] = []
+        for key, value in fields.items():
+            if value == "CURRENT_TIMESTAMP":
+                assignments.append(f"{key} = CURRENT_TIMESTAMP")
+            else:
+                assignments.append(f"{key} = ?")
+                values.append(value)
+        values.extend(
+            (
+                int(allocation_id),
+                AllocationStatus.PENDING.value,
+                str(expected_pending_reason),
+            )
+        )
+        with self.connect(busy_timeout_ms=5000) as conn:
+            cursor = conn.execute(
+                f"UPDATE allocations SET {', '.join(assignments)} "
+                "WHERE id = ? AND state = ? AND slurm_job_id IS NULL "
+                "AND pending_reason = ?",
+                values,
+            )
+            return cursor.rowcount == 1
 
     def update_allocation_capacities(self, rows: list[dict[str, Any]]) -> None:
         """Persist one capacity snapshot batch under a single writer lock."""

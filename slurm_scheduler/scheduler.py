@@ -26,6 +26,7 @@ from .inventory import CPU_PROFILES_BY_PARTITION, GPU_PRIORITY, gpu_model_candid
 from .models import AedtBackend, AccountSnapshot, AllocationStatus, JobStatus, SchedulingProfile, TaskStatus, normalize_aedt_backend, normalize_scheduling_profile
 from .pestat import PestatNode, parse_pestat
 from .slurm import (
+    AllocationSubmissionNotCreated,
     JobStateInfo,
     RemoteExecutionError,
     SSHSession,
@@ -34,6 +35,7 @@ from .slurm import (
     TaskProbe,
     resolve_task_placeholders,
     shell_path,
+    workspace_runs_dir,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -48,6 +50,9 @@ TERMINAL_AEDT_WORKSPACE_SCAN_LIMIT = 1000
 TERMINAL_AEDT_WORKSPACE_SUBMIT_LIMIT = 128
 TERMINAL_AEDT_WORKSPACE_DELETED_MARKER = "SLURM_AEDT_WORKSPACE_DELETED"
 TERMINAL_AEDT_WORKSPACE_ABSENT_MARKER = "SLURM_AEDT_WORKSPACE_ABSENT"
+ALLOCATION_SUBMISSION_RESERVED = "scheduler allocation submission reserved"
+ALLOCATION_SUBMISSION_IN_PROGRESS = "scheduler allocation submission in progress"
+ALLOCATION_SUBMISSION_RECOVERY_GRACE_SECONDS = 120
 _STDERR_FAILURE_SIGNAL_RE = re.compile(
     r"(?:^|[\s\[])(?:error|critical|fatal)(?=[:\]\s-])"
     r"|(?:^|\s)(?:[A-Za-z_][\w.]*?(?:Error|Exception)):",
@@ -635,6 +640,10 @@ class Scheduler:
         self._last_tick_duration: float | None = None
         self._last_tick_stage_seconds: dict[str, float] = {}
         self._last_demand_reservation_plan: dict[str, Any] = {}
+        self._allocation_submission_recovery: dict[str, Any] = {
+            "blocked": False,
+            "blockers": [],
+        }
         self._consecutive_tick_failures = 0
         self.watchdog_enabled = watchdog_enabled
         self.watchdog_stall_seconds = max(0, int(watchdog_stall_seconds))
@@ -798,6 +807,14 @@ class Scheduler:
             else None,
             "last_tick_stage_seconds": dict(self._last_tick_stage_seconds),
             "demand_reservation_plan": dict(self._last_demand_reservation_plan),
+            "allocation_submission_recovery": {
+                "blocked": bool(
+                    self._allocation_submission_recovery.get("blocked")
+                ),
+                "blockers": list(
+                    self._allocation_submission_recovery.get("blockers") or []
+                ),
+            },
             "tick_in_progress_seconds": round(tick_in_progress_seconds, 1)
             if tick_in_progress_seconds is not None
             else None,
@@ -864,13 +881,206 @@ class Scheduler:
                     entity_id=task["id"],
                     account_name=str(task.get("account_name") or ""),
                 )
+        self.recover_allocation_submission_claims()
         self._reconstruct_license_admission_claims()
 
+    def recover_allocation_submission_claims(self) -> None:
+        """Resolve allocation rows left around the remote sbatch boundary.
+
+        A reserved claim proves sbatch was never entered and is safe to fail
+        for deterministic retry.  An in-progress claim is reconciled by the
+        allocation-specific Slurm job name; ambiguous outcomes remain visible
+        and capacity-holding rather than risking a duplicate pool job.
+        """
+        blockers: list[dict[str, Any]] = []
+        candidates = [
+            allocation
+            for allocation in self.db.list_allocations_with_live(
+                limit=0, live_limit=10000
+            )
+            if allocation["state"] == AllocationStatus.PENDING.value
+            and not str(allocation.get("slurm_job_id") or "")
+            and str(allocation.get("pending_reason") or "")
+            in {
+                ALLOCATION_SUBMISSION_RESERVED,
+                ALLOCATION_SUBMISSION_IN_PROGRESS,
+            }
+        ]
+        for allocation in sorted(candidates, key=lambda item: int(item["id"])):
+            allocation_id = int(allocation["id"])
+            phase = str(allocation.get("pending_reason") or "")
+            account_name = str(allocation.get("account_name") or "")
+            if phase == ALLOCATION_SUBMISSION_RESERVED:
+                recovered = self.db.update_allocation_if_submission_claim(
+                    allocation_id,
+                    ALLOCATION_SUBMISSION_RESERVED,
+                    state=AllocationStatus.FAILED.value,
+                    pending_reason="",
+                    failure_message=(
+                        "scheduler restarted before allocation sbatch began; "
+                        "safe to retry"
+                    ),
+                    closed_at="CURRENT_TIMESTAMP",
+                )
+                if recovered:
+                    self.record_event(
+                        "allocation_submission_recovered",
+                        "reserved allocation failed before remote submission; safe to retry",
+                        entity_type="allocation",
+                        entity_id=allocation_id,
+                        account_name=account_name,
+                    )
+                continue
+            account = self.account_by_name(account_name)
+            matches: list[dict[str, str]] | None = None
+            query_error = ""
+            if account is None:
+                query_error = f"account {account_name or '<blank>'} not configured"
+            else:
+                try:
+                    finder = getattr(
+                        self._client(account), "find_allocation_submissions", None
+                    )
+                    if not callable(finder):
+                        raise RuntimeError(
+                            "client does not support exact allocation submission recovery"
+                        )
+                    matches = finder(allocation)
+                except Exception as exc:
+                    query_error = str(exc) or type(exc).__name__
+            if query_error:
+                message = f"allocation submission recovery query failed: {query_error}"
+                if message != str(allocation.get("failure_message") or ""):
+                    self.db.update_allocation(
+                        allocation_id, failure_message=message
+                    )
+                    self.record_event(
+                        "allocation_submission_recovery_held",
+                        message,
+                        entity_type="allocation",
+                        entity_id=allocation_id,
+                        account_name=account_name,
+                    )
+                blockers.append(
+                    {
+                        "allocation_id": allocation_id,
+                        "account_name": account_name,
+                        "reason": message,
+                    }
+                )
+                continue
+            exact_matches = list(matches or [])
+            if len(exact_matches) == 1:
+                slurm_job_id = str(
+                    exact_matches[0].get("slurm_job_id") or ""
+                ).strip()
+                if slurm_job_id:
+                    adopted = self.db.update_allocation_if_submission_claim(
+                        allocation_id,
+                        ALLOCATION_SUBMISSION_IN_PROGRESS,
+                        state=AllocationStatus.PENDING.value,
+                        slurm_job_id=slurm_job_id,
+                        pending_reason="",
+                        failure_message="",
+                        stdout_path=str(allocation.get("stdout_path") or "").replace(
+                            "%j", slurm_job_id
+                        ),
+                        stderr_path=str(allocation.get("stderr_path") or "").replace(
+                            "%j", slurm_job_id
+                        ),
+                    )
+                    if adopted:
+                        self.record_event(
+                            "allocation_submission_adopted",
+                            f"adopted exact Slurm job {slurm_job_id} after scheduler restart",
+                            entity_type="allocation",
+                            entity_id=allocation_id,
+                            account_name=account_name,
+                        )
+                    continue
+            if len(exact_matches) > 1:
+                job_ids = sorted(
+                    str(match.get("slurm_job_id") or "")
+                    for match in exact_matches
+                )
+                message = (
+                    "allocation submission recovery ambiguous; exact job name "
+                    f"matched {', '.join(job_ids)}"
+                )
+                if message != str(allocation.get("failure_message") or ""):
+                    self.db.update_allocation(
+                        allocation_id, failure_message=message
+                    )
+                    self.record_event(
+                        "allocation_submission_recovery_held",
+                        message,
+                        entity_type="allocation",
+                        entity_id=allocation_id,
+                        account_name=account_name,
+                    )
+                blockers.append(
+                    {
+                        "allocation_id": allocation_id,
+                        "account_name": account_name,
+                        "reason": message,
+                    }
+                )
+                continue
+            started_at = self._timestamp(
+                allocation.get("submitted_at") or allocation.get("updated_at")
+            )
+            age = (
+                (self._now() - started_at).total_seconds()
+                if started_at is not None
+                else float(ALLOCATION_SUBMISSION_RECOVERY_GRACE_SECONDS)
+            )
+            if age >= ALLOCATION_SUBMISSION_RECOVERY_GRACE_SECONDS:
+                recovered = self.db.update_allocation_if_submission_claim(
+                    allocation_id,
+                    ALLOCATION_SUBMISSION_IN_PROGRESS,
+                    state=AllocationStatus.FAILED.value,
+                    pending_reason="",
+                    failure_message=(
+                        "no exact Slurm allocation job appeared within "
+                        f"{ALLOCATION_SUBMISSION_RECOVERY_GRACE_SECONDS}s; safe to retry"
+                    ),
+                    closed_at="CURRENT_TIMESTAMP",
+                )
+                if recovered:
+                    self.record_event(
+                        "allocation_submission_recovered",
+                        "in-progress allocation had no exact Slurm job after recovery grace; safe to retry",
+                        entity_type="allocation",
+                        entity_id=allocation_id,
+                        account_name=account_name,
+                    )
+                continue
+            remaining = max(
+                1,
+                int(ALLOCATION_SUBMISSION_RECOVERY_GRACE_SECONDS - age),
+            )
+            message = (
+                "awaiting exact Slurm allocation job during recovery grace "
+                f"({remaining}s remaining)"
+            )
+            self.db.update_allocation(allocation_id, failure_message=message)
+            blockers.append(
+                {
+                    "allocation_id": allocation_id,
+                    "account_name": account_name,
+                    "reason": message,
+                }
+            )
+        self._allocation_submission_recovery = {
+            "blocked": bool(blockers),
+            "blockers": blockers,
+        }
+
     def reconcile_slurm_state(self) -> None:
-        """Cancel scheduler-created 'pool' allocation jobs the DB no longer
-        tracks (rows lost or DB reset while the Slurm job kept running).
-        Only jobs named 'pool' are touched — that name is set exclusively by
-        build_allocation_script."""
+        """Cancel scheduler-created pool allocation jobs the DB no longer
+        tracks, while protecting exact restart-recovery claims. Legacy
+        ``pool`` and exact ``pool-<allocation id>`` names are scheduler-owned.
+        """
         live_states = {
             AllocationStatus.PENDING.value,
             AllocationStatus.WARM.value,
@@ -878,10 +1088,26 @@ class Scheduler:
             AllocationStatus.DRAINING.value,
             AllocationStatus.CLOSING.value,
         }
+        live_allocations = [
+            allocation
+            for allocation in self.db.list_allocations(limit=1000)
+            if allocation["state"] in live_states
+        ]
         known_ids = {
             str(allocation.get("slurm_job_id"))
-            for allocation in self.db.list_allocations(limit=1000)
-            if allocation["state"] in live_states and allocation.get("slurm_job_id")
+            for allocation in live_allocations
+            if allocation.get("slurm_job_id")
+        }
+        protected_job_names = {
+            (
+                str(allocation.get("account_name") or ""),
+                f"pool-{int(allocation['id'])}",
+            )
+            for allocation in live_allocations
+            if allocation["state"] == AllocationStatus.PENDING.value
+            and not allocation.get("slurm_job_id")
+            and allocation.get("pending_reason")
+            == ALLOCATION_SUBMISSION_IN_PROGRESS
         }
         for account in self.accounts:
             try:
@@ -892,7 +1118,13 @@ class Scheduler:
                 orphan_ids = []
                 for line in result.stdout.splitlines():
                     job_id, sep, job_name = line.strip().partition("|")
-                    if not sep or job_name.strip() != "pool":
+                    normalized_name = job_name.strip()
+                    if not sep or not (
+                        normalized_name == "pool"
+                        or re.fullmatch(r"pool-\d+", normalized_name)
+                    ):
+                        continue
+                    if (account.name, normalized_name) in protected_job_names:
                         continue
                     if job_id.strip() and job_id.strip() not in known_ids:
                         orphan_ids.append(job_id.strip())
@@ -7332,6 +7564,10 @@ class Scheduler:
         return int(allocation["free_cpus"]) >= int(task["cpus"])
 
     def maintain_allocation_pool(self) -> None:
+        # Startup reconciliation deliberately holds ambiguous remote submits.
+        # Revisit those claims every tick so query failures and the zero-match
+        # grace are bounded without risking a duplicate allocation job.
+        self.recover_allocation_submission_claims()
         self.prewarm_gpu_for_minimum()
         self.prewarm_cpu_for_minimum()
         # Retire stale demand pools before opening replacements. Opening first
@@ -7507,21 +7743,40 @@ class Scheduler:
             remaining_allocations = self.current_reservation_allocations()
             self.annotate_fea_node_worker_counts(remaining_allocations)
             start_index = 0
-        opened = 0
+        reserved_submissions: list[dict] = []
         blocked = False
-        for task in queued_tasks[start_index:]:
-            if self.reserve_inflight_capacity_for_task(remaining_allocations, task):
-                continue
-            if opened >= self.allocation_max_new_per_loop:
-                blocked = True
-                continue
-            allocation = self.open_allocation_for_task_record(task)
-            if not allocation:
-                blocked = True
-                continue
-            opened += 1
-            remaining_allocations.append(dict(allocation))
-            self.reserve_inflight_capacity_for_task(remaining_allocations, task)
+        # Fix account limits, allocation shapes, and queue capacity in durable
+        # PENDING rows before any worker may enter remote sbatch. Sequential
+        # planning means each later choice observes every earlier reservation.
+        with self._task_assignment_lock:
+            for task in queued_tasks[start_index:]:
+                if self.reserve_inflight_capacity_for_task(
+                    remaining_allocations, task
+                ):
+                    continue
+                if (
+                    len(reserved_submissions)
+                    >= self.allocation_max_new_per_loop
+                ):
+                    blocked = True
+                    continue
+                allocation = self.open_allocation_for_task_record(
+                    task, submit=False
+                )
+                if not allocation:
+                    blocked = True
+                    continue
+                reserved_submissions.append(dict(allocation))
+                remaining_allocations.append(dict(allocation))
+                self.reserve_inflight_capacity_for_task(
+                    remaining_allocations, task
+                )
+        successful_ids = self.submit_reserved_allocation_records(
+            reserved_submissions
+        )
+        opened = len(successful_ids)
+        if opened != len(reserved_submissions):
+            blocked = True
         self._last_demand_reservation_plan = {
             "tick": self._tick_seq,
             "mode": (
@@ -7539,6 +7794,7 @@ class Scheduler:
             "scanned_tasks": len(queued_tasks) - start_index,
             "reason": replay_reason,
             "opened_allocations": opened,
+            "reserved_allocations": len(reserved_submissions),
             "blocked": blocked,
         }
         return opened, blocked
@@ -8039,7 +8295,9 @@ class Scheduler:
     def open_allocation_for_task(self, task: dict) -> bool:
         return self.open_allocation_for_task_record(task) is not None
 
-    def open_allocation_for_task_record(self, task: dict) -> dict | None:
+    def open_allocation_for_task_record(
+        self, task: dict, *, submit: bool = True
+    ) -> dict | None:
         if self.same_node_as_task_id(task) or self.task_requested_allocation_id(task):
             return None
         if self.task_requires_gpu(task):
@@ -8059,6 +8317,7 @@ class Scheduler:
                 requested_cpus=int(task.get("cpus") or 0),
                 requested_memory_mb=int(task.get("memory_mb") or 0),
                 require_fea_eligible_node=self.task_is_fea_bursty(task),
+                submit=submit,
             )
         if self.allocation_pool_in_backoff("cpu"):
             return None
@@ -8073,6 +8332,7 @@ class Scheduler:
             requested_cpus=int(task.get("cpus") or 0) if exclusive_node or not self.task_is_fea_bursty(task) else 0,
             requested_memory_mb=int(task.get("memory_mb") or 0) if exclusive_node else 0,
             require_fea_eligible_node=self.task_is_fea_bursty(task),
+            submit=submit,
         )
 
     def scale_in_idle_allocations(
@@ -8366,6 +8626,7 @@ class Scheduler:
         cpu_only_nodes: bool = False,
         aedt_pool_node_sharing: bool = False,
         aedt_pool_max_sessions: int = 0,
+        submit: bool = True,
     ) -> dict | None:
         account = self.choose_account_for_allocation(
             preferred_accounts=preferred_accounts,
@@ -8390,6 +8651,11 @@ class Scheduler:
         )
         if not shape:
             return None
+        stamp = int(time.time())
+        remote_dir = posixpath.join(
+            workspace_runs_dir(account.remote_workspace, stamp),
+            f"allocation-reserved-{uuid.uuid4().hex}-{stamp}",
+        )
         allocation_id = self.db.create_allocation(
             account_name=account.name,
             partition=shape["partition"],
@@ -8400,36 +8666,257 @@ class Scheduler:
             gpu_model=shape["gpu_model"],
             resource_pool=resource_pool,
             exclusive_node=shape["exclusive_node"],
+            remote_dir=remote_dir,
+            stdout_path=posixpath.join(remote_dir, "allocation-%j.out"),
+            stderr_path=posixpath.join(remote_dir, "allocation-%j.err"),
+            drain_reason=reason,
+            pending_reason=ALLOCATION_SUBMISSION_RESERVED,
         )
         allocation = self.db.get_allocation(allocation_id)
         if not allocation:
             return None
-        try:
-            time_limit = self.gpu_prewarm_time_limit if resource_pool.startswith("gpu:") else self.allocation_time_limit
-            result = self._client(account).submit_allocation(allocation, time_limit)
-        except Exception as exc:
-            self.db.update_allocation(
-                allocation_id,
-                state=AllocationStatus.FAILED.value,
-                failure_message=f"{reason}: {exc}",
-                closed_at="CURRENT_TIMESTAMP",
-            )
+        if not submit:
+            return allocation
+        successful_ids = self.submit_reserved_allocation_records([allocation])
+        if allocation_id not in successful_ids:
             return None
-        self.db.update_allocation(
-            allocation_id,
-            state=AllocationStatus.PENDING.value,
-            submitted_at="CURRENT_TIMESTAMP",
-            drain_reason=reason,
-            **result,
-        )
-        self.record_event(
-            "allocation_opened",
-            f"{reason} (pool {resource_pool}, slurm job {result.get('slurm_job_id')})",
-            entity_type="allocation",
-            entity_id=allocation_id,
-            account_name=account.name,
-        )
         return self.db.get_allocation(allocation_id)
+
+    def submit_reserved_allocation_records(
+        self, allocations: list[dict]
+    ) -> set[int]:
+        """Submit a durable allocation plan with one serial worker per account."""
+        if not allocations:
+            return set()
+        accounts_by_name = {account.name: account for account in self.accounts}
+        outcomes_by_id: dict[int, dict[str, Any]] = {}
+        by_account: dict[str, list[dict]] = {}
+        # Submission-phase claims are also fixed in global plan order on the
+        # scheduler thread. Workers below perform remote I/O only, preventing
+        # concurrent SQLite writers from becoming the next tick bottleneck.
+        for allocation in allocations:
+            allocation_id = int(allocation["id"])
+            account_name = str(allocation.get("account_name") or "")
+            if account_name not in accounts_by_name:
+                outcomes_by_id[allocation_id] = {
+                    "allocation_id": allocation_id,
+                    "claimed": False,
+                    "definitely_not_created": True,
+                    "error": RuntimeError(
+                        f"allocation account {account_name!r} is not configured"
+                    ),
+                }
+                continue
+            claimed = self.db.update_allocation_if_submission_claim(
+                allocation_id,
+                ALLOCATION_SUBMISSION_RESERVED,
+                pending_reason=ALLOCATION_SUBMISSION_IN_PROGRESS,
+                submitted_at="CURRENT_TIMESTAMP",
+                failure_message="",
+            )
+            if not claimed:
+                outcomes_by_id[allocation_id] = {
+                    "allocation_id": allocation_id,
+                    "claimed": False,
+                }
+                continue
+            current = self.db.get_allocation(allocation_id)
+            if current is None:
+                outcomes_by_id[allocation_id] = {
+                    "allocation_id": allocation_id,
+                    "claimed": True,
+                    "error": RuntimeError(
+                        "claimed allocation disappeared before remote submission"
+                    ),
+                }
+                continue
+            by_account.setdefault(account_name, []).append(current)
+
+        def submit_account(
+            account_name: str, account_allocations: list[dict]
+        ) -> list[dict[str, Any]]:
+            account = accounts_by_name.get(account_name)
+            if account is None:
+                raise RuntimeError(f"allocation account {account_name!r} is not configured")
+            # One client (and therefore one SSH transport) is owned by this
+            # account worker.  Its loop is the serialization boundary.
+            try:
+                client = self._client(account)
+            except Exception as exc:
+                return [
+                    {
+                        "allocation_id": int(allocation["id"]),
+                        "claimed": True,
+                        "definitely_not_created": True,
+                        "error": exc,
+                    }
+                    for allocation in account_allocations
+                ]
+            outcomes: list[dict[str, Any]] = []
+            for allocation in account_allocations:
+                allocation_id = int(allocation["id"])
+                time_limit = (
+                    self.gpu_prewarm_time_limit
+                    if str(allocation.get("resource_pool") or "").startswith("gpu:")
+                    else self.allocation_time_limit
+                )
+                try:
+                    result = client.submit_allocation(allocation, time_limit)
+                except Exception as exc:
+                    outcomes.append(
+                        {
+                            "allocation_id": allocation_id,
+                            "claimed": True,
+                            "definitely_not_created": isinstance(
+                                exc, AllocationSubmissionNotCreated
+                            ),
+                            "error": exc,
+                        }
+                    )
+                    continue
+                outcomes.append(
+                    {
+                        "allocation_id": allocation_id,
+                        "claimed": True,
+                        "result": result,
+                    }
+                )
+            return outcomes
+
+        account_outcomes = self._fan_out_by_account(by_account, submit_account)
+        for account_name, outcome in account_outcomes.items():
+            if isinstance(outcome, Exception):
+                for allocation in by_account.get(account_name, []):
+                    outcomes_by_id[int(allocation["id"])] = {
+                        "allocation_id": int(allocation["id"]),
+                        "claimed": True,
+                        # Executor budget expiry can leave the worker inside
+                        # sbatch. Preserve the claim for exact reconciliation.
+                        "definitely_not_created": False,
+                        "error": outcome,
+                    }
+                continue
+            for item in outcome:
+                outcomes_by_id[int(item["allocation_id"])] = item
+
+        successful_ids: set[int] = set()
+        for allocation in allocations:
+            allocation_id = int(allocation["id"])
+            outcome = outcomes_by_id.get(allocation_id)
+            if not outcome:
+                continue
+            error = outcome.get("error")
+            if error is not None:
+                expected_phase = (
+                    ALLOCATION_SUBMISSION_IN_PROGRESS
+                    if outcome.get("claimed")
+                    else ALLOCATION_SUBMISSION_RESERVED
+                )
+                if (
+                    outcome.get("claimed")
+                    and not outcome.get("definitely_not_created")
+                ):
+                    # The SSH result was lost after the sbatch boundary. Keep
+                    # the exact claim live; per-tick recovery will adopt the
+                    # deterministic pool-<id> job or fail it after grace.
+                    message = (
+                        "allocation sbatch outcome ambiguous; awaiting exact "
+                        f"Slurm reconciliation: {error}"
+                    )
+                    self.db.update_allocation_if_submission_claim(
+                        allocation_id,
+                        ALLOCATION_SUBMISSION_IN_PROGRESS,
+                        failure_message=message,
+                    )
+                    self.record_event(
+                        "allocation_submission_recovery_held",
+                        message,
+                        entity_type="allocation",
+                        entity_id=allocation_id,
+                        account_name=str(allocation.get("account_name") or ""),
+                    )
+                    blockers = list(
+                        self._allocation_submission_recovery.get("blockers")
+                        or []
+                    )
+                    blockers = [
+                        blocker
+                        for blocker in blockers
+                        if int(blocker.get("allocation_id") or 0)
+                        != allocation_id
+                    ]
+                    blockers.append(
+                        {
+                            "allocation_id": allocation_id,
+                            "account_name": str(
+                                allocation.get("account_name") or ""
+                            ),
+                            "reason": message,
+                        }
+                    )
+                    self._allocation_submission_recovery = {
+                        "blocked": True,
+                        "blockers": blockers,
+                    }
+                    continue
+                self.db.update_allocation_if_submission_claim(
+                    allocation_id,
+                    expected_phase,
+                    state=AllocationStatus.FAILED.value,
+                    pending_reason="",
+                    failure_message=(
+                        f"{allocation.get('drain_reason') or 'allocation submission'}: {error}"
+                    ),
+                    closed_at="CURRENT_TIMESTAMP",
+                )
+                self.record_event(
+                    "allocation_submission_failed",
+                    str(error) or type(error).__name__,
+                    entity_type="allocation",
+                    entity_id=allocation_id,
+                    account_name=str(allocation.get("account_name") or ""),
+                )
+                continue
+            result = outcome.get("result")
+            if not outcome.get("claimed") or not isinstance(result, dict):
+                continue
+            acknowledged = self.db.update_allocation_if_submission_claim(
+                allocation_id,
+                ALLOCATION_SUBMISSION_IN_PROGRESS,
+                state=AllocationStatus.PENDING.value,
+                pending_reason="",
+                failure_message="",
+                **result,
+            )
+            if not acknowledged:
+                # A concurrent close won the DB claim after sbatch returned.
+                # Reap the now-unowned remote job instead of leaking it.
+                slurm_job_id = str(result.get("slurm_job_id") or "")
+                account = accounts_by_name.get(
+                    str(allocation.get("account_name") or "")
+                )
+                if account is not None and slurm_job_id:
+                    try:
+                        self._client(account).cancel(slurm_job_id)
+                    except Exception:
+                        LOGGER.exception(
+                            "failed to reap unacknowledged allocation job %s",
+                            slurm_job_id,
+                        )
+                continue
+            successful_ids.add(allocation_id)
+            self.record_event(
+                "allocation_opened",
+                (
+                    f"{allocation.get('drain_reason') or 'allocation opened'} "
+                    f"(pool {allocation.get('resource_pool') or 'cpu'}, "
+                    f"slurm job {result.get('slurm_job_id')})"
+                ),
+                entity_type="allocation",
+                entity_id=allocation_id,
+                account_name=str(allocation.get("account_name") or ""),
+            )
+        return successful_ids
 
     def choose_account_for_allocation(
         self,

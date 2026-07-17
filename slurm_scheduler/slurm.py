@@ -40,6 +40,10 @@ class RemoteCommandTimeout(RemoteExecutionError, TimeoutError):
     """
 
 
+class AllocationSubmissionNotCreated(RemoteExecutionError):
+    """A pool submission failed before Slurm could create a job."""
+
+
 DEFAULT_COMMAND_TIMEOUT = 30.0
 SLOW_COMMAND_TIMEOUT = 300.0
 _UNSET = object()
@@ -604,9 +608,11 @@ def build_allocation_script(allocation: dict, time_limit: str) -> str:
     is_absolute = allocation["remote_dir"].startswith("/")
     stdout_path = allocation["stdout_path"] if is_absolute else "allocation-%j.out"
     stderr_path = allocation["stderr_path"] if is_absolute else "allocation-%j.err"
+    allocation_id = str(allocation.get("id") or "").strip()
+    job_name = f"pool-{allocation_id}" if allocation_id else "pool"
     lines = [
         "#!/usr/bin/env bash",
-        "#SBATCH --job-name=pool",
+        f"#SBATCH --job-name={job_name}",
         f"#SBATCH --time={time_limit}",
         "#SBATCH --nodes=1",
         "#SBATCH --ntasks=1",
@@ -1120,35 +1126,52 @@ class SlurmAccountClient:
 
     def submit_allocation(self, allocation: dict, time_limit: str) -> dict[str, str]:
         stamp = int(time.time())
-        remote_dir = posixpath.join(
-            workspace_runs_dir(self.account.remote_workspace, stamp), f"allocation-{allocation['id']}-{stamp}"
+        remote_dir = str(allocation.get("remote_dir") or "") or posixpath.join(
+            workspace_runs_dir(self.account.remote_workspace, stamp),
+            f"allocation-{allocation['id']}-{stamp}",
         )
         allocation = {
             **allocation,
             "remote_dir": remote_dir,
-            "stdout_path": posixpath.join(remote_dir, "allocation-%j.out"),
-            "stderr_path": posixpath.join(remote_dir, "allocation-%j.err"),
+            "stdout_path": str(allocation.get("stdout_path") or "")
+            or posixpath.join(remote_dir, "allocation-%j.out"),
+            "stderr_path": str(allocation.get("stderr_path") or "")
+            or posixpath.join(remote_dir, "allocation-%j.err"),
         }
         script = build_allocation_script(allocation, time_limit)
         commands = [
             f"mkdir -p {shlex.quote(remote_dir)}",
             f"cd {shlex.quote(remote_dir)} && sbatch allocation.sbatch",
         ]
+        result_fields = {
+            "remote_dir": remote_dir,
+            "stdout_path": allocation["stdout_path"],
+            "stderr_path": allocation["stderr_path"],
+        }
         with self._open_session() as ssh:
             result = ssh.run(commands[0])
             if result.exit_code != 0:
-                raise RemoteExecutionError(
+                raise AllocationSubmissionNotCreated(
                     command_failure_message(result, "failed to create remote allocation directory"),
-                    {
-                        "remote_dir": remote_dir,
-                        "stdout_path": allocation["stdout_path"],
-                        "stderr_path": allocation["stderr_path"],
-                    },
+                    result_fields,
                 )
-            ssh.write_text_file(posixpath.join(remote_dir, "allocation.sbatch"), script)
+            try:
+                ssh.write_text_file(
+                    posixpath.join(remote_dir, "allocation.sbatch"), script
+                )
+            except Exception as exc:
+                raise AllocationSubmissionNotCreated(
+                    f"failed to write remote allocation script: {exc}",
+                    result_fields,
+                ) from exc
             result = ssh.run(commands[1])
         if result.exit_code != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "allocation sbatch failed")
+            raise AllocationSubmissionNotCreated(
+                result.stderr.strip()
+                or result.stdout.strip()
+                or "allocation sbatch failed",
+                result_fields,
+            )
         slurm_job_id = parse_sbatch_job_id(result.stdout)
         return {
             "slurm_job_id": slurm_job_id,
@@ -1156,6 +1179,64 @@ class SlurmAccountClient:
             "stdout_path": posixpath.join(remote_dir, f"allocation-{slurm_job_id}.out"),
             "stderr_path": posixpath.join(remote_dir, f"allocation-{slurm_job_id}.err"),
         }
+
+    def find_allocation_submissions(self, allocation: dict) -> list[dict[str, str]]:
+        """Find the exact Slurm job named for one durable allocation claim.
+
+        Both squeue and sacct must succeed.  Treating a failed history query as
+        an empty result could re-submit a job that left squeue just before a
+        scheduler restart.
+        """
+        allocation_id = int(allocation["id"])
+        job_name = f"pool-{allocation_id}"
+        quoted_name = shlex.quote(job_name)
+        with self._open_session() as ssh:
+            queued = ssh.run(
+                f'squeue -h -u "$USER" -n {quoted_name} -o "%i|%j|%T"'
+            )
+            if queued.exit_code != 0:
+                raise RuntimeError(
+                    queued.stderr.strip() or "allocation recovery squeue failed"
+                )
+            accounted = ssh.run(
+                "sacct -n -X -S now-2days -u \"$USER\" "
+                f"--name={quoted_name} -o JobIDRaw,JobName,State -P"
+            )
+            if accounted.exit_code != 0:
+                raise RuntimeError(
+                    accounted.stderr.strip() or "allocation recovery sacct failed"
+                )
+        matches: dict[str, dict[str, str]] = {}
+        for line in queued.stdout.splitlines():
+            job_id, sep, remainder = line.strip().partition("|")
+            found_name, sep2, state = remainder.partition("|")
+            if (
+                sep
+                and sep2
+                and job_id.strip()
+                and found_name.strip() == job_name
+            ):
+                matches[job_id.strip()] = {
+                    "slurm_job_id": job_id.strip(),
+                    "state": state.strip(),
+                    "source": "squeue",
+                }
+        for line in accounted.stdout.splitlines():
+            fields = [field.strip() for field in line.strip().split("|")]
+            if len(fields) < 3:
+                continue
+            job_id, found_name, state = fields[:3]
+            if not job_id or "." in job_id or found_name != job_name:
+                continue
+            matches.setdefault(
+                job_id,
+                {
+                    "slurm_job_id": job_id,
+                    "state": state,
+                    "source": "sacct",
+                },
+            )
+        return [matches[job_id] for job_id in sorted(matches)]
 
     def attach_task(self, task: dict, allocation: dict) -> dict[str, str]:
         stamp = int(time.time())
