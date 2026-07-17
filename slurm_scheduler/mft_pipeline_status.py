@@ -47,6 +47,12 @@ def _integer(value: object) -> int | None:
         return None
 
 
+def _nonnegative_integer(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
 def _number(value: object) -> float | None:
     if isinstance(value, bool):
         return None
@@ -65,6 +71,22 @@ def _text_items(value: object, *, limit: int = 20) -> list[str]:
         for item in value[:limit]
         if item is not None and str(item).strip()
     ]
+
+
+def _bounded_text(value: object, *, limit: int = 200) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, (Mapping, list, tuple)):
+        try:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+    else:
+        text = str(value)
+    text = " ".join(text.split())
+    return text[:limit]
 
 
 def _parse_timestamp(value: object) -> datetime | None:
@@ -91,6 +113,50 @@ def _model_id(pointer: Mapping[str, Any]) -> str:
     if training_run and dataset_hash and report_hash:
         return f"{lane}:{training_run}:{dataset_hash[:16]}:{report_hash[:16]}"
     return training_run
+
+
+def _canonical_contract_errors(payload: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    schema_version = payload.get("schema_version")
+    if type(schema_version) is not int or schema_version != 1:
+        schema_text = _bounded_text(schema_version, limit=80) or "<missing>"
+        errors.append(f"unsupported schema_version={schema_text}")
+    for name in (
+        "cycle",
+        "raw_rows",
+        "strict_full_rows",
+        "activation_minimum_strict_full_rows",
+        "first_tuning_strict_full_rows",
+    ):
+        if name in payload and _nonnegative_integer(payload.get(name)) is None:
+            errors.append(f"{name} must be a nonnegative integer")
+    queue = payload.get("queue")
+    if queue is not None and not isinstance(queue, Mapping):
+        errors.append("queue must be an object")
+    elif isinstance(queue, Mapping):
+        for name in (
+            "running",
+            "queued",
+            "retry_wait",
+            "succeeded",
+            "failed",
+            "cancelled",
+        ):
+            if name in queue and _nonnegative_integer(queue.get(name)) is None:
+                errors.append(f"queue.{name} must be a nonnegative integer")
+    last_jobs = payload.get("last_jobs")
+    if last_jobs is not None and not isinstance(last_jobs, Mapping):
+        errors.append("last_jobs must be an object")
+    elif isinstance(last_jobs, Mapping):
+        for name in ("collect", "train"):
+            if name not in last_jobs or last_jobs.get(name) is None:
+                continue
+            job_id = _nonnegative_integer(last_jobs.get(name))
+            if job_id is None or job_id == 0:
+                errors.append(f"last_jobs.{name} must be a positive integer")
+    if "blocked" in payload and not isinstance(payload.get("blocked"), Mapping):
+        errors.append("blocked must be an object")
+    return errors
 
 
 class MftPipelineStatusReader:
@@ -164,6 +230,20 @@ class MftPipelineStatusReader:
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "available": False,
             "data": {"available": False},
+            "canonical_training": {
+                "available": False,
+                "pipeline_active": False,
+                "queue": {
+                    "running": 0,
+                    "queued": 0,
+                    "retry_wait": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "cancelled": 0,
+                },
+                "last_jobs": {"collect": None, "train": None},
+                "blocked": [],
+            },
             "surrogate": {
                 "available": False,
                 "hpo": {"ready": 0, "total": 0, "targets": []},
@@ -730,6 +810,22 @@ class MftPipelineStatusReader:
                 "full_model_state", "mft_nsga_full_model_validation/state.json"
             ),
         }
+        canonical_status, canonical_meta = sources["canonical_surrogate_status"]
+        if canonical_meta.get("available"):
+            contract_errors = _canonical_contract_errors(canonical_status)
+            if contract_errors:
+                canonical_status = {}
+                canonical_meta = {
+                    **canonical_meta,
+                    "available": False,
+                    "message": "invalid canonical status contract: "
+                    + "; ".join(contract_errors[:8]),
+                }
+                sources["canonical_surrogate_status"] = (
+                    canonical_status,
+                    canonical_meta,
+                )
+
         errors = [
             {
                 "source": meta.get("source"),
@@ -740,7 +836,6 @@ class MftPipelineStatusReader:
             if meta.get("message")
         ]
 
-        canonical_status, canonical_meta = sources["canonical_surrogate_status"]
         surrogate_status, surrogate_meta = sources["surrogate_status"]
         pointer, pointer_meta = sources["surrogate_pointer"]
         surrogate_state, surrogate_state_meta = sources["surrogate_state"]
@@ -891,6 +986,43 @@ class MftPipelineStatusReader:
             if freshness["stale"]
         )
 
+        canonical_queue_payload = _mapping(canonical_status.get("queue"))
+        canonical_queue = {
+            name: _nonnegative_integer(canonical_queue_payload.get(name)) or 0
+            for name in (
+                "running",
+                "queued",
+                "retry_wait",
+                "succeeded",
+                "failed",
+                "cancelled",
+            )
+        }
+        canonical_last_jobs_payload = _mapping(canonical_status.get("last_jobs"))
+        canonical_last_jobs: dict[str, int | None] = {}
+        for name in ("collect", "train"):
+            job_id = _nonnegative_integer(canonical_last_jobs_payload.get(name))
+            canonical_last_jobs[name] = job_id if job_id else None
+        canonical_strict_rows = _nonnegative_integer(
+            canonical_status.get("strict_full_rows")
+        )
+        activation_minimum = _nonnegative_integer(
+            canonical_status.get("activation_minimum_strict_full_rows")
+        )
+        first_tuning = _nonnegative_integer(
+            canonical_status.get("first_tuning_strict_full_rows")
+        )
+        canonical_blocked = [
+            {
+                "name": _bounded_text(name, limit=64),
+                "detail": _bounded_text(detail, limit=200),
+            }
+            for name, detail in sorted(
+                _mapping(canonical_status.get("blocked")).items(),
+                key=lambda item: str(item[0]),
+            )[:20]
+        ]
+
         available = any(bool(meta.get("available")) for _payload, meta in sources.values())
         return {
             "schema_version": "mft-pipeline-visibility-v2",
@@ -915,6 +1047,52 @@ class MftPipelineStatusReader:
                 "source_kind": "strict_full_rows",
                 "updated_at": canonical_status.get("updated_at")
                 or surrogate_status.get("updated_at"),
+            },
+            "canonical_training": {
+                "available": bool(canonical_meta.get("available")),
+                "state": _bounded_text(
+                    canonical_status.get("state"), limit=80
+                )
+                or "unavailable",
+                "cycle": _nonnegative_integer(canonical_status.get("cycle")),
+                "raw_rows": _nonnegative_integer(canonical_status.get("raw_rows")),
+                "strict_rows": canonical_strict_rows,
+                "activation_minimum_strict_full_rows": activation_minimum,
+                "rows_until_activation": (
+                    max(0, activation_minimum - canonical_strict_rows)
+                    if activation_minimum is not None
+                    and canonical_strict_rows is not None
+                    else None
+                ),
+                "first_tuning_strict_full_rows": first_tuning,
+                "rows_until_first_tuning": (
+                    max(0, first_tuning - canonical_strict_rows)
+                    if first_tuning is not None and canonical_strict_rows is not None
+                    else None
+                ),
+                # The canonical queue aggregates collect/train/optimize/verify
+                # jobs.  Do not claim a train-specific state from this count.
+                "pipeline_active": canonical_queue["running"] > 0,
+                "queue": canonical_queue,
+                "last_jobs": canonical_last_jobs,
+                "dataset_generation": _bounded_text(
+                    canonical_status.get("dataset_generation"), limit=160
+                ),
+                "active_model_state": _bounded_text(
+                    canonical_status.get("active_model_state"), limit=80
+                ),
+                "solver_revision": _bounded_text(
+                    canonical_status.get("solver_revision"), limit=80
+                ),
+                "library_revision": _bounded_text(
+                    canonical_status.get("library_revision"), limit=80
+                ),
+                "blocked": canonical_blocked,
+                "last_error": _bounded_text(
+                    canonical_status.get("last_error"), limit=300
+                ),
+                "freshness": source_freshness["canonical_surrogate_status"],
+                "updated_at": canonical_status.get("updated_at"),
             },
             "surrogate": {
                 "available": bool(

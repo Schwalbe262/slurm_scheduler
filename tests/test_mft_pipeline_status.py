@@ -25,8 +25,26 @@ def write_complete_runtime(root: Path) -> None:
         root,
         "mft_pipeline/surrogate_status.json",
         {
+            "schema_version": 1,
             "state": "waiting_for_next_dataset_check",
+            "cycle": 40,
+            "raw_rows": 300,
             "strict_full_rows": 120,
+            "activation_minimum_strict_full_rows": 100,
+            "first_tuning_strict_full_rows": 4000,
+            "queue": {
+                "cancelled": 3,
+                "failed": 12,
+                "queued": 0,
+                "retry_wait": 0,
+                "running": 1,
+                "succeeded": 264,
+            },
+            "last_jobs": {"collect": 279, "train": 280},
+            "dataset_generation": "dataset:" + "c" * 64,
+            "blocked": {},
+            "last_error": None,
+            "active_model_state": "awaiting_activation",
             "updated_at": "2026-07-17T01:00:01+09:00",
         },
     )
@@ -280,6 +298,7 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
                 root,
                 "mft_pipeline/surrogate_status.json",
                 {
+                    "schema_version": 1,
                     "state": "waiting_for_next_dataset_check",
                     "raw_rows": 350,
                     "strict_full_rows": 137,
@@ -307,6 +326,16 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
         self.assertEqual(payload["data"]["dataset_rows"], 120)
         self.assertEqual(payload["data"]["raw_rows"], 300)
         self.assertEqual(payload["data"]["strict_delta_since_model"], 20)
+        self.assertTrue(payload["canonical_training"]["available"])
+        self.assertTrue(payload["canonical_training"]["pipeline_active"])
+        self.assertEqual(payload["canonical_training"]["queue"]["running"], 1)
+        self.assertEqual(payload["canonical_training"]["last_jobs"]["train"], 280)
+        self.assertEqual(payload["canonical_training"]["rows_until_activation"], 0)
+        self.assertEqual(payload["canonical_training"]["rows_until_first_tuning"], 3880)
+        self.assertEqual(
+            payload["canonical_training"]["active_model_state"],
+            "awaiting_activation",
+        )
         self.assertEqual(payload["surrogate"]["phase"], "candidate_training")
         self.assertTrue(payload["surrogate"]["training_active"])
         self.assertEqual(payload["surrogate"]["training_jobs_ready"], 1)
@@ -360,6 +389,56 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
         self.assertEqual(payload["full_model"]["active"], 1)
         self.assertEqual(payload["full_model"]["pass"], 1)
         self.assertEqual(payload["errors"], [])
+
+    def test_reader_rejects_invalid_canonical_schema_and_integer_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_complete_runtime(root)
+            write_json(
+                root,
+                "mft_pipeline/surrogate_status.json",
+                {
+                    "schema_version": 999,
+                    "strict_full_rows": -5,
+                    "queue": {"running": 1.9},
+                    "last_jobs": {"train": 280.9},
+                    "blocked": [],
+                },
+            )
+            payload = MftPipelineStatusReader(root, cache_seconds=0).snapshot()
+
+        self.assertFalse(payload["canonical_training"]["available"])
+        self.assertFalse(payload["canonical_training"]["pipeline_active"])
+        self.assertIsNone(payload["canonical_training"]["strict_rows"])
+        self.assertTrue(
+            any(
+                error["source"] == "canonical_surrogate_status"
+                and "invalid canonical status contract" in error["message"]
+                for error in payload["errors"]
+            )
+        )
+
+    def test_reader_requires_exact_integer_canonical_schema_v1(self) -> None:
+        for invalid_schema in (True, 1.0, "1"):
+            with self.subTest(schema_version=invalid_schema):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    root = Path(tmpdir)
+                    write_complete_runtime(root)
+                    write_json(
+                        root,
+                        "mft_pipeline/surrogate_status.json",
+                        {
+                            "schema_version": invalid_schema,
+                            "strict_full_rows": 120,
+                            "queue": {"running": 1},
+                        },
+                    )
+                    payload = MftPipelineStatusReader(
+                        root, cache_seconds=0
+                    ).snapshot()
+
+                self.assertFalse(payload["canonical_training"]["available"])
+                self.assertFalse(payload["canonical_training"]["pipeline_active"])
 
     def test_oversize_and_missing_sources_fail_soft(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -647,6 +726,11 @@ class MftPipelineStatusRouteTests(unittest.TestCase):
         self.assertIn('data-mft-pipeline="standalone"', html)
         self.assertIn('id="mft-nsga-lanes"', html)
         self.assertIn('id="mft-surrogate-live-results"', html)
+        self.assertIn('id="mft-canonical-training-live"', html)
+        self.assertIn('id="mft-canonical-training-state"', html)
+        self.assertIn('id="mft-canonical-training-thresholds"', html)
+        self.assertIn('id="mft-canonical-training-jobs"', html)
+        self.assertIn('id="mft-canonical-training-issues"', html)
         self.assertIn('id="mft-nsga-live-results"', html)
         self.assertIn('id="mft-surrogate-hpo-targets"', html)
         self.assertIn('id="mft-validated-designs"', html)
@@ -659,6 +743,14 @@ class MftPipelineStatusRouteTests(unittest.TestCase):
         self.assertIn("Standard/Full PASS는 검증 evidence", html)
         self.assertIn("activeMetrics.aggregate_loss_ratio", html)
         self.assertIn("activeModel.dataset_sha256", html)
+        self.assertIn("canonicalTraining.pipeline_active", html)
+        self.assertIn("canonicalTraining.available === true", html)
+        self.assertIn("정식 파이프라인 상태 소스 unavailable", html)
+        self.assertIn("canonicalLastJobs.train", html)
+        self.assertIn("canonicalTraining.rows_until_first_tuning", html)
+        self.assertIn("canonicalQueue.cancelled", html)
+        self.assertIn("canonicalTraining.raw_rows", html)
+        self.assertIn('.filter((item) => item && typeof item === "object")', html)
         self.assertIn("lane.infeasible_runs", html)
         self.assertIn("zero-pass:", html)
         panel = html[

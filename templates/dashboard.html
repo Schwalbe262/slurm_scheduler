@@ -530,6 +530,16 @@
         <span class="muted" data-mft-pipeline-detail="full-model">PASS -</span>
       </div>
     </div>
+    <div id="mft-canonical-training-live" class="section-gap" aria-live="polite">
+      <div class="title-row">
+        <h3>정식 모델 체크포인트 파이프라인</h3>
+        <span class="muted" id="mft-canonical-training-freshness">-</span>
+      </div>
+      <p id="mft-canonical-training-state" class="muted">정식 학습 상태 불러오는 중…</p>
+      <p id="mft-canonical-training-thresholds" class="muted">학습 임계값 -</p>
+      <p id="mft-canonical-training-jobs" class="muted">최근 collect/train job -</p>
+      <p id="mft-canonical-training-issues" class="muted">blocked/error -</p>
+    </div>
     <div id="mft-surrogate-live-results" class="section-gap" aria-live="polite">
       <div class="title-row">
         <h3>Surrogate 학습 결과</h3>
@@ -643,11 +653,64 @@
           `실행 AEDT ${shown(standalone.running)} / ${shown(standalone.running_target)} · queue ${shown(standalone.queued)}`,
         );
 
+        const canonicalTraining = payload.canonical_training || {};
+        const canonicalQueue = canonicalTraining.queue || {};
+        const canonicalLastJobs = canonicalTraining.last_jobs || {};
         const surrogate = payload.surrogate || {};
         const surrogateState = surrogate.phase || surrogate.state || "unavailable";
-        setText(value("surrogate"), surrogateState);
-        setText(detail("surrogate"), `model ${compact(surrogate.model_id, 30)}`);
+        setText(
+          value("surrogate"),
+          canonicalTraining.pipeline_active ? `canonical jobs · ${surrogateState}` : surrogateState,
+        );
+        setText(
+          detail("surrogate"),
+          `canonical ${canonicalTraining.state || "unavailable"} · model ${compact(surrogate.model_id, 30)}`,
+        );
         if (detail("surrogate")) detail("surrogate").title = String(surrogate.model_id || "");
+
+        setText(
+          document.getElementById("mft-canonical-training-freshness"),
+          freshnessText(canonicalTraining.freshness),
+        );
+        const canonicalJobsLine = document.getElementById("mft-canonical-training-jobs");
+        if (canonicalTraining.available === true) {
+          setText(
+            document.getElementById("mft-canonical-training-state"),
+            `state ${canonicalTraining.state || "unavailable"} · cycle ${shown(canonicalTraining.cycle)} · ${canonicalTraining.pipeline_active ? "pipeline job 실행 중" : "pipeline job 대기"} · running ${shown(canonicalQueue.running)} · queued ${shown(canonicalQueue.queued)} · retry wait ${shown(canonicalQueue.retry_wait)} · succeeded ${shown(canonicalQueue.succeeded)} · failed ${shown(canonicalQueue.failed)} · cancelled ${shown(canonicalQueue.cancelled)}`,
+          );
+          setText(
+            document.getElementById("mft-canonical-training-thresholds"),
+            `raw rows ${shown(canonicalTraining.raw_rows)} · strict rows ${shown(canonicalTraining.strict_rows)} · activation ${shown(canonicalTraining.activation_minimum_strict_full_rows)} (remaining ${shown(canonicalTraining.rows_until_activation)}) · first tuning ${shown(canonicalTraining.first_tuning_strict_full_rows)} (remaining ${shown(canonicalTraining.rows_until_first_tuning)})`,
+          );
+          setText(
+            canonicalJobsLine,
+            `last collect job ${shown(canonicalLastJobs.collect)} · train job ${shown(canonicalLastJobs.train)} · active model ${canonicalTraining.active_model_state || "-"} · dataset ${compact(canonicalTraining.dataset_generation, 30)}`,
+          );
+          if (canonicalJobsLine) {
+            canonicalJobsLine.title = `dataset=${String(canonicalTraining.dataset_generation || "")} solver=${String(canonicalTraining.solver_revision || "")} library=${String(canonicalTraining.library_revision || "")}`;
+          }
+          const canonicalBlocked = Array.isArray(canonicalTraining.blocked)
+            ? canonicalTraining.blocked
+            : [];
+          const canonicalBlockedText = canonicalBlocked
+            .filter((item) => item && typeof item === "object")
+            .map((item) => `${item.name || "blocked"}: ${item.detail || "-"}`)
+            .join(", ");
+          const canonicalIssues = [
+            canonicalBlockedText ? `blocked ${canonicalBlockedText}` : "",
+            canonicalTraining.last_error ? `error ${canonicalTraining.last_error}` : "",
+          ].filter(Boolean).join(" · ");
+          setText(
+            document.getElementById("mft-canonical-training-issues"),
+            canonicalIssues || "blocked/error 없음",
+          );
+        } else {
+          setText(document.getElementById("mft-canonical-training-state"), "정식 파이프라인 상태 소스 unavailable");
+          setText(document.getElementById("mft-canonical-training-thresholds"), "학습 임계값 unavailable");
+          setText(canonicalJobsLine, "최근 collect/train job unavailable");
+          if (canonicalJobsLine) canonicalJobsLine.title = "";
+          setText(document.getElementById("mft-canonical-training-issues"), "blocked/error 상태 unavailable");
+        }
 
         const hpo = surrogate.hpo || {};
         setText(
