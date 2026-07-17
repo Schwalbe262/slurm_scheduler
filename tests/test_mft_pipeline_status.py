@@ -621,6 +621,12 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
             ],
             2.5,
         )
+        self.assertEqual(
+            payload["nsga"]["lanes"][0]["least_violation"][
+                "zero_pass_constraints"
+            ],
+            ["Llt_robust_band"],
+        )
         self.assertEqual(len(payload["nsga"]["designs"]["items"]), 1)
         self.assertEqual(
             payload["nsga"]["designs"]["items"][0]["standard"]["task_id"],
@@ -1303,6 +1309,24 @@ class MftPipelineStatusRouteTests(unittest.TestCase):
         ]
         self.assertNotIn("<form", panel)
         self.assertNotIn(".innerHTML", panel)
+
+    def test_dashboard_distinguishes_surrogate_gate_from_actual_fea(self) -> None:
+        response = self.route_endpoint("/", "GET")(self.dashboard_request())
+        html = response.body.decode("utf-8")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('id="mft-nsga-scope-summary"', html)
+        self.assertIn('id="mft-nsga-surrogate-gate"', html)
+        self.assertIn('id="mft-nsga-actual-fea"', html)
+        self.assertIn('id="mft-nsga-zero-pass-constraints"', html)
+        self.assertIn("실제 FEA 결과 아님", html)
+        self.assertIn("물리 실패 판정 아님", html)
+        self.assertIn("nsga.current_model_feasible_runs", html)
+        self.assertIn("designs.known_standard_pass_count", html)
+        self.assertIn("designs.nondominated_count", html)
+        self.assertIn("lane.least_violation.zero_pass_constraints", html)
+        self.assertIn("dominantZeroPassConstraints", html)
+        self.assertIn("zeroPassConstraintCounts", html)
 
 
 if __name__ == "__main__":

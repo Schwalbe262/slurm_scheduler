@@ -579,9 +579,27 @@
         </table>
       </div>
     </div>
+    <div id="mft-nsga-scope-summary" class="summary-row section-gap" aria-label="NSGA surrogate and actual FEA result scopes" aria-live="polite">
+      <div class="summary-item">
+        <span class="summary-label">Surrogate gate (현재 모델)</span>
+        <span class="summary-value" id="mft-nsga-surrogate-gate">- runs · - feasible</span>
+        <span class="muted" id="mft-nsga-surrogate-gate-detail">모델 제약 통과 수 · 실제 FEA 결과 아님</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Actual FEA 검증 설계</span>
+        <span class="summary-value" id="mft-nsga-actual-fea">Standard PASS -</span>
+        <span class="muted" id="mft-nsga-actual-fea-detail">nondominated - · Full running -</span>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Surrogate zero-pass 신호</span>
+        <span class="summary-value mono-cell" id="mft-nsga-zero-pass-constraints">-</span>
+        <span class="muted" id="mft-nsga-zero-pass-detail">모델 gate 신호 · 물리 실패 판정 아님</span>
+      </div>
+    </div>
+    <p id="mft-nsga-scope-explanation" class="muted">현재 모델 feasible 0은 surrogate의 보수적 제약 또는 앙상블 불일치 gate 결과입니다. 실제 Standard FEA PASS 설계가 없다는 뜻도, 물리적으로 실패했다는 뜻도 아닙니다.</p>
     <div class="table-scroll section-gap">
       <table aria-label="NSGA-II parallel lanes">
-        <thead><tr><th>NSGA lane</th><th>State</th><th>Run</th><th>Active seeds</th><th>Model ID</th><th>Current model C / F / I / P</th><th>Lifetime C / F / I / P</th><th>Latest LV</th><th>Freshness</th></tr></thead>
+        <thead><tr><th>NSGA lane</th><th>State</th><th>Run</th><th>Active seeds</th><th>Model ID</th><th>Current surrogate C / F / I / P</th><th>Lifetime C / F / I / P</th><th>Surrogate least violation</th><th>Freshness</th></tr></thead>
         <tbody id="mft-nsga-lanes">
           <tr><td colspan="9" class="muted">상태 불러오는 중…</td></tr>
         </tbody>
@@ -1032,14 +1050,29 @@
         }
 
         const nsga = payload.nsga || {};
+        const nsgaLanes = Array.isArray(nsga.lanes) ? nsga.lanes : [];
+        const designs = nsga.designs || {};
+        const zeroPassConstraintCounts = new Map();
+        nsgaLanes.forEach((lane) => {
+          const constraints = Array.isArray(lane && lane.least_violation && lane.least_violation.zero_pass_constraints)
+            ? lane.least_violation.zero_pass_constraints
+            : [];
+          [...new Set(constraints.filter((name) => typeof name === "string" && name.trim()))]
+            .forEach((name) => zeroPassConstraintCounts.set(name, (zeroPassConstraintCounts.get(name) || 0) + 1));
+        });
+        const dominantZeroPassConstraints = [...zeroPassConstraintCounts.entries()]
+          .sort(([leftName, leftCount], [rightName, rightCount]) => (
+            rightCount - leftCount || leftName.localeCompare(rightName)
+          ))
+          .slice(0, 4);
         setText(value("nsga"), `${shown(nsga.active_seed_workers)} seed workers`);
         setText(
           detail("nsga"),
           nsga.current_model_aggregate_complete === true
-            ? `현재 모델 완료 ${shown(nsga.current_model_completed_runs)} · feasible ${shown(nsga.current_model_feasible_runs)} · Pareto ${shown(nsga.current_model_pareto_runs)} · lifetime 완료 ${shown(nsga.lifetime_completed_runs)}`
+            ? `현재 surrogate 모델 완료 ${shown(nsga.current_model_completed_runs)} · feasible ${shown(nsga.current_model_feasible_runs)} · Pareto ${shown(nsga.current_model_pareto_runs)} · lifetime 완료 ${shown(nsga.lifetime_completed_runs)}`
             : (number(nsga.current_model_result_lanes) > 0
-              ? `현재 모델 결과 partial ${shown(nsga.current_model_result_lanes)} / ${shown(nsga.current_model_expected_lanes)} lanes · lifetime 완료 ${shown(nsga.lifetime_completed_runs)}`
-              : `현재 모델 결과 unavailable · lifetime 완료 ${shown(nsga.lifetime_completed_runs)}`),
+              ? `현재 surrogate 모델 결과 partial ${shown(nsga.current_model_result_lanes)} / ${shown(nsga.current_model_expected_lanes)} lanes · lifetime 완료 ${shown(nsga.lifetime_completed_runs)}`
+              : `현재 surrogate 모델 결과 unavailable · lifetime 완료 ${shown(nsga.lifetime_completed_runs)}`),
         );
 
         const standard = payload.standard_fea || {};
@@ -1055,19 +1088,46 @@
           detail("full-model"),
           `run ${shown(full.running)} · queue ${shown(full.queued)} · PASS ${shown(full.pass)} / FAIL ${shown(full.fail)} · standard PASS 발견 ${shown(full.standard_pass_discovered)}`,
         );
+        setText(
+          document.getElementById("mft-nsga-surrogate-gate"),
+          `${shown(nsga.current_model_completed_runs)} runs · ${shown(nsga.current_model_feasible_runs)} feasible · ${shown(nsga.current_model_pareto_runs)} Pareto`,
+        );
+        setText(
+          document.getElementById("mft-nsga-surrogate-gate-detail"),
+          `현재 surrogate 모델 gate · ${shown(nsga.current_model_infeasible_runs)} infeasible · 실제 FEA 결과 아님`,
+        );
+        setText(
+          document.getElementById("mft-nsga-actual-fea"),
+          `Standard PASS ${shown(designs.known_standard_pass_count)} · nondominated ${shown(designs.nondominated_count)}`,
+        );
+        setText(
+          document.getElementById("mft-nsga-actual-fea-detail"),
+          `실제 FEA 설계 ${shown(designs.total_count)} · Full running ${shown(full.running)} · PASS ${shown(full.pass)}`,
+        );
+        setText(
+          document.getElementById("mft-nsga-zero-pass-constraints"),
+          dominantZeroPassConstraints.length
+            ? dominantZeroPassConstraints.map(([name, count]) => `${name} (${shown(count)} lane${count === 1 ? "" : "s"})`).join(" · ")
+            : "zero-pass 제약 없음",
+        );
+        setText(
+          document.getElementById("mft-nsga-zero-pass-detail"),
+          dominantZeroPassConstraints.length
+            ? "surrogate 보수 제약/앙상블 불일치 gate 신호 · 물리 실패 판정 아님"
+            : "현재 lane evidence에 zero-pass 제약 신호 없음",
+        );
 
         const laneBody = document.getElementById("mft-nsga-lanes");
         if (laneBody) {
           laneBody.textContent = "";
-          const lanes = Array.isArray(nsga.lanes) ? nsga.lanes : [];
-          if (!lanes.length) {
+          if (!nsgaLanes.length) {
             const row = laneBody.insertRow();
             const cell = row.insertCell();
             cell.colSpan = 9;
             cell.className = "muted";
             cell.textContent = "NSGA-II 상태 없음";
           } else {
-            lanes.forEach((lane) => {
+            nsgaLanes.forEach((lane) => {
               const leastViolation = lane.least_violation || {};
               const currentModel = lane.current_model || {};
               const lifetime = lane.lifetime || {};
@@ -1170,7 +1230,6 @@
           }
         }
 
-        const designs = nsga.designs || {};
         const designItems = Array.isArray(designs.items) ? designs.items : [];
         setText(
           document.getElementById("mft-design-counts"),
