@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -103,6 +104,20 @@ def write_complete_runtime(root: Path) -> None:
             "incumbent_comparison": {
                 "aggregate_loss_ratio": 0.95,
                 "worst_target_loss_ratio": 1.02,
+                "comparisons": {
+                    "Llt_phys": {
+                        "metric": "normalized_rmse_pct",
+                        "candidate": 2.8019900580506305,
+                        "incumbent": 3.400370638116442,
+                        "ratio": 0.8240248950046014,
+                    },
+                    "P_loss": {
+                        "metric": "normalized_rmse_pct",
+                        "candidate": 5.016840851927763,
+                        "incumbent": 7.110606823742417,
+                        "ratio": 0.7055432786940856,
+                    },
+                },
             },
         },
     )
@@ -363,6 +378,19 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
             ],
             0.95,
         )
+        target_metrics = payload["surrogate"]["active_model"]["target_metrics"]
+        self.assertEqual(target_metrics["total"], 2)
+        self.assertFalse(target_metrics["truncated"])
+        self.assertEqual(target_metrics["items"][0]["target"], "Llt_phys")
+        self.assertEqual(
+            target_metrics["items"][0]["candidate"], 2.8019900580506305
+        )
+        self.assertEqual(
+            target_metrics["items"][0]["incumbent"], 3.400370638116442
+        )
+        self.assertEqual(
+            target_metrics["items"][0]["ratio"], 0.8240248950046014
+        )
         self.assertEqual(payload["nsga"]["active_seed_workers"], 8)
         self.assertEqual(payload["nsga"]["completed_runs"], 3)
         self.assertEqual(payload["nsga"]["feasible_runs"], 1)
@@ -507,6 +535,83 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
         self.assertEqual(len(payload["surrogate"]["hpo"]["targets"]), 20)
         self.assertEqual(payload["surrogate"]["hpo"]["ready"], 3)
         self.assertTrue(payload["surrogate"]["hpo"]["truncated"])
+
+    def test_active_model_target_metrics_are_finite_bounded_and_text_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_complete_runtime(root)
+            comparisons = {
+                '<img src=x onerror="alert(1)">': {
+                    "metric": "normalized_rmse_pct",
+                    "candidate": 0.12345678901234568,
+                    "incumbent": 0.9876543210987654,
+                    "ratio": 0.12500000000158204,
+                }
+            }
+            comparisons.update(
+                {
+                    f"target-{index:02d}": {
+                        "metric": "normalized_rmse_pct",
+                        "candidate": index + 0.1,
+                        "incumbent": index + 1.1,
+                        "ratio": (index + 0.1) / (index + 1.1),
+                    }
+                    for index in range(27)
+                }
+            )
+            comparisons.update(
+                {
+                    "bad-nan": {
+                        "metric": "normalized_rmse_pct",
+                        "candidate": "NaN",
+                        "incumbent": 1.0,
+                        "ratio": 1.0,
+                    },
+                    "bad-infinity": {
+                        "metric": "normalized_rmse_pct",
+                        "candidate": 1.0,
+                        "incumbent": 1.0,
+                        "ratio": "Infinity",
+                    },
+                    "bad-shape": "not-an-object",
+                    "bad-empty-metric": {
+                        "metric": "",
+                        "candidate": 1.0,
+                        "incumbent": 1.0,
+                        "ratio": 1.0,
+                    },
+                }
+            )
+            write_json(
+                root,
+                "mft_pipeline/experimental_surrogate.json",
+                {
+                    "lane": "experimental",
+                    "training_run_id": "model-target-metrics",
+                    "incumbent_comparison": {"comparisons": comparisons},
+                },
+            )
+
+            payload = MftPipelineStatusReader(root, cache_seconds=0).snapshot()
+
+        target_metrics = payload["surrogate"]["active_model"]["target_metrics"]
+        self.assertEqual(target_metrics["limit"], 25)
+        self.assertEqual(target_metrics["total"], 28)
+        self.assertEqual(len(target_metrics["items"]), 25)
+        self.assertTrue(target_metrics["truncated"])
+        self.assertEqual(
+            target_metrics["items"][0]["target"],
+            '<img src=x onerror="alert(1)">',
+        )
+        self.assertEqual(
+            target_metrics["items"][0]["candidate"], 0.12345678901234568
+        )
+        for item in target_metrics["items"]:
+            self.assertLessEqual(len(item["target"]), 96)
+            self.assertLessEqual(len(item["metric"]), 96)
+            self.assertTrue(math.isfinite(item["candidate"]))
+            self.assertTrue(math.isfinite(item["incumbent"]))
+            self.assertTrue(math.isfinite(item["ratio"]))
 
     def test_design_rows_prioritize_active_full_and_cap_at_twelve(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -733,6 +838,8 @@ class MftPipelineStatusRouteTests(unittest.TestCase):
         self.assertIn('id="mft-canonical-training-issues"', html)
         self.assertIn('id="mft-nsga-live-results"', html)
         self.assertIn('id="mft-surrogate-hpo-targets"', html)
+        self.assertIn('id="mft-surrogate-target-metrics"', html)
+        self.assertIn('id="mft-surrogate-target-metrics-count"', html)
         self.assertIn('id="mft-validated-designs"', html)
         self.assertIn('fetch("/api/mft-pipeline/status"', html)
         self.assertIn("window.setInterval(refresh, 15000)", html)
@@ -742,6 +849,10 @@ class MftPipelineStatusRouteTests(unittest.TestCase):
         self.assertIn("stale / last good", html)
         self.assertIn("Standard/Full PASS는 검증 evidence", html)
         self.assertIn("activeMetrics.aggregate_loss_ratio", html)
+        self.assertIn("activeModel.target_metrics", html)
+        self.assertIn("targetMetrics.items.slice(0, 25)", html)
+        self.assertIn("targetMetricBody.textContent = \"\"", html)
+        self.assertIn("targetMetric.candidate", html)
         self.assertIn("activeModel.dataset_sha256", html)
         self.assertIn("canonicalTraining.pipeline_active", html)
         self.assertIn("canonicalTraining.available === true", html)

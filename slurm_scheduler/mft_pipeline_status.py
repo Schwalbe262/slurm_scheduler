@@ -14,6 +14,7 @@ from typing import Any, Iterable, Mapping
 DEFAULT_RUNTIME_ROOT = Path(r"C:\Users\peets\slurm_scheduler_runtime")
 DEFAULT_MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_HPO_TARGETS = 20
+MAX_ACTIVE_MODEL_TARGET_METRICS = 25
 MAX_VALIDATED_DESIGNS = 12
 
 STALE_AFTER_SECONDS = {
@@ -644,6 +645,47 @@ class MftPipelineStatusReader:
         }
 
     @staticmethod
+    def _active_model_target_metrics(
+        incumbent_comparison: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        comparisons = _mapping(incumbent_comparison.get("comparisons"))
+        items: list[dict[str, Any]] = []
+        valid_count = 0
+        for raw_target, raw_comparison in comparisons.items():
+            comparison = _mapping(raw_comparison)
+            target = _bounded_text(raw_target, limit=96)
+            metric = _bounded_text(comparison.get("metric"), limit=96)
+            candidate = _number(comparison.get("candidate"))
+            incumbent = _number(comparison.get("incumbent"))
+            ratio = _number(comparison.get("ratio"))
+            if (
+                not target
+                or not metric
+                or candidate is None
+                or incumbent is None
+                or ratio is None
+            ):
+                continue
+            valid_count += 1
+            if len(items) >= MAX_ACTIVE_MODEL_TARGET_METRICS:
+                continue
+            items.append(
+                {
+                    "target": target,
+                    "metric": metric,
+                    "candidate": candidate,
+                    "incumbent": incumbent,
+                    "ratio": ratio,
+                }
+            )
+        return {
+            "items": items,
+            "total": valid_count,
+            "limit": MAX_ACTIVE_MODEL_TARGET_METRICS,
+            "truncated": valid_count > MAX_ACTIVE_MODEL_TARGET_METRICS,
+        }
+
+    @staticmethod
     def _validated_designs(
         full_state: Mapping[str, Any],
         full_status: Mapping[str, Any],
@@ -897,6 +939,9 @@ class MftPipelineStatusReader:
             )
             if (value := _number(incumbent_comparison.get(name))) is not None
         }
+        active_model_target_metrics = self._active_model_target_metrics(
+            incumbent_comparison
+        )
 
         nsga_main, main_meta = sources["nsga_main"]
         nsga_fast, fast_meta = sources["nsga_fast"]
@@ -1142,6 +1187,7 @@ class MftPipelineStatusReader:
                         or ""
                     ),
                     "metrics": active_model_metrics,
+                    "target_metrics": active_model_target_metrics,
                 },
                 "hpo": surrogate_hpo,
                 "last_decision": surrogate_decision,

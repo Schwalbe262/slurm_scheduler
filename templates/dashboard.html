@@ -547,6 +547,15 @@
       </div>
       <p id="mft-surrogate-wave" class="muted">active wave - · HPO - / - · next strict rows -</p>
       <p id="mft-surrogate-model" class="muted">active model - · training rows -</p>
+      <p id="mft-surrogate-target-metrics-count" class="muted">active model target metrics -</p>
+      <div class="table-scroll">
+        <table aria-label="Active surrogate model target metrics">
+          <thead><tr><th>Target</th><th>Metric</th><th>Candidate</th><th>Incumbent</th><th>Ratio</th></tr></thead>
+          <tbody id="mft-surrogate-target-metrics">
+            <tr><td colspan="5" class="muted">target metric 상태 불러오는 중…</td></tr>
+          </tbody>
+        </table>
+      </div>
       <p id="mft-surrogate-decision" class="muted">최근 모델 판정 없음</p>
       <div class="table-scroll">
         <table aria-label="Surrogate HPO target progress">
@@ -730,6 +739,39 @@
         const activeModelLine = document.getElementById("mft-surrogate-model");
         if (activeModelLine) {
           activeModelLine.title = `model=${String(activeModel.model_id || surrogate.model_id || "")} dataset=${String(activeModel.dataset_sha256 || "")} generation=${String(activeModel.generation_id || "")} report=${String(activeModel.generation_report_sha256 || "")} solver=${String(activeModel.solver_revision || "")} library=${String(activeModel.library_revision || "")}`;
+        }
+        const targetMetrics = activeModel.target_metrics || {};
+        const targetMetricItems = Array.isArray(targetMetrics.items)
+          ? targetMetrics.items.slice(0, 25)
+          : [];
+        setText(
+          document.getElementById("mft-surrogate-target-metrics-count"),
+          `active model target metrics ${shown(targetMetricItems.length)} / ${shown(targetMetrics.total)}${targetMetrics.truncated ? ` · first ${shown(targetMetrics.limit)}` : ""}`,
+        );
+        const targetMetricBody = document.getElementById("mft-surrogate-target-metrics");
+        if (targetMetricBody) {
+          targetMetricBody.textContent = "";
+          if (!targetMetricItems.length) {
+            const row = targetMetricBody.insertRow();
+            const cell = row.insertCell();
+            cell.colSpan = 5;
+            cell.className = "muted";
+            cell.textContent = "active model target metric 없음";
+          } else {
+            targetMetricItems.forEach((targetMetric) => {
+              const row = targetMetricBody.insertRow();
+              [
+                targetMetric.target || "-",
+                targetMetric.metric || "-",
+                shown(targetMetric.candidate),
+                shown(targetMetric.incumbent),
+                shown(targetMetric.ratio),
+              ].forEach((field) => {
+                const cell = row.insertCell();
+                cell.textContent = String(field);
+              });
+            });
+          }
         }
         const decision = surrogate.last_decision || {};
         const reasons = Array.isArray(decision.reasons) ? decision.reasons : [];
