@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import tempfile
@@ -11,7 +12,10 @@ from unittest import mock
 from starlette.requests import Request
 
 from slurm_scheduler.db import Database
-from slurm_scheduler.mft_pipeline_status import MftPipelineStatusReader
+from slurm_scheduler.mft_pipeline_status import (
+    MftPipelineStatusReader,
+    NSGA_DESIGN_FIELDS,
+)
 from slurm_scheduler.models import TaskCreate, TaskStatus
 
 
@@ -19,6 +23,111 @@ def write_json(root: Path, relative_path: str, payload: dict) -> None:
     path = root / relative_path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def completed_hpo_fixture() -> dict:
+    best_params = {
+        "n_estimators": 800,
+        "learning_rate": 0.05,
+        "num_leaves": 63,
+        "min_child_samples": 20,
+        "subsample": 0.8,
+        "colsample_bytree": 0.9,
+        "reg_lambda": 0.1,
+    }
+    second_best_params = {**best_params, "num_leaves": 95}
+
+    def target_auth(params: dict, digit: str) -> dict:
+        tuned = hashlib.sha256(
+            json.dumps(
+                params,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        return {
+            "generation_id": digit * 64,
+            "params_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+            "tuned_override_sha256": tuned,
+            "target_task_ids_sha256": "c" * 64,
+            "hpo_train_task_ids_sha256": "f" * 64,
+        }
+
+    value = {
+        "schema_version": 1,
+        "status": "completed",
+        "evidence_authentication": "complete",
+        "wave": "wave-" + "d" * 16,
+        "result_phase": "candidate_rejected",
+        "completed_at": "2026-07-17T01:00:00+09:00",
+        "dataset_generation": "d" * 64,
+        "dataset_sha256": "e" * 64,
+        "strict_full_rows": 2997,
+        "target_count": 2,
+        "targets": [
+            {
+                "target": "Llt_phys",
+                "family": "lightgbm",
+                "cv_mse_transformed": 0.002359,
+                "eligible_rows": 2997,
+                "target_rows": 2997,
+                "hpo_train_rows": 2397,
+                "trials": 16,
+                "model_threads": 2,
+                "best_params": best_params,
+                "authentication": target_auth(best_params, "1"),
+            },
+            {
+                "target": "Tprobe_Rx_main_leeward_max",
+                "family": "lightgbm",
+                "cv_mse_transformed": 0.022064,
+                "eligible_rows": 2997,
+                "target_rows": 2997,
+                "hpo_train_rows": 2397,
+                "trials": 16,
+                "model_threads": 2,
+                "best_params": second_best_params,
+                "authentication": target_auth(second_best_params, "2"),
+            },
+        ],
+        "common_authentication": {
+            "dataset_manifest_sha256": "3" * 64,
+            "data_contract_sha256": "5" * 64,
+            "search_implementation_sha256": "6" * 64,
+            "training_split_contract_sha256": "7" * 64,
+            "feature_schema_sha256": "8" * 64,
+        },
+        "wave_outcome": {
+            "candidate_training_run_id": "candidate-hpo-001",
+            "promoted": False,
+            "quality_status_sha256": "4" * 64,
+        },
+    }
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    value["evidence_sha256"] = hashlib.sha256(encoded).hexdigest()
+    return value
+
+
+def resign_completed_hpo(value: dict) -> None:
+    unsigned = {key: item for key, item in value.items() if key != "evidence_sha256"}
+    value["evidence_sha256"] = hashlib.sha256(
+        json.dumps(
+            unsigned,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def write_complete_runtime(root: Path) -> None:
@@ -46,6 +155,40 @@ def write_complete_runtime(root: Path) -> None:
             "blocked": {},
             "last_error": None,
             "active_model_state": "awaiting_activation",
+            "last_checkpoint_result": {
+                "schema_version": 1,
+                "status": "failed",
+                "kind": "quality_rejected",
+                "threshold": 3000,
+                "actual_strict_full_rows": 3011,
+                "quality_passed": False,
+                "completed_at": "2026-07-17T15:35:51+09:00",
+                "training_run_id": "candidate-canonical-001",
+                "generation": "generations/candidate-canonical-001",
+                "reason_count": 2,
+                "reasons": ["T_max_core:mape_pct", "P_core_total:r2"],
+                "target_count": 2,
+                "failed_target_count": 1,
+                "target_summaries": [
+                    {
+                        "target": "T_max_core",
+                        "passed": False,
+                        "blocking": True,
+                        "reason_count": 1,
+                        "reasons": ["mape_pct"],
+                        "metrics": {"r2": 0.91, "mape_pct": 7.2},
+                    },
+                    {
+                        "target": "Llt_phys",
+                        "passed": True,
+                        "blocking": True,
+                        "reason_count": 0,
+                        "reasons": [],
+                        "metrics": {"r2": 0.99, "mape_pct": 1.2},
+                    },
+                ],
+                "evidence_authentication": "complete",
+            },
             "updated_at": "2026-07-17T01:00:01+09:00",
         },
     )
@@ -87,6 +230,8 @@ def write_complete_runtime(root: Path) -> None:
                 "total_hpo_thread_budget": 4,
                 "trials_per_target": 50,
             },
+            "last_completed_hpo_results": completed_hpo_fixture(),
+            "last_completed_hpo_results_error": None,
         },
     )
     write_json(
@@ -156,6 +301,9 @@ def write_complete_runtime(root: Path) -> None:
                 "feasible_complete": 1,
                 "infeasible_complete": 1,
             },
+            "current_model_id": "model-A",
+            "current_model_completed_run_count": 1,
+            "current_model_completed_outcomes": {"infeasible_complete": 1},
             "next_seed_base": 104,
             "active_run": {
                 "run_id": "run-3",
@@ -169,12 +317,59 @@ def write_complete_runtime(root: Path) -> None:
                     "reevaluation_required": True,
                 },
             },
-            "last_infeasibility": {
+            "current_model_last_infeasibility": {
                 "least_violation_archive": {
                     "best_total_positive_violation": 2.5,
                     "candidate_count": 400,
                 },
                 "seed_invariant_zero_pass_constraints": ["Llt_robust_band"],
+            },
+            "latest_feasible_pareto_lifetime": {
+                "schema_version": "mft-nsga-pareto-status-v1",
+                "available": True,
+                "scope": "lifetime",
+                "run_id": "run-000001",
+                "model_id": "model-old",
+                "model_lane": "experimental",
+                "production_eligible": False,
+                "fea_submission_approved": False,
+                "seeds": [92, 93, 94, 95],
+                "finished_at": "2026-07-17T00:10:00+09:00",
+                "point_count": 2,
+                "points": [
+                    {
+                        "candidate_index": 0,
+                        "row_number": 1,
+                        "volume_L": 1300.5,
+                        "total_loss_W": 6200.25,
+                        "design": {
+                            **{name: 1 for name in NSGA_DESIGN_FIELDS},
+                            "N1_main": 6,
+                            "gap1": 4.9,
+                        },
+                    },
+                    {
+                        "candidate_index": 1,
+                        "row_number": 2,
+                        "volume_L": 1310.75,
+                        "total_loss_W": 6100.5,
+                        "design": {
+                            **{name: 1 for name in NSGA_DESIGN_FIELDS},
+                            "N1_main": 7,
+                            "gap1": 5.1,
+                        },
+                    },
+                ],
+                "limit": 500,
+                "truncated": False,
+                "objective_names": ["volume_L", "total_loss_W"],
+                "objective_units": {"volume_L": "L", "total_loss_W": "W"},
+                "objective_source": "surrogate_prediction",
+                "fea_verified": False,
+                "optimization_manifest_sha256": "d" * 64,
+                "pareto_front_sha256": "e" * 64,
+                "run_manifest_sha256": "f" * 64,
+                "model_source_sha256": "a" * 64,
             },
         },
     )
@@ -185,6 +380,9 @@ def write_complete_runtime(root: Path) -> None:
             "state": "running",
             "completed_run_count": 1,
             "completed_outcomes": {"infeasible_complete": 1},
+            "current_model_id": "model-B",
+            "current_model_completed_run_count": 1,
+            "current_model_completed_outcomes": {"infeasible_complete": 1},
             "next_seed_base": 204,
             "active_run": {
                 "run_id": "run-fast-2",
@@ -351,6 +549,13 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
             payload["canonical_training"]["active_model_state"],
             "awaiting_activation",
         )
+        checkpoint = payload["canonical_training"]["last_checkpoint_result"]
+        self.assertTrue(checkpoint["available"])
+        self.assertEqual(checkpoint["kind"], "quality_rejected")
+        self.assertFalse(checkpoint["quality_passed"])
+        self.assertEqual(checkpoint["actual_strict_rows"], 3011)
+        self.assertEqual(checkpoint["target_summaries"][0]["target"], "T_max_core")
+        self.assertEqual(checkpoint["target_summaries"][0]["metrics"]["r2"], 0.91)
         self.assertEqual(payload["surrogate"]["phase"], "candidate_training")
         self.assertTrue(payload["surrogate"]["training_active"])
         self.assertEqual(payload["surrogate"]["training_jobs_ready"], 1)
@@ -359,6 +564,14 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
         self.assertEqual(
             payload["surrogate"]["hpo"]["targets"][1]["target"], "P_loss"
         )
+        completed_hpo = payload["surrogate"]["last_completed_hpo_results"]
+        self.assertTrue(completed_hpo["available"])
+        self.assertEqual(completed_hpo["target_count"], 2)
+        self.assertEqual(completed_hpo["targets"][0]["target"], "Llt_phys")
+        self.assertEqual(
+            completed_hpo["targets"][0]["cv_mse_transformed"], 0.002359
+        )
+        self.assertEqual(completed_hpo["targets"][0]["best_params"]["num_leaves"], 63)
         self.assertEqual(
             payload["surrogate"]["last_decision"]["outcome"], "rejected"
         )
@@ -395,6 +608,13 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
         self.assertEqual(payload["nsga"]["completed_runs"], 3)
         self.assertEqual(payload["nsga"]["feasible_runs"], 1)
         self.assertEqual(payload["nsga"]["pareto_runs"], 1)
+        self.assertEqual(payload["nsga"]["current_model_completed_runs"], 2)
+        self.assertEqual(payload["nsga"]["lifetime_completed_runs"], 3)
+        self.assertEqual(payload["nsga"]["lanes"][0]["current_model"]["feasible_runs"], 0)
+        self.assertEqual(payload["nsga"]["lanes"][0]["lifetime"]["feasible_runs"], 1)
+        self.assertEqual(len(payload["nsga"]["pareto_results"]), 1)
+        self.assertEqual(payload["nsga"]["pareto_results"][0]["scope"], "lifetime")
+        self.assertEqual(payload["nsga"]["pareto_results"][0]["points"][0]["design"]["N1_main"], 6.0)
         self.assertEqual(
             payload["nsga"]["lanes"][0]["least_violation"][
                 "best_total_positive_violation"
@@ -536,6 +756,162 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
         self.assertEqual(payload["surrogate"]["hpo"]["ready"], 3)
         self.assertTrue(payload["surrogate"]["hpo"]["truncated"])
 
+    def test_completed_hpo_result_fingerprint_tamper_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_complete_runtime(root)
+            status_path = root / "mft_pipeline/experimental_continuous/status.json"
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            status["last_completed_hpo_results"]["targets"][0][
+                "cv_mse_transformed"
+            ] = 0.0
+            write_json(
+                root,
+                "mft_pipeline/experimental_continuous/status.json",
+                status,
+            )
+
+            payload = MftPipelineStatusReader(root, cache_seconds=0).snapshot()
+
+        completed = payload["surrogate"]["last_completed_hpo_results"]
+        self.assertFalse(completed["available"])
+        self.assertEqual(
+            completed["evidence_error"],
+            "completed HPO result fingerprint mismatch",
+        )
+
+    def test_completed_hpo_signed_but_invalid_contract_fails_closed(self) -> None:
+        completed = completed_hpo_fixture()
+        completed["targets"][0]["family"] = "unexpected"
+        resign_completed_hpo(completed)
+
+        result = MftPipelineStatusReader._completed_hpo_results(
+            {"last_completed_hpo_results": completed}
+        )
+
+        self.assertFalse(result["available"])
+        self.assertEqual(
+            result["evidence_error"], "invalid completed HPO target contract"
+        )
+
+    def test_checkpoint_quality_pass_requires_complete_evidence(self) -> None:
+        result = MftPipelineStatusReader._checkpoint_result({
+            "schema_version": 1,
+            "status": "evidence_error",
+            "kind": "evidence_error",
+            "quality_passed": True,
+            "evidence_authentication": "failed",
+            "error": {"type": "RuntimeError", "message": "tampered"},
+        })
+
+        self.assertFalse(result["available"])
+        self.assertEqual(result["error"], "invalid checkpoint result contract")
+
+    def test_checkpoint_evidence_error_is_visible(self) -> None:
+        result = MftPipelineStatusReader._checkpoint_result({
+            "schema_version": 1,
+            "status": "evidence_error",
+            "kind": "evidence_error",
+            "quality_passed": None,
+            "evidence_authentication": "failed",
+            "error": {"type": "RuntimeError", "message": "artifact mismatch"},
+        })
+
+        self.assertFalse(result["available"])
+        self.assertEqual(result["status"], "evidence_error")
+        self.assertIn("artifact mismatch", result["evidence_error"])
+
+    def test_invalid_pareto_points_fail_closed_and_surface_error(self) -> None:
+        mutations = (
+            lambda points: points[0]["design"].pop("gap1"),
+            lambda points: points.__setitem__(0, "not-an-object"),
+            lambda points: points[0].update(candidate_index=1, row_number=2),
+        )
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    root = Path(tmpdir)
+                    write_complete_runtime(root)
+                    path = root / "mft_nsga_continuous/status.json"
+                    status = json.loads(path.read_text(encoding="utf-8"))
+                    mutate(status["latest_feasible_pareto_lifetime"]["points"])
+                    write_json(root, "mft_nsga_continuous/status.json", status)
+
+                    payload = MftPipelineStatusReader(
+                        root, cache_seconds=0
+                    ).snapshot()
+
+                self.assertEqual(payload["nsga"]["pareto_results"], [])
+                self.assertEqual(len(payload["nsga"]["pareto_errors"]), 1)
+                self.assertIn(
+                    "contract", payload["nsga"]["pareto_errors"][0]["error"]
+                )
+
+    def test_current_model_aggregate_reports_partial_lane_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_complete_runtime(root)
+            path = root / "mft_nsga_newmodel_fastlane_v2/status.json"
+            status = json.loads(path.read_text(encoding="utf-8"))
+            status.pop("current_model_completed_outcomes")
+            write_json(root, "mft_nsga_newmodel_fastlane_v2/status.json", status)
+
+            payload = MftPipelineStatusReader(root, cache_seconds=0).snapshot()
+
+        self.assertFalse(payload["nsga"]["current_model_aggregate_complete"])
+        self.assertEqual(payload["nsga"]["current_model_result_lanes"], 1)
+        self.assertEqual(payload["nsga"]["current_model_expected_lanes"], 2)
+
+    def test_checkpoint_result_reasons_and_targets_are_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_complete_runtime(root)
+            status_path = root / "mft_pipeline/surrogate_status.json"
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            status["last_checkpoint_result"] = {
+                "schema_version": 1,
+                "status": "failed",
+                "kind": "quality_rejected",
+                "threshold": 3000,
+                "actual_strict_full_rows": 3011,
+                "quality_passed": False,
+                "completed_at": "2026-07-17T15:35:51+09:00",
+                "reason_count": 30,
+                "reasons": [f"reason-{index}" for index in range(12)],
+                "reasons_truncated": True,
+                "target_count": 30,
+                "failed_target_count": 30,
+                "target_summaries": [
+                    {
+                        "target": f"target-{index}",
+                        "passed": False,
+                        "blocking": True,
+                        "reasons": ["r1", "r2", "r3", "r4"],
+                        "reason_count": 5,
+                        "reasons_truncated": True,
+                        "metrics": {"r2": 0.5},
+                    }
+                    for index in range(24)
+                ],
+                "target_summaries_truncated": True,
+                "evidence_authentication": "complete",
+            }
+            write_json(root, "mft_pipeline/surrogate_status.json", status)
+
+            payload = MftPipelineStatusReader(root, cache_seconds=0).snapshot()
+
+        checkpoint = payload["canonical_training"]["last_checkpoint_result"]
+        self.assertEqual(len(checkpoint["reasons"]), 12)
+        self.assertTrue(checkpoint["reasons_truncated"])
+        self.assertEqual(len(checkpoint["target_summaries"]), 24)
+        self.assertTrue(checkpoint["target_summaries_truncated"])
+        self.assertEqual(
+            set(checkpoint["target_summaries"][0]["metrics"]), {"r2"}
+        )
+        self.assertEqual(
+            len(checkpoint["target_summaries"][0]["reasons"]), 4
+        )
+
     def test_active_model_target_metrics_are_finite_bounded_and_text_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -655,7 +1031,47 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
         self.assertEqual(designs["items"][0]["candidate_digest"], "digest-13")
         self.assertEqual(designs["items"][0]["full"]["task_id"], 5013)
         self.assertEqual(designs["nondominated_count"], 14)
+        self.assertEqual(designs["total_count"], 14)
+        self.assertEqual(designs["displayed_count"], 12)
         self.assertTrue(designs["truncated"])
+
+    def test_all_twelve_standard_pass_designs_include_dominated_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_complete_runtime(root)
+            candidates = {
+                f"digest-{index:02d}": {
+                    "candidate_digest": f"digest-{index:02d}",
+                    "standard_task_id": 2000 + index,
+                    "standard_actual_volume_L": 1300.0 + index,
+                    "standard_actual_total_loss_W": 6000.0 + index,
+                    "run_id": f"run-{index:02d}",
+                    "model_id": "model-test",
+                }
+                for index in range(12)
+            }
+            write_json(
+                root,
+                "mft_nsga_full_model_validation/state.json",
+                {"candidates": candidates},
+            )
+            write_json(
+                root,
+                "mft_nsga_full_model_validation/status.json",
+                {"state": "active", "active_tasks": []},
+            )
+
+            payload = MftPipelineStatusReader(root, cache_seconds=0).snapshot()
+
+        designs = payload["nsga"]["designs"]
+        self.assertEqual(designs["total_count"], 12)
+        self.assertEqual(designs["displayed_count"], 12)
+        self.assertEqual(len(designs["items"]), 12)
+        self.assertEqual(designs["nondominated_count"], 1)
+        self.assertEqual(
+            sum(1 for item in designs["items"] if not item["nondominated"]),
+            11,
+        )
 
     def test_controller_age_is_stale_but_event_pointer_age_is_not(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -836,11 +1252,17 @@ class MftPipelineStatusRouteTests(unittest.TestCase):
         self.assertIn('id="mft-canonical-training-thresholds"', html)
         self.assertIn('id="mft-canonical-training-jobs"', html)
         self.assertIn('id="mft-canonical-training-issues"', html)
+        self.assertIn('id="mft-canonical-checkpoint-summary"', html)
+        self.assertIn('id="mft-canonical-checkpoint-targets"', html)
         self.assertIn('id="mft-nsga-live-results"', html)
         self.assertIn('id="mft-surrogate-hpo-targets"', html)
+        self.assertIn('id="mft-completed-hpo-summary"', html)
+        self.assertIn('id="mft-completed-hpo-targets"', html)
         self.assertIn('id="mft-surrogate-target-metrics"', html)
         self.assertIn('id="mft-surrogate-target-metrics-count"', html)
         self.assertIn('id="mft-validated-designs"', html)
+        self.assertIn('id="mft-nsga-pareto-chart"', html)
+        self.assertIn('id="mft-nsga-pareto-points"', html)
         self.assertIn('fetch("/api/mft-pipeline/status"', html)
         self.assertIn("window.setInterval(refresh, 15000)", html)
         self.assertIn('document.createElement("a")', html)
@@ -862,7 +1284,13 @@ class MftPipelineStatusRouteTests(unittest.TestCase):
         self.assertIn("canonicalQueue.cancelled", html)
         self.assertIn("canonicalTraining.raw_rows", html)
         self.assertIn('.filter((item) => item && typeof item === "object")', html)
-        self.assertIn("lane.infeasible_runs", html)
+        self.assertIn("currentModel.infeasible_runs", html)
+        self.assertIn("lifetime.infeasible_runs", html)
+        self.assertIn("surrogate.last_completed_hpo_results", html)
+        self.assertIn("canonicalTraining.last_checkpoint_result", html)
+        self.assertIn("nsga.pareto_results", html)
+        self.assertIn('document.createElementNS(svg, "circle")', html)
+        self.assertIn("point.candidate_index", html)
         self.assertIn("zero-pass:", html)
         panel = html[
             html.index('id="mft-continuous-pipeline"') : html.index(

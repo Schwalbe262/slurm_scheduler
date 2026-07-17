@@ -539,6 +539,19 @@
       <p id="mft-canonical-training-thresholds" class="muted">학습 임계값 -</p>
       <p id="mft-canonical-training-jobs" class="muted">최근 collect/train job -</p>
       <p id="mft-canonical-training-issues" class="muted">blocked/error -</p>
+      <div id="mft-canonical-checkpoint-result" class="section-gap">
+        <h3>최근 정식 모델 학습 판정</h3>
+        <p id="mft-canonical-checkpoint-summary" class="muted">최근 체크포인트 결과 없음</p>
+        <p id="mft-canonical-checkpoint-reasons" class="muted">판정 사유 -</p>
+        <div class="table-scroll">
+          <table aria-label="Latest canonical checkpoint target quality results">
+            <thead><tr><th>Target</th><th>Result</th><th>Blocking</th><th>Metrics</th><th>Reasons</th></tr></thead>
+            <tbody id="mft-canonical-checkpoint-targets">
+              <tr><td colspan="5" class="muted">최근 목표별 학습 판정 없음</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
     <div id="mft-surrogate-live-results" class="section-gap" aria-live="polite">
       <div class="title-row">
@@ -568,11 +581,40 @@
     </div>
     <div class="table-scroll section-gap">
       <table aria-label="NSGA-II parallel lanes">
-        <thead><tr><th>NSGA lane</th><th>State</th><th>Run</th><th>Active seeds</th><th>Model ID</th><th>Completed</th><th>Feasible / Infeasible / Pareto</th><th>Latest LV</th><th>Freshness</th></tr></thead>
+        <thead><tr><th>NSGA lane</th><th>State</th><th>Run</th><th>Active seeds</th><th>Model ID</th><th>Current model C / F / I / P</th><th>Lifetime C / F / I / P</th><th>Latest LV</th><th>Freshness</th></tr></thead>
         <tbody id="mft-nsga-lanes">
           <tr><td colspan="9" class="muted">상태 불러오는 중…</td></tr>
         </tbody>
       </table>
+    </div>
+    <div id="mft-nsga-pareto-results" class="section-gap" aria-live="polite">
+      <div class="title-row">
+        <h3>Surrogate NSGA-II Pareto 결과</h3>
+        <span class="muted" id="mft-nsga-pareto-counts">-</span>
+      </div>
+      <p id="mft-nsga-pareto-errors" class="muted">Pareto evidence error 없음</p>
+      <p class="muted">아래 점은 surrogate 예측 결과이며 FEA 검증값이 아닙니다. 모든 공개 점은 그래프에 반영하고 표에는 각 결과의 앞 50개를 표시합니다.</p>
+      <svg id="mft-nsga-pareto-chart" viewBox="0 0 900 360" role="img" aria-label="Surrogate NSGA Pareto volume and loss chart" style="display:block;width:100%;height:auto;min-height:260px;border:1px solid var(--line);border-radius:8px;"></svg>
+      <div class="table-scroll">
+        <table aria-label="Latest surrogate NSGA Pareto points">
+          <thead><tr><th>Lane / scope</th><th>Run</th><th>Point</th><th>Pred. volume (L)</th><th>Pred. loss (W)</th><th>Selected design variables</th><th>Model</th></tr></thead>
+          <tbody id="mft-nsga-pareto-points">
+            <tr><td colspan="7" class="muted">공개된 surrogate Pareto 결과 없음</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="mft-completed-hpo-results" class="section-gap">
+        <h3>직전 완료 HPO 튜닝 결과</h3>
+        <p id="mft-completed-hpo-summary" class="muted">완료 HPO 결과 없음</p>
+        <div class="table-scroll">
+          <table aria-label="Last completed authenticated HPO target results">
+            <thead><tr><th>Target</th><th>Family</th><th>CV MSE (transformed)</th><th>Eligible / train rows</th><th>Trials / threads</th><th>Best parameters</th></tr></thead>
+            <tbody id="mft-completed-hpo-targets">
+              <tr><td colspan="6" class="muted">완료 HPO 결과 없음</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
     <div id="mft-nsga-live-results" class="section-gap" aria-live="polite">
       <div class="title-row">
@@ -645,6 +687,84 @@
           ? "PASS"
           : (result && result.pass === false ? "FAIL" : String((result && result.status) || "-"))
       );
+      const designSummary = (design) => {
+        if (!design || typeof design !== "object" || Array.isArray(design)) return "-";
+        const fields = Object.entries(design)
+          .filter(([, fieldValue]) => number(fieldValue) !== null)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([name, fieldValue]) => `${name}=${shown(fieldValue)}`);
+        return fields.length ? fields.join(", ") : "-";
+      };
+      function drawParetoChart(results) {
+        const chart = document.getElementById("mft-nsga-pareto-chart");
+        if (!chart) return;
+        chart.textContent = "";
+        const svg = "http://www.w3.org/2000/svg";
+        const series = (Array.isArray(results) ? results : []).map((result) => ({
+          result,
+          points: (Array.isArray(result && result.points) ? result.points : [])
+            .slice(0, 500)
+            .filter((point) => number(point.volume_L) !== null && number(point.total_loss_W) !== null),
+        })).filter((item) => item.points.length);
+        const points = series.flatMap((item) => item.points);
+        if (!points.length) {
+          const empty = document.createElementNS(svg, "text");
+          empty.setAttribute("x", "450");
+          empty.setAttribute("y", "180");
+          empty.setAttribute("text-anchor", "middle");
+          empty.setAttribute("fill", "currentColor");
+          empty.textContent = "공개된 surrogate Pareto 점 없음";
+          chart.appendChild(empty);
+          return;
+        }
+        const width = 900;
+        const height = 360;
+        const margin = {left: 76, right: 28, top: 30, bottom: 58};
+        const volumes = points.map((point) => number(point.volume_L));
+        const losses = points.map((point) => number(point.total_loss_W));
+        let minVolume = Math.min(...volumes);
+        let maxVolume = Math.max(...volumes);
+        let minLoss = Math.min(...losses);
+        let maxLoss = Math.max(...losses);
+        if (minVolume === maxVolume) { minVolume -= 1; maxVolume += 1; }
+        if (minLoss === maxLoss) { minLoss -= 1; maxLoss += 1; }
+        const x = (value) => margin.left + ((value - minVolume) / (maxVolume - minVolume)) * (width - margin.left - margin.right);
+        const y = (value) => height - margin.bottom - ((value - minLoss) / (maxLoss - minLoss)) * (height - margin.top - margin.bottom);
+        const axis = document.createElementNS(svg, "path");
+        axis.setAttribute("d", `M ${margin.left} ${margin.top} V ${height - margin.bottom} H ${width - margin.right}`);
+        axis.setAttribute("fill", "none");
+        axis.setAttribute("stroke", "currentColor");
+        axis.setAttribute("stroke-opacity", "0.55");
+        chart.appendChild(axis);
+        [
+          {x: width / 2, y: height - 16, text: `Predicted volume (L): ${decimal(minVolume, 2)} – ${decimal(maxVolume, 2)}`},
+          {x: margin.left, y: 20, text: `Predicted loss (W): ${decimal(minLoss, 1)} – ${decimal(maxLoss, 1)}`},
+        ].forEach((label) => {
+          const node = document.createElementNS(svg, "text");
+          node.setAttribute("x", String(label.x));
+          node.setAttribute("y", String(label.y));
+          node.setAttribute("text-anchor", label.x === margin.left ? "start" : "middle");
+          node.setAttribute("fill", "currentColor");
+          node.setAttribute("font-size", "13");
+          node.textContent = label.text;
+          chart.appendChild(node);
+        });
+        const colors = ["#4f8cff", "#ef8354", "#47b881", "#b06cff"];
+        series.forEach((item, seriesIndex) => {
+          item.points.forEach((point) => {
+            const circle = document.createElementNS(svg, "circle");
+            circle.setAttribute("cx", String(x(number(point.volume_L))));
+            circle.setAttribute("cy", String(y(number(point.total_loss_W))));
+            circle.setAttribute("r", "3.2");
+            circle.style.fill = colors[seriesIndex % colors.length];
+            circle.setAttribute("fill-opacity", "0.82");
+            const title = document.createElementNS(svg, "title");
+            title.textContent = `${item.result.lane || "lane"} ${item.result.scope || "result"} · ${item.result.run_id || "run"} · candidate ${shown(point.candidate_index)} (row ${shown(point.row_number)}) · ${decimal(point.volume_L, 3)} L · ${decimal(point.total_loss_W, 3)} W · ${designSummary(point.design)}`;
+            circle.appendChild(title);
+            chart.appendChild(circle);
+          });
+        });
+      }
 
       function render(payload) {
         const data = payload.data || {};
@@ -719,6 +839,59 @@
           setText(canonicalJobsLine, "최근 collect/train job unavailable");
           if (canonicalJobsLine) canonicalJobsLine.title = "";
           setText(document.getElementById("mft-canonical-training-issues"), "blocked/error 상태 unavailable");
+        }
+
+        const checkpoint = canonicalTraining.last_checkpoint_result || {};
+        const checkpointTargets = Array.isArray(checkpoint.target_summaries)
+          ? checkpoint.target_summaries.slice(0, 24)
+          : [];
+        const checkpointReasons = Array.isArray(checkpoint.reasons)
+          ? checkpoint.reasons.slice(0, 12)
+          : [];
+        const checkpointOutcome = checkpoint.quality_passed === true
+          ? "QUALITY PASS"
+          : (checkpoint.quality_passed === false ? "QUALITY REJECTED" : (checkpoint.kind || checkpoint.status || "unknown"));
+        const checkpointError = checkpoint.evidence_error || checkpoint.error || "";
+        setText(
+          document.getElementById("mft-canonical-checkpoint-summary"),
+          checkpoint.available
+            ? `${checkpointOutcome} · threshold ${shown(checkpoint.threshold)} · actual strict rows ${shown(checkpoint.actual_strict_rows)} · run ${compact(checkpoint.training_run_id, 42)} · completed ${checkpoint.completed_at || "-"} · evidence ${checkpoint.evidence_authentication || "-"} · failed targets ${shown(checkpoint.failed_target_count)} / ${shown(checkpoint.target_count)}${checkpoint.evidence_error ? ` · ${checkpoint.evidence_error}` : ""}`
+            : (checkpointError ? `체크포인트 evidence error: ${checkpointError}` : "최근 체크포인트 결과 없음"),
+        );
+        setText(
+          document.getElementById("mft-canonical-checkpoint-reasons"),
+          checkpointReasons.length
+            ? `판정 사유 (${shown(checkpoint.reason_count)}): ${checkpointReasons.join(" · ")}${checkpoint.reasons_truncated ? " · …" : ""}`
+            : (checkpointError ? "판정 evidence를 인증하지 못했습니다." : "판정 사유 없음"),
+        );
+        const checkpointBody = document.getElementById("mft-canonical-checkpoint-targets");
+        if (checkpointBody) {
+          checkpointBody.textContent = "";
+          if (!checkpointTargets.length) {
+            const row = checkpointBody.insertRow();
+            const cell = row.insertCell();
+            cell.colSpan = 5;
+            cell.className = "muted";
+            cell.textContent = checkpoint.available ? "목표별 품질 결과 없음" : "최근 목표별 학습 판정 없음";
+          } else {
+            checkpointTargets.forEach((target) => {
+              const targetReasons = Array.isArray(target.reasons) ? target.reasons : [];
+              const targetMetrics = target.metrics && typeof target.metrics === "object"
+                ? Object.entries(target.metrics).map(([name, metricValue]) => `${name}=${shown(metricValue)}`).join(", ")
+                : "";
+              const row = checkpointBody.insertRow();
+              [
+                target.target || "-",
+                target.passed === true ? "PASS" : (target.passed === false ? "FAIL" : "measured"),
+                target.blocking ? "blocking" : "non-blocking",
+                targetMetrics || "-",
+                targetReasons.length ? targetReasons.join(" · ") : "-",
+              ].forEach((field) => {
+                const cell = row.insertCell();
+                cell.textContent = String(field);
+              });
+            });
+          }
         }
 
         const hpo = surrogate.hpo || {};
@@ -813,11 +986,60 @@
           }
         }
 
+        const completedHpo = surrogate.last_completed_hpo_results || {};
+        const completedHpoTargets = Array.isArray(completedHpo.targets)
+          ? completedHpo.targets.slice(0, 8)
+          : [];
+        const completedHpoOutcome = completedHpo.promoted === true
+          ? "candidate promoted"
+          : (completedHpo.promoted === false ? "candidate rejected" : (completedHpo.result_phase || "completed"));
+        setText(
+          document.getElementById("mft-completed-hpo-summary"),
+          completedHpo.available
+            ? `${completedHpoOutcome} · wave ${compact(completedHpo.wave, 28)} · strict rows ${shown(completedHpo.strict_rows)} · targets ${shown(completedHpo.target_count)} · run ${compact(completedHpo.candidate_training_run_id, 36)} · completed ${completedHpo.completed_at || "-"} · evidence complete${completedHpo.evidence_error ? ` · newer evidence error: ${completedHpo.evidence_error}` : ""}`
+            : (completedHpo.evidence_error ? `완료 HPO evidence error: ${completedHpo.evidence_error}` : "완료 HPO 결과 없음"),
+        );
+        const completedHpoBody = document.getElementById("mft-completed-hpo-targets");
+        if (completedHpoBody) {
+          completedHpoBody.textContent = "";
+          if (!completedHpoTargets.length) {
+            const row = completedHpoBody.insertRow();
+            const cell = row.insertCell();
+            cell.colSpan = 6;
+            cell.className = "muted";
+            cell.textContent = "완료 HPO 결과 없음";
+          } else {
+            completedHpoTargets.forEach((target) => {
+              const params = target.best_params && typeof target.best_params === "object"
+                ? Object.entries(target.best_params).map(([name, paramValue]) => `${name}=${shown(paramValue)}`).join(", ")
+                : "-";
+              const row = completedHpoBody.insertRow();
+              const fields = [
+                target.target || "-",
+                target.family || "-",
+                decimal(target.cv_mse_transformed, 6),
+                `${shown(target.eligible_rows)} / ${shown(target.hpo_train_rows)}`,
+                `${shown(target.trials)} / ${shown(target.model_threads)}`,
+                params,
+              ];
+              fields.forEach((field, index) => {
+                const cell = row.insertCell();
+                cell.textContent = String(field);
+                if (index === 5) cell.title = params;
+              });
+            });
+          }
+        }
+
         const nsga = payload.nsga || {};
         setText(value("nsga"), `${shown(nsga.active_seed_workers)} seed workers`);
         setText(
           detail("nsga"),
-          `완료 ${shown(nsga.completed_runs)} · feasible ${shown(nsga.feasible_runs)} · Pareto ${shown(nsga.pareto_runs)}`,
+          nsga.current_model_aggregate_complete === true
+            ? `현재 모델 완료 ${shown(nsga.current_model_completed_runs)} · feasible ${shown(nsga.current_model_feasible_runs)} · Pareto ${shown(nsga.current_model_pareto_runs)} · lifetime 완료 ${shown(nsga.lifetime_completed_runs)}`
+            : (number(nsga.current_model_result_lanes) > 0
+              ? `현재 모델 결과 partial ${shown(nsga.current_model_result_lanes)} / ${shown(nsga.current_model_expected_lanes)} lanes · lifetime 완료 ${shown(nsga.lifetime_completed_runs)}`
+              : `현재 모델 결과 unavailable · lifetime 완료 ${shown(nsga.lifetime_completed_runs)}`),
         );
 
         const standard = payload.standard_fea || {};
@@ -847,15 +1069,19 @@
           } else {
             lanes.forEach((lane) => {
               const leastViolation = lane.least_violation || {};
+              const currentModel = lane.current_model || {};
+              const lifetime = lane.lifetime || {};
               const row = laneBody.insertRow();
               const fields = [
                 lane.name || "-",
                 lane.state || "unavailable",
                 lane.run_id || "-",
                 Array.isArray(lane.seeds) && lane.seeds.length ? lane.seeds.join(", ") : "-",
-                compact(lane.model_id, 42),
-                shown(lane.completed_runs),
-                `${shown(lane.feasible_runs)} / ${shown(lane.infeasible_runs)} / ${shown(lane.pareto_runs)}`,
+                compact(lane.current_model_id || lane.model_id, 42),
+                currentModel.available
+                  ? `${shown(currentModel.completed_runs)} / ${shown(currentModel.feasible_runs)} / ${shown(currentModel.infeasible_runs)} / ${shown(currentModel.pareto_runs)}`
+                  : "unavailable",
+                `${shown(lifetime.completed_runs)} / ${shown(lifetime.feasible_runs)} / ${shown(lifetime.infeasible_runs)} / ${shown(lifetime.pareto_runs)}`,
                 leastViolation.best_total_positive_violation === null || leastViolation.best_total_positive_violation === undefined
                   ? "-"
                   : `${decimal(leastViolation.best_total_positive_violation, 4)} (${shown(leastViolation.candidate_count)})`,
@@ -865,7 +1091,7 @@
                 const cell = row.insertCell();
                 cell.textContent = String(field);
                 if (index === 3 || index === 4) cell.className = "mono-cell";
-                if (index === 4) cell.title = String(lane.model_id || "");
+                if (index === 4) cell.title = String(lane.current_model_id || lane.model_id || "");
                 if (index === 7) {
                   const constraints = Array.isArray(leastViolation.zero_pass_constraints)
                     ? leastViolation.zero_pass_constraints
@@ -880,11 +1106,75 @@
           }
         }
 
+        const paretoResults = Array.isArray(nsga.pareto_results)
+          ? nsga.pareto_results.slice(0, 4)
+          : [];
+        const publishedParetoPoints = paretoResults.reduce(
+          (total, result) => total + (Array.isArray(result.points) ? result.points.length : 0),
+          0,
+        );
+        const totalParetoPoints = paretoResults.reduce(
+          (total, result) => total + (number(result.point_count) || 0),
+          0,
+        );
+        const staleParetoResults = paretoResults.filter((result) => result.stale === true).length;
+        const paretoErrors = Array.isArray(nsga.pareto_errors)
+          ? nsga.pareto_errors.slice(0, 4)
+          : [];
+        setText(
+          document.getElementById("mft-nsga-pareto-counts"),
+          `${shown(paretoResults.length)} results · ${shown(publishedParetoPoints)} published / ${shown(totalParetoPoints)} total points · surrogate only${staleParetoResults ? ` · stale ${shown(staleParetoResults)}` : ""}`,
+        );
+        setText(
+          document.getElementById("mft-nsga-pareto-errors"),
+          paretoErrors.length
+            ? `Pareto evidence error: ${paretoErrors.map((item) => `${item.lane || "lane"}/${item.scope || "scope"}${item.run_id ? ` ${item.run_id}` : ""}: ${item.error || "invalid evidence"}`).join(" · ")}`
+            : "Pareto evidence error 없음",
+        );
+        drawParetoChart(paretoResults);
+        const paretoBody = document.getElementById("mft-nsga-pareto-points");
+        if (paretoBody) {
+          paretoBody.textContent = "";
+          const tableRows = paretoResults.flatMap((result) => (
+            Array.isArray(result.points)
+              ? result.points.slice(0, 50).map((point) => ({result, point}))
+              : []
+          ));
+          if (!tableRows.length) {
+            const row = paretoBody.insertRow();
+            const cell = row.insertCell();
+            cell.colSpan = 7;
+            cell.className = "muted";
+            cell.textContent = "공개된 surrogate Pareto 결과 없음";
+          } else {
+            tableRows.forEach(({result, point}) => {
+              const designText = designSummary(point.design);
+              const row = paretoBody.insertRow();
+              const fields = [
+                `${result.lane || "-"} / ${result.scope || "-"}${result.stale ? " [STALE]" : ""}`,
+                result.run_id || "-",
+                `${shown(point.candidate_index)} (row ${shown(point.row_number)})`,
+                decimal(point.volume_L, 3),
+                decimal(point.total_loss_W, 3),
+                compact(designText, 140),
+                compact(result.model_id, 42),
+              ];
+              fields.forEach((field, index) => {
+                const cell = row.insertCell();
+                cell.textContent = String(field);
+                if (index === 1 || index === 6) cell.className = "mono-cell";
+                if (index === 5) cell.title = designText;
+                if (index === 6) cell.title = String(result.model_id || "");
+              });
+            });
+          }
+        }
+
         const designs = nsga.designs || {};
         const designItems = Array.isArray(designs.items) ? designs.items : [];
         setText(
           document.getElementById("mft-design-counts"),
-          `nondominated ${shown(designs.nondominated_count)} · active Full ${shown(designs.active_full_count)}${designs.truncated ? ` · first ${shown(designs.limit)}` : ""}`,
+          `Known Standard PASS ${shown(designs.known_standard_pass_count)} · Full controller 반영 ${shown(designs.full_discovered_standard_pass_count)} · discovery 대기 ${shown(designs.pending_full_discovery_count)} · 표시 ${shown(designs.displayed_count)} · Full ready ${shown(designs.ready_full_count)} · active Full ${shown(designs.active_full_count)} · nondominated ${shown(designs.nondominated_count)}${designs.truncated ? ` · first ${shown(designs.limit)}` : ""}`,
         );
         const designBody = document.getElementById("mft-validated-designs");
         if (designBody) {

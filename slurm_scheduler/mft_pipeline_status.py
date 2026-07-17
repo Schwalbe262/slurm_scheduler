@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -14,8 +16,146 @@ from typing import Any, Iterable, Mapping
 DEFAULT_RUNTIME_ROOT = Path(r"C:\Users\peets\slurm_scheduler_runtime")
 DEFAULT_MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_HPO_TARGETS = 20
+MAX_COMPLETED_HPO_TARGETS = 8
 MAX_ACTIVE_MODEL_TARGET_METRICS = 25
+MAX_CHECKPOINT_TARGETS = 24
+MAX_CHECKPOINT_REASONS = 12
+MAX_NSGA_PARETO_POINTS = 500
+MAX_NSGA_PARETO_ROWS = 10_000
 MAX_VALIDATED_DESIGNS = 12
+MAX_COMPLETED_HPO_STATUS_BYTES = 32_768
+CHECKPOINT_METRIC_KEYS = (
+    "n_train",
+    "n_calibration",
+    "n_evaluation",
+    "n_holdout",
+    "r2",
+    "rmse",
+    "normalized_rmse_pct",
+    "mape_pct",
+    "p90_ape_pct",
+    "interval_coverage",
+    "interval_p90_half_width_pct",
+    "interval_p90_width",
+)
+NSGA_DESIGN_FIELDS = frozenset({
+    "N1_main", "N1_side", "N2_main", "N2_side",
+    "l1", "l2", "h1", "w1", "n_core_group",
+    "core_plate_t", "core_plate_on", "cw1", "gap1", "cw2", "gap2",
+    "nwh1", "nwh2", "cc_w2c_space_x", "cc_w2c_space_y",
+    "w2c_w1c_space_x", "w2c_w1c_space_y", "w1c_w2s_space_x",
+    "w2s_w1s_space_x", "w1s_w2s_space_y", "w1s_cs_space_x",
+    "cs_w1s_space_y", "wcp_t", "wcp_pad_t", "wcp_len_x", "wcp_on",
+    "core_plate_pad_t", "core_depth_min", "core_depth_max",
+    "core_depth_each",
+})
+HPO_PARAM_NAMES = (
+    "n_estimators",
+    "learning_rate",
+    "num_leaves",
+    "min_child_samples",
+    "subsample",
+    "colsample_bytree",
+    "reg_lambda",
+)
+HPO_PARAM_RANGES = {
+    "n_estimators": (int, 400, 3000),
+    "learning_rate": (float, 0.01, 0.15),
+    "num_leaves": (int, 31, 255),
+    "min_child_samples": (int, 5, 60),
+    "subsample": (float, 0.6, 1.0),
+    "colsample_bytree": (float, 0.6, 1.0),
+    "reg_lambda": (float, 0.001, 10.0),
+}
+COMPLETED_HPO_TOP_KEYS = frozenset({
+    "schema_version",
+    "status",
+    "evidence_authentication",
+    "wave",
+    "result_phase",
+    "completed_at",
+    "dataset_generation",
+    "dataset_sha256",
+    "strict_full_rows",
+    "target_count",
+    "targets",
+    "common_authentication",
+    "wave_outcome",
+    "evidence_sha256",
+})
+COMPLETED_HPO_TARGET_KEYS = frozenset({
+    "target",
+    "family",
+    "cv_mse_transformed",
+    "eligible_rows",
+    "target_rows",
+    "hpo_train_rows",
+    "trials",
+    "model_threads",
+    "best_params",
+    "authentication",
+})
+COMPLETED_HPO_TARGET_AUTH_KEYS = frozenset({
+    "generation_id",
+    "params_sha256",
+    "manifest_sha256",
+    "tuned_override_sha256",
+    "target_task_ids_sha256",
+    "hpo_train_task_ids_sha256",
+})
+COMPLETED_HPO_COMMON_AUTH_KEYS = frozenset({
+    "dataset_manifest_sha256",
+    "data_contract_sha256",
+    "search_implementation_sha256",
+    "training_split_contract_sha256",
+    "feature_schema_sha256",
+})
+NSGA_PARETO_KEYS = frozenset({
+    "schema_version",
+    "available",
+    "scope",
+    "run_id",
+    "model_id",
+    "model_lane",
+    "production_eligible",
+    "fea_submission_approved",
+    "seeds",
+    "finished_at",
+    "point_count",
+    "points",
+    "limit",
+    "truncated",
+    "objective_names",
+    "objective_units",
+    "objective_source",
+    "fea_verified",
+    "optimization_manifest_sha256",
+    "pareto_front_sha256",
+    "run_manifest_sha256",
+    "model_source_sha256",
+})
+NSGA_PARETO_POINT_KEYS = frozenset({
+    "candidate_index",
+    "row_number",
+    "volume_L",
+    "total_loss_W",
+    "design",
+})
+CHECKPOINT_COMPLETE_KINDS = frozenset({
+    "metrics_only",
+    "accepted_generation",
+    "quality_rejected",
+})
+CHECKPOINT_PARTIAL_EVIDENCE = frozenset({
+    "state_only",
+    "state_and_metrics",
+    "state_metrics_and_candidate",
+})
+_HEX_64_RE = re.compile(r"[0-9a-f]{64}")
+_HPO_TARGET_RE = re.compile(r"[A-Za-z0-9_]{1,128}")
+_HPO_RUN_RE = re.compile(r"[A-Za-z0-9._-]{1,160}")
+_HPO_WAVE_RE = re.compile(r"wave-[0-9a-f]{16}")
+_NSGA_RUN_RE = re.compile(r"run-[0-9]{6}")
 
 STALE_AFTER_SECONDS = {
     "canonical_surrogate_status": 150.0,
@@ -64,6 +204,56 @@ def _number(value: object) -> float | None:
     return result if result is not None and math.isfinite(result) else None
 
 
+def _strict_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    normalized = float(value)
+    return normalized if math.isfinite(normalized) else None
+
+
+def _exact_sha256(value: object) -> str | None:
+    text = str(value or "").strip().lower()
+    return text if _HEX_64_RE.fullmatch(text) else None
+
+
+def _positive_integer(value: object, *, maximum: int | None = None) -> int | None:
+    normalized = _nonnegative_integer(value)
+    if normalized is None or normalized == 0:
+        return None
+    if maximum is not None and normalized > maximum:
+        return None
+    return normalized
+
+
+def _validated_hpo_params(value: object) -> dict[str, int | float] | None:
+    if not isinstance(value, Mapping) or set(value) != set(HPO_PARAM_RANGES):
+        return None
+    normalized: dict[str, int | float] = {}
+    for name, (kind, lower, upper) in HPO_PARAM_RANGES.items():
+        raw = value.get(name)
+        if kind is int:
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                return None
+            number: int | float = raw
+        else:
+            strict = _strict_number(raw)
+            if strict is None:
+                return None
+            number = strict
+        if float(number) < lower or float(number) > upper:
+            return None
+        normalized[name] = number
+    return normalized
+
+
+def _exact_sha_mapping(value: object, expected_keys: frozenset[str]) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and set(value) == expected_keys
+        and all(_exact_sha256(value.get(key)) is not None for key in expected_keys)
+    )
+
+
 def _text_items(value: object, *, limit: int = 20) -> list[str]:
     if not isinstance(value, (list, tuple)):
         return []
@@ -71,6 +261,18 @@ def _text_items(value: object, *, limit: int = 20) -> list[str]:
         str(item)
         for item in value[:limit]
         if item is not None and str(item).strip()
+    ]
+
+
+def _bounded_text_items(
+    value: object, *, item_limit: int, text_limit: int = 300
+) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [
+        text
+        for item in value[:item_limit]
+        if (text := _bounded_text(item, limit=text_limit))
     ]
 
 
@@ -244,20 +446,38 @@ class MftPipelineStatusReader:
                 },
                 "last_jobs": {"collect": None, "train": None},
                 "blocked": [],
+                "last_checkpoint_result": {"available": False},
             },
             "surrogate": {
                 "available": False,
                 "hpo": {"ready": 0, "total": 0, "targets": []},
+                "last_completed_hpo_results": {
+                    "available": False,
+                    "targets": [],
+                },
                 "last_decision": {"available": False},
             },
             "nsga": {
                 "available": False,
                 "lanes": [],
                 "active_seed_workers": 0,
+                "current_model_completed_runs": 0,
+                "lifetime_completed_runs": 0,
+                "pareto_results": [],
+                "pareto_errors": [],
+                "current_model_result_lanes": 0,
+                "current_model_expected_lanes": 0,
+                "current_model_aggregate_complete": False,
                 "designs": {
                     "items": [],
                     "nondominated_count": 0,
                     "active_full_count": 0,
+                    "total_count": 0,
+                    "displayed_count": 0,
+                    "ready_full_count": 0,
+                    "known_standard_pass_count": 0,
+                    "full_discovered_standard_pass_count": 0,
+                    "pending_full_discovery_count": 0,
                     "limit": MAX_VALIDATED_DESIGNS,
                     "truncated": False,
                 },
@@ -387,11 +607,53 @@ class MftPipelineStatusReader:
             if seed is not None
         ]
         outcomes = _mapping(status.get("completed_outcomes"))
-        infeasibility = _mapping(status.get("last_infeasibility"))
+        current_outcomes_raw = status.get("current_model_completed_outcomes")
+        current_outcomes = _mapping(current_outcomes_raw)
+        current_model_id = _bounded_text(
+            status.get("current_model_id") or active_run.get("model_id"),
+            limit=160,
+        )
+        current_completed = _nonnegative_integer(
+            status.get("current_model_completed_run_count")
+        )
+        allowed_current_outcomes = {
+            "feasible_complete",
+            "infeasible_complete",
+            "failed",
+        }
+        current_outcomes_valid = (
+            isinstance(current_outcomes_raw, Mapping)
+            and set(current_outcomes).issubset(allowed_current_outcomes)
+            and all(
+                _nonnegative_integer(value) is not None
+                for value in current_outcomes.values()
+            )
+        )
+        current_contract_available = bool(
+            meta.get("available")
+            and current_model_id
+            and current_completed is not None
+            and current_outcomes_valid
+            and sum(current_outcomes.values()) == current_completed
+        )
+        current_contract_error = ""
+        if isinstance(current_outcomes_raw, Mapping) and not current_contract_available:
+            current_contract_error = "invalid current-model NSGA result contract"
+        infeasibility = _mapping(
+            status.get("current_model_last_infeasibility")
+            if "current_model_last_infeasibility" in status
+            else {}
+        )
         archive = _mapping(infeasibility.get("least_violation_archive"))
         warm_start = _mapping(active_run.get("warm_start"))
         feasible_runs = _integer(outcomes.get("feasible_complete"))
         infeasible_runs = _integer(outcomes.get("infeasible_complete"))
+        current_feasible = (
+            _nonnegative_integer(current_outcomes.get("feasible_complete")) or 0
+        )
+        current_infeasible = (
+            _nonnegative_integer(current_outcomes.get("infeasible_complete")) or 0
+        )
         return {
             "name": name,
             "available": bool(meta.get("available")),
@@ -401,6 +663,7 @@ class MftPipelineStatusReader:
             "seeds": seeds,
             "seed_workers": len(seeds),
             "model_id": str(active_run.get("model_id") or ""),
+            "current_model_id": current_model_id,
             "model_lane": str(active_run.get("model_lane") or ""),
             "completed_runs": _integer(status.get("completed_run_count")) or 0,
             "feasible_runs": feasible_runs if feasible_runs is not None else 0,
@@ -408,6 +671,26 @@ class MftPipelineStatusReader:
             # Every feasible completed run publishes an authenticated Pareto
             # front.  Keep the producer's outcome terminology as well.
             "pareto_runs": feasible_runs if feasible_runs is not None else 0,
+            "current_model": {
+                "available": current_contract_available,
+                "completed_runs": current_completed,
+                "feasible_runs": current_feasible,
+                "infeasible_runs": current_infeasible,
+                "pareto_runs": current_feasible,
+                "error": current_contract_error,
+            },
+            "lifetime": {
+                "completed_runs": _integer(status.get("completed_run_count")) or 0,
+                "feasible_runs": feasible_runs if feasible_runs is not None else 0,
+                "infeasible_runs": infeasible_runs if infeasible_runs is not None else 0,
+                "pareto_runs": feasible_runs if feasible_runs is not None else 0,
+            },
+            "latest_pareto": cls._nsga_pareto(
+                status.get("latest_feasible_pareto"), scope="current_model"
+            ),
+            "lifetime_latest_pareto": cls._nsga_pareto(
+                status.get("latest_feasible_pareto_lifetime"), scope="lifetime"
+            ),
             "next_seed_base": _integer(status.get("next_seed_base")),
             "model_switch_policy": str(status.get("model_switch_policy") or ""),
             "fea_submission_enabled": status.get("fea_submission_enabled") is True,
@@ -433,6 +716,167 @@ class MftPipelineStatusReader:
                 stale_after_seconds=STALE_AFTER_SECONDS["nsga"],
             ),
             "updated_at": status.get("updated_at"),
+        }
+
+    @staticmethod
+    def _nsga_pareto(value: object, *, scope: str) -> dict[str, Any]:
+        raw = _mapping(value)
+        if not raw:
+            return {"available": False, "scope": scope, "points": []}
+        if raw.get("available") is not True:
+            return {
+                "available": False,
+                "scope": scope,
+                "run_id": _bounded_text(raw.get("run_id"), limit=32),
+                "model_id": _bounded_text(raw.get("model_id"), limit=160),
+                "error": _bounded_text(raw.get("error"), limit=240),
+                "points": [],
+            }
+        if (
+            set(raw) != NSGA_PARETO_KEYS
+            or raw.get("schema_version") != "mft-nsga-pareto-status-v1"
+            or raw.get("scope") != scope
+            or raw.get("objective_source") != "surrogate_prediction"
+            or raw.get("fea_verified") is not False
+            or raw.get("fea_submission_approved") is not False
+            or not isinstance(raw.get("production_eligible"), bool)
+            or raw.get("objective_names") != ["volume_L", "total_loss_W"]
+            or raw.get("objective_units")
+            != {"volume_L": "L", "total_loss_W": "W"}
+            or raw.get("limit") != MAX_NSGA_PARETO_POINTS
+        ):
+            return {
+                "available": False,
+                "scope": scope,
+                "error": "invalid NSGA Pareto provenance",
+                "points": [],
+            }
+        run_id = str(raw.get("run_id") or "")
+        model_id = str(raw.get("model_id") or "")
+        model_lane = str(raw.get("model_lane") or "")
+        finished_at = str(raw.get("finished_at") or "")
+        point_count = _positive_integer(
+            raw.get("point_count"), maximum=MAX_NSGA_PARETO_ROWS
+        )
+        raw_seeds = raw.get("seeds")
+        hashes = {
+            name: _exact_sha256(raw.get(name))
+            for name in (
+                "optimization_manifest_sha256",
+                "pareto_front_sha256",
+                "run_manifest_sha256",
+                "model_source_sha256",
+            )
+        }
+        if (
+            _NSGA_RUN_RE.fullmatch(run_id) is None
+            or not model_id
+            or len(model_id) > 160
+            or not model_lane
+            or len(model_lane) > 32
+            or not finished_at
+            or len(finished_at) > 64
+            or point_count is None
+            or not isinstance(raw_seeds, list)
+            or not 1 <= len(raw_seeds) <= 16
+            or any(
+                _nonnegative_integer(seed) is None for seed in raw_seeds
+            )
+            or any(value is None for value in hashes.values())
+        ):
+            return {
+                "available": False,
+                "scope": scope,
+                "error": "invalid NSGA Pareto identity contract",
+                "points": [],
+            }
+        points: list[dict[str, Any]] = []
+        raw_points_value = raw.get("points")
+        expected_published = min(point_count, MAX_NSGA_PARETO_POINTS)
+        if (
+            not isinstance(raw_points_value, list)
+            or len(raw_points_value) != expected_published
+            or raw.get("truncated") is not (
+                point_count > MAX_NSGA_PARETO_POINTS
+            )
+        ):
+            return {
+                "available": False,
+                "scope": scope,
+                "error": "invalid NSGA Pareto point contract",
+                "points": [],
+            }
+        for expected_index, raw_point_value in enumerate(raw_points_value):
+            if not isinstance(raw_point_value, Mapping):
+                return {
+                    "available": False,
+                    "scope": scope,
+                    "error": "invalid NSGA Pareto point contract",
+                    "points": [],
+                }
+            raw_point = dict(raw_point_value)
+            volume = _strict_number(raw_point.get("volume_L"))
+            loss = _strict_number(raw_point.get("total_loss_W"))
+            candidate_index = _nonnegative_integer(
+                raw_point.get("candidate_index")
+            )
+            row_number = _nonnegative_integer(raw_point.get("row_number"))
+            if (
+                set(raw_point) != NSGA_PARETO_POINT_KEYS
+                or volume is None
+                or loss is None
+                or candidate_index != expected_index
+                or row_number != expected_index + 1
+            ):
+                return {
+                    "available": False,
+                    "scope": scope,
+                    "error": "invalid NSGA Pareto point contract",
+                    "points": [],
+                }
+            raw_design = raw_point.get("design")
+            if not isinstance(raw_design, Mapping) or set(raw_design) != NSGA_DESIGN_FIELDS:
+                return {
+                    "available": False,
+                    "scope": scope,
+                    "error": "invalid NSGA Pareto design contract",
+                    "points": [],
+                }
+            design: dict[str, float] = {}
+            for key in NSGA_DESIGN_FIELDS:
+                number = _strict_number(raw_design.get(key))
+                if number is None:
+                    return {
+                        "available": False,
+                        "scope": scope,
+                        "error": "invalid NSGA Pareto design contract",
+                        "points": [],
+                    }
+                design[key] = number
+            points.append({
+                "candidate_index": candidate_index,
+                "row_number": row_number,
+                "volume_L": volume,
+                "total_loss_W": loss,
+                "design": design,
+            })
+        return {
+            "available": True,
+            "scope": scope,
+            "run_id": run_id,
+            "model_id": model_id,
+            "model_lane": model_lane,
+            "seeds": list(raw_seeds),
+            "finished_at": finished_at,
+            "point_count": point_count,
+            "points": points,
+            "limit": MAX_NSGA_PARETO_POINTS,
+            "truncated": point_count > len(points),
+            "objective_source": "surrogate_prediction",
+            "fea_verified": False,
+            "production_eligible": raw.get("production_eligible"),
+            "fea_submission_approved": False,
+            **hashes,
         }
 
     @staticmethod
@@ -587,6 +1031,184 @@ class MftPipelineStatusReader:
         }
 
     @staticmethod
+    def _completed_hpo_results(status: Mapping[str, Any]) -> dict[str, Any]:
+        raw = _mapping(status.get("last_completed_hpo_results"))
+        raw_error = _mapping(status.get("last_completed_hpo_results_error"))
+        error_message = _bounded_text(raw_error.get("message"), limit=500)
+        error_wave = _bounded_text(raw_error.get("wave"), limit=80)
+
+        def invalid(message: str) -> dict[str, Any]:
+            return {
+                "available": False,
+                "targets": [],
+                "evidence_error": message,
+                "error_wave": error_wave,
+            }
+
+        if not raw:
+            return invalid(error_message)
+        if (
+            set(raw) != COMPLETED_HPO_TOP_KEYS
+            or raw.get("schema_version") != 1
+            or raw.get("status") != "completed"
+            or raw.get("evidence_authentication") != "complete"
+        ):
+            return invalid("invalid completed HPO result contract")
+        evidence_sha = str(raw.get("evidence_sha256") or "").lower()
+        unsigned = {
+            key: value for key, value in raw.items() if key != "evidence_sha256"
+        }
+        try:
+            canonical = json.dumps(
+                unsigned,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+            full_canonical = json.dumps(
+                raw,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            canonical = b""
+            full_canonical = b""
+        if (
+            _exact_sha256(evidence_sha) is None
+            or hashlib.sha256(canonical).hexdigest() != evidence_sha
+            or not full_canonical
+            or len(full_canonical) > MAX_COMPLETED_HPO_STATUS_BYTES
+        ):
+            return invalid("completed HPO result fingerprint mismatch")
+        wave = str(raw.get("wave") or "")
+        phase = str(raw.get("result_phase") or "")
+        completed_at = str(raw.get("completed_at") or "")
+        generation = _exact_sha256(raw.get("dataset_generation"))
+        dataset_sha = _exact_sha256(raw.get("dataset_sha256"))
+        strict_rows = _positive_integer(raw.get("strict_full_rows"))
+        target_count = _positive_integer(
+            raw.get("target_count"), maximum=MAX_COMPLETED_HPO_TARGETS
+        )
+        raw_targets = raw.get("targets")
+        outcome = raw.get("wave_outcome")
+        if (
+            _HPO_WAVE_RE.fullmatch(wave) is None
+            or generation is None
+            or wave != f"wave-{generation[:16]}"
+            or dataset_sha is None
+            or phase not in {"candidate_promoted", "candidate_rejected"}
+            or not completed_at
+            or len(completed_at) > 64
+            or strict_rows is None
+            or target_count is None
+            or not isinstance(raw_targets, list)
+            or len(raw_targets) != target_count
+            or not _exact_sha_mapping(
+                raw.get("common_authentication"),
+                COMPLETED_HPO_COMMON_AUTH_KEYS,
+            )
+            or not isinstance(outcome, Mapping)
+            or set(outcome)
+            != {
+                "candidate_training_run_id",
+                "promoted",
+                "quality_status_sha256",
+            }
+            or not isinstance(outcome.get("promoted"), bool)
+            or outcome.get("promoted") is not (phase == "candidate_promoted")
+            or _HPO_RUN_RE.fullmatch(
+                str(outcome.get("candidate_training_run_id") or "")
+            )
+            is None
+            or _exact_sha256(outcome.get("quality_status_sha256")) is None
+        ):
+            return invalid("invalid completed HPO result contract")
+        targets: list[dict[str, Any]] = []
+        seen_targets: set[str] = set()
+        for raw_item in raw_targets:
+            if not isinstance(raw_item, Mapping):
+                return invalid("invalid completed HPO target contract")
+            item = dict(raw_item)
+            target = str(item.get("target") or "")
+            cv_mse = _strict_number(item.get("cv_mse_transformed"))
+            eligible_rows = _positive_integer(item.get("eligible_rows"))
+            target_rows = _positive_integer(item.get("target_rows"))
+            train_rows = _positive_integer(item.get("hpo_train_rows"))
+            trials = _positive_integer(item.get("trials"), maximum=100_000)
+            model_threads = _positive_integer(
+                item.get("model_threads"), maximum=64
+            )
+            best_params = _validated_hpo_params(item.get("best_params"))
+            authentication = item.get("authentication")
+            if (
+                set(item) != COMPLETED_HPO_TARGET_KEYS
+                or _HPO_TARGET_RE.fullmatch(target) is None
+                or target in seen_targets
+                or item.get("family") != "lightgbm"
+                or cv_mse is None
+                or cv_mse < 0
+                or eligible_rows is None
+                or target_rows is None
+                or eligible_rows != target_rows
+                or target_rows > strict_rows
+                or train_rows is None
+                or train_rows >= target_rows
+                or trials is None
+                or model_threads is None
+                or best_params is None
+                or not _exact_sha_mapping(
+                    authentication, COMPLETED_HPO_TARGET_AUTH_KEYS
+                )
+            ):
+                return invalid("invalid completed HPO target contract")
+            raw_best_params = dict(item["best_params"])
+            params_sha = hashlib.sha256(
+                json.dumps(
+                    raw_best_params,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            if authentication.get("tuned_override_sha256") != params_sha:
+                return invalid("invalid completed HPO target contract")
+            seen_targets.add(target)
+            targets.append({
+                "target": target,
+                "family": "lightgbm",
+                "cv_mse_transformed": cv_mse,
+                "eligible_rows": eligible_rows,
+                "target_rows": target_rows,
+                "hpo_train_rows": train_rows,
+                "trials": trials,
+                "model_threads": model_threads,
+                "best_params": best_params,
+            })
+        return {
+            "available": True,
+            "wave": wave,
+            "result_phase": phase,
+            "completed_at": completed_at,
+            "dataset_generation": generation,
+            "dataset_sha256": dataset_sha,
+            "strict_rows": strict_rows,
+            "target_count": target_count,
+            "targets": targets,
+            "candidate_training_run_id": str(
+                outcome.get("candidate_training_run_id")
+            ),
+            "promoted": outcome.get("promoted"),
+            "evidence_sha256": evidence_sha,
+            "evidence_authentication": "complete",
+            "evidence_error": error_message,
+            "error_wave": error_wave,
+        }
+
+    @staticmethod
     def _surrogate_decision(state: Mapping[str, Any]) -> dict[str, Any]:
         result = _mapping(state.get("last_result"))
         comparison = _mapping(result.get("comparison"))
@@ -642,6 +1264,205 @@ class MftPipelineStatusReader:
                 gate.get("quality_blocked_targets"), limit=20
             ),
             "metrics": metrics[:8],
+        }
+
+    @staticmethod
+    def _checkpoint_result(value: object) -> dict[str, Any]:
+        result = _mapping(value)
+        if not result:
+            return {"available": False, "target_summaries": [], "reasons": []}
+
+        def invalid(message: str) -> dict[str, Any]:
+            return {
+                "available": False,
+                "error": message,
+                "evidence_error": message,
+                "target_summaries": [],
+                "reasons": [],
+            }
+
+        if result.get("schema_version") != 1:
+            return invalid("unsupported checkpoint result schema")
+        status = _bounded_text(result.get("status"), limit=80)
+        kind = _bounded_text(result.get("kind"), limit=80)
+        evidence = _bounded_text(
+            result.get("evidence_authentication"), limit=80
+        )
+        error = _mapping(result.get("error"))
+        evidence_error = (
+            f"{_bounded_text(error.get('type'), limit=80)}: "
+            f"{_bounded_text(error.get('message'), limit=500)}"
+        ).strip(": ") if error else ""
+        if evidence == "failed":
+            if (
+                status == "evidence_error"
+                and kind == "evidence_error"
+                and result.get("quality_passed") is None
+                and evidence_error
+            ):
+                failed = invalid(evidence_error)
+                failed.update({
+                    "status": status,
+                    "kind": kind,
+                    "evidence_authentication": evidence,
+                })
+                return failed
+            return invalid("invalid checkpoint result contract")
+        threshold = _nonnegative_integer(result.get("threshold"))
+        actual_rows = _nonnegative_integer(
+            result.get("actual_strict_full_rows")
+        )
+        reason_count = _nonnegative_integer(result.get("reason_count"))
+        target_count = _nonnegative_integer(result.get("target_count"))
+        failed_target_count = _nonnegative_integer(
+            result.get("failed_target_count")
+        )
+        raw_reasons = result.get("reasons")
+        raw_targets = result.get("target_summaries")
+        completed_at = _bounded_text(result.get("completed_at"), limit=80)
+        if (
+            evidence not in ({"complete"} | CHECKPOINT_PARTIAL_EVIDENCE)
+            or status not in {
+                "completed",
+                "failed",
+                "promotion_committed_state_recovery_required",
+            }
+            or not kind
+            or threshold is None
+            or actual_rows is None
+            or reason_count is None
+            or target_count is None
+            or failed_target_count is None
+            or failed_target_count > target_count
+            or not completed_at
+            or not isinstance(raw_reasons, list)
+            or len(raw_reasons) > MAX_CHECKPOINT_REASONS
+            or reason_count < len(raw_reasons)
+            or not isinstance(raw_targets, list)
+            or len(raw_targets) > MAX_CHECKPOINT_TARGETS
+            or target_count < len(raw_targets)
+            or (reason_count > len(raw_reasons))
+            is not (result.get("reasons_truncated") is True)
+            or (target_count > len(raw_targets))
+            is not (result.get("target_summaries_truncated") is True)
+        ):
+            return invalid("invalid checkpoint result contract")
+        quality_passed = result.get("quality_passed")
+        if evidence == "complete":
+            quality_contract = {
+                "metrics_only": None,
+                "accepted_generation": True,
+                "quality_rejected": False,
+            }
+            if (
+                kind not in CHECKPOINT_COMPLETE_KINDS
+                or quality_passed is not quality_contract[kind]
+                or (kind == "metrics_only" and status != "completed")
+                or (kind == "quality_rejected" and status != "failed")
+                or (
+                    kind == "accepted_generation"
+                    and status not in {
+                        "completed",
+                        "promotion_committed_state_recovery_required",
+                    }
+                )
+            ):
+                return invalid("invalid checkpoint result contract")
+        elif (
+            status != "failed"
+            or quality_passed is not None
+            or target_count != 0
+            or failed_target_count != 0
+        ):
+            return invalid("invalid checkpoint result contract")
+        targets: list[dict[str, Any]] = []
+        seen_targets: set[str] = set()
+        for raw_target_value in raw_targets:
+            if not isinstance(raw_target_value, Mapping):
+                return invalid("invalid checkpoint target contract")
+            raw_target = dict(raw_target_value)
+            target = _bounded_text(raw_target.get("target"), limit=160)
+            if not target or target in seen_targets:
+                return invalid("invalid checkpoint target contract")
+            seen_targets.add(target)
+            raw_metrics = raw_target.get("metrics")
+            if (
+                not isinstance(raw_metrics, Mapping)
+                or not set(raw_metrics).issubset(CHECKPOINT_METRIC_KEYS)
+            ):
+                return invalid("invalid checkpoint target contract")
+            metrics = {
+                name: value_number
+                for name in CHECKPOINT_METRIC_KEYS
+                if (value_number := _strict_number(
+                    raw_metrics.get(name)
+                )) is not None
+            }
+            if len(metrics) != len(raw_metrics):
+                return invalid("invalid checkpoint target contract")
+            target_reasons = raw_target.get("reasons", [])
+            target_reason_count = raw_target.get("reason_count", 0)
+            if (
+                not isinstance(target_reasons, list)
+                or len(target_reasons) > 4
+                or _nonnegative_integer(target_reason_count) is None
+                or target_reason_count < len(target_reasons)
+                or (target_reason_count > len(target_reasons))
+                is not (raw_target.get("reasons_truncated") is True)
+                or (
+                    kind != "metrics_only"
+                    and (
+                        not isinstance(raw_target.get("passed"), bool)
+                        or not isinstance(raw_target.get("blocking"), bool)
+                    )
+                )
+            ):
+                return invalid("invalid checkpoint target contract")
+            targets.append({
+                "target": target,
+                "passed": (
+                    raw_target.get("passed")
+                    if isinstance(raw_target.get("passed"), bool)
+                    else None
+                ),
+                "blocking": raw_target.get("blocking") is True,
+                "reasons": _bounded_text_items(
+                    target_reasons, item_limit=4, text_limit=300
+                ),
+                "reason_count": target_reason_count,
+                "reasons_truncated": raw_target.get("reasons_truncated") is True,
+                "metrics": metrics,
+            })
+        reasons = _bounded_text_items(
+            raw_reasons,
+            item_limit=MAX_CHECKPOINT_REASONS,
+            text_limit=500,
+        )
+        if len(reasons) != len(raw_reasons):
+            return invalid("invalid checkpoint result contract")
+        return {
+            "available": True,
+            "status": status,
+            "kind": kind,
+            "threshold": threshold,
+            "actual_strict_rows": actual_rows,
+            "quality_passed": quality_passed,
+            "completed_at": completed_at,
+            "training_run_id": _bounded_text(
+                result.get("training_run_id"), limit=160
+            ),
+            "generation": _bounded_text(result.get("generation"), limit=160),
+            "reason_count": reason_count,
+            "reasons": reasons,
+            "reasons_truncated": result.get("reasons_truncated") is True,
+            "target_count": target_count,
+            "failed_target_count": failed_target_count,
+            "target_summaries": targets,
+            "target_summaries_truncated": result.get(
+                "target_summaries_truncated"
+            ) is True,
+            "evidence_authentication": evidence,
+            "evidence_error": evidence_error,
         }
 
     @staticmethod
@@ -777,11 +1598,7 @@ class MftPipelineStatusReader:
                 for other in candidates
             )
 
-        selected = [
-            candidate
-            for candidate in candidates
-            if candidate["active_full"] or candidate["nondominated"]
-        ]
+        selected = list(candidates)
         selected.sort(
             key=lambda item: (
                 not item["active_full"],
@@ -799,9 +1616,19 @@ class MftPipelineStatusReader:
             "active_full_count": sum(
                 1 for candidate in candidates if candidate["active_full"]
             ),
-            "eligible_count": len(selected),
+            "eligible_count": sum(
+                1 for candidate in candidates
+                if candidate["active_full"] or candidate["nondominated"]
+            ),
+            "total_count": len(candidates),
+            "displayed_count": min(len(candidates), MAX_VALIDATED_DESIGNS),
+            "ready_full_count": sum(
+                1 for candidate in candidates
+                if not candidate["active_full"]
+                and candidate["full"]["status"] == "not_submitted"
+            ),
             "limit": MAX_VALIDATED_DESIGNS,
-            "truncated": len(selected) > MAX_VALIDATED_DESIGNS,
+            "truncated": len(candidates) > MAX_VALIDATED_DESIGNS,
             "objective_names": ["volume_L", "total_loss_W"],
             "objective_source": "standard_fea_actual",
         }
@@ -927,6 +1754,7 @@ class MftPipelineStatusReader:
             }
         )
         surrogate_hpo = self._surrogate_hpo(surrogate_status)
+        completed_hpo_results = self._completed_hpo_results(surrogate_status)
         surrogate_decision = self._surrogate_decision(surrogate_state)
         incumbent_comparison = _mapping(pointer.get("incumbent_comparison"))
         active_model_metrics = {
@@ -949,6 +1777,48 @@ class MftPipelineStatusReader:
             self._nsga_lane("main", nsga_main, main_meta),
             self._nsga_lane("new-model-fast", nsga_fast, fast_meta),
         ]
+        pareto_results: list[dict[str, Any]] = []
+        pareto_errors: list[dict[str, Any]] = []
+        seen_pareto: set[tuple[str, str, str]] = set()
+        for lane in nsga_lanes:
+            for field in ("latest_pareto", "lifetime_latest_pareto"):
+                pareto = _mapping(lane.get(field))
+                if pareto.get("available") is not True:
+                    if pareto.get("error"):
+                        pareto_errors.append({
+                            "lane": _bounded_text(lane.get("name"), limit=40),
+                            "scope": _bounded_text(
+                                pareto.get("scope"), limit=40
+                            ),
+                            "run_id": _bounded_text(
+                                pareto.get("run_id"), limit=32
+                            ),
+                            "model_id": _bounded_text(
+                                pareto.get("model_id"), limit=160
+                            ),
+                            "error": _bounded_text(
+                                pareto.get("error"), limit=240
+                            ),
+                            "stale": bool(
+                                _mapping(lane.get("freshness")).get("stale")
+                            ),
+                        })
+                    continue
+                identity = (
+                    str(lane.get("name") or ""),
+                    str(pareto.get("run_id") or ""),
+                    str(pareto.get("model_id") or ""),
+                )
+                if identity in seen_pareto:
+                    continue
+                seen_pareto.add(identity)
+                pareto_results.append({
+                    "lane": lane.get("name"),
+                    "stale": bool(
+                        _mapping(lane.get("freshness")).get("stale")
+                    ),
+                    **pareto,
+                })
 
         fea_statuses = [
             sources["standard_fea_main"][0],
@@ -985,6 +1855,19 @@ class MftPipelineStatusReader:
             full_status,
             fea_states,
         )
+        full_discovered_standard_pass = validated_designs["total_count"]
+        validated_designs.update({
+            "known_standard_pass_count": max(
+                standard_pass, full_discovered_standard_pass
+            ),
+            "full_discovered_standard_pass_count": (
+                full_discovered_standard_pass
+            ),
+            "pending_full_discovery_count": max(
+                0, standard_pass - full_discovered_standard_pass
+            ),
+            "source_scope": "full_controller_discovered_standard_pass",
+        })
 
         source_freshness = {
             "canonical_surrogate_status": self._freshness(
@@ -1067,6 +1950,19 @@ class MftPipelineStatusReader:
                 key=lambda item: str(item[0]),
             )[:20]
         ]
+        checkpoint_result = self._checkpoint_result(
+            canonical_status.get("last_checkpoint_result")
+        )
+        nsga_available_lanes = sum(1 for lane in nsga_lanes if lane["available"])
+        nsga_current_result_lanes = sum(
+            1
+            for lane in nsga_lanes
+            if lane["available"] and lane["current_model"]["available"]
+        )
+        nsga_current_aggregate_complete = bool(
+            nsga_available_lanes > 0
+            and nsga_current_result_lanes == nsga_available_lanes
+        )
 
         available = any(bool(meta.get("available")) for _payload, meta in sources.values())
         return {
@@ -1133,6 +2029,7 @@ class MftPipelineStatusReader:
                     canonical_status.get("library_revision"), limit=80
                 ),
                 "blocked": canonical_blocked,
+                "last_checkpoint_result": checkpoint_result,
                 "last_error": _bounded_text(
                     canonical_status.get("last_error"), limit=300
                 ),
@@ -1190,6 +2087,7 @@ class MftPipelineStatusReader:
                     "target_metrics": active_model_target_metrics,
                 },
                 "hpo": surrogate_hpo,
+                "last_completed_hpo_results": completed_hpo_results,
                 "last_decision": surrogate_decision,
                 "next_refresh_strict_rows": (
                     _integer(surrogate_status.get("next_refresh_strict_rows"))
@@ -1207,6 +2105,34 @@ class MftPipelineStatusReader:
                 "available": any(lane["available"] for lane in nsga_lanes),
                 "lanes": nsga_lanes,
                 "active_seed_workers": sum(lane["seed_workers"] for lane in nsga_lanes),
+                "current_model_completed_runs": sum(
+                    lane["current_model"]["completed_runs"] or 0
+                    for lane in nsga_lanes
+                    if lane["current_model"]["available"]
+                ),
+                "current_model_feasible_runs": sum(
+                    lane["current_model"]["feasible_runs"]
+                    for lane in nsga_lanes
+                    if lane["current_model"]["available"]
+                ),
+                "current_model_infeasible_runs": sum(
+                    lane["current_model"]["infeasible_runs"]
+                    for lane in nsga_lanes
+                    if lane["current_model"]["available"]
+                ),
+                "current_model_pareto_runs": sum(
+                    lane["current_model"]["pareto_runs"]
+                    for lane in nsga_lanes
+                    if lane["current_model"]["available"]
+                ),
+                "current_model_result_lanes": nsga_current_result_lanes,
+                "current_model_expected_lanes": nsga_available_lanes,
+                "current_model_aggregate_complete": (
+                    nsga_current_aggregate_complete
+                ),
+                "lifetime_completed_runs": sum(
+                    lane["lifetime"]["completed_runs"] for lane in nsga_lanes
+                ),
                 "completed_runs": sum(lane["completed_runs"] for lane in nsga_lanes),
                 "feasible_runs": sum(lane["feasible_runs"] for lane in nsga_lanes),
                 "infeasible_runs": sum(
@@ -1216,6 +2142,8 @@ class MftPipelineStatusReader:
                 "active_models": sorted(
                     {lane["model_id"] for lane in nsga_lanes if lane["model_id"]}
                 ),
+                "pareto_results": pareto_results,
+                "pareto_errors": pareto_errors,
                 "designs": validated_designs,
             },
             "standard_fea": {
