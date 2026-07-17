@@ -626,9 +626,9 @@
         <p id="mft-completed-hpo-summary" class="muted">완료 HPO 결과 없음</p>
         <div class="table-scroll">
           <table aria-label="Last completed authenticated HPO target results">
-            <thead><tr><th>Target</th><th>Family</th><th>CV MSE (transformed)</th><th>Eligible / train rows</th><th>Trials / threads</th><th>Best parameters</th></tr></thead>
+            <thead><tr><th>Target</th><th>Family</th><th>CV objective</th><th>Objective contract</th><th>Eligible / train rows</th><th>Trials / threads</th><th>Best parameters</th></tr></thead>
             <tbody id="mft-completed-hpo-targets">
-              <tr><td colspan="6" class="muted">완료 HPO 결과 없음</td></tr>
+              <tr><td colspan="7" class="muted">완료 HPO 결과 없음</td></tr>
             </tbody>
           </table>
         </div>
@@ -1023,7 +1023,7 @@
           if (!completedHpoTargets.length) {
             const row = completedHpoBody.insertRow();
             const cell = row.insertCell();
-            cell.colSpan = 6;
+            cell.colSpan = 7;
             cell.className = "muted";
             cell.textContent = "완료 HPO 결과 없음";
           } else {
@@ -1032,10 +1032,16 @@
                 ? Object.entries(target.best_params).map(([name, paramValue]) => `${name}=${shown(paramValue)}`).join(", ")
                 : "-";
               const row = completedHpoBody.insertRow();
+              const objectiveValue = Number.isFinite(Number(target.cv_objective_value))
+                ? target.cv_objective_value
+                : target.cv_mse_transformed;
+              const objectiveName = target.objective_name || "cv_mse_transformed";
+              const objectiveSummary = target.objective_contract_summary || "legacy transformed-space CV MSE";
               const fields = [
                 target.target || "-",
                 target.family || "-",
-                decimal(target.cv_mse_transformed, 6),
+                `${objectiveName}: ${decimal(objectiveValue, 6)}`,
+                objectiveSummary,
                 `${shown(target.eligible_rows)} / ${shown(target.hpo_train_rows)}`,
                 `${shown(target.trials)} / ${shown(target.model_threads)}`,
                 params,
@@ -1043,7 +1049,8 @@
               fields.forEach((field, index) => {
                 const cell = row.insertCell();
                 cell.textContent = String(field);
-                if (index === 5) cell.title = params;
+                if (index === 3) cell.title = objectiveSummary;
+                if (index === 6) cell.title = params;
               });
             });
           }

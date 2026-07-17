@@ -83,7 +83,8 @@ COMPLETED_HPO_TOP_KEYS = frozenset({
     "wave_outcome",
     "evidence_sha256",
 })
-COMPLETED_HPO_TARGET_KEYS = frozenset({
+COMPLETED_HPO_SCHEMA_VERSIONS = frozenset({1, 2})
+COMPLETED_HPO_TARGET_KEYS_V1 = frozenset({
     "target",
     "family",
     "cv_mse_transformed",
@@ -95,6 +96,10 @@ COMPLETED_HPO_TARGET_KEYS = frozenset({
     "best_params",
     "authentication",
 })
+COMPLETED_HPO_TARGET_KEYS_V2 = frozenset(
+    COMPLETED_HPO_TARGET_KEYS_V1.difference({"cv_mse_transformed"})
+    | {"cv_objective_value", "objective_contract"}
+)
 COMPLETED_HPO_TARGET_AUTH_KEYS = frozenset({
     "generation_id",
     "params_sha256",
@@ -109,6 +114,49 @@ COMPLETED_HPO_COMMON_AUTH_KEYS = frozenset({
     "search_implementation_sha256",
     "training_split_contract_sha256",
     "feature_schema_sha256",
+})
+HPO_OBJECTIVE_SCHEMA = "mft-hpo-objective-v1"
+TRANSFORMED_MSE_OBJECTIVE = "transformed_mse_v1"
+TEMPERATURE_PHYSICAL_OBJECTIVE = (
+    "temperature_gate_normalized_rmse_c_plus_p90_ape_v1"
+)
+TEMPERATURE_HPO_QUALITY_THRESHOLDS_SHA256 = (
+    "4aeb0a376d9017cde2a78dd8b965e99ed89134b0663185dd87547580c4cbc9b0"
+)
+SURROGATE_TEMPERATURE_TARGETS = frozenset({
+    "T_max_Tx",
+    "T_max_Rx_main",
+    "T_max_Rx_side",
+    "T_max_core",
+    "Tprobe_Tx_leeward_max",
+    "Tprobe_Rx_main_leeward_max",
+    "Tprobe_Rx_side_leeward_max",
+    "Tprobe_core_center_max",
+    "Tprobe_core_center_leg_max",
+    "Tprobe_core_side_leg_max",
+    "Tprobe_core_top_yoke_max",
+})
+HPO_OBJECTIVE_COMMON_KEYS = frozenset({
+    "schema_version",
+    "name",
+    "units",
+    "scope",
+    "fold_aggregation",
+    "components",
+})
+HPO_TEMPERATURE_OBJECTIVE_KEYS = frozenset(
+    HPO_OBJECTIVE_COMMON_KEYS
+    | {
+        "p90_quantile_method",
+        "relative_error_denominator",
+        "quality_thresholds_sha256",
+    }
+)
+HPO_TEMPERATURE_COMPONENT_KEYS = frozenset({
+    "weight",
+    "normalizer",
+    "normalizer_units",
+    "gate_metric",
 })
 NSGA_PARETO_KEYS = frozenset({
     "schema_version",
@@ -252,6 +300,110 @@ def _exact_sha_mapping(value: object, expected_keys: frozenset[str]) -> bool:
         and set(value) == expected_keys
         and all(_exact_sha256(value.get(key)) is not None for key in expected_keys)
     )
+
+
+def _validated_hpo_objective_contract(
+    target: str, value: object
+) -> dict[str, Any] | None:
+    """Validate and normalize the authenticated schema-2 HPO objective."""
+    if not isinstance(value, Mapping):
+        return None
+    contract = dict(value)
+    is_temperature = target in SURROGATE_TEMPERATURE_TARGETS
+    expected_keys = (
+        HPO_TEMPERATURE_OBJECTIVE_KEYS
+        if is_temperature
+        else HPO_OBJECTIVE_COMMON_KEYS
+    )
+    if (
+        set(contract) != expected_keys
+        or contract.get("schema_version") != HPO_OBJECTIVE_SCHEMA
+        or contract.get("scope") != "model_fit_partition_cv_only"
+        or contract.get("fold_aggregation") != "mean"
+    ):
+        return None
+
+    components = contract.get("components")
+    if not isinstance(components, Mapping):
+        return None
+    if not is_temperature:
+        component_value = _strict_number(components.get("mse_transformed"))
+        if (
+            contract.get("name") != TRANSFORMED_MSE_OBJECTIVE
+            or contract.get("units") != "transformed_target_squared"
+            or set(components) != {"mse_transformed"}
+            or component_value != 1.0
+        ):
+            return None
+        normalized_contract = {
+            "schema_version": HPO_OBJECTIVE_SCHEMA,
+            "name": TRANSFORMED_MSE_OBJECTIVE,
+            "units": "transformed_target_squared",
+            "scope": "model_fit_partition_cv_only",
+            "fold_aggregation": "mean",
+            "components": {"mse_transformed": 1.0},
+        }
+        return {
+            "name": TRANSFORMED_MSE_OBJECTIVE,
+            "summary": "model-fit CV only; mean transformed-target squared error",
+            "contract": normalized_contract,
+        }
+
+    if (
+        contract.get("name") != TEMPERATURE_PHYSICAL_OBJECTIVE
+        or contract.get("units") != "dimensionless_gate_ratio_sum"
+        or contract.get("p90_quantile_method") != "numpy_linear"
+        or contract.get("relative_error_denominator")
+        != "absolute_truth_temperature_c"
+        or contract.get("quality_thresholds_sha256")
+        != TEMPERATURE_HPO_QUALITY_THRESHOLDS_SHA256
+        or set(components) != {"rmse_C", "p90_ape_pct"}
+    ):
+        return None
+    component_contracts = {
+        "rmse_C": (5.0, "degC", "max_rmse"),
+        "p90_ape_pct": (10.0, "percent", "max_p90_ape_pct"),
+    }
+    normalized_components: dict[str, dict[str, Any]] = {}
+    for name, (expected_normalizer, units, gate_metric) in component_contracts.items():
+        component = components.get(name)
+        if not isinstance(component, Mapping):
+            return None
+        weight = _strict_number(component.get("weight"))
+        normalizer = _strict_number(component.get("normalizer"))
+        if (
+            set(component) != HPO_TEMPERATURE_COMPONENT_KEYS
+            or weight != 1.0
+            or normalizer != expected_normalizer
+            or component.get("normalizer_units") != units
+            or component.get("gate_metric") != gate_metric
+        ):
+            return None
+        normalized_components[name] = {
+            "weight": 1.0,
+            "normalizer": expected_normalizer,
+            "normalizer_units": units,
+            "gate_metric": gate_metric,
+        }
+    normalized_contract = {
+        "schema_version": HPO_OBJECTIVE_SCHEMA,
+        "name": TEMPERATURE_PHYSICAL_OBJECTIVE,
+        "units": "dimensionless_gate_ratio_sum",
+        "scope": "model_fit_partition_cv_only",
+        "fold_aggregation": "mean",
+        "components": normalized_components,
+        "p90_quantile_method": "numpy_linear",
+        "relative_error_denominator": "absolute_truth_temperature_c",
+        "quality_thresholds_sha256": TEMPERATURE_HPO_QUALITY_THRESHOLDS_SHA256,
+    }
+    return {
+        "name": TEMPERATURE_PHYSICAL_OBJECTIVE,
+        "summary": (
+            "model-fit CV only; mean(RMSE/5 degC + P90 APE/10%); "
+            f"thresholds {TEMPERATURE_HPO_QUALITY_THRESHOLDS_SHA256[:12]}"
+        ),
+        "contract": normalized_contract,
+    }
 
 
 def _text_items(value: object, *, limit: int = 20) -> list[str]:
@@ -1047,9 +1199,12 @@ class MftPipelineStatusReader:
 
         if not raw:
             return invalid(error_message)
+        schema_version = raw.get("schema_version")
         if (
             set(raw) != COMPLETED_HPO_TOP_KEYS
-            or raw.get("schema_version") != 1
+            or isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version not in COMPLETED_HPO_SCHEMA_VERSIONS
             or raw.get("status") != "completed"
             or raw.get("evidence_authentication") != "complete"
         ):
@@ -1133,7 +1288,23 @@ class MftPipelineStatusReader:
                 return invalid("invalid completed HPO target contract")
             item = dict(raw_item)
             target = str(item.get("target") or "")
-            cv_mse = _strict_number(item.get("cv_mse_transformed"))
+            target_keys = (
+                COMPLETED_HPO_TARGET_KEYS_V2
+                if schema_version == 2
+                else COMPLETED_HPO_TARGET_KEYS_V1
+            )
+            if schema_version == 2:
+                cv_objective = _strict_number(item.get("cv_objective_value"))
+                objective = _validated_hpo_objective_contract(
+                    target, item.get("objective_contract")
+                )
+            else:
+                cv_objective = _strict_number(item.get("cv_mse_transformed"))
+                objective = {
+                    "name": "cv_mse_transformed",
+                    "summary": "legacy schema 1; transformed-space CV MSE",
+                    "contract": None,
+                }
             eligible_rows = _positive_integer(item.get("eligible_rows"))
             target_rows = _positive_integer(item.get("target_rows"))
             train_rows = _positive_integer(item.get("hpo_train_rows"))
@@ -1144,12 +1315,13 @@ class MftPipelineStatusReader:
             best_params = _validated_hpo_params(item.get("best_params"))
             authentication = item.get("authentication")
             if (
-                set(item) != COMPLETED_HPO_TARGET_KEYS
+                set(item) != target_keys
                 or _HPO_TARGET_RE.fullmatch(target) is None
                 or target in seen_targets
                 or item.get("family") != "lightgbm"
-                or cv_mse is None
-                or cv_mse < 0
+                or cv_objective is None
+                or cv_objective < 0
+                or objective is None
                 or eligible_rows is None
                 or target_rows is None
                 or eligible_rows != target_rows
@@ -1177,19 +1349,26 @@ class MftPipelineStatusReader:
             if authentication.get("tuned_override_sha256") != params_sha:
                 return invalid("invalid completed HPO target contract")
             seen_targets.add(target)
-            targets.append({
+            normalized_target = {
                 "target": target,
                 "family": "lightgbm",
-                "cv_mse_transformed": cv_mse,
+                "cv_objective_value": cv_objective,
+                "objective_name": objective["name"],
+                "objective_contract_summary": objective["summary"],
+                "objective_contract": objective["contract"],
                 "eligible_rows": eligible_rows,
                 "target_rows": target_rows,
                 "hpo_train_rows": train_rows,
                 "trials": trials,
                 "model_threads": model_threads,
                 "best_params": best_params,
-            })
+            }
+            if schema_version == 1:
+                normalized_target["cv_mse_transformed"] = cv_objective
+            targets.append(normalized_target)
         return {
             "available": True,
+            "schema_version": schema_version,
             "wave": wave,
             "result_phase": phase,
             "completed_at": completed_at,

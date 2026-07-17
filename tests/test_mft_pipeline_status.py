@@ -130,6 +130,55 @@ def resign_completed_hpo(value: dict) -> None:
     ).hexdigest()
 
 
+def schema2_objective_contract(target: str) -> dict:
+    if not target.startswith("T"):
+        return {
+            "schema_version": "mft-hpo-objective-v1",
+            "name": "transformed_mse_v1",
+            "units": "transformed_target_squared",
+            "scope": "model_fit_partition_cv_only",
+            "fold_aggregation": "mean",
+            "components": {"mse_transformed": 1.0},
+        }
+    return {
+        "schema_version": "mft-hpo-objective-v1",
+        "name": "temperature_gate_normalized_rmse_c_plus_p90_ape_v1",
+        "units": "dimensionless_gate_ratio_sum",
+        "scope": "model_fit_partition_cv_only",
+        "fold_aggregation": "mean",
+        "components": {
+            "rmse_C": {
+                "weight": 1.0,
+                "normalizer": 5.0,
+                "normalizer_units": "degC",
+                "gate_metric": "max_rmse",
+            },
+            "p90_ape_pct": {
+                "weight": 1.0,
+                "normalizer": 10.0,
+                "normalizer_units": "percent",
+                "gate_metric": "max_p90_ape_pct",
+            },
+        },
+        "p90_quantile_method": "numpy_linear",
+        "relative_error_denominator": "absolute_truth_temperature_c",
+        "quality_thresholds_sha256": (
+            "4aeb0a376d9017cde2a78dd8b965e99ed89134b0663185dd87547580c4cbc9b0"
+        ),
+    }
+
+
+def completed_hpo_schema2_fixture() -> dict:
+    value = completed_hpo_fixture()
+    value["schema_version"] = 2
+    for item in value["targets"]:
+        objective_value = item.pop("cv_mse_transformed")
+        item["cv_objective_value"] = objective_value
+        item["objective_contract"] = schema2_objective_contract(item["target"])
+    resign_completed_hpo(value)
+    return value
+
+
 def write_complete_runtime(root: Path) -> None:
     write_json(
         root,
@@ -800,6 +849,77 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
             result["evidence_error"], "invalid completed HPO target contract"
         )
 
+    def test_completed_hpo_schema2_objectives_are_validated_and_visible(self) -> None:
+        completed = completed_hpo_schema2_fixture()
+
+        result = MftPipelineStatusReader._completed_hpo_results(
+            {"last_completed_hpo_results": completed}
+        )
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["schema_version"], 2)
+        transformed = result["targets"][0]
+        self.assertEqual(transformed["cv_objective_value"], 0.002359)
+        self.assertEqual(transformed["objective_name"], "transformed_mse_v1")
+        self.assertIn(
+            "transformed-target squared error",
+            transformed["objective_contract_summary"],
+        )
+        temperature = result["targets"][1]
+        self.assertEqual(
+            temperature["objective_name"],
+            "temperature_gate_normalized_rmse_c_plus_p90_ape_v1",
+        )
+        self.assertIn("RMSE/5 degC", temperature["objective_contract_summary"])
+        self.assertEqual(
+            temperature["objective_contract"]["quality_thresholds_sha256"],
+            "4aeb0a376d9017cde2a78dd8b965e99ed89134b0663185dd87547580c4cbc9b0",
+        )
+
+    def test_completed_hpo_schema2_tampered_objective_fails_closed(self) -> None:
+        completed = completed_hpo_schema2_fixture()
+        completed["targets"][1]["objective_contract"]["components"]["rmse_C"][
+            "normalizer"
+        ] = 6.0
+        resign_completed_hpo(completed)
+
+        result = MftPipelineStatusReader._completed_hpo_results(
+            {"last_completed_hpo_results": completed}
+        )
+
+        self.assertFalse(result["available"])
+        self.assertEqual(
+            result["evidence_error"], "invalid completed HPO target contract"
+        )
+
+    def test_completed_hpo_schema2_boolean_objective_fails_closed(self) -> None:
+        completed = completed_hpo_schema2_fixture()
+        completed["targets"][0]["cv_objective_value"] = True
+        resign_completed_hpo(completed)
+
+        result = MftPipelineStatusReader._completed_hpo_results(
+            {"last_completed_hpo_results": completed}
+        )
+
+        self.assertFalse(result["available"])
+        self.assertEqual(
+            result["evidence_error"], "invalid completed HPO target contract"
+        )
+
+    def test_completed_hpo_boolean_schema_version_fails_closed(self) -> None:
+        completed = completed_hpo_fixture()
+        completed["schema_version"] = True
+        resign_completed_hpo(completed)
+
+        result = MftPipelineStatusReader._completed_hpo_results(
+            {"last_completed_hpo_results": completed}
+        )
+
+        self.assertFalse(result["available"])
+        self.assertEqual(
+            result["evidence_error"], "invalid completed HPO result contract"
+        )
+
     def test_checkpoint_quality_pass_requires_complete_evidence(self) -> None:
         result = MftPipelineStatusReader._checkpoint_result({
             "schema_version": 1,
@@ -1296,6 +1416,11 @@ class MftPipelineStatusRouteTests(unittest.TestCase):
         self.assertIn("currentModel.infeasible_runs", html)
         self.assertIn("lifetime.infeasible_runs", html)
         self.assertIn("surrogate.last_completed_hpo_results", html)
+        self.assertIn("CV objective", html)
+        self.assertIn("Objective contract", html)
+        self.assertIn("target.cv_objective_value", html)
+        self.assertIn("target.objective_name", html)
+        self.assertIn("target.objective_contract_summary", html)
         self.assertIn("canonicalTraining.last_checkpoint_result", html)
         self.assertIn("nsga.pareto_results", html)
         self.assertIn('document.createElementNS(svg, "circle")', html)
