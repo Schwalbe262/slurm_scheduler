@@ -18,6 +18,7 @@ from .db import Database
 from .models import SchedulingProfile, TaskCreate, TaskStatus
 from .aedt_session_host import (
     EXPECTED_AEDT_VERSION,
+    EXPECTED_SESSION_PROFILE_JSON,
     SUPPORTED_DSO_PROFILE,
     SUPPORTED_DSO_PROFILES,
     canonical_expected_session_profile,
@@ -514,6 +515,33 @@ class AedtPoolService:
             Callable[[dict[str, Any]], tuple[bool, dict[str, Any]]] | None
         ) = None
         self._task_account_selector: Callable[[dict[str, Any]], str] | None = None
+        self._task_account_batch_selector: (
+            Callable[
+                [
+                    list[dict[str, Any]],
+                    dict[int, str],
+                    list[dict[str, Any]],
+                    int,
+                ],
+                Any,
+            ]
+            | None
+        ) = None
+        # Blank-account tasks need a stable route while their cohort capacity
+        # is being created.  This cache is only an anti-oscillation hint: every
+        # batch planner reconstructs its inputs from live DB state and the
+        # storage guard remains the authoritative, fail-closed admission gate.
+        self._task_account_batch_lock = threading.RLock()
+        self._task_account_route_lock = threading.RLock()
+        self._task_account_routes: dict[
+            int, tuple[tuple[str, ...], str]
+        ] = {}
+        # Keep the latest actionable result distinct from durable route hints.
+        # Empty selections are cached too, preventing concurrent or sequential
+        # pre-admission callers from multiplying one failed remote snapshot.
+        self._task_account_batch_selections: dict[
+            int, tuple[tuple[str, ...], str]
+        ] = {}
         self._config_cache: AedtPoolConfig | None = None
         self._config_cache_until = 0.0
         self._placement_cursor = 0
@@ -529,6 +557,36 @@ class AedtPoolService:
         """Install the scheduler's read-only account choice for pooled demand."""
 
         self._task_account_selector = selector
+
+    def set_task_account_batch_selector(
+        self,
+        selector: (
+            Callable[
+                [
+                    list[dict[str, Any]],
+                    dict[int, str],
+                    list[dict[str, Any]],
+                    int,
+                ],
+                Any,
+            ]
+            | None
+        ),
+    ) -> None:
+        """Install one-snapshot routing for flexible pooled task cohorts.
+
+        The callback receives queued task snapshots, still-valid route hints,
+        READY/BUSY capacity plus reserved STARTING cohorts, and projects/session.
+        It returns either an actionable route mapping or
+        ``(actionable_routes, retained_route_hints)``.  A hint may survive
+        prospective-only pressure, but only the actionable mapping feeds the
+        current plan.  Keeping this planner separate from the legacy
+        single-task selector avoids one SSH snapshot/quota refresh per task.
+        """
+
+        with self._task_account_batch_lock, self._task_account_route_lock:
+            self._task_account_batch_selector = selector
+            self._task_account_batch_selections.clear()
 
     def set_runtime_start_block_reasons(
         self, reasons: dict[str, str] | None
@@ -1599,7 +1657,10 @@ class AedtPoolService:
         # Account selection can refresh Slurm/storage state over SSH.  Resolve
         # it before BEGIN IMMEDIATE, then authenticate the routing fingerprint
         # again against the task row inside the writer transaction.
-        selector_configured = self._task_account_selector is not None
+        selector_configured = bool(
+            self._task_account_selector is not None
+            or self._task_account_batch_selector is not None
+        )
         task_account_selection = self._preselect_task_account(task_id)
         now_dt = self._now()
         now = _sql_time(now_dt)
@@ -1642,6 +1703,8 @@ class AedtPoolService:
                 "task_account_name": task["account_name"],
                 "required_capability": str(task["required_capability"] or ""),
                 "env_profile": str(task["env_profile"] or ""),
+                "env_setup": str(task["env_setup"] or ""),
+                "command": str(task["command"] or ""),
             }
             selected_account = ""
             selection_matches = False
@@ -5834,6 +5897,8 @@ class AedtPoolService:
                 "task_account_name",
                 "required_capability",
                 "env_profile",
+                "env_setup",
+                "command",
             )
         )
 
@@ -5875,14 +5940,17 @@ class AedtPoolService:
     ) -> tuple[tuple[str, ...], str] | None:
         """Snapshot and route one queued pooled task outside a writer lock."""
 
-        if self._task_account_selector is None:
+        if (
+            self._task_account_selector is None
+            and self._task_account_batch_selector is None
+        ):
             return None
         with self.db.connect() as conn:
             row = conn.execute(
                 """
                 SELECT id AS task_id, name, project, requested_account_name,
                        account_name AS task_account_name,
-                       required_capability, env_profile
+                       required_capability, env_profile, env_setup, command
                 FROM tasks
                 WHERE id = ? AND status = 'queued'
                   AND LOWER(TRIM(COALESCE(aedt_backend, ''))) = 'pooled'
@@ -5891,9 +5959,147 @@ class AedtPoolService:
             ).fetchone()
         if row is None:
             return None
-        return self._select_task_account_from_snapshot(dict(row))
+        task = dict(row)
+        if len(self._task_requested_accounts(task)) == 1:
+            return None
+        fingerprint = self._task_account_fingerprint(task)
+        if self._task_account_batch_selector is not None:
+            with self._task_account_batch_lock:
+                with self._task_account_route_lock:
+                    cached = self._task_account_batch_selections.get(int(task_id))
+                if cached and cached[0] == fingerprint:
+                    return cached
+                # The first scheduler pre-admission after a restart may race
+                # ahead of the pool adapter. Rebuild every flexible route once;
+                # later callers, including empty results, share that outcome.
+                return self._preselect_task_accounts_locked().get(
+                    int(task_id), (fingerprint, "")
+                )
+        return self._select_task_account_from_snapshot(task)
+
+    def _routing_session_capacity_snapshot(
+        self,
+        conn: Any,
+        *,
+        heartbeat_cutoff: str,
+        now: str,
+    ) -> list[dict[str, Any]]:
+        """Snapshot existing cohort slots with full sharing-contract evidence.
+
+        BUSY sibling slots are just as storage-paid as READY slots, but they
+        are usable only by a compatible family/profile/isolation contract.
+        STARTING slots reconstruct durable cohort routing after a restart; they
+        can satisfy account demand but writer-path pre-admission still waits
+        until the session is READY/BUSY.
+        The batch planner performs a virtual fit with this evidence and the
+        writer-path pre-admission rechecks the same contract atomically.
+        """
+
+        sessions = conn.execute(
+            """
+            SELECT s.id, s.state, s.slots_total, s.session_profile,
+                   a.account_name,
+                   (SELECT COUNT(*) FROM aedt_project_leases l
+                    WHERE l.session_id = s.id
+                      AND l.state IN (
+                          'offered','leased','attaching','active','releasing'
+                      )) AS used_slots,
+                   (SELECT COUNT(*) FROM aedt_exact_session_reservations r
+                    WHERE r.session_id = s.id
+                      AND r.state IN ('reserved','claimed')) AS held_slots
+            FROM aedt_sessions s
+            JOIN allocations a ON a.id = s.allocation_id
+            WHERE a.state IN ('warm','active')
+              AND s.reuse_blocked_at IS NULL
+              AND s.solve_batch_sealed_at IS NULL
+              AND s.drain_requested_at IS NULL
+              AND (
+                  s.state = 'starting'
+                  OR (
+                      s.state IN ('ready','busy')
+                      AND s.last_heartbeat_at >= ?
+                      AND (
+                          s.quarantine_until IS NULL
+                          OR s.quarantine_until <= ?
+                      )
+                      AND TRIM(COALESCE(s.endpoint, '')) != ''
+                      AND TRIM(COALESCE(s.process_id, '')) != ''
+                  )
+              )
+            ORDER BY (used_slots + held_slots) DESC,
+                     COALESCE(s.idle_since, s.created_at), s.id
+            """,
+            (heartbeat_cutoff, now),
+        ).fetchall()
+        snapshot: list[dict[str, Any]] = []
+        for session in sessions:
+            free_slots = max(
+                0,
+                int(session["slots_total"] or 0)
+                - int(session["used_slots"] or 0)
+                - int(session["held_slots"] or 0),
+            )
+            if free_slots <= 0:
+                continue
+            session_id = int(session["id"])
+            occupants = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT protocol_version, session_profile,
+                           workload_family, isolation_policy,
+                           exclusive_session
+                    FROM aedt_project_leases
+                    WHERE session_id = ?
+                      AND state IN (
+                          'offered','leased','attaching','active','releasing'
+                      )
+                    ORDER BY id
+                    """,
+                    (session_id,),
+                ).fetchall()
+            ]
+            reservations = [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT workload_family, isolation_policy
+                    FROM aedt_exact_session_reservations
+                    WHERE session_id = ? AND state IN ('reserved','claimed')
+                    ORDER BY id
+                    """,
+                    (session_id,),
+                ).fetchall()
+            ]
+            state = str(session["state"] or "")
+            snapshot.append(
+                {
+                    "session_id": session_id,
+                    "account_name": str(session["account_name"] or ""),
+                    "state": state,
+                    "session_profile": (
+                        str(session["session_profile"] or "")
+                        or (
+                            EXPECTED_SESSION_PROFILE_JSON
+                            if state == "starting"
+                            else ""
+                        )
+                    ),
+                    "assignable": state in SESSION_ASSIGNABLE_STATES,
+                    "free_slots": free_slots,
+                    "occupants": occupants,
+                    "reservations": reservations,
+                }
+            )
+        return snapshot
 
     def _preselect_task_accounts(
+        self,
+    ) -> dict[int, tuple[tuple[str, ...], str]]:
+        with self._task_account_batch_lock:
+            return self._preselect_task_accounts_locked()
+
+    def _preselect_task_accounts_locked(
         self,
     ) -> dict[int, tuple[tuple[str, ...], str]]:
         """Resolve scheduler-owned account choices outside a DB transaction.
@@ -5907,8 +6113,14 @@ class AedtPoolService:
         """
 
         selector = self._task_account_selector
-        if selector is None:
+        batch_selector = self._task_account_batch_selector
+        if selector is None and batch_selector is None:
             return {}
+        config = self.config()
+        heartbeat_cutoff = _sql_time(
+            self._now()
+            - timedelta(seconds=config.session_heartbeat_timeout_seconds)
+        )
         with self.db.connect() as conn:
             tasks = [
                 dict(row)
@@ -5917,7 +6129,8 @@ class AedtPoolService:
                     SELECT DISTINCT t.id AS task_id, t.name, t.project,
                            t.requested_account_name,
                            t.account_name AS task_account_name,
-                           t.required_capability, t.env_profile
+                           t.required_capability, t.env_profile,
+                           t.env_setup, t.command
                     FROM aedt_project_leases l
                     JOIN tasks t ON t.id = l.task_id
                     LEFT JOIN aedt_sessions s ON s.id = l.session_id
@@ -5932,7 +6145,8 @@ class AedtPoolService:
                     SELECT DISTINCT t.id AS task_id, t.name, t.project,
                            t.requested_account_name,
                            t.account_name AS task_account_name,
-                           t.required_capability, t.env_profile
+                           t.required_capability, t.env_profile,
+                           t.env_setup, t.command
                     FROM tasks t
                     LEFT JOIN aedt_exact_session_reservations r
                       ON r.task_id = t.id AND r.state IN ('reserved','claimed')
@@ -5953,6 +6167,92 @@ class AedtPoolService:
                     """
                 ).fetchall()
             ]
+            session_capacity = self._routing_session_capacity_snapshot(
+                conn,
+                heartbeat_cutoff=heartbeat_cutoff,
+                now=_sql_time(self._now()),
+            )
+
+        flexible_tasks = [
+            task
+            for task in tasks
+            if len(self._task_requested_accounts(task)) != 1
+        ]
+        if batch_selector is not None:
+            fingerprints = {
+                int(task.get("task_id") or 0): self._task_account_fingerprint(task)
+                for task in flexible_tasks
+                if int(task.get("task_id") or 0) > 0
+            }
+            with self._task_account_route_lock:
+                existing_routes = {
+                    task_id: str(cached[1] or "").strip()
+                    for task_id, fingerprint in fingerprints.items()
+                    if (cached := self._task_account_routes.get(task_id))
+                    and cached[0] == fingerprint
+                    and str(cached[1] or "").strip()
+                }
+            try:
+                raw_result = batch_selector(
+                    [dict(task) for task in flexible_tasks],
+                    dict(existing_routes),
+                    [dict(item) for item in session_capacity],
+                    max(1, int(config.projects_per_session)),
+                )
+                if (
+                    isinstance(raw_result, tuple)
+                    and len(raw_result) == 2
+                ):
+                    raw_routes, raw_hints = raw_result
+                else:
+                    raw_routes = raw_result
+                    raw_hints = raw_result
+                planned_routes = {
+                    int(task_id): str(account or "").strip()
+                    for task_id, account in (raw_routes or {}).items()
+                    if int(task_id) in fingerprints
+                    and str(account or "").strip()
+                }
+                retained_hints = {
+                    int(task_id): str(account or "").strip()
+                    for task_id, account in (raw_hints or {}).items()
+                    if int(task_id) in fingerprints
+                    and str(account or "").strip()
+                }
+            except Exception:
+                # A batch probe failure is fail-closed for new work, but must
+                # not erase stable routes and make every task jump accounts.
+                LOGGER.exception("AEDT pooled demand batch account selection failed")
+                planned_routes = {}
+                retained_hints = dict(existing_routes)
+
+            selections = {
+                task_id: (fingerprint, planned_routes.get(task_id, ""))
+                for task_id, fingerprint in fingerprints.items()
+            }
+            with self._task_account_route_lock:
+                live_task_ids = set(fingerprints)
+                self._task_account_routes = {
+                    task_id: cached
+                    for task_id, cached in self._task_account_routes.items()
+                    if task_id in live_task_ids
+                    and cached[0] == fingerprints.get(task_id)
+                }
+                for task_id, account in retained_hints.items():
+                    self._task_account_routes[task_id] = (
+                        fingerprints[task_id],
+                        account,
+                    )
+                # A successful batch result is authoritative.  Accounts are
+                # removed only by its current-pressure/unavailability rules.
+                for task_id in live_task_ids - set(retained_hints):
+                    self._task_account_routes.pop(task_id, None)
+                self._task_account_batch_selections = dict(selections)
+
+            # Include an explicit empty selection for unroutable flexible work.
+            # Both planning and single-task pre-admission then remain fail-closed
+            # instead of silently falling back to the pool's default account.
+            return selections
 
         selections: dict[int, tuple[tuple[str, ...], str]] = {}
         for task in tasks:
@@ -6103,10 +6403,19 @@ class AedtPoolService:
         )
         resolved_task_accounts = task_account_selections or {}
 
-        def planned_account(row: Any) -> str:
+        def planned_account_route(row: Any) -> tuple[str, bool, bool]:
+            """Return account, durability, and whether routing is actionable.
+
+            Exact reservations, live leases, and one-account operator requests
+            are durable demand.  A batch/single selector result for an unbound
+            blank-account task is deliberately transient: it may authorize new
+            capacity, but it must not immediately destroy healthy capacity on a
+            different account before the scheduler can reserve its free slots.
+            """
+
             reserved_account = str(row["reserved_account"] or "").strip()
             if reserved_account:
-                return reserved_account
+                return reserved_account, True, True
             task = dict(row)
             requested_value = task.get("requested_account_name")
             if requested_value is None:
@@ -6117,14 +6426,20 @@ class AedtPoolService:
                 if item.strip()
             ]
             if len(requested) == 1:
-                return requested[0]
+                return requested[0], True, True
             task_id = int(task.get("task_id") or task.get("id") or 0)
             resolved = resolved_task_accounts.get(task_id)
             if resolved and resolved[0] == self._task_account_fingerprint(task):
                 selected = str(resolved[1] or "").strip()
-                if selected:
-                    return selected
-            return requested[0] if requested else fallback_account
+                return selected, False, bool(selected)
+            # A blank account is a valid legacy/default runtime route when no
+            # selector made an authoritative decision.  Only an explicit empty
+            # batch result is unrouted/fail-closed.
+            return (
+                requested[0] if requested else fallback_account,
+                False,
+                True,
+            )
 
         live_project_rows = conn.execute(
             """
@@ -6133,7 +6448,8 @@ class AedtPoolService:
                    COALESCE(sa.account_name, ra.account_name, '') AS reserved_account,
                    t.name, t.project, t.requested_account_name,
                    t.account_name AS task_account_name,
-                   t.required_capability, t.env_profile
+                   t.required_capability, t.env_profile,
+                   t.env_setup, t.command
             FROM aedt_project_leases l
             LEFT JOIN aedt_sessions s ON s.id = l.session_id
             LEFT JOIN allocations sa ON sa.id = s.allocation_id
@@ -6154,7 +6470,8 @@ class AedtPoolService:
                    t.required_capability, t.env_profile,
                    COALESCE(r.workload_family, '') AS reserved_family,
                    COALESCE(r.isolation_policy, '') AS reserved_policy,
-                   COALESCE(a.account_name, '') AS reserved_account
+                   COALESCE(a.account_name, '') AS reserved_account,
+                   t.env_setup, t.command
             FROM tasks t
             LEFT JOIN aedt_exact_session_reservations r
               ON r.task_id = t.id AND r.state IN ('reserved','claimed')
@@ -6173,19 +6490,22 @@ class AedtPoolService:
             """
         ).fetchall()
         queued_pooled_task_backlog = len(queued_backlog_rows)
-        demand_entries: list[tuple[str, str, bool]] = []
+        demand_entries: list[tuple[str, str, bool, bool, bool]] = []
         for row in live_project_rows:
             family = str(
                 row["workload_family"] or row["placement_group"] or ""
             ).strip().lower()
             if not family:
                 family = f"__legacy_lease_{int(row['lease_id'])}"
+            account, durable_route, actionable_route = planned_account_route(row)
             demand_entries.append(
                 (
-                    planned_account(row),
+                    account,
                     family,
                     bool(row["exclusive_session"])
                     or str(row["isolation_policy"] or "") == "exclusive",
+                    durable_route,
+                    actionable_route,
                 )
             )
         for row in queued_backlog_rows:
@@ -6194,39 +6514,89 @@ class AedtPoolService:
                 family = canonical_workload_family(
                     "", str(row["project"] or row["name"] or "")
                 )
+            account, durable_route, actionable_route = planned_account_route(row)
             demand_entries.append(
                 (
-                    planned_account(row),
+                    account,
                     family,
                     str(row["reserved_policy"] or "") == "exclusive",
+                    durable_route,
+                    actionable_route,
                 )
             )
         demand_entries = demand_entries[: config.target_projects]
         desired_projects = len(demand_entries)
-        desired_exclusive = sum(1 for _account, _family, exclusive in demand_entries if exclusive)
+        desired_exclusive = sum(
+            1
+            for _account, _family, exclusive, _durable, _actionable in demand_entries
+            if exclusive
+        )
         shared_counts: dict[tuple[str, str], int] = {}
+        durable_shared_counts: dict[tuple[str, str], int] = {}
+        unrouted_shared_counts: dict[str, int] = {}
         queued_pooled_task_backlog_by_account: dict[str, int] = {}
+        unrouted_queued_pooled_task_backlog = 0
         for row in queued_backlog_rows:
-            account = planned_account(row)
+            account, _durable, actionable_route = planned_account_route(row)
+            if not actionable_route:
+                unrouted_queued_pooled_task_backlog += 1
+                continue
             queued_pooled_task_backlog_by_account[account] = (
                 queued_pooled_task_backlog_by_account.get(account, 0) + 1
             )
         group_demand: dict[tuple[str, str], int] = {}
+        durable_group_demand: dict[tuple[str, str], int] = {}
         exclusive_counts_by_account: dict[str, int] = {}
-        for account, family, exclusive in demand_entries:
+        durable_exclusive_counts_by_account: dict[str, int] = {}
+        unrouted_exclusive_count = 0
+        for (
+            account,
+            family,
+            exclusive,
+            durable_route,
+            actionable_route,
+        ) in demand_entries:
+            if not actionable_route:
+                if exclusive:
+                    unrouted_exclusive_count += 1
+                else:
+                    unrouted_shared_counts[family] = (
+                        unrouted_shared_counts.get(family, 0) + 1
+                    )
+                continue
             if exclusive:
                 exclusive_counts_by_account[account] = (
                     exclusive_counts_by_account.get(account, 0) + 1
                 )
+                if durable_route:
+                    durable_exclusive_counts_by_account[account] = (
+                        durable_exclusive_counts_by_account.get(account, 0) + 1
+                    )
             else:
                 key = (account, family)
                 shared_counts[key] = shared_counts.get(key, 0) + 1
+                if durable_route:
+                    durable_shared_counts[key] = (
+                        durable_shared_counts.get(key, 0) + 1
+                    )
         for account, count in exclusive_counts_by_account.items():
             group_demand[(account, "__exclusive__")] = count
+        for account, count in durable_exclusive_counts_by_account.items():
+            durable_group_demand[(account, "__exclusive__")] = count
         for (account, family), count in sorted(shared_counts.items()):
             group_demand[(account, f"family:{family}")] = math.ceil(
                 count / config.projects_per_session
             )
+        for (account, family), count in sorted(durable_shared_counts.items()):
+            durable_group_demand[(account, f"family:{family}")] = math.ceil(
+                count / config.projects_per_session
+            )
+        unrouted_group_demand = {
+            f"family:{family}": math.ceil(count / config.projects_per_session)
+            for family, count in sorted(unrouted_shared_counts.items())
+        }
+        if unrouted_exclusive_count:
+            unrouted_group_demand["__exclusive__"] = unrouted_exclusive_count
 
         bound_contracts: dict[tuple[int, str], dict[str, Any]] = {}
         for row in conn.execute(
@@ -6335,7 +6705,14 @@ class AedtPoolService:
             if remaining_session_ceiling <= 0:
                 break
         demand_sessions_by_account = capped_demand_by_account
-        demand_sessions = sum(demand_sessions_by_account.values())
+        unrouted_demand_sessions = min(
+            max(0, sum(unrouted_group_demand.values())),
+            max(0, remaining_session_ceiling),
+        )
+        demand_sessions = (
+            sum(demand_sessions_by_account.values())
+            + unrouted_demand_sessions
+        )
         desired_sessions = min(
             config.max_sessions,
             demand_sessions + config.min_idle_sessions,
@@ -6413,6 +6790,27 @@ class AedtPoolService:
         demand_start_needed_by_account = {
             account: count
             for account, count in demand_start_needed_by_account.items()
+            if count > 0
+        }
+        durable_unsatisfied_group_sessions_by_account: dict[str, int] = {}
+        for (account, group), required in durable_group_demand.items():
+            durable_unsatisfied_group_sessions_by_account[account] = (
+                durable_unsatisfied_group_sessions_by_account.get(account, 0)
+                + max(
+                    0,
+                    required - bound_sessions_by_group.get((account, group), 0),
+                )
+            )
+        durable_demand_start_needed_by_account = {
+            account: max(
+                0,
+                count - flexible_sessions_by_account.get(account, 0),
+            )
+            for account, count in durable_unsatisfied_group_sessions_by_account.items()
+        }
+        durable_demand_start_needed_by_account = {
+            account: count
+            for account, count in durable_demand_start_needed_by_account.items()
             if count > 0
         }
         demand_start_needed = sum(demand_start_needed_by_account.values())
@@ -6554,9 +6952,11 @@ class AedtPoolService:
             for account, surplus in flexible_surplus_by_account.items()
             if surplus - spare_to_keep_by_account.get(account, 0) > 0
         }
-        if not demand_start_needed_by_account:
+        if not durable_demand_start_needed_by_account:
             # Ordinary scale-in still observes idle_ttl. Immediate drains are
-            # only for freeing wrong-account capacity needed by queued work.
+            # only for freeing wrong-account capacity needed by durable/bound
+            # work.  A transient blank-account batch route must not close a
+            # healthy Desktop before the scheduler can reserve its paid slots.
             rebalance_drains_by_account = {}
         planned_rebalance_drains = sum(rebalance_drains_by_account.values())
         dead_parent_counted_session_count = int(
@@ -6824,12 +7224,19 @@ class AedtPoolService:
             "live_projects": live_projects,
             "queued_pooled_task_backlog": queued_pooled_task_backlog,
             "queued_pooled_task_backlog_by_account": queued_pooled_task_backlog_by_account,
+            "unrouted_queued_pooled_task_backlog": (
+                unrouted_queued_pooled_task_backlog
+            ),
             "desired_projects": desired_projects,
             "exclusive_projects": desired_exclusive,
+            "unrouted_demand_sessions": unrouted_demand_sessions,
             "demand_sessions_by_account": demand_sessions_by_account,
             "active_sessions_by_account": active_sessions_by_account,
             "starting_sessions_by_account": starting_sessions_by_account,
             "start_needed_by_account": start_needed_by_account,
+            "durable_start_needed_by_account": (
+                durable_demand_start_needed_by_account
+            ),
             "blocked_start_needed": sum(
                 blocked_start_needed_by_account.values()
             ),

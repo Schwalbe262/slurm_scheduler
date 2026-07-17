@@ -28,6 +28,7 @@ from .aedt_pool_api import create_aedt_pool_router
 from .aedt_session_host import (
     EXPECTED_AEDT_VERSION,
     SUPPORTED_DSO_PROFILE,
+    canonical_expected_session_profile,
     is_expected_session_profile,
 )
 from .campaign_mutation_lock import campaign_mutation_lock
@@ -128,6 +129,383 @@ def _literal_task_environment(task: dict) -> dict[str, str]:
         )
     )
     return result
+
+
+def _plan_aedt_pool_demand_accounts(
+    scheduler: Scheduler,
+    tasks: list[dict],
+    existing_routes: dict[int, str],
+    session_capacity: list[dict],
+    projects_per_session: int,
+    *,
+    pool_required_capability: str = "",
+    pool_env_profile: str = "",
+) -> tuple[dict[int, str], dict[int, str]]:
+    """Route flexible pooled demand once per reconciliation snapshot.
+
+    Already-paid READY/BUSY slots and already-reserved STARTING cohorts are
+    packed first without adding storage growth. Only demand that needs another
+    Desktop cohort is charged, in cumulative ``projects_per_session`` units per
+    account. Existing route hints survive prospective-only pressure; they move
+    only after confirmed current pressure or conclusive account/capability
+    unavailability.
+    """
+
+    projects_per_session = max(1, int(projects_per_session or 1))
+    task_by_id = {
+        int(task.get("task_id") or task.get("id") or 0): dict(task)
+        for task in tasks
+        if int(task.get("task_id") or task.get("id") or 0) > 0
+    }
+    ordered_task_ids = sorted(task_by_id)
+    if not ordered_task_ids:
+        return {}, {}
+
+    # One Slurm snapshot and one allocation snapshot serve the whole queued
+    # batch.  Storage decisions are memoized by (account, prospective slots),
+    # avoiding the previous task-by-task SSH/quota fan-out.
+    snapshots_by_name = {
+        snapshot.account_name: snapshot for snapshot in scheduler.snapshots()
+    }
+    open_by_account: dict[str, int] = {}
+    pending_by_account: dict[str, int] = {}
+    for allocation in scheduler.db.list_allocations(limit=500):
+        account_name = str(allocation.get("account_name") or "")
+        if allocation.get("state") in {
+            "pending",
+            "warm",
+            "active",
+            "draining",
+            "closing",
+        }:
+            open_by_account[account_name] = open_by_account.get(account_name, 0) + 1
+        if allocation.get("state") == "pending":
+            pending_by_account[account_name] = (
+                pending_by_account.get(account_name, 0) + 1
+            )
+    accounts_by_name = {
+        str(account.name): account for account in scheduler.accounts
+    }
+    storage_status_cache: dict[tuple[str, int], tuple[bool, bool]] = {}
+
+    def storage_status(account_name: str, future_projects: int) -> tuple[bool, bool]:
+        key = (account_name, max(0, int(future_projects or 0)))
+        if key in storage_status_cache:
+            return storage_status_cache[key]
+        account = accounts_by_name.get(account_name)
+        if account is None:
+            result = (True, True)
+        else:
+            try:
+                raw = scheduler.account_storage_guard_status(
+                    account,
+                    for_fea=True,
+                    additional_future_projects=key[1],
+                )
+                if isinstance(raw, tuple):
+                    result = (bool(raw[0]), bool(raw[1]))
+                else:
+                    result = (bool(raw), bool(raw))
+            except Exception:
+                # Probe failures are fail-closed for new cohorts, but are not
+                # evidence permitting an established route to jump accounts.
+                result = (True, False)
+            storage_status_cache[key] = result
+        return result
+
+    def requested_accounts(task: dict) -> set[str]:
+        return set(
+            scheduler.requested_accounts(
+                scheduler.task_requested_account_name(task)
+            )
+        )
+
+    def account_supports_task(account_name: str, task: dict) -> bool:
+        account = accounts_by_name.get(account_name)
+        allowed = requested_accounts(task)
+        return bool(
+            account
+            and account_name in snapshots_by_name
+            and (not allowed or account_name in allowed)
+            and scheduler.account_supports(
+                account,
+                str(pool_required_capability or ""),
+                str(pool_env_profile or ""),
+            )
+            and scheduler.account_supports(
+                account,
+                str(task.get("required_capability") or ""),
+                str(task.get("env_profile") or ""),
+            )
+        )
+
+    def account_can_open_cohort(account_name: str, task: dict) -> bool:
+        if not account_supports_task(account_name, task):
+            return False
+        account = accounts_by_name[account_name]
+        snapshot = snapshots_by_name[account_name]
+        max_total = max(
+            0,
+            int(account.max_total_jobs)
+            - int(scheduler.allocation_reserved_job_slots),
+        )
+        current_total = max(
+            int(snapshot.running) + int(snapshot.pending),
+            open_by_account.get(account_name, 0),
+        )
+        current_pending = max(
+            int(snapshot.pending), pending_by_account.get(account_name, 0)
+        )
+        return bool(
+            current_total < max_total
+            and current_pending < int(account.max_pending_jobs)
+        )
+
+    def task_contract(task: dict) -> tuple[str, str, str] | None:
+        values = _literal_task_environment(task)
+        try:
+            profile = canonical_expected_session_profile(
+                values.get("MFT_AEDT_SESSION_PROFILE", "")
+            )
+        except (TypeError, ValueError):
+            return None
+        family = canonical_workload_family(
+            values.get("MFT_AEDT_WORKLOAD_FAMILY", ""),
+            str(task.get("project") or task.get("name") or ""),
+        )
+        policy = str(
+            values.get("MFT_AEDT_ISOLATION_POLICY", "family") or "family"
+        ).strip().lower()
+        if not family or policy not in {
+            "family",
+            "shared_if_compatible",
+            "exclusive",
+        }:
+            return None
+        return profile, family, policy
+
+    contracts = {
+        task_id: task_contract(task_by_id[task_id])
+        for task_id in ordered_task_ids
+    }
+    virtual_sessions = []
+    for raw in session_capacity:
+        account_name = str(raw.get("account_name") or "").strip()
+        free_slots = max(0, int(raw.get("free_slots") or 0))
+        if not account_name or free_slots <= 0:
+            continue
+        virtual_sessions.append(
+            {
+                **dict(raw),
+                "account_name": account_name,
+                "free_slots": free_slots,
+                "occupants": [dict(item) for item in raw.get("occupants") or []],
+                "reservations": [
+                    dict(item) for item in raw.get("reservations") or []
+                ],
+            }
+        )
+
+    actionable_routes: dict[int, str] = {}
+    route_hints: dict[int, str] = {}
+    storage_paid_task_ids: set[int] = set()
+
+    def reserve_virtual_slot(
+        task_id: int, *, required_account: str = ""
+    ) -> bool:
+        task = task_by_id[task_id]
+        contract = contracts.get(task_id)
+        if contract is None:
+            return False
+        profile, family, policy = contract
+        candidates = sorted(
+            virtual_sessions,
+            key=lambda item: (
+                0 if required_account and item["account_name"] == required_account else 1,
+                {"busy": 0, "ready": 1, "starting": 2}.get(
+                    str(item.get("state") or ""), 3
+                ),
+                snapshots_by_name.get(item["account_name"]).score
+                if item["account_name"] in snapshots_by_name
+                else (10**9, 10**9, 10**9),
+                int(item.get("session_id") or 0),
+            ),
+        )
+        for session in candidates:
+            account_name = str(session["account_name"])
+            if required_account and account_name != required_account:
+                continue
+            if int(session["free_slots"]) <= 0:
+                continue
+            if not account_supports_task(account_name, task):
+                continue
+            current_blocked, _current_confirmed = storage_status(account_name, 0)
+            if current_blocked:
+                # Confirmed pressure permits reroute.  Probe-only uncertainty
+                # keeps an old route but cannot spend a previously unclaimed slot.
+                continue
+            if str(session.get("session_profile") or "") != profile:
+                continue
+            if not AedtPoolService._auto_reservation_fits_session(
+                workload_family=family,
+                isolation_policy=policy,
+                session_profile=profile,
+                occupants=list(session["occupants"]),
+                reservations=list(session["reservations"]),
+            ):
+                continue
+            session["free_slots"] = int(session["free_slots"]) - 1
+            session["reservations"].append(
+                {
+                    "workload_family": family,
+                    "isolation_policy": policy,
+                }
+            )
+            actionable_routes[task_id] = account_name
+            route_hints[task_id] = account_name
+            storage_paid_task_ids.add(task_id)
+            return True
+        return False
+
+    # Stable routes get first claim on compatible storage-paid siblings.
+    for task_id in ordered_task_ids:
+        account_name = str(existing_routes.get(task_id) or "").strip()
+        if not account_name or not account_supports_task(
+            account_name, task_by_id[task_id]
+        ):
+            continue
+        current_blocked, current_confirmed = storage_status(account_name, 0)
+        if current_blocked:
+            if not current_confirmed:
+                # An inconclusive current probe cannot authorize work, but it
+                # also is not evidence that an established route should move.
+                route_hints[task_id] = account_name
+            continue
+        route_hints[task_id] = account_name
+        reserve_virtual_slot(task_id, required_account=account_name)
+
+    # A cached route which has neither a paid compatible slot nor the ability
+    # to create capacity is conclusively unavailable and may be rerouted.
+    for task_id in list(route_hints):
+        if task_id in storage_paid_task_ids:
+            continue
+        account_name = route_hints[task_id]
+        current_blocked, current_confirmed = storage_status(account_name, 0)
+        if current_blocked and not current_confirmed:
+            continue
+        if not account_can_open_cohort(account_name, task_by_id[task_id]):
+            route_hints.pop(task_id, None)
+
+    # Cold-cache/restart reconstruction always consumes compatible paid slots
+    # before asking storage admission for another Desktop cohort.
+    for task_id in ordered_task_ids:
+        if task_id not in route_hints:
+            reserve_virtual_slot(task_id)
+
+    # Retained routes not covered by a live free slot represent provisional
+    # cohorts.  Validate each cumulative +projects/session step.  A blocked
+    # prospective step remains a stability hint but is deliberately omitted
+    # from the actionable plan for this reconciliation.
+    future_projects_by_account: dict[str, int] = {}
+    retained_future_groups: dict[
+        tuple[str, tuple[str, str, str]], list[int]
+    ] = {}
+    for task_id, account_name in route_hints.items():
+        if task_id in storage_paid_task_ids:
+            continue
+        contract = contracts.get(task_id)
+        if contract is None:
+            continue
+        key = (account_name, contract)
+        retained_future_groups.setdefault(key, []).append(task_id)
+    for account_name, contract in sorted(retained_future_groups):
+        task_ids = retained_future_groups[(account_name, contract)]
+        for offset in range(0, len(task_ids), projects_per_session):
+            cohort = task_ids[offset : offset + projects_per_session]
+            representative = task_by_id[cohort[0]]
+            if not account_can_open_cohort(account_name, representative):
+                for task_id in cohort:
+                    route_hints.pop(task_id, None)
+                continue
+            prospective = (
+                future_projects_by_account.get(account_name, 0)
+                + projects_per_session
+            )
+            current_blocked, _current_confirmed = storage_status(account_name, 0)
+            prospective_blocked = True
+            if not current_blocked:
+                prospective_blocked, _prospective_confirmed = storage_status(
+                    account_name, prospective
+                )
+            if not prospective_blocked:
+                for task_id in cohort:
+                    actionable_routes[task_id] = account_name
+            # Reserve the hinted cohort even when it is currently blocked so
+            # later cold demand cannot steal its prospective storage budget.
+            future_projects_by_account[account_name] = prospective
+
+    def cohort_candidate_key(account_name: str) -> tuple:
+        snapshot = snapshots_by_name[account_name]
+        planned_sessions = ceil(
+            future_projects_by_account.get(account_name, 0)
+            / projects_per_session
+        )
+        return (
+            int(snapshot.running) + int(snapshot.pending) + planned_sessions,
+            int(snapshot.running) + planned_sessions,
+            int(snapshot.pending),
+            account_name,
+        )
+
+    unassigned_by_contract: dict[tuple, list[int]] = {}
+    for task_id in ordered_task_ids:
+        if task_id in route_hints:
+            continue
+        contract = contracts.get(task_id)
+        if contract is None:
+            continue
+        task = task_by_id[task_id]
+        route_group = (
+            *contract,
+            str(task.get("required_capability") or ""),
+            str(task.get("env_profile") or ""),
+            tuple(sorted(requested_accounts(task))),
+        )
+        unassigned_by_contract.setdefault(route_group, []).append(task_id)
+
+    for contract in sorted(unassigned_by_contract):
+        task_ids = unassigned_by_contract[contract]
+        for offset in range(0, len(task_ids), projects_per_session):
+            cohort = task_ids[offset : offset + projects_per_session]
+            representative = task_by_id[cohort[0]]
+            candidates: list[str] = []
+            for account_name in sorted(accounts_by_name):
+                if not account_can_open_cohort(account_name, representative):
+                    continue
+                current_blocked, _current_confirmed = storage_status(account_name, 0)
+                if current_blocked:
+                    continue
+                prospective = (
+                    future_projects_by_account.get(account_name, 0)
+                    + projects_per_session
+                )
+                prospective_blocked, _ = storage_status(
+                    account_name, prospective
+                )
+                if not prospective_blocked:
+                    candidates.append(account_name)
+            if not candidates:
+                continue
+            selected = min(candidates, key=cohort_candidate_key)
+            for task_id in cohort:
+                actionable_routes[task_id] = selected
+                route_hints[task_id] = selected
+            future_projects_by_account[selected] = (
+                future_projects_by_account.get(selected, 0)
+                + projects_per_session
+            )
+
+    return actionable_routes, route_hints
 
 
 def pooled_task_contract_error(
@@ -748,9 +1126,27 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         )
         return account.name if account else ""
 
+    def select_aedt_pool_demand_accounts(
+        tasks: list[dict],
+        existing_routes: dict[int, str],
+        session_capacity: list[dict],
+        projects_per_session: int,
+    ) -> tuple[dict[int, str], dict[int, str]]:
+        pool_config = aedt_pool.config()
+        return _plan_aedt_pool_demand_accounts(
+            scheduler,
+            tasks,
+            existing_routes,
+            session_capacity,
+            projects_per_session,
+            pool_required_capability=pool_config.required_capability,
+            pool_env_profile=pool_config.env_profile,
+        )
+
     scheduler.set_aedt_backend_admission_checker(aedt_backend_admission)
     scheduler.set_aedt_backend_task_preparer(prepare_aedt_backend_task)
     aedt_pool.set_task_account_selector(select_aedt_pool_demand_account)
+    aedt_pool.set_task_account_batch_selector(select_aedt_pool_demand_accounts)
     relay_account = scheduler.account_by_name(config.control_plane_relay_account.strip())
     relay_bind_host = config.bind_host.strip() or "127.0.0.1"
     if relay_bind_host == "0.0.0.0":

@@ -5,6 +5,8 @@ import http.client
 import io
 import json
 import os
+import re
+import shlex
 import stat
 import sys
 import tempfile
@@ -129,6 +131,127 @@ class Clock:
 
     def advance(self, seconds: int) -> None:
         self.value += timedelta(seconds=seconds)
+
+
+class FakeBatchRoutingScheduler:
+    def __init__(self, db: Database, status, supports=None) -> None:
+        self.db = db
+        self.accounts = [
+            AccountConfig(
+                name=name,
+                host="host",
+                port=22,
+                username=name,
+                private_key_path="key",
+                remote_workspace="/work",
+                max_running_jobs=20,
+                max_pending_jobs=20,
+                max_total_jobs=20,
+            )
+            for name in ("dhj02", "r1jae262")
+        ]
+        self.allocation_reserved_job_slots = 0
+        self.status = status
+        self.supports = supports or (
+            lambda _account, _capability, _profile: True
+        )
+        self.snapshot_calls = 0
+        self.storage_calls: list[tuple[str, int]] = []
+
+    def snapshots(self):
+        self.snapshot_calls += 1
+        return [
+            SimpleNamespace(
+                account_name="dhj02",
+                running=1,
+                pending=0,
+                score=(1, 1, 0),
+            ),
+            SimpleNamespace(
+                account_name="r1jae262",
+                running=2,
+                pending=0,
+                score=(2, 2, 0),
+            ),
+        ]
+
+    @staticmethod
+    def requested_accounts(value: str) -> list[str]:
+        return [
+            part.strip()
+            for part in re.split(r"[\s,;/|]+", str(value or ""))
+            if part.strip()
+        ]
+
+    @staticmethod
+    def task_requested_account_name(task: dict) -> str:
+        if (
+            "requested_account_name" in task
+            and task.get("requested_account_name") is not None
+        ):
+            return str(task.get("requested_account_name") or "")
+        return str(task.get("task_account_name") or task.get("account_name") or "")
+
+    def account_supports(self, account, capability: str, profile: str) -> bool:
+        return bool(self.supports(str(account.name), capability, profile))
+
+    def account_storage_guard_status(
+        self,
+        account,
+        *,
+        for_fea: bool = False,
+        additional_future_projects: int = 0,
+    ) -> tuple[bool, bool]:
+        if not for_fea:
+            raise AssertionError("batch routing must request FEA storage status")
+        future = max(0, int(additional_future_projects or 0))
+        self.storage_calls.append((str(account.name), future))
+        return self.status(str(account.name), future)
+
+
+def load_batch_routing_planner(root: Path):
+    """Import the app-owned planner with a minimal isolated app config."""
+
+    accounts_path = root / "batch-routing-accounts.yaml"
+    accounts_path.write_text(
+        "\n".join(
+            [
+                "accounts:",
+                "  - name: a",
+                "    host: invalid",
+                "    port: 22",
+                "    username: a",
+                "    private_key_path: key",
+                "    remote_workspace: /work",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    config_path = root / "batch-routing-app.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                f'database_path: "{(root / "batch-routing-app.db").as_posix()}"',
+                f'accounts_path: "{accounts_path.as_posix()}"',
+                "min_warm_allocations: 0",
+                "cluster_refresh_interval_seconds: 0",
+                "reconcile_on_start: false",
+                "backup_enabled: false",
+                "web_listener_watchdog_enabled: false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    environment = {
+        "SLURM_SCHEDULER_CONFIG": str(config_path),
+        "SLURM_AEDT_POOL_BOOTSTRAP_TOKEN": "",
+        "SLURM_AEDT_POOL_CLIENT_TOKEN": "",
+        "SLURM_SCHEDULER_SERVICE_PROCESS": "",
+    }
+    with patch.dict(os.environ, environment, clear=False):
+        from slurm_scheduler.app import _plan_aedt_pool_demand_accounts
+
+    return _plan_aedt_pool_demand_accounts
 
 
 class AedtPoolTestCase(unittest.TestCase):
@@ -873,6 +996,479 @@ class AedtPoolGateTests(AedtPoolTestCase):
             {"pinned-account": 1, "reserved-account": 1},
         )
         self.assertEqual(self.db.get_task(pinned_task_id)["requested_account_name"], "pinned-account")
+
+    def test_batch_routes_paid_busy_slots_then_cumulative_new_cohorts_without_churn(
+        self,
+    ) -> None:
+        _plan_aedt_pool_demand_accounts = load_batch_routing_planner(
+            Path(self.tmp.name)
+        )
+
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.service.set_operator_limits(
+            max_sessions=7,
+            min_idle_sessions=0,
+            target_projects=21,
+            projects_per_session=3,
+        )
+        dhj_allocation = self.db.create_allocation(
+            "dhj02", "cpu", "cpu-dhj", 64, 512 * 1024
+        )
+        r1_allocation = self.db.create_allocation(
+            "r1jae262", "cpu", "cpu-r1", 128, 1024 * 1024
+        )
+        for allocation_id, account in (
+            (dhj_allocation, "dhj02"),
+            (r1_allocation, "r1jae262"),
+        ):
+            self.db.update_allocation(
+                allocation_id,
+                state="active",
+                slurm_job_id=f"job-{account}",
+                drain_reason="AEDT pool project demand",
+                created_at=now,
+                started_at=now,
+            )
+        with self.db.connect() as conn:
+            dhj_session = int(
+                conn.execute(
+                    """
+                    INSERT INTO aedt_sessions (
+                        session_key, allocation_id, account_name, node_name,
+                        endpoint, process_id, session_profile, slots_total,
+                        state, last_heartbeat_at, started_at, created_at, updated_at
+                    ) VALUES ('batch-dhj-busy', ?, 'dhj02', 'cpu-dhj',
+                              'cpu-dhj:53001', '53001', ?, 3, 'busy',
+                              ?, ?, ?, ?)
+                    """,
+                    (
+                        dhj_allocation,
+                        EXPECTED_SESSION_PROFILE_JSON,
+                        now,
+                        now,
+                        now,
+                        now,
+                    ),
+                ).lastrowid
+            )
+            conn.execute(
+                """
+                INSERT INTO aedt_project_leases (
+                    request_key, project_name, workload_family,
+                    session_profile, project_namespace, isolation_policy,
+                    protocol_version, session_id, slot_index, state,
+                    client_token_hash, expires_at
+                ) VALUES ('batch-existing-owner', 'mft-existing-owner', 'mft',
+                          ?, 'mft', 'family', 2, ?, 0, 'active',
+                          'token', '2099-01-01 00:00:00')
+                """,
+                (EXPECTED_SESSION_PROFILE_JSON, dhj_session),
+            )
+
+        env_setup = "\n".join(
+            (
+                "export MFT_AEDT_SESSION_PROFILE="
+                + shlex.quote(EXPECTED_SESSION_PROFILE_JSON),
+                "export MFT_AEDT_WORKLOAD_FAMILY=mft",
+                "export MFT_AEDT_ISOLATION_POLICY=family",
+            )
+        )
+        task_ids = [
+            self.db.create_task(
+                TaskCreate(
+                    name=f"batch-flexible-{index:02d}",
+                    remote_cwd=f"/work/batch/{index}",
+                    command="true",
+                    env_setup=env_setup,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                    aedt_backend="pooled",
+                    project="MFT_1MW_2026v1",
+                )
+            )
+            for index in range(18)
+        ]
+        def ledger_aware_storage_status(account: str, future: int):
+            if account == "dhj02":
+                return future >= 3, False
+            with self.db.connect() as conn:
+                reserved = int(
+                    conn.execute(
+                        """
+                        SELECT COALESCE(SUM(slots_total), 0)
+                        FROM aedt_sessions
+                        WHERE account_name = ?
+                          AND state IN ('starting','ready','busy')
+                        """,
+                        (account,),
+                    ).fetchone()[0]
+                )
+            return reserved + future > 18, False
+
+        scheduler = FakeBatchRoutingScheduler(
+            self.db, ledger_aware_storage_status
+        )
+        self.service.set_task_account_batch_selector(
+            lambda tasks, routes, capacity, projects: (
+                _plan_aedt_pool_demand_accounts(
+                    scheduler,
+                    tasks,
+                    routes,
+                    capacity,
+                    projects,
+                )
+            )
+        )
+        self.make_operational()
+
+        plans = [self.service.reconcile(execute=True)]
+        self.assertEqual(
+            plans[0]["queued_pooled_task_backlog_by_account"],
+            {"dhj02": 2, "r1jae262": 16},
+        )
+        self.assertEqual(
+            plans[0]["starting_sessions_by_account"], {"r1jae262": 6}
+        )
+        self.assertEqual(plans[0]["start_needed_by_account"], {})
+        starts = self.service.starting_sessions()
+        self.assertEqual(len(starts), 6)
+        self.assertTrue(
+            all(str(row["account_name"]) == "r1jae262" for row in starts)
+        )
+
+        # A second tick while all six cohorts are still STARTING must rebuild
+        # their route from DB capacity and must not charge another +18 projects.
+        plans.append(self.service.reconcile(execute=True))
+        self.assertEqual(len(self.service.starting_sessions()), 6)
+        with self.db.connect() as conn:
+            for index, start in enumerate(starts):
+                conn.execute(
+                    """
+                    UPDATE aedt_sessions
+                    SET state = 'ready', endpoint = ?, process_id = ?,
+                        session_profile = ?, last_heartbeat_at = ?,
+                        started_at = ?, idle_since = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        f"cpu-r1:{53100 + index}",
+                        str(53100 + index),
+                        EXPECTED_SESSION_PROFILE_JSON,
+                        now,
+                        now,
+                        now,
+                        now,
+                        int(start["id"]),
+                    ),
+                )
+
+        for _ in range(2):
+            plans.append(self.service.reconcile(execute=True))
+        self.assertEqual(scheduler.snapshot_calls, 4)
+        self.assertTrue(
+            all(
+                plan["queued_pooled_task_backlog_by_account"]
+                == {"dhj02": 2, "r1jae262": 16}
+                for plan in plans
+            )
+        )
+        self.assertTrue(all(plan["rebalance_drains_by_account"] == {} for plan in plans))
+        with self.db.connect() as conn:
+            lifecycle = conn.execute(
+                """
+                SELECT state, drain_requested_at, failure_message
+                FROM aedt_sessions ORDER BY id
+                """
+            ).fetchall()
+        self.assertEqual(len(lifecycle), 7)
+        self.assertTrue(all(row["state"] in {"ready", "busy"} for row in lifecycle))
+        self.assertTrue(all(row["drain_requested_at"] is None for row in lifecycle))
+        self.assertTrue(all(str(row["failure_message"] or "") == "" for row in lifecycle))
+
+        cached_routes = {
+            task_id: self.service._task_account_routes[task_id][1]
+            for task_id in task_ids
+        }
+        self.assertEqual(
+            [cached_routes[task_id] for task_id in task_ids].count("dhj02"),
+            2,
+        )
+        for task_id in task_ids:
+            reservation = self.service.prepare_pooled_task_session(
+                task_id=task_id,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                workload_family="mft",
+                isolation_policy="family",
+            )
+            self.assertIsNotNone(reservation)
+            expected_allocation = (
+                dhj_allocation
+                if cached_routes[task_id] == "dhj02"
+                else r1_allocation
+            )
+            expected_node = (
+                "cpu-dhj" if expected_allocation == dhj_allocation else "cpu-r1"
+            )
+            task = self.db.get_task(task_id)
+            self.assertEqual(int(reservation["allocation_id"]), expected_allocation)
+            self.assertEqual(int(task["requested_allocation_id"]), expected_allocation)
+            self.assertEqual(str(task["node_name"]), expected_node)
+            self.assertEqual(str(task["requested_account_name"]), "")
+
+    def test_batch_routing_cold_failure_preserves_unrouted_demand_and_sessions(
+        self,
+    ) -> None:
+        self.service.set_operator_limits(
+            max_sessions=6,
+            min_idle_sessions=0,
+            target_projects=18,
+            projects_per_session=3,
+        )
+        allocation_id = self.add_dedicated_allocation()
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        old_idle = (self.clock.now() - timedelta(hours=2)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        with self.db.connect() as conn:
+            for index in range(6):
+                conn.execute(
+                    """
+                    INSERT INTO aedt_sessions (
+                        session_key, allocation_id, account_name, node_name,
+                        endpoint, process_id, session_profile, slots_total,
+                        state, last_heartbeat_at, started_at, idle_since,
+                        created_at, updated_at
+                    ) VALUES (?, ?, 'a', 'cpu-01', ?, ?, ?, 3, 'ready',
+                              ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"cold-route-ready-{index}",
+                        allocation_id,
+                        f"cpu-01:{54000 + index}",
+                        str(54000 + index),
+                        EXPECTED_SESSION_PROFILE_JSON,
+                        now,
+                        old_idle,
+                        old_idle,
+                        old_idle,
+                        now,
+                    ),
+                )
+        for index in range(18):
+            self.db.create_task(
+                TaskCreate(
+                    name=f"cold-unrouted-{index}",
+                    remote_cwd=f"/work/cold/{index}",
+                    command="true",
+                    aedt_backend="pooled",
+                    project="MFT_1MW_2026v1",
+                )
+            )
+        calls = 0
+
+        def failed_batch(*_args):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("quota snapshot unavailable")
+
+        self.service.set_task_account_batch_selector(failed_batch)
+        self.make_operational()
+
+        with self.assertLogs("slurm_scheduler.aedt_pool", level="ERROR"):
+            plans = [self.service.reconcile(execute=True) for _ in range(4)]
+
+        self.assertEqual(calls, 4)
+        for plan in plans:
+            self.assertEqual(plan["queued_pooled_task_backlog"], 18)
+            self.assertEqual(plan["unrouted_queued_pooled_task_backlog"], 18)
+            self.assertEqual(plan["desired_projects"], 18)
+            self.assertEqual(plan["demand_sessions"], 6)
+            self.assertEqual(plan["unrouted_demand_sessions"], 6)
+            self.assertEqual(plan["start_needed"], 0)
+            self.assertEqual(plan["drain_needed"], 0)
+            self.assertEqual(plan["rebalance_drains_by_account"], {})
+        with self.db.connect() as conn:
+            sessions = conn.execute(
+                """
+                SELECT state, drain_requested_at FROM aedt_sessions ORDER BY id
+                """
+            ).fetchall()
+        self.assertEqual(len(sessions), 6)
+        self.assertTrue(all(row["state"] == "ready" for row in sessions))
+        self.assertTrue(all(row["drain_requested_at"] is None for row in sessions))
+
+    def test_batch_routing_cold_preadmission_is_singleflight_and_hints_are_not_actionable(
+        self,
+    ) -> None:
+        task_id = self.db.create_task(
+            TaskCreate(
+                name="cold-singleflight",
+                remote_cwd="/work/cold-singleflight",
+                command="true",
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                aedt_backend="pooled",
+                project="MFT_1MW_2026v1",
+            )
+        )
+        call_count = 0
+        count_lock = threading.Lock()
+        callback_started = threading.Event()
+        release_callback = threading.Event()
+
+        def hint_only_batch(tasks, _routes, _capacity, _projects):
+            nonlocal call_count
+            with count_lock:
+                call_count += 1
+            callback_started.set()
+            self.assertTrue(release_callback.wait(timeout=2))
+            hints = {int(task["task_id"]): "a" for task in tasks}
+            return {}, hints
+
+        self.service.set_task_account_batch_selector(hint_only_batch)
+        callers_ready = threading.Barrier(8)
+
+        def preselect():
+            callers_ready.wait(timeout=2)
+            return self.service._preselect_task_account(task_id)
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(preselect) for _ in range(8)]
+            self.assertTrue(callback_started.wait(timeout=2))
+            release_callback.set()
+            selections = [future.result(timeout=2) for future in futures]
+
+        self.assertEqual(call_count, 1)
+        self.assertTrue(all(selection is not None for selection in selections))
+        self.assertTrue(all(selection[1] == "" for selection in selections))
+        self.assertEqual(self.service._task_account_routes[task_id][1], "a")
+        self.assertEqual(
+            self.service._task_account_batch_selections[task_id][1], ""
+        )
+
+    def test_batch_route_rechecks_busy_compatibility_and_only_confirmed_pressure_moves_cache(
+        self,
+    ) -> None:
+        _plan_aedt_pool_demand_accounts = load_batch_routing_planner(
+            Path(self.tmp.name)
+        )
+
+        task = {
+            "task_id": 101,
+            "name": "batch-incompatible-busy",
+            "project": "MFT_1MW_2026v1",
+            "requested_account_name": "",
+            "task_account_name": "",
+            "required_capability": "",
+            "env_profile": "",
+            "env_setup": "\n".join(
+                (
+                    "export MFT_AEDT_SESSION_PROFILE="
+                    + shlex.quote(EXPECTED_SESSION_PROFILE_JSON),
+                    "export MFT_AEDT_WORKLOAD_FAMILY=mft",
+                    "export MFT_AEDT_ISOLATION_POLICY=family",
+                )
+            ),
+            "command": "true",
+        }
+        incompatible_busy = [
+            {
+                "session_id": 1,
+                "account_name": "dhj02",
+                "state": "busy",
+                "session_profile": EXPECTED_SESSION_PROFILE_JSON,
+                "free_slots": 2,
+                "occupants": [
+                    {
+                        "protocol_version": 2,
+                        "session_profile": EXPECTED_SESSION_PROFILE_JSON,
+                        "workload_family": "ipmsm",
+                        "isolation_policy": "family",
+                        "exclusive_session": 0,
+                    }
+                ],
+                "reservations": [],
+            }
+        ]
+        prospective_scheduler = FakeBatchRoutingScheduler(
+            self.db,
+            lambda account, future: (
+                (future >= 3, False)
+                if account == "dhj02"
+                else (False, False)
+            ),
+        )
+        cold, cold_hints = _plan_aedt_pool_demand_accounts(
+            prospective_scheduler,
+            [task],
+            {},
+            incompatible_busy,
+            3,
+        )
+        self.assertEqual(cold, {101: "r1jae262"})
+        self.assertEqual(cold_hints, {101: "r1jae262"})
+        self.assertEqual(prospective_scheduler.snapshot_calls, 1)
+
+        probe_failure_scheduler = FakeBatchRoutingScheduler(
+            self.db,
+            lambda account, future: (
+                (True, False)
+                if account == "dhj02" and future == 0
+                else (False, False)
+            ),
+        )
+        retained, retained_hints = _plan_aedt_pool_demand_accounts(
+            probe_failure_scheduler,
+            [task],
+            {101: "dhj02"},
+            incompatible_busy,
+            3,
+        )
+        self.assertEqual(retained, {})
+        self.assertEqual(retained_hints, {101: "dhj02"})
+
+        confirmed_scheduler = FakeBatchRoutingScheduler(
+            self.db,
+            lambda account, _future: (
+                (True, True) if account == "dhj02" else (False, False)
+            ),
+        )
+        moved, moved_hints = _plan_aedt_pool_demand_accounts(
+            confirmed_scheduler,
+            [task],
+            {101: "dhj02"},
+            incompatible_busy,
+            3,
+        )
+        self.assertEqual(moved, {101: "r1jae262"})
+        self.assertEqual(moved_hints, {101: "r1jae262"})
+
+        compatible_busy = [
+            {
+                **incompatible_busy[0],
+                "occupants": [
+                    {
+                        **incompatible_busy[0]["occupants"][0],
+                        "workload_family": "mft",
+                    }
+                ],
+            }
+        ]
+        capability_scheduler = FakeBatchRoutingScheduler(
+            self.db,
+            lambda _account, _future: (False, False),
+            supports=lambda account, capability, _profile: not (
+                account == "dhj02" and capability == "aedt-host"
+            ),
+        )
+        capable, capable_hints = _plan_aedt_pool_demand_accounts(
+            capability_scheduler,
+            [task],
+            {},
+            compatible_busy,
+            3,
+            pool_required_capability="aedt-host",
+        )
+        self.assertEqual(capable, {101: "r1jae262"})
+        self.assertEqual(capable_hints, {101: "r1jae262"})
 
     def test_reconcile_resolves_warm_admission_before_writer_transaction(
         self,
