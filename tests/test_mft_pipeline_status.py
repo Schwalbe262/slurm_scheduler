@@ -6,6 +6,7 @@ import math
 import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -177,6 +178,118 @@ def completed_hpo_schema2_fixture() -> dict:
         item["objective_contract"] = schema2_objective_contract(item["target"])
     resign_completed_hpo(value)
     return value
+
+
+def targeted_hpo_live_fixture(*, phase: str = "hpo_running") -> dict:
+    targets = ["B_max_core", "T_max_core"]
+    jobs = [
+        {
+            "index": 0,
+            "target": targets[0],
+            "family": "lightgbm",
+            "state": "completed",
+            "model_threads": 2,
+            "trials": 50,
+            "result_json_sha256": "1" * 64,
+        },
+        {
+            "index": 1,
+            "target": targets[1],
+            "family": "lightgbm",
+            "state": "running" if phase == "hpo_running" else "completed",
+            "model_threads": 2,
+            "trials": 50,
+            "result_json_sha256": (
+                None if phase == "hpo_running" else "2" * 64
+            ),
+        },
+    ]
+    value = {
+        "schema_version": "mft-targeted-hpo-batch-v1",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "phase": phase,
+        "wave": "targeted14-test-wave",
+        "lane": "experimental",
+        "eligibility": "HPO-ONLY-NO-PUBLISH",
+        "dataset": {"sha256": "3" * 64},
+        "pins": {
+            "solver_revision": "4" * 40,
+            "library_revision": "5" * 40,
+            "data_contract_sha256": "6" * 64,
+        },
+        "code": {
+            "runner_sha256": "7" * 64,
+            "tune_optuna_sha256": "8" * 64,
+            "merge_params_implementation_sha256": "9" * 64,
+        },
+        "objective_contracts": {
+            target: {
+                "contract": {},
+                "sha256": hashlib.sha256(b"{}").hexdigest(),
+            }
+            for target in targets
+        },
+        "budget": {
+            "max_processes": 4,
+            "model_threads_per_process": 2,
+            "maximum_total_model_threads": 8,
+        },
+        "targets": targets,
+        "target_count": len(targets),
+        "jobs": jobs,
+        "publication": {
+            "attempted": False,
+            "allowed": False,
+            "reason": "HPO only",
+        },
+    }
+    if phase == "hpo_completed_no_publish":
+        value["result"] = {
+            "merged_params_sha256": "b" * 64,
+            "tuning_evidence_sha256": "c" * 64,
+            "completed_target_count": 2,
+        }
+    return value
+
+
+def isolated_nsga_live_fixture(lane: str, seed_base: int) -> dict:
+    return {
+        "schema_version": "mft-isolated-nsga-live-v1",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "lane": lane,
+        "state": "running",
+        "pid": 12345 + seed_base,
+        "alive": True,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds": 120.5,
+        "config": {
+            "seed_base": seed_base,
+            "restarts": 16,
+            "population": 200,
+            "max_generations": 600,
+            "workers": 2,
+        },
+        "model": {
+            "training_run_id": "candidate-model-001",
+            "dataset_sha256": "d" * 64,
+            "generation_report_sha256": "e" * 64,
+            "quality_status_sha256": "f" * 64,
+            "eligibility": "FEA-NOT-APPROVED",
+        },
+        "events": [],
+        "terminal": {
+            "available": False,
+            "outcome": None,
+            "finished_at": None,
+            "artifacts": {},
+            "summary": {
+                "completed_restarts": 0,
+                "feasible_restarts": 0,
+                "pareto_points": 0,
+                "best_violation": None,
+            },
+        },
+    }
 
 
 def write_complete_runtime(root: Path) -> None:
@@ -836,6 +949,89 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
         self.assertEqual(payload["surrogate"]["hpo"]["ready"], 3)
         self.assertTrue(payload["surrogate"]["hpo"]["truncated"])
 
+    def test_targeted_hpo_live_status_overrides_stopped_generic_wave(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_complete_runtime(root)
+            write_json(
+                root,
+                "mft_pipeline/experimental_continuous/status.json",
+                {
+                    "state": "stopped",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            write_json(
+                root,
+                "mft_pipeline/targeted_hpo_exact14/run-001/status.json",
+                targeted_hpo_live_fixture(),
+            )
+
+            payload = MftPipelineStatusReader(root, cache_seconds=0).snapshot()
+
+        surrogate = payload["surrogate"]
+        self.assertEqual(surrogate["controller_state"], "stopped")
+        self.assertEqual(surrogate["phase"], "hpo_running")
+        self.assertEqual(surrogate["wave"], "targeted14-test-wave")
+        self.assertTrue(surrogate["training_active"])
+        self.assertEqual(surrogate["hpo"]["ready"], 1)
+        self.assertEqual(surrogate["hpo"]["running"], 1)
+        self.assertEqual(surrogate["hpo"]["total"], 2)
+        self.assertEqual(surrogate["hpo"]["thread_budget"], 8)
+        self.assertTrue(surrogate["targeted_hpo"]["available"])
+
+    def test_targeted_hpo_completion_requires_merged_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_complete_runtime(root)
+            status = targeted_hpo_live_fixture(
+                phase="hpo_completed_no_publish"
+            )
+            status["result"].pop("merged_params_sha256")
+            write_json(
+                root,
+                "mft_pipeline/targeted_hpo_exact14/run-001/status.json",
+                status,
+            )
+
+            payload = MftPipelineStatusReader(root, cache_seconds=0).snapshot()
+
+        self.assertFalse(payload["surrogate"]["targeted_hpo"]["available"])
+        self.assertTrue(any(
+            error["source"].startswith("targeted_hpo_")
+            and "completion evidence" in error["message"]
+            for error in payload["errors"]
+        ))
+
+    def test_isolated_nsga_live_lanes_are_discovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_complete_runtime(root)
+            write_json(
+                root,
+                "mft_nsga_transition_audit/a/isolated_nsga/cold/ui_status.json",
+                isolated_nsga_live_fixture("isolated-cold", 41000),
+            )
+            write_json(
+                root,
+                "mft_nsga_transition_audit/a/isolated_nsga/warm/ui_status.json",
+                isolated_nsga_live_fixture("isolated-warm", 42000),
+            )
+
+            payload = MftPipelineStatusReader(root, cache_seconds=0).snapshot()
+
+        lanes = {lane["name"]: lane for lane in payload["nsga"]["lanes"]}
+        self.assertIn("isolated-cold", lanes)
+        self.assertIn("isolated-warm", lanes)
+        self.assertEqual(lanes["isolated-cold"]["seed_workers"], 2)
+        self.assertEqual(len(lanes["isolated-cold"]["seeds"]), 16)
+        self.assertEqual(lanes["isolated-cold"]["elapsed_seconds"], 120.5)
+        self.assertEqual(
+            lanes["isolated-warm"]["source_type"],
+            "isolated_transition_audit",
+        )
+        self.assertGreaterEqual(payload["nsga"]["active_seed_workers"], 4)
+
     def test_completed_hpo_result_fingerprint_tamper_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -1433,6 +1629,7 @@ class MftPipelineStatusRouteTests(unittest.TestCase):
         self.assertIn('id="mft-canonical-checkpoint-targets"', html)
         self.assertIn('id="mft-nsga-live-results"', html)
         self.assertIn('id="mft-surrogate-hpo-targets"', html)
+        self.assertIn('id="mft-targeted-hpo-result"', html)
         self.assertIn('id="mft-completed-hpo-summary"', html)
         self.assertIn('id="mft-completed-hpo-targets"', html)
         self.assertIn('id="mft-surrogate-target-metrics"', html)
@@ -1475,6 +1672,10 @@ class MftPipelineStatusRouteTests(unittest.TestCase):
         self.assertIn("canonicalTraining.last_checkpoint_result", html)
         self.assertIn("nsga.pareto_results", html)
         self.assertIn('document.createElementNS(svg, "circle")', html)
+        self.assertIn('document.createElementNS(svg, "path")', html)
+        self.assertIn("actual FEA diamonds", html)
+        self.assertIn('lane.source_type === "isolated_transition_audit"', html)
+        self.assertIn("surrogate.targeted_hpo", html)
         self.assertIn("point.candidate_index", html)
         self.assertIn("zero-pass:", html)
         panel = html[

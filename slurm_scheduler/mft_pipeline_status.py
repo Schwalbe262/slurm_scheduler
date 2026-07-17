@@ -24,6 +24,9 @@ MAX_NSGA_PARETO_POINTS = 500
 MAX_NSGA_PARETO_ROWS = 10_000
 MAX_VALIDATED_DESIGNS = 12
 MAX_COMPLETED_HPO_STATUS_BYTES = 32_768
+TARGETED_HPO_STATUS_SCHEMA = "mft-targeted-hpo-batch-v1"
+ISOLATED_NSGA_STATUS_SCHEMA = "mft-isolated-nsga-live-v1"
+MAX_DYNAMIC_STATUS_FILES = 16
 CHECKPOINT_METRIC_KEYS = (
     "n_train",
     "n_calibration",
@@ -210,11 +213,27 @@ STALE_AFTER_SECONDS = {
     "surrogate_status": 75.0,
     "nsga": 75.0,
     "validation": 90.0,
+    "targeted_hpo": 75.0,
+    "isolated_nsga": 75.0,
 }
 
 
 def _mapping(value: object) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _canonical_json_sha256(value: object) -> str | None:
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _items(value: object) -> list[dict[str, Any]]:
@@ -744,6 +763,430 @@ class MftPipelineStatusReader:
             "available": False,
             "stale": False,
             "message": "; ".join(errors) or "status file unavailable",
+        }
+
+    def _dynamic_json_sources(
+        self,
+        source_prefix: str,
+        relative_pattern: str,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """Read a bounded newest-first set of status files below runtime_root."""
+
+        try:
+            root = self.runtime_root.resolve()
+            candidates: list[tuple[int, Path]] = []
+            for path in self.runtime_root.glob(relative_pattern):
+                try:
+                    resolved = path.resolve(strict=True)
+                    resolved.relative_to(root)
+                    stat = resolved.stat()
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                if resolved.is_file():
+                    candidates.append((stat.st_mtime_ns, resolved))
+            candidates.sort(key=lambda item: (-item[0], str(item[1])))
+        except (OSError, RuntimeError, ValueError):
+            candidates = []
+
+        results: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for index, (_mtime, path) in enumerate(
+            candidates[:MAX_DYNAMIC_STATUS_FILES]
+        ):
+            relative = path.relative_to(root).as_posix()
+            payload, meta = self._read_json(
+                f"{source_prefix}_{index}", relative
+            )
+            results.append((payload, {**meta, "relative_path": relative}))
+        return results
+
+    @staticmethod
+    def _targeted_hpo(
+        status: Mapping[str, Any],
+        meta: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        unavailable = {
+            "available": False,
+            "phase": "",
+            "wave": "",
+            "hpo": {"ready": 0, "running": 0, "total": 0, "targets": []},
+            "result": {},
+            "freshness": MftPipelineStatusReader._freshness(
+                {}, meta, stale_after_seconds=STALE_AFTER_SECONDS["targeted_hpo"]
+            ),
+        }
+        if not meta.get("available"):
+            return unavailable
+
+        phase = str(status.get("phase") or "")
+        allowed_phases = {
+            "hpo_queued",
+            "hpo_running",
+            "hpo_merging",
+            "hpo_completed_no_publish",
+            "hpo_failed_closed",
+        }
+        targets = status.get("targets")
+        jobs = status.get("jobs")
+        target_count = _positive_integer(
+            status.get("target_count"), maximum=MAX_HPO_TARGETS
+        )
+        budget = _mapping(status.get("budget"))
+        publication = _mapping(status.get("publication"))
+        dataset = _mapping(status.get("dataset"))
+        code = _mapping(status.get("code"))
+        pins = _mapping(status.get("pins"))
+        objective_contracts = _mapping(status.get("objective_contracts"))
+        valid_targets = bool(
+            target_count is not None
+            and isinstance(targets, list)
+            and isinstance(jobs, list)
+            and len(targets) == target_count
+            and len(jobs) == target_count
+            and len(set(targets)) == target_count
+            and all(
+                isinstance(target, str)
+                and _HPO_TARGET_RE.fullmatch(target) is not None
+                for target in targets
+            )
+        )
+        valid_hashes = bool(
+            _exact_sha256(dataset.get("sha256"))
+            and set(code) == {
+                "runner_sha256",
+                "tune_optuna_sha256",
+                "merge_params_implementation_sha256",
+            }
+            and all(_exact_sha256(value) for value in code.values())
+            and set(objective_contracts) == set(targets or [])
+            and all(
+                _exact_sha256(_mapping(value).get("sha256"))
+                == _canonical_json_sha256(_mapping(value).get("contract"))
+                for value in objective_contracts.values()
+            )
+            and all(
+                re.fullmatch(r"[0-9a-f]{40}", str(pins.get(name) or ""))
+                for name in ("solver_revision", "library_revision")
+            )
+            and _exact_sha256(pins.get("data_contract_sha256"))
+        )
+        valid_contract = bool(
+            status.get("schema_version") == TARGETED_HPO_STATUS_SCHEMA
+            and phase in allowed_phases
+            and _HPO_RUN_RE.fullmatch(str(status.get("wave") or ""))
+            and valid_targets
+            and valid_hashes
+            and _nonnegative_integer(budget.get("max_processes")) == 4
+            and _nonnegative_integer(budget.get("model_threads_per_process")) == 2
+            and _nonnegative_integer(budget.get("maximum_total_model_threads")) == 8
+            and publication.get("allowed") is False
+            and publication.get("attempted") is False
+        )
+        normalized: list[dict[str, Any]] = []
+        if valid_contract:
+            allowed_states = {
+                "queued",
+                "running",
+                "completed",
+                "failed",
+                "cancelled_after_peer_failure",
+            }
+            for index, (target, raw_job) in enumerate(zip(targets, jobs)):
+                job = _mapping(raw_job)
+                state = str(job.get("state") or "")
+                result_sha = job.get("result_json_sha256")
+                if (
+                    _nonnegative_integer(job.get("index")) != index
+                    or job.get("target") != target
+                    or job.get("family") != "lightgbm"
+                    or state not in allowed_states
+                    or _nonnegative_integer(job.get("model_threads")) != 2
+                    or _positive_integer(job.get("trials")) is None
+                    or (
+                        state == "completed"
+                        and _exact_sha256(result_sha) is None
+                    )
+                ):
+                    valid_contract = False
+                    normalized = []
+                    break
+                normalized.append({
+                    "target": target,
+                    "family": "lightgbm",
+                    "status": state,
+                    "alive": state == "running",
+                    "result_ready": state == "completed",
+                    "model_threads": 2,
+                    "trials": _positive_integer(job.get("trials")),
+                    "cpu_seconds": None,
+                    "source": "targeted_failed_gate_cohort",
+                })
+        if not valid_contract:
+            return {
+                **unavailable,
+                "error": "invalid targeted HPO live-status contract",
+            }
+
+        result = _mapping(status.get("result"))
+        completed = phase == "hpo_completed_no_publish"
+        result_hash = _exact_sha256(result.get("merged_params_sha256"))
+        if completed and (
+            result_hash is None
+            or _nonnegative_integer(result.get("completed_target_count"))
+            != target_count
+            or _exact_sha256(result.get("tuning_evidence_sha256")) is None
+        ):
+            return {
+                **unavailable,
+                "error": "invalid targeted HPO completion evidence",
+            }
+        return {
+            "available": True,
+            "phase": phase,
+            "wave": str(status.get("wave") or ""),
+            "eligibility": _bounded_text(status.get("eligibility"), limit=80),
+            "dataset_sha256": str(dataset.get("sha256") or ""),
+            "hpo": {
+                "ready": sum(1 for job in normalized if job["result_ready"]),
+                "running": sum(1 for job in normalized if job["alive"]),
+                "total": target_count,
+                "targets": normalized,
+                "processes": 4,
+                "thread_budget": 8,
+                "trials_per_target": (
+                    normalized[0]["trials"] if normalized else None
+                ),
+                "total_trials": sum(job["trials"] or 0 for job in normalized),
+                "limit": MAX_HPO_TARGETS,
+                "truncated": False,
+            },
+            "result": {
+                "available": completed,
+                "merged_params_sha256": result_hash or "",
+                "completed_target_count": _nonnegative_integer(
+                    result.get("completed_target_count")
+                ),
+                "tuning_evidence_sha256": str(
+                    result.get("tuning_evidence_sha256") or ""
+                ),
+            },
+            "error": _bounded_text(
+                _mapping(status.get("error")).get("message"), limit=300
+            ),
+            "freshness": MftPipelineStatusReader._freshness(
+                status,
+                meta,
+                stale_after_seconds=STALE_AFTER_SECONDS["targeted_hpo"],
+            ),
+            "updated_at": status.get("updated_at"),
+        }
+
+    @classmethod
+    def _isolated_nsga_lane(
+        cls,
+        status: Mapping[str, Any],
+        meta: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        lane_name = _bounded_text(status.get("lane"), limit=80)
+        state = _bounded_text(status.get("state"), limit=40)
+        config = _mapping(status.get("config"))
+        model = _mapping(status.get("model"))
+        eligibility = model.get("eligibility")
+        eligibility_contract = _mapping(eligibility)
+        monitor = _mapping(status.get("monitor"))
+        terminal = _mapping(status.get("terminal"))
+        summary = _mapping(terminal.get("summary"))
+        seed_base = _nonnegative_integer(config.get("seed_base"))
+        restart_count = _positive_integer(config.get("restarts"), maximum=64)
+        population = _positive_integer(config.get("population"), maximum=100_000)
+        max_generations = _positive_integer(
+            config.get("max_generations"), maximum=1_000_000
+        )
+        workers = _positive_integer(config.get("workers"), maximum=64)
+        pid = _positive_integer(status.get("pid"))
+        alive = status.get("alive")
+        elapsed = _strict_number(status.get("elapsed_seconds"))
+        valid = bool(
+            meta.get("available")
+            and status.get("schema_version") == ISOLATED_NSGA_STATUS_SCHEMA
+            and lane_name
+            and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", lane_name)
+            and state in {"waiting", "running", "completed", "infeasible", "failed"}
+            and pid is not None
+            and isinstance(alive, bool)
+            and elapsed is not None
+            and elapsed >= 0
+            and seed_base is not None
+            and restart_count is not None
+            and population is not None
+            and max_generations is not None
+            and workers is not None
+            and _exact_sha256(model.get("dataset_sha256")) is not None
+            and _exact_sha256(model.get("generation_report_sha256")) is not None
+            and (
+                str(eligibility or "") == "FEA-NOT-APPROVED"
+                or (
+                    eligibility_contract.get("production_eligible") is False
+                    and eligibility_contract.get("fea_submission_approved") is False
+                    and eligibility_contract.get("standard_fea_only") is True
+                    and eligibility_contract.get("direct_full_fea_allowed") is False
+                )
+            )
+        )
+        freshness = cls._freshness(
+            status,
+            meta,
+            stale_after_seconds=STALE_AFTER_SECONDS["isolated_nsga"],
+        )
+        if not valid:
+            return {
+                "name": lane_name or "isolated-invalid",
+                "available": False,
+                "stale": bool(meta.get("stale")),
+                "state": "invalid",
+                "run_id": "",
+                "seeds": [],
+                "seed_workers": 0,
+                "model_id": "",
+                "current_model_id": "",
+                "model_lane": "isolated",
+                "completed_runs": 0,
+                "feasible_runs": 0,
+                "infeasible_runs": 0,
+                "pareto_runs": 0,
+                "current_model": {
+                    "available": False,
+                    "completed_runs": None,
+                    "feasible_runs": 0,
+                    "infeasible_runs": 0,
+                    "pareto_runs": 0,
+                    "error": "invalid isolated NSGA live-status contract",
+                },
+                "lifetime": {
+                    "completed_runs": 0,
+                    "feasible_runs": 0,
+                    "infeasible_runs": 0,
+                    "pareto_runs": 0,
+                },
+                "latest_pareto": {"available": False, "scope": "current_model", "points": []},
+                "lifetime_latest_pareto": {"available": False, "scope": "lifetime", "points": []},
+                "least_violation": {
+                    "best_total_positive_violation": None,
+                    "candidate_count": None,
+                    "zero_pass_constraints": [],
+                },
+                "warm_start": {},
+                "freshness": freshness,
+                "updated_at": status.get("updated_at"),
+                "error": "invalid isolated NSGA live-status contract",
+            }
+
+        completed_runs = (
+            _nonnegative_integer(summary.get("completed_restarts")) or 0
+        )
+        feasible_restarts = _nonnegative_integer(
+            summary.get("feasible_restarts")
+        )
+        if feasible_restarts is None:
+            feasible_restarts = (
+                completed_runs
+                if terminal.get("outcome") == "feasible_complete"
+                else 0
+            )
+        feasible_runs = feasible_restarts
+        infeasible_runs = max(0, completed_runs - feasible_runs)
+        pareto_points = _nonnegative_integer(summary.get("pareto_points")) or 0
+        terminal_available = terminal.get("available") is True
+        seeds = list(range(seed_base, seed_base + restart_count))
+        training_run_id = _bounded_text(model.get("training_run_id"), limit=160)
+        model_id = (
+            f"isolated:{training_run_id}:"
+            f"{str(model.get('dataset_sha256'))[:16]}:"
+            f"{str(model.get('generation_report_sha256'))[:16]}"
+        )
+        pareto = cls._nsga_pareto(
+            terminal.get("pareto"), scope="current_model"
+        )
+        return {
+            "name": lane_name,
+            "available": True,
+            "stale": bool(freshness.get("stale")),
+            "source_type": "isolated_transition_audit",
+            "state": state,
+            "run_id": _bounded_text(
+                status.get("run_id"), limit=80
+            ) or f"seed-{seed_base}",
+            "seeds": seeds,
+            "seed_workers": (
+                workers if alive and state in {"waiting", "running"} else 0
+            ),
+            "model_id": model_id,
+            "current_model_id": model_id,
+            "model_lane": "isolated",
+            "completed_runs": completed_runs,
+            "feasible_runs": feasible_runs,
+            "infeasible_runs": infeasible_runs,
+            "pareto_runs": feasible_runs,
+            "current_model": {
+                "available": terminal_available,
+                "completed_runs": completed_runs if terminal_available else None,
+                "feasible_runs": feasible_runs,
+                "infeasible_runs": infeasible_runs,
+                "pareto_runs": feasible_runs,
+                "error": "",
+            },
+            "lifetime": {
+                "completed_runs": completed_runs,
+                "feasible_runs": feasible_runs,
+                "infeasible_runs": infeasible_runs,
+                "pareto_runs": feasible_runs,
+            },
+            "latest_pareto": pareto,
+            "lifetime_latest_pareto": {
+                **pareto,
+                "scope": "lifetime",
+            } if pareto.get("available") else {
+                "available": False,
+                "scope": "lifetime",
+                "points": [],
+            },
+            "next_seed_base": seed_base + restart_count,
+            "model_switch_policy": "pinned isolated generation; no hot swap",
+            "fea_submission_enabled": False,
+            "least_violation": {
+                "best_total_positive_violation": _number(
+                    summary.get("best_violation")
+                ),
+                "candidate_count": pareto_points or None,
+                "zero_pass_constraints": _text_items(
+                    summary.get("zero_pass_constraints"), limit=12
+                ),
+            },
+            "warm_start": {
+                "artifact_kind": _bounded_text(
+                    status.get("warm_start_kind"), limit=80
+                ),
+                "reevaluation_required": True,
+            },
+            "elapsed_seconds": elapsed,
+            "config": {
+                "seed_base": seed_base,
+                "restarts": restart_count,
+                "population": population,
+                "max_generations": max_generations,
+                "workers": workers,
+            },
+            "eligibility": "FEA-NOT-APPROVED",
+            "handoff_state": _bounded_text(
+                monitor.get("bridge_state"), limit=40
+            ),
+            "authenticated_handoff_complete": (
+                terminal.get("authenticated_handoff_complete") is True
+            ),
+            "terminal_outcome": _bounded_text(
+                terminal.get("outcome"), limit=80
+            ),
+            "freshness": freshness,
+            "updated_at": status.get("updated_at"),
         }
 
     @classmethod
@@ -1863,6 +2306,21 @@ class MftPipelineStatusReader:
                 "full_model_state", "mft_nsga_full_model_validation/state.json"
             ),
         }
+        targeted_sources = self._dynamic_json_sources(
+            "targeted_hpo",
+            "mft_pipeline/targeted_hpo_exact14/*/status.json",
+        )
+        sources["targeted_hpo"] = (
+            targeted_sources[0]
+            if targeted_sources
+            else ({}, {"source": "targeted_hpo", "available": False, "stale": False})
+        )
+        isolated_sources = self._dynamic_json_sources(
+            "isolated_nsga",
+            "mft_nsga_transition_audit/*/isolated_nsga/*/ui_status.json",
+        )
+        for index, source in enumerate(isolated_sources):
+            sources[f"isolated_nsga_{index}"] = source
         canonical_status, canonical_meta = sources["canonical_surrogate_status"]
         if canonical_meta.get("available"):
             contract_errors = _canonical_contract_errors(canonical_status)
@@ -1892,6 +2350,14 @@ class MftPipelineStatusReader:
         surrogate_status, surrogate_meta = sources["surrogate_status"]
         pointer, pointer_meta = sources["surrogate_pointer"]
         surrogate_state, surrogate_state_meta = sources["surrogate_state"]
+        targeted_status, targeted_meta = sources["targeted_hpo"]
+        targeted_hpo = self._targeted_hpo(targeted_status, targeted_meta)
+        if targeted_hpo.get("error") and targeted_hpo.get("available") is not True:
+            errors.append({
+                "source": targeted_meta.get("source"),
+                "message": targeted_hpo.get("error"),
+                "stale": bool(targeted_meta.get("stale")),
+            })
         wave_detail = _mapping(surrogate_status.get("active_wave_detail"))
         strict_snapshot = _mapping(wave_detail.get("strict_snapshot"))
         raw_rows = max(
@@ -1923,21 +2389,39 @@ class MftPipelineStatusReader:
             else None
         )
         model_id = _model_id(pointer)
-        phase = str(surrogate_status.get("wave_phase") or wave_detail.get("phase") or "")
-        training_jobs = _items(wave_detail.get("jobs"))
-        training_active = bool(
+        canonical_phase = str(
+            surrogate_status.get("wave_phase") or wave_detail.get("phase") or ""
+        )
+        canonical_training_jobs = _items(wave_detail.get("jobs"))
+        canonical_training_active = bool(
             wave_detail.get("worker_pid")
             or wave_detail.get("supervisor_pid")
-            or any(job.get("alive") is True for job in training_jobs)
+            or any(job.get("alive") is True for job in canonical_training_jobs)
             or surrogate_status.get("state") == "wave_running"
-            or phase in {
+            or canonical_phase in {
                 "candidate_training",
                 "experimental_hpo",
                 "hpo_running",
                 "training",
             }
         )
-        surrogate_hpo = self._surrogate_hpo(surrogate_status)
+        targeted_visible = targeted_hpo.get("available") is True
+        if targeted_visible:
+            phase = str(targeted_hpo.get("phase") or "")
+            training_jobs = list(
+                _mapping(targeted_hpo.get("hpo")).get("targets") or []
+            )
+            training_active = phase in {
+                "hpo_queued",
+                "hpo_running",
+                "hpo_merging",
+            }
+            surrogate_hpo = _mapping(targeted_hpo.get("hpo"))
+        else:
+            phase = canonical_phase
+            training_jobs = canonical_training_jobs
+            training_active = canonical_training_active
+            surrogate_hpo = self._surrogate_hpo(surrogate_status)
         completed_hpo_results = self._completed_hpo_results(surrogate_status)
         surrogate_decision = self._surrogate_decision(surrogate_state)
         incumbent_comparison = _mapping(pointer.get("incumbent_comparison"))
@@ -1961,6 +2445,15 @@ class MftPipelineStatusReader:
             self._nsga_lane("main", nsga_main, main_meta),
             self._nsga_lane("new-model-fast", nsga_fast, fast_meta),
         ]
+        for isolated_status, isolated_meta in isolated_sources:
+            lane = self._isolated_nsga_lane(isolated_status, isolated_meta)
+            nsga_lanes.append(lane)
+            if lane.get("error"):
+                errors.append({
+                    "source": isolated_meta.get("source"),
+                    "message": lane.get("error"),
+                    "stale": bool(isolated_meta.get("stale")),
+                })
         active_nsga_lanes = [
             lane
             for lane in nsga_lanes
@@ -2080,6 +2573,7 @@ class MftPipelineStatusReader:
             "surrogate_state": self._freshness(
                 surrogate_state, surrogate_state_meta, stale_after_seconds=None
             ),
+            "targeted_hpo": _mapping(targeted_hpo.get("freshness")),
             "nsga_main": nsga_lanes[0]["freshness"],
             "nsga_fast": nsga_lanes[1]["freshness"],
             "standard_fea_main": self._freshness(
@@ -2098,6 +2592,10 @@ class MftPipelineStatusReader:
                 stale_after_seconds=STALE_AFTER_SECONDS["validation"],
             ),
         }
+        for index, lane in enumerate(nsga_lanes[2:]):
+            source_freshness[f"isolated_nsga_{index}"] = _mapping(
+                lane.get("freshness")
+            )
         stale_sources = sorted(
             name
             for name, freshness in source_freshness.items()
@@ -2232,11 +2730,22 @@ class MftPipelineStatusReader:
                     or surrogate_state_meta.get("available")
                     or pointer_meta.get("available")
                 ),
-                "state": str(surrogate_status.get("state") or "unavailable"),
+                "state": (
+                    phase
+                    if targeted_visible
+                    else str(surrogate_status.get("state") or "unavailable")
+                ),
+                "controller_state": str(
+                    surrogate_status.get("state") or "unavailable"
+                ),
                 "wave": str(
-                    surrogate_status.get("active_wave")
-                    or surrogate_state.get("active_wave")
-                    or ""
+                    targeted_hpo.get("wave")
+                    if targeted_visible
+                    else (
+                        surrogate_status.get("active_wave")
+                        or surrogate_state.get("active_wave")
+                        or ""
+                    )
                 ),
                 "phase": phase,
                 "last_result_phase": str(
@@ -2277,6 +2786,7 @@ class MftPipelineStatusReader:
                     "target_metrics": active_model_target_metrics,
                 },
                 "hpo": surrogate_hpo,
+                "targeted_hpo": targeted_hpo,
                 "last_completed_hpo_results": completed_hpo_results,
                 "last_decision": surrogate_decision,
                 "next_refresh_strict_rows": (
@@ -2287,9 +2797,19 @@ class MftPipelineStatusReader:
                     )
                     or None
                 ),
-                "freshness": source_freshness["surrogate_status"],
-                "updated_at": surrogate_status.get("updated_at")
-                or pointer.get("published_at"),
+                "freshness": (
+                    source_freshness["targeted_hpo"]
+                    if targeted_visible
+                    else source_freshness["surrogate_status"]
+                ),
+                "updated_at": (
+                    targeted_hpo.get("updated_at")
+                    if targeted_visible
+                    else (
+                        surrogate_status.get("updated_at")
+                        or pointer.get("published_at")
+                    )
+                ),
             },
             "nsga": {
                 "available": any(lane["available"] for lane in nsga_lanes),

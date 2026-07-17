@@ -559,6 +559,7 @@
         <span class="muted" id="mft-surrogate-freshness">-</span>
       </div>
       <p id="mft-surrogate-wave" class="muted">active wave - · HPO - / - · next strict rows -</p>
+      <p id="mft-targeted-hpo-result" class="muted">targeted HPO -</p>
       <p id="mft-surrogate-model" class="muted">active model - · training rows -</p>
       <p id="mft-surrogate-target-metrics-count" class="muted">active model target metrics -</p>
       <div class="table-scroll">
@@ -607,11 +608,11 @@
     </div>
     <div id="mft-nsga-pareto-results" class="section-gap" aria-live="polite">
       <div class="title-row">
-        <h3>Surrogate NSGA-II Pareto 결과</h3>
+        <h3>NSGA-II Pareto / Actual Standard-FEA objectives</h3>
         <span class="muted" id="mft-nsga-pareto-counts">-</span>
       </div>
       <p id="mft-nsga-pareto-errors" class="muted">Pareto evidence error 없음</p>
-      <p class="muted">아래 점은 surrogate 예측 결과이며 FEA 검증값이 아닙니다. 모든 공개 점은 그래프에 반영하고 표에는 각 결과의 앞 50개를 표시합니다.</p>
+      <p class="muted">그래프의 원은 surrogate 예측, 마름모는 실제 Standard-FEA 목적값입니다. 아래 표는 surrogate 결과만 표시합니다.</p>
       <svg id="mft-nsga-pareto-chart" viewBox="0 0 900 360" role="img" aria-label="Surrogate NSGA Pareto volume and loss chart" style="display:block;width:100%;height:auto;min-height:260px;border:1px solid var(--line);border-radius:8px;"></svg>
       <div class="table-scroll">
         <table aria-label="Latest surrogate NSGA Pareto points">
@@ -713,7 +714,7 @@
           .map(([name, fieldValue]) => `${name}=${shown(fieldValue)}`);
         return fields.length ? fields.join(", ") : "-";
       };
-      function drawParetoChart(results) {
+      function drawParetoChart(results, actualDesigns) {
         const chart = document.getElementById("mft-nsga-pareto-chart");
         if (!chart) return;
         chart.textContent = "";
@@ -724,14 +725,22 @@
             .slice(0, 500)
             .filter((point) => number(point.volume_L) !== null && number(point.total_loss_W) !== null),
         })).filter((item) => item.points.length);
-        const points = series.flatMap((item) => item.points);
+        const actualPoints = (Array.isArray(actualDesigns) ? actualDesigns : [])
+          .slice(0, 500)
+          .map((design) => ({
+            design,
+            volume_L: number(design && design.objectives && design.objectives.volume_L),
+            total_loss_W: number(design && design.objectives && design.objectives.total_loss_W),
+          }))
+          .filter((point) => point.volume_L !== null && point.total_loss_W !== null);
+        const points = [...series.flatMap((item) => item.points), ...actualPoints];
         if (!points.length) {
           const empty = document.createElementNS(svg, "text");
           empty.setAttribute("x", "450");
           empty.setAttribute("y", "180");
           empty.setAttribute("text-anchor", "middle");
           empty.setAttribute("fill", "currentColor");
-          empty.textContent = "공개된 surrogate Pareto 점 없음";
+          empty.textContent = "공개된 surrogate / actual FEA 목적값 없음";
           chart.appendChild(empty);
           return;
         }
@@ -755,8 +764,8 @@
         axis.setAttribute("stroke-opacity", "0.55");
         chart.appendChild(axis);
         [
-          {x: width / 2, y: height - 16, text: `Predicted volume (L): ${decimal(minVolume, 2)} – ${decimal(maxVolume, 2)}`},
-          {x: margin.left, y: 20, text: `Predicted loss (W): ${decimal(minLoss, 1)} – ${decimal(maxLoss, 1)}`},
+          {x: width / 2, y: height - 16, text: `Volume (L): ${decimal(minVolume, 2)} – ${decimal(maxVolume, 2)}`},
+          {x: margin.left, y: 20, text: `Loss (W): ${decimal(minLoss, 1)} – ${decimal(maxLoss, 1)}`},
         ].forEach((label) => {
           const node = document.createElementNS(svg, "text");
           node.setAttribute("x", String(label.x));
@@ -782,6 +791,27 @@
             chart.appendChild(circle);
           });
         });
+        actualPoints.forEach((point) => {
+          const marker = document.createElementNS(svg, "path");
+          const px = x(point.volume_L);
+          const py = y(point.total_loss_W);
+          marker.setAttribute("d", `M ${px} ${py - 5} L ${px + 5} ${py} L ${px} ${py + 5} L ${px - 5} ${py} Z`);
+          marker.setAttribute("fill", "#111827");
+          marker.setAttribute("stroke", "#ffffff");
+          marker.setAttribute("stroke-width", "1.2");
+          const title = document.createElementNS(svg, "title");
+          title.textContent = `actual Standard FEA · ${point.design.run_id || "run"} · ${decimal(point.volume_L, 3)} L · ${decimal(point.total_loss_W, 3)} W · ${point.design.nondominated ? "nondominated" : "dominated"}`;
+          marker.appendChild(title);
+          chart.appendChild(marker);
+        });
+        const legend = document.createElementNS(svg, "text");
+        legend.setAttribute("x", String(width - margin.right));
+        legend.setAttribute("y", "20");
+        legend.setAttribute("text-anchor", "end");
+        legend.setAttribute("fill", "currentColor");
+        legend.setAttribute("font-size", "12");
+        legend.textContent = `surrogate circles ${shown(series.reduce((total, item) => total + item.points.length, 0))} · actual FEA diamonds ${shown(actualPoints.length)}`;
+        chart.appendChild(legend);
       }
 
       function render(payload) {
@@ -920,6 +950,14 @@
         setText(
           document.getElementById("mft-surrogate-wave"),
           `wave ${compact(surrogate.wave, 26)} · HPO ${shown(hpo.ready)} / ${shown(hpo.total)} · strict rows ${shown(data.strict_rows)} · model rows ${shown(surrogate.model_rows)} · next ${shown(surrogate.next_refresh_strict_rows)}`,
+        );
+        const targetedHpo = surrogate.targeted_hpo || {};
+        const targetedResult = targetedHpo.result || {};
+        setText(
+          document.getElementById("mft-targeted-hpo-result"),
+          targetedHpo.available === true
+            ? `targeted HPO ${targetedHpo.phase || "-"} · ${shown(hpo.ready)} / ${shown(hpo.total)} complete · running ${shown(hpo.running)} · budget ${shown(hpo.thread_budget)} threads · merged ${compact(targetedResult.merged_params_sha256, 13)} · ${freshnessText(targetedHpo.freshness)}`
+            : "targeted HPO unavailable",
         );
         const activeModel = surrogate.active_model || {};
         const activeMetrics = activeModel.metrics || {};
@@ -1141,9 +1179,11 @@
               const row = laneBody.insertRow();
               const fields = [
                 lane.name || "-",
-                lane.state || "unavailable",
+                `${lane.state || "unavailable"}${lane.handoff_state ? ` · handoff ${lane.handoff_state}` : ""}${lane.authenticated_handoff_complete === true ? " ✓" : ""}${number(lane.elapsed_seconds) === null ? "" : ` · ${Math.round(number(lane.elapsed_seconds))}s`}`,
                 lane.run_id || "-",
-                Array.isArray(lane.seeds) && lane.seeds.length ? lane.seeds.join(", ") : "-",
+                lane.source_type === "isolated_transition_audit"
+                  ? `${shown(lane.seed_workers)} workers / ${shown(Array.isArray(lane.seeds) ? lane.seeds.length : 0)} seeds`
+                  : (Array.isArray(lane.seeds) && lane.seeds.length ? lane.seeds.join(", ") : "-"),
                 compact(lane.current_model_id || lane.model_id, 42),
                 currentModel.available
                   ? `${shown(currentModel.completed_runs)} / ${shown(currentModel.feasible_runs)} / ${shown(currentModel.infeasible_runs)} / ${shown(currentModel.pareto_runs)}`
@@ -1198,7 +1238,10 @@
             ? `Pareto evidence error: ${paretoErrors.map((item) => `${item.lane || "lane"}/${item.scope || "scope"}${item.run_id ? ` ${item.run_id}` : ""}: ${item.error || "invalid evidence"}`).join(" · ")}`
             : "Pareto evidence error 없음",
         );
-        drawParetoChart(paretoResults);
+        drawParetoChart(
+          paretoResults,
+          Array.isArray(designs.items) ? designs.items : [],
+        );
         const paretoBody = document.getElementById("mft-nsga-pareto-points");
         if (paretoBody) {
           paretoBody.textContent = "";
