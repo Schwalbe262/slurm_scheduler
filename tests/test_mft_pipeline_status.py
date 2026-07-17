@@ -1252,6 +1252,32 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
         self.assertFalse(payload["sources"]["surrogate_pointer"]["stale"])
         self.assertIn("nsga_main", payload["stale_sources"])
 
+    def test_stale_nsga_lanes_keep_history_but_report_no_active_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_complete_runtime(root)
+            for relative_path in (
+                "mft_nsga_continuous/status.json",
+                "mft_nsga_newmodel_fastlane_v2/status.json",
+            ):
+                path = root / relative_path
+                status = json.loads(path.read_text(encoding="utf-8"))
+                status["updated_at"] = "2000-01-01T00:00:00+00:00"
+                write_json(root, relative_path, status)
+
+            payload = MftPipelineStatusReader(root, cache_seconds=0).snapshot()
+
+        self.assertEqual(payload["nsga"]["active_seed_workers"], 0)
+        self.assertEqual(payload["nsga"]["completed_runs"], 3)
+        self.assertEqual(payload["nsga"]["lifetime_completed_runs"], 3)
+        self.assertEqual(len(payload["nsga"]["pareto_results"]), 1)
+        self.assertEqual(
+            [lane["seed_workers"] for lane in payload["nsga"]["lanes"]],
+            [4, 4],
+        )
+        self.assertTrue(payload["sources"]["nsga_main"]["stale"])
+        self.assertTrue(payload["sources"]["nsga_fast"]["stale"])
+
 
 class StandaloneCampaignSummaryTests(unittest.TestCase):
     def test_summary_excludes_pooled_and_validation_lanes(self) -> None:

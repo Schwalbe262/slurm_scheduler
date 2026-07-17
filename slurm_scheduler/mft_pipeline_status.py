@@ -1961,6 +1961,12 @@ class MftPipelineStatusReader:
             self._nsga_lane("main", nsga_main, main_meta),
             self._nsga_lane("new-model-fast", nsga_fast, fast_meta),
         ]
+        active_nsga_lanes = [
+            lane
+            for lane in nsga_lanes
+            if lane["available"]
+            and not _mapping(lane.get("freshness")).get("stale")
+        ]
         pareto_results: list[dict[str, Any]] = []
         pareto_errors: list[dict[str, Any]] = []
         seen_pareto: set[tuple[str, str, str]] = set()
@@ -2288,7 +2294,12 @@ class MftPipelineStatusReader:
             "nsga": {
                 "available": any(lane["available"] for lane in nsga_lanes),
                 "lanes": nsga_lanes,
-                "active_seed_workers": sum(lane["seed_workers"] for lane in nsga_lanes),
+                # Seeds in a stale controller snapshot are historical evidence,
+                # not live OS workers.  Preserve them in each lane while keeping
+                # the aggregate active-worker count honest.
+                "active_seed_workers": sum(
+                    lane["seed_workers"] for lane in active_nsga_lanes
+                ),
                 "current_model_completed_runs": sum(
                     lane["current_model"]["completed_runs"] or 0
                     for lane in nsga_lanes
