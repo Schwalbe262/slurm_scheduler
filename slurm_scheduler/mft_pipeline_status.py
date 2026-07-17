@@ -1201,7 +1201,9 @@ class MftPipelineStatusReader:
             "lane": lane,
             "eligibility": eligibility,
             "watcher_pid": _positive_integer(status.get("watcher_pid")),
-            "training_active": phase == "candidate_training",
+            "training_active": (
+                phase == "candidate_training" and not freshness.get("stale")
+            ),
             "worker_pid": _positive_integer(status.get("worker_pid")),
             "cpu_budget": {
                 "target_workers": _positive_integer(cpu.get("target_workers")),

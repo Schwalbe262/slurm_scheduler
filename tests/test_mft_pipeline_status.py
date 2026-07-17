@@ -1942,6 +1942,8 @@ class MftPipelineStatusRouteTests(unittest.TestCase):
         self.assertIn("surrogate.post_targeted_full25", html)
         self.assertIn("postTargeted.pass24_replay", html)
         self.assertIn("postTargeted.nsga_launch", html)
+        self.assertIn('postNsga.seeds.join(", ")', html)
+        self.assertIn("launch attested", html)
         self.assertIn("point.candidate_index", html)
         self.assertIn("zero-pass:", html)
         panel = html[
