@@ -1058,14 +1058,9 @@ class MftPipelineStatusReader:
         passed: set[str] = set()
         failed: set[str] = set()
         valid: set[str] = set()
-        failure_states = {
-            "collector_failed",
-            "failed",
-            "invalid_result",
-            "scheduler_failed",
-            "task_failed",
+        terminal_task_states = {
+            "cancelled", "completed", "failed", "timed_out", "timeout"
         }
-        terminal_task_states = {"cancelled", "failed", "timed_out", "timeout"}
         for state in states:
             for candidate in _items(state.get("candidates")):
                 identity = str(
@@ -1076,16 +1071,26 @@ class MftPipelineStatusReader:
                 )
                 if not identity:
                     continue
-                collection_state = str(candidate.get("collection_state") or "").lower()
                 task_status = str(candidate.get("task_status") or "").lower()
-                if collection_state == "collector_succeeded":
-                    if candidate.get("result_contract_valid") is True:
-                        valid.add(identity)
-                    if candidate.get("standard_fea_spec_pass") is True:
-                        passed.add(identity)
-                    elif candidate.get("standard_fea_spec_pass") is False:
-                        failed.add(identity)
-                elif collection_state in failure_states or task_status in terminal_task_states:
+                if task_status not in terminal_task_states:
+                    continue
+                authenticated_result = bool(
+                    candidate.get("result_state") == "valid"
+                    and candidate.get("result_contract_valid") is True
+                    and candidate.get("candidate_identity_matches") is True
+                )
+                if authenticated_result:
+                    valid.add(identity)
+                # Durable authenticated solver evidence outranks a later AEDT
+                # teardown exit or collector failure.  Missing any exact gate
+                # remains fail-closed, so an actual solver failure is never
+                # converted into PASS merely because its task is terminal.
+                if (
+                    authenticated_result
+                    and candidate.get("standard_fea_spec_pass") is True
+                ):
+                    passed.add(identity)
+                else:
                     failed.add(identity)
         failed.difference_update(passed)
         return len(passed), len(failed), len(valid)

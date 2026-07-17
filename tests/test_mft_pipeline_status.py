@@ -468,13 +468,37 @@ def write_complete_runtime(root: Path) -> None:
                 "pass": {
                     "candidate_digest": "pass",
                     "collection_state": "collector_succeeded",
+                    "task_status": "completed",
+                    "result_state": "valid",
                     "result_contract_valid": True,
+                    "candidate_identity_matches": True,
                     "standard_fea_spec_pass": True,
                 },
                 "fail": {
                     "candidate_digest": "fail",
                     "collection_state": "collector_succeeded",
+                    "task_status": "completed",
+                    "result_state": "valid",
                     "result_contract_valid": True,
+                    "candidate_identity_matches": True,
+                    "standard_fea_spec_pass": False,
+                },
+                "post-result-failed": {
+                    "candidate_digest": "post-result-failed",
+                    "collection_state": "collector_retry",
+                    "task_status": "failed",
+                    "result_state": "valid",
+                    "result_contract_valid": True,
+                    "candidate_identity_matches": True,
+                    "standard_fea_spec_pass": True,
+                },
+                "actual-solver-failed": {
+                    "candidate_digest": "actual-solver-failed",
+                    "collection_state": "collector_retry",
+                    "task_status": "failed",
+                    "result_state": "missing",
+                    "result_contract_valid": False,
+                    "candidate_identity_matches": False,
                     "standard_fea_spec_pass": False,
                 },
             }
@@ -687,8 +711,9 @@ class MftPipelineStatusReaderTests(unittest.TestCase):
         self.assertEqual(payload["standard_fea"]["active"], 3)
         self.assertEqual(payload["standard_fea"]["running"], 2)
         self.assertEqual(payload["standard_fea"]["queued"], 1)
-        self.assertEqual(payload["standard_fea"]["pass"], 1)
-        self.assertEqual(payload["standard_fea"]["fail"], 1)
+        self.assertEqual(payload["standard_fea"]["pass"], 2)
+        self.assertEqual(payload["standard_fea"]["fail"], 2)
+        self.assertEqual(payload["standard_fea"]["valid_results"], 3)
         self.assertEqual(payload["full_model"]["active"], 1)
         self.assertEqual(payload["full_model"]["pass"], 1)
         self.assertEqual(payload["errors"], [])
