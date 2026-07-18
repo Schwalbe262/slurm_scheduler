@@ -401,6 +401,8 @@ population before selecting the requested page. The response is an object with
 `items`, `filtered_total`, `page`, `page_size`, `page_count`, `has_previous`,
 `has_next`, and the normalized filter/sort metadata. Supported sort keys are
 `id`, `name`, `status`, `allocation`, and `scheduling`.
+The same count/page/next fields are also available under `pagination` for
+compatibility with long-running polling clients.
 
 ### `POST /api/tasks`
 

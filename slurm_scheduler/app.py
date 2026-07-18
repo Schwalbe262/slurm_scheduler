@@ -2656,13 +2656,21 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 sort_by=task_sort_key,
                 sort_order=task_sort_direction,
             )
-            page_metadata = {
+            pagination_metadata = {
                 "filtered_total": filtered_total,
                 "page": selected_page,
                 "page_size": int(page_size),
                 "page_count": page_count,
                 "has_previous": selected_page > 1,
                 "has_next": selected_page < page_count,
+            }
+            page_metadata = {
+                **pagination_metadata,
+                # Compatibility for polling clients that predate the flat
+                # page metadata fields.  Keep the flat fields for the public
+                # API while providing the exact nested object those clients
+                # inspect before deciding whether to request another page.
+                "pagination": dict(pagination_metadata),
                 "sort_by": task_sort_key,
                 "sort_order": task_sort_direction,
                 "filters": {

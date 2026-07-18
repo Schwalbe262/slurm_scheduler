@@ -571,6 +571,17 @@ class TaskCountHistoryRouteTests(unittest.TestCase):
         self.assertEqual(payload["page_count"], 1)
         self.assertFalse(payload["has_previous"])
         self.assertFalse(payload["has_next"])
+        self.assertEqual(
+            payload["pagination"],
+            {
+                "filtered_total": 53,
+                "page": 1,
+                "page_size": 100,
+                "page_count": 1,
+                "has_previous": False,
+                "has_next": False,
+            },
+        )
         self.assertEqual(len(payload["items"]), 53)
         self.assertEqual(
             [item["name"] for item in payload["items"]],
