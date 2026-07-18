@@ -693,6 +693,7 @@ class Scheduler:
         if self._thread and self._thread.is_alive():
             return
         self.recover_transient_states()
+        self.retire_legacy_unprofiled_pending_demand_allocations()
         self._needs_reconcile = self.reconcile_on_start
         self._stop.clear()
         self._thread = threading.Thread(target=self.run_forever, name="scheduler", daemon=True)
@@ -5139,6 +5140,11 @@ class Scheduler:
             return ["CPU-only FEA cannot claim a GPU allocation pool"]
         if self.allocation_profile_conflicts(allocation, task):
             wanted = self.task_allocation_profile(task)
+            demand_profile = self.allocation_demand_profile(allocation)
+            if demand_profile and demand_profile != wanted:
+                return [
+                    f"CPU allocation is reserved for queued {demand_profile} demand"
+                ]
             occupied = "standard" if wanted == "fea" else "fea"
             return [f"CPU allocation is occupied by active {occupied} tasks"]
         if self.task_is_fea_bursty(task):
@@ -7696,6 +7702,53 @@ class Scheduler:
         return "fea" if self.task_is_fea_bursty(task) else "standard"
 
     @staticmethod
+    def allocation_demand_profile(allocation: dict) -> str:
+        """Return the durable profile reserved by an unclaimed demand pool.
+
+        ``drain_reason`` already persists why a demand allocation was opened,
+        survives PENDING -> WARM/ACTIVE, and is included in reservation-plan
+        signatures. Encoding only the exceptional FEA lane keeps historical
+        and generic standard rows backward-compatible.
+        """
+        reason = str(allocation.get("drain_reason") or "")
+        return "fea" if reason.startswith("queued FEA ") else ""
+
+    def retire_legacy_unprofiled_pending_demand_allocations(self) -> int:
+        """One-time restart migration for pre-profile demand requests.
+
+        Historical demand rows do not say whether FEA or standard work opened
+        them.  A pending allocation cannot host a live step yet, so retiring
+        only claimless legacy rows is lossless: queued tasks remain queued and
+        the fixed planner recreates exact, profile-tagged FEA capacity.  Both
+        direct and requested allocation claims are protected by an unbounded
+        database query.  The durable setting prevents later restarts from
+        resetting the queue age of newly created standard demand pools.
+        """
+        setting = "legacy_demand_profile_retired_v1"
+        if self.db.get_setting(setting) == "1":
+            return 0
+        retired = 0
+        all_processed = True
+        for allocation in self.db.list_legacy_unprofiled_pending_demand_allocations():
+            if self.db.list_nonterminal_task_claims_for_allocation(
+                int(allocation["id"])
+            ):
+                # Retry on a later restart after the protected claim becomes
+                # terminal; do not permanently bless an unprofiled survivor.
+                all_processed = False
+                continue
+            if self.close_allocation(
+                allocation,
+                "legacy unprofiled pending demand retired",
+            ):
+                retired += 1
+            else:
+                all_processed = False
+        if all_processed:
+            self.db.set_setting(setting, "1")
+        return retired
+
+    @staticmethod
     def allocation_has_gpu_pool(allocation: dict) -> bool:
         return (
             int(allocation.get("total_gpus") or 0) > 0
@@ -7720,6 +7773,9 @@ class Scheduler:
             return False
         reserved_profile = str(allocation.get("_reserved_scheduling_profile") or "")
         if reserved_profile and reserved_profile != profile:
+            return True
+        demand_profile = self.allocation_demand_profile(allocation)
+        if demand_profile and demand_profile != profile:
             return True
         fea_allocation_ids, standard_allocation_ids = self.active_profile_allocation_sets(refresh=refresh)
         allocation_id = int(allocation.get("id") or 0)
@@ -8657,7 +8713,11 @@ class Scheduler:
             if not model or self.allocation_pool_in_backoff(resource_pool):
                 return None
             return self.open_allocation_record(
-                f"queued GPU demand {model}",
+                (
+                    f"queued FEA GPU demand {model}"
+                    if self.task_is_fea_bursty(task)
+                    else f"queued GPU demand {model}"
+                ),
                 resource_pool=resource_pool,
                 gpu_model=model,
                 gpus=max(1, int(task.get("gpus") or self.gpu_prewarm_gpus_per_allocation)),
@@ -8674,7 +8734,11 @@ class Scheduler:
             return None
         exclusive_node = bool(task.get("exclusive_node"))
         return self.open_allocation_record(
-            "queued CPU demand",
+            (
+                "queued FEA CPU demand"
+                if self.task_is_fea_bursty(task)
+                else "queued CPU demand"
+            ),
             resource_pool="cpu",
             exclusive_node=exclusive_node,
             required_capability=str(task.get("required_capability") or ""),
@@ -8691,11 +8755,24 @@ class Scheduler:
         reservation_plan: _QueuedTaskAllocationReservationPlan | None = None,
         queued_tasks: list[dict] | None = None,
     ) -> None:
-        self.scale_in_unneeded_demand_allocations(
-            reservation_plan=reservation_plan,
-            queued_tasks=queued_tasks,
+        tasks = (
+            queued_tasks
+            if queued_tasks is not None
+            else self.queued_tasks_for_allocation_reservations()
         )
-        self.enforce_cpu_partition_allocation_limits()
+        plan = (
+            reservation_plan
+            if reservation_plan is not None
+            else self.queued_task_allocation_reservation_plan(tasks)
+        )
+        protected_allocation_ids = set(plan.reservations)
+        self.scale_in_unneeded_demand_allocations(
+            reservation_plan=plan,
+            queued_tasks=tasks,
+        )
+        self.enforce_cpu_partition_allocation_limits(
+            protected_allocation_ids=protected_allocation_ids,
+        )
         warm_allocations = [
             item
             for item in self.db.list_allocations_with_live(limit=500)
@@ -8705,28 +8782,53 @@ class Scheduler:
             [item for item in warm_allocations if (item.get("resource_pool") or "cpu") == "cpu"],
             self.min_warm_allocations,
             self.allocation_scale_in_idle_seconds,
+            protected_allocation_ids=protected_allocation_ids,
         )
         self.scale_in_pool(
             [item for item in warm_allocations if (item.get("resource_pool") or "cpu").startswith("gpu:")],
             self.gpu_prewarm_min_warm_allocations if self.gpu_prewarm_enabled else 0,
             self.allocation_scale_in_idle_seconds,
+            protected_allocation_ids=protected_allocation_ids,
         )
 
-    def scale_in_pool(self, warm_allocations: list[dict], minimum: int, idle_seconds: int) -> None:
-        if len(warm_allocations) <= minimum:
-            return
-        warm_allocations.sort(key=lambda item: item.get("last_active_at") or item.get("started_at") or item.get("created_at") or "")
+    def scale_in_pool(
+        self,
+        warm_allocations: list[dict],
+        minimum: int,
+        idle_seconds: int,
+        *,
+        protected_allocation_ids: set[int] | None = None,
+    ) -> None:
+        protected_ids = protected_allocation_ids or set()
         excess = len(warm_allocations) - minimum
-        for allocation in warm_allocations[:excess]:
+        if excess <= 0:
+            return
+        closable_allocations = [
+            allocation
+            for allocation in warm_allocations
+            if int(allocation.get("id") or 0) not in protected_ids
+        ]
+        closable_allocations.sort(
+            key=lambda item: item.get("last_active_at")
+            or item.get("started_at")
+            or item.get("created_at")
+            or ""
+        )
+        for allocation in closable_allocations[:excess]:
             last_active = self._timestamp(allocation.get("last_active_at") or allocation.get("started_at") or allocation.get("created_at"))
             if not last_active:
                 continue
             if (self._now() - last_active).total_seconds() >= idle_seconds:
                 self.close_allocation(allocation, "idle scale-in")
 
-    def enforce_cpu_partition_allocation_limits(self) -> None:
+    def enforce_cpu_partition_allocation_limits(
+        self,
+        *,
+        protected_allocation_ids: set[int] | None = None,
+    ) -> None:
         if not self.cpu_partition_allocation_limits:
             return
+        protected_ids = protected_allocation_ids or set()
         live_states = {
             AllocationStatus.PENDING.value,
             AllocationStatus.WARM.value,
@@ -8761,12 +8863,18 @@ class Scheduler:
                 closable = [
                     allocation
                     for allocation in live
+                    if int(allocation.get("id") or 0) not in protected_ids
                     if not self.active_task_ids_for_allocation(int(allocation["id"]))
                     and allocation["state"] not in {AllocationStatus.DRAINING.value, AllocationStatus.CLOSING.value}
                     # AEDT pools deliberately use up to floor(node CPUs / pool
                     # CPUs) pinned allocations.  The generic cpu2 count limit
                     # must not collapse four exact 64-CPU pools back to two.
                     and not self.allocation_is_dedicated_aedt_pool(allocation)
+                    # A durable FEA demand lane is retired by the reservation-
+                    # aware scale-in pass.  The generic per-node limiter also
+                    # runs independently early in a tick, so it must never
+                    # destroy that lane before its queued task can attach.
+                    and self.allocation_demand_profile(allocation) != "fea"
                 ]
                 closable.sort(
                     key=lambda allocation: (
@@ -8811,6 +8919,7 @@ class Scheduler:
         ]
         demand_allocations.sort(key=lambda item: int(item.get("id") or 0))
         for allocation in demand_allocations:
+            allocation_is_reserved = int(allocation["id"]) in reserved_allocation_ids
             if (
                 (allocation.get("resource_pool") or "cpu") == "cpu"
                 and allocation["state"] == AllocationStatus.PENDING.value
@@ -8818,6 +8927,20 @@ class Scheduler:
             ):
                 self.backoff_rejected_allocation_shape(allocation)
                 self.close_allocation(allocation, "CPU demand allocation exceeds QOS CPU-per-node limit")
+                continue
+            # A profiled FEA reservation is the capacity authority.  Dynamic
+            # pestat preferences can flip between cpu1/cpu2 on every long tick;
+            # replacing its already reserved request merely resets Slurm queue
+            # age (and can alternate forever).  Also preserve structurally
+            # valid AssocMaxJobsLimit waits.  Generic unprofiled reservations
+            # still follow the shape-replacement policy below.  The structural
+            # QOS rejection above remains fatal because it can never start.
+            pending_reason = str(allocation.get("pending_reason") or "").lower()
+            preserve_waiting_reservation = "assocmaxjobslimit" in pending_reason
+            if allocation_is_reserved and (
+                self.allocation_demand_profile(allocation) == "fea"
+                or preserve_waiting_reservation
+            ):
                 continue
             allocation_desired_cpu_pool_cpus = desired_cpu_pool_cpus
             reserved_task_cpus = [
@@ -8833,7 +8956,9 @@ class Scheduler:
                 allocation_desired_cpu_pool_cpus = int(reserved_shape.get("cpus") or 0) if reserved_shape else 0
                 if self.pinned_gpu_cpu_demand_allocation_covers_queue(allocation, reserved_allocation_ids):
                     continue
-                if self.cpu_demand_allocation_superseded_by_shape(allocation, reserved_shape):
+                if self.cpu_demand_allocation_superseded_by_shape(
+                    allocation, reserved_shape
+                ):
                     self.close_allocation(
                         allocation,
                         f"CPU demand allocation superseded by current-fit partition {reserved_shape.get('partition')}",
@@ -8841,7 +8966,9 @@ class Scheduler:
                     continue
             elif self.pinned_gpu_cpu_demand_allocation_covers_queue(allocation, reserved_allocation_ids):
                 continue
-            elif self.cpu_demand_allocation_superseded_by_shape(allocation, desired_cpu_shape):
+            elif self.cpu_demand_allocation_superseded_by_shape(
+                allocation, desired_cpu_shape
+            ):
                 self.close_allocation(
                     allocation,
                     f"CPU demand allocation superseded by current-fit partition {desired_cpu_shape.get('partition')}",
@@ -8857,7 +8984,7 @@ class Scheduler:
             ):
                 self.close_allocation(allocation, "undersized CPU demand allocation after pool sizing policy change")
                 continue
-            if int(allocation["id"]) in reserved_allocation_ids:
+            if allocation_is_reserved:
                 continue
             if tasks and self.pending_demand_allocation_in_shape_grace(allocation):
                 continue
@@ -9279,9 +9406,23 @@ class Scheduler:
         storage_additional_future_projects: int = 0,
     ) -> AccountConfig | None:
         snapshots_by_name = {snapshot.account_name: snapshot for snapshot in self.snapshots()}
-        open_by_account: dict[str, int] = {}
-        pending_by_account: dict[str, int] = {}
+        submitted_open_by_account: dict[str, int] = {}
+        submitted_pending_by_account: dict[str, int] = {}
+        unsubmitted_open_by_account: dict[str, int] = {}
+        unsubmitted_pending_by_account: dict[str, int] = {}
         for allocation in self.db.list_allocations_with_live(limit=500):
+            account_name_for_allocation = str(allocation.get("account_name") or "")
+            submitted = bool(str(allocation.get("slurm_job_id") or ""))
+            open_counts = (
+                submitted_open_by_account
+                if submitted
+                else unsubmitted_open_by_account
+            )
+            pending_counts = (
+                submitted_pending_by_account
+                if submitted
+                else unsubmitted_pending_by_account
+            )
             if allocation["state"] in {
                 AllocationStatus.PENDING.value,
                 AllocationStatus.WARM.value,
@@ -9289,10 +9430,14 @@ class Scheduler:
                 AllocationStatus.DRAINING.value,
                 AllocationStatus.CLOSING.value,
             }:
-                open_by_account[allocation["account_name"]] = open_by_account.get(allocation["account_name"], 0) + 1
+                open_counts[account_name_for_allocation] = (
+                    open_counts.get(account_name_for_allocation, 0) + 1
+                )
             if allocation["state"] == AllocationStatus.PENDING.value:
-                pending_by_account[allocation["account_name"]] = pending_by_account.get(allocation["account_name"], 0) + 1
-        candidates: list[tuple[AccountConfig, int, int, int]] = []
+                pending_counts[account_name_for_allocation] = (
+                    pending_counts.get(account_name_for_allocation, 0) + 1
+                )
+        candidates: list[tuple[AccountConfig, int, int, int, bool]] = []
         requested_accounts = self.requested_accounts(account_name)
         for account in self.accounts:
             if requested_accounts and account.name not in requested_accounts:
@@ -9311,16 +9456,34 @@ class Scheduler:
             if not snapshot:
                 continue
             max_total = max(0, account.max_total_jobs - self.allocation_reserved_job_slots)
-            local_open = open_by_account.get(account.name, 0)
-            local_pending = pending_by_account.get(account.name, 0)
-            current_total = max(snapshot.running + snapshot.pending, local_open)
-            current_pending = max(snapshot.pending, local_pending)
+            submitted_open = submitted_open_by_account.get(account.name, 0)
+            submitted_pending = submitted_pending_by_account.get(account.name, 0)
+            unsubmitted_open = unsubmitted_open_by_account.get(account.name, 0)
+            unsubmitted_pending = unsubmitted_pending_by_account.get(account.name, 0)
+            # Submitted local rows should already be represented in the Slurm
+            # snapshot, so max() avoids double counting them.  A submit=False
+            # reservation has no Slurm job id and therefore must be debited on
+            # top of that snapshot immediately within this planning pass.
+            current_total = (
+                max(snapshot.running + snapshot.pending, submitted_open)
+                + unsubmitted_open
+            )
+            current_pending = (
+                max(snapshot.pending, submitted_pending) + unsubmitted_pending
+            )
             if current_total >= max_total:
                 continue
             if current_pending >= account.max_pending_jobs:
                 continue
             candidates.append(
-                (account, current_total, snapshot.running, current_pending)
+                (
+                    account,
+                    current_total,
+                    snapshot.running,
+                    current_pending,
+                    snapshot.running
+                    < min(account.max_running_jobs, snapshot.max_running),
+                )
             )
         if not candidates:
             return None
@@ -9329,6 +9492,11 @@ class Scheduler:
         return min(
             candidates,
             key=lambda candidate: (
+                # A job submitted through an account that has already reached
+                # MaxJobs can only wait in AssocMaxJobsLimit.  Prefer any
+                # compatible account with immediate running headroom before
+                # balancing queued demand across saturated accounts.
+                0 if candidate[4] else 1,
                 0 if candidate[0].name in preferred_index else 1,
                 preferred_index.get(candidate[0].name, len(preferred_index)),
                 # Include durable reservations made earlier in this planning

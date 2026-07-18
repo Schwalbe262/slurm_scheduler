@@ -4492,7 +4492,7 @@ class SchedulerTests(unittest.TestCase):
         demand = [
             allocation
             for allocation in self.db.list_allocations()
-            if allocation.get("drain_reason") == "queued CPU demand"
+            if allocation.get("drain_reason") == "queued FEA CPU demand"
         ]
         self.assertEqual(len(demand), 1)
         self.assertEqual(demand[0]["node_name"], "cpu2-good")
@@ -4655,7 +4655,7 @@ class SchedulerTests(unittest.TestCase):
         demand = [
             allocation
             for allocation in self.db.list_allocations()
-            if allocation.get("drain_reason") == "queued CPU demand"
+            if allocation.get("drain_reason") == "queued FEA CPU demand"
         ]
         self.assertEqual(len(demand), 1)
         self.assertEqual(demand[0]["state"], AllocationStatus.PENDING.value)
@@ -5067,6 +5067,83 @@ class SchedulerTests(unittest.TestCase):
         # Slurm's cached score is still tied at 0/0. The durable reservation
         # from this planning pass must move the next unpinned allocation to b.
         self.assertEqual(scheduler.choose_account_for_allocation().name, "b")
+
+    def test_allocation_account_selection_prefers_immediate_maxjobs_headroom(self) -> None:
+        accounts = [
+            AccountConfig("saturated", "host", 22, "saturated", "key", "/work", 10, 10, 20),
+            AccountConfig("headroom", "host", 22, "headroom", "key", "/work", 10, 10, 20),
+        ]
+        # This is the observed live shape: the saturated account has a shorter
+        # total queue, but every new job can only enter AssocMaxJobsLimit.  The
+        # second account has two immediately runnable association slots even
+        # though unrelated pending work makes its total queue longer.
+        FakeClient.snapshots = {
+            "saturated": AccountSnapshot("saturated", 10, 0, 10, 10, 20),
+            "headroom": AccountSnapshot("headroom", 8, 8, 10, 10, 20),
+        }
+        scheduler = Scheduler(
+            self.db,
+            accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+
+        self.assertEqual(
+            scheduler.choose_account_for_allocation().name,
+            "headroom",
+        )
+        self.assertEqual(
+            scheduler.choose_account_for_allocation(
+                preferred_accounts=["saturated"]
+            ).name,
+            "headroom",
+        )
+        # A strict caller constraint remains strict; the preference is generic
+        # capacity policy rather than a hard-coded account allowlist.
+        self.assertEqual(
+            scheduler.choose_account_for_allocation(account_name="saturated").name,
+            "saturated",
+        )
+        for index in range(2):
+            self.assertEqual(
+                scheduler.choose_account_for_allocation(
+                    account_name="headroom"
+                ).name,
+                "headroom",
+            )
+            self.db.create_allocation(
+                account_name="headroom",
+                partition="cpu2",
+                node_name="",
+                total_cpus=48,
+                total_memory_mb=262144,
+                drain_reason=f"unsubmitted reservation {index}",
+            )
+        # Snapshot pending=8 plus two submit=False rows reaches MaxPending=10.
+        # Neither local row has a Slurm id yet, so max(snapshot, local) would
+        # incorrectly hide both and allow an entire planning batch to pile on.
+        self.assertIsNone(
+            scheduler.choose_account_for_allocation(account_name="headroom")
+        )
+
+        FakeClient.snapshots = {
+            "saturated": AccountSnapshot("saturated", 10, 0, 10, 10, 20),
+            "headroom": AccountSnapshot("headroom", 10, 1, 10, 10, 20),
+        }
+        scheduler = Scheduler(
+            self.db,
+            accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+        # If every compatible account is saturated, retain the old fallback
+        # behavior so durable demand can queue instead of disappearing.
+        self.assertEqual(
+            scheduler.choose_account_for_allocation().name,
+            "saturated",
+        )
 
     def test_demand_allocation_fanout_isolates_partial_safe_failure(self) -> None:
         FakeClient.snapshots = {
@@ -8762,6 +8839,401 @@ class SchedulerTests(unittest.TestCase):
         standard = self.db.get_task(standard_id)
         self.assertEqual(standard["status"], TaskStatus.RUNNING.value)
         self.assertEqual(standard["allocation_id"], standard_allocation_id)
+
+    def test_newly_ready_fea_demand_pool_cannot_be_stolen_by_standard_stage(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n001 cpu1 mix 0 64 0.0 262144 240000 idle\n"
+            )
+        )
+        fea_id = self.db.create_task(
+            TaskCreate(
+                "diagnostic-fea-priority-9",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                priority=9,
+            )
+        )
+        standard_id = self.db.create_task(
+            TaskCreate(
+                "rolling-standard-priority-minus-7",
+                "~/case",
+                "run",
+                cpus=8,
+                memory_mb=32768,
+                priority=-7,
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+        allocation = scheduler.open_allocation_for_task_record(
+            self.db.get_task(fea_id),
+            submit=False,
+        )
+        self.assertIsNotNone(allocation)
+        self.assertEqual(allocation["drain_reason"], "queued FEA CPU demand")
+        self.db.update_allocation(
+            allocation["id"],
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="fea-demand-pool",
+            node_name="n001",
+        )
+
+        # Match the live tick's current order.  Before the durable demand tag,
+        # this standard stage claimed the pool within seconds of Slurm start
+        # and permanently profile-locked the waiting FEA task out.
+        scheduler.assign_ready_standard_tasks()
+        self.assertEqual(
+            self.db.get_task(standard_id)["status"],
+            TaskStatus.QUEUED.value,
+        )
+        scheduler.assign_ready_fea_tasks()
+        fea = self.db.get_task(fea_id)
+        self.assertEqual(fea["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(fea["allocation_id"], allocation["id"])
+        self.assertEqual(
+            scheduler.allocation_rejection_reasons(
+                self.db.get_allocation(allocation["id"]),
+                self.db.get_task(standard_id),
+            ),
+            ["CPU allocation is reserved for queued fea demand"],
+        )
+
+    def test_reserved_demand_pool_survives_shape_flip_but_not_fatal_qos(self) -> None:
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+        task_id = self.db.create_task(
+            TaskCreate(
+                "queued-fea",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu2",
+            node_name="n107",
+            total_cpus=48,
+            total_memory_mb=262144,
+            drain_reason="queued FEA CPU demand",
+        )
+        self.db.update_allocation(
+            allocation_id,
+            slurm_job_id="pending-fea-pool",
+            pending_reason="(AssocMaxJobsLimit)",
+            created_at="2000-01-01 00:00:00",
+        )
+        warm_allocation_id = self.db.create_allocation(
+            account_name="b",
+            partition="cpu2",
+            node_name="n108",
+            total_cpus=48,
+            total_memory_mb=262144,
+            drain_reason="queued FEA CPU demand",
+        )
+        self.db.update_allocation(
+            warm_allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="warm-fea-pool",
+            started_at="2000-01-01 00:00:00",
+        )
+        plan = mock.Mock(
+            reservations={
+                allocation_id: [task_id],
+                warm_allocation_id: [task_id],
+            }
+        )
+        desired_cpu1 = {
+            "partition": "cpu1",
+            "node_name": "",
+            "cpus": 64,
+            "memory_mb": 262144,
+            "gpus": 0,
+            "gpu_model": "",
+            "exclusive_node": False,
+        }
+        with mock.patch.object(
+            scheduler,
+            "choose_allocation_shape",
+            return_value=desired_cpu1,
+        ):
+            scheduler.scale_in_unneeded_demand_allocations(
+                reservation_plan=plan,
+                queued_tasks=[self.db.get_task(task_id)],
+            )
+
+        allocation = self.db.get_allocation(allocation_id)
+        self.assertEqual(allocation["state"], AllocationStatus.PENDING.value)
+        self.assertEqual(allocation["slurm_job_id"], "pending-fea-pool")
+        self.assertEqual(allocation["drain_reason"], "queued FEA CPU demand")
+        self.assertEqual(
+            self.db.get_allocation(warm_allocation_id)["state"],
+            AllocationStatus.WARM.value,
+        )
+        self.assertEqual(
+            self.db.get_allocation(warm_allocation_id)["drain_reason"],
+            "queued FEA CPU demand",
+        )
+        self.assertEqual(FakeClient.cancelled, [])
+
+        # A structural Slurm rejection remains fatal even for reserved demand;
+        # preserving a request that can never run would deadlock scale-out.
+        self.db.update_allocation(
+            allocation_id,
+            pending_reason="(QOSMaxCpuPerNodeLimit)",
+        )
+        with mock.patch.object(
+            scheduler,
+            "choose_allocation_shape",
+            return_value=desired_cpu1,
+        ):
+            scheduler.scale_in_unneeded_demand_allocations(
+                reservation_plan=plan,
+                queued_tasks=[self.db.get_task(task_id)],
+            )
+        self.assertEqual(
+            self.db.get_allocation(allocation_id)["state"],
+            AllocationStatus.CLOSED.value,
+        )
+        self.assertEqual(FakeClient.cancelled, ["pending-fea-pool"])
+
+    def test_reserved_fea_pool_survives_entire_idle_scale_in_pipeline(self) -> None:
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            cpu_partition_allocation_limits={"cpu2": 2},
+        )
+        queued_task_id = self.db.create_task(
+            TaskCreate(
+                "task56591",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        reserved_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu2",
+            node_name="n107",
+            total_cpus=48,
+            total_memory_mb=262144,
+            drain_reason="queued FEA CPU demand",
+        )
+        self.db.update_allocation(
+            reserved_id,
+            slurm_job_id="alloc-13081",
+        )
+        standard_ids = []
+        for index in range(2):
+            allocation_id = self.db.create_allocation(
+                account_name="b",
+                partition="cpu2",
+                node_name="n107",
+                total_cpus=48,
+                total_memory_mb=262144,
+            )
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.WARM.value,
+                slurm_job_id=f"standard-warm-{index}",
+                started_at="CURRENT_TIMESTAMP",
+            )
+            standard_ids.append(allocation_id)
+
+        queued_tasks = scheduler.queued_tasks_for_allocation_reservations()
+        plan = scheduler.queued_task_allocation_reservation_plan(queued_tasks)
+        self.assertEqual(plan.reservations, {reserved_id: [queued_task_id]})
+        scheduler.scale_in_idle_allocations(
+            reservation_plan=plan,
+            queued_tasks=queued_tasks,
+        )
+
+        self.assertEqual(
+            self.db.get_allocation(reserved_id)["state"],
+            AllocationStatus.PENDING.value,
+        )
+        standard_states = [
+            self.db.get_allocation(allocation_id)["state"]
+            for allocation_id in standard_ids
+        ]
+        self.assertEqual(
+            standard_states.count(AllocationStatus.CLOSED.value),
+            1,
+        )
+        self.assertEqual(
+            standard_states.count(AllocationStatus.WARM.value),
+            1,
+        )
+        self.assertEqual(len(FakeClient.cancelled), 1)
+        self.assertIn(FakeClient.cancelled[0], {"standard-warm-0", "standard-warm-1"})
+
+    def test_startup_retires_only_claimless_legacy_pending_demand_once(self) -> None:
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+        legacy_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="",
+            total_cpus=48,
+            total_memory_mb=262144,
+            drain_reason="queued CPU demand",
+        )
+        self.db.update_allocation(legacy_id, slurm_job_id="legacy-pending")
+        tagged_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu2",
+            node_name="n107",
+            total_cpus=64,
+            total_memory_mb=262144,
+            drain_reason="queued FEA CPU demand",
+        )
+        self.db.update_allocation(tagged_id, slurm_job_id="tagged-pending")
+        claimed_id = self.db.create_allocation(
+            account_name="b",
+            partition="cpu1",
+            node_name="",
+            total_cpus=48,
+            total_memory_mb=262144,
+            drain_reason="queued CPU demand",
+        )
+        self.db.update_allocation(claimed_id, slurm_job_id="claimed-pending")
+        task_id = self.db.create_task(TaskCreate("recovery-claim", "~/case", "run"))
+        self.db.update_task(
+            task_id,
+            status=TaskStatus.ATTACHING.value,
+            allocation_id=claimed_id,
+            account_name="b",
+        )
+        requested_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu2",
+            node_name="",
+            total_cpus=48,
+            total_memory_mb=262144,
+            drain_reason="queued CPU demand",
+        )
+        self.db.update_allocation(requested_id, slurm_job_id="requested-pending")
+        requested_task_id = self.db.create_task(
+            TaskCreate(
+                "held-canary-requested-claim",
+                "~/case",
+                "run",
+                requested_allocation_id=requested_id,
+            )
+        )
+        # Production has extension states that intentionally are not in the
+        # core enum.  Any status other than an explicit terminal state must
+        # remain an allocation owner.
+        self.db.update_task(requested_task_id, status="held_canary")
+
+        self.assertEqual(
+            scheduler.retire_legacy_unprofiled_pending_demand_allocations(),
+            1,
+        )
+        self.assertEqual(
+            self.db.get_allocation(legacy_id)["state"],
+            AllocationStatus.CLOSED.value,
+        )
+        self.assertEqual(
+            self.db.get_allocation(tagged_id)["state"],
+            AllocationStatus.PENDING.value,
+        )
+        self.assertEqual(
+            self.db.get_allocation(claimed_id)["state"],
+            AllocationStatus.PENDING.value,
+        )
+        self.assertEqual(
+            self.db.get_allocation(requested_id)["state"],
+            AllocationStatus.PENDING.value,
+        )
+        self.assertEqual(
+            [
+                task["id"]
+                for task in self.db.list_nonterminal_task_claims_for_allocation(
+                    requested_id
+                )
+            ],
+            [requested_task_id],
+        )
+        self.assertEqual(FakeClient.cancelled, ["legacy-pending"])
+        self.assertIsNone(self.db.get_setting("legacy_demand_profile_retired_v1"))
+        self.assertEqual(
+            scheduler.retire_legacy_unprofiled_pending_demand_allocations(),
+            0,
+        )
+        self.assertEqual(FakeClient.cancelled, ["legacy-pending"])
+
+        self.db.update_task(task_id, status=TaskStatus.COMPLETED.value)
+        self.db.update_task(requested_task_id, status=TaskStatus.CANCELLED.value)
+        self.assertEqual(
+            scheduler.retire_legacy_unprofiled_pending_demand_allocations(),
+            2,
+        )
+        self.assertEqual(
+            FakeClient.cancelled,
+            ["legacy-pending", "claimed-pending", "requested-pending"],
+        )
+        self.assertEqual(self.db.get_setting("legacy_demand_profile_retired_v1"), "1")
+
+    def test_legacy_pending_demand_migration_query_is_not_recent_row_limited(self) -> None:
+        with self.db.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO allocations (account_name, state, drain_reason)
+                VALUES (?, ?, ?)
+                """,
+                [
+                    (
+                        "a",
+                        AllocationStatus.PENDING.value,
+                        "queued CPU demand",
+                    )
+                    for _ in range(501)
+                ],
+            )
+            conn.execute(
+                """
+                INSERT INTO allocations (account_name, state, drain_reason)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    "a",
+                    AllocationStatus.PENDING.value,
+                    "queued FEA CPU demand",
+                ),
+            )
+
+        self.assertEqual(
+            len(self.db.list_legacy_unprofiled_pending_demand_allocations()),
+            501,
+        )
 
     def test_fea_bursty_max_workers_is_enforced_per_physical_node_for_reservations(self) -> None:
         allocation_ids = []

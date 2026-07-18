@@ -2132,6 +2132,34 @@ class Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def list_nonterminal_task_claims_for_allocation(
+        self,
+        allocation_id: int,
+    ) -> list[dict[str, Any]]:
+        """Return every nonterminal direct or requested allocation claim.
+
+        This migration/lifecycle safety query deliberately has no LIMIT and
+        includes queued placement reservations as well as attached work.  It
+        must not be replaced by a globally limited task listing.
+        """
+        terminal_statuses = (
+            TaskStatus.COMPLETED.value,
+            TaskStatus.FAILED.value,
+            TaskStatus.CANCELLED.value,
+        )
+        placeholders = ",".join("?" for _ in terminal_statuses)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM tasks
+                WHERE status NOT IN ({placeholders})
+                  AND (allocation_id = ? OR requested_allocation_id = ?)
+                ORDER BY id ASC
+                """,
+                (*terminal_statuses, int(allocation_id), int(allocation_id)),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def list_finished_tasks_for_cleanup(
         self,
         statuses: list[str],
@@ -2353,6 +2381,23 @@ class Database:
             item = dict(row)
             by_id[int(item["id"])] = item
         return sorted(by_id.values(), key=lambda item: int(item["id"]), reverse=True)
+
+    def list_legacy_unprofiled_pending_demand_allocations(self) -> list[dict[str, Any]]:
+        """Return every pre-profile pending demand allocation without a LIMIT."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM allocations
+                WHERE state = ?
+                  AND (
+                    drain_reason = 'queued CPU demand'
+                    OR drain_reason LIKE 'queued GPU demand %'
+                  )
+                ORDER BY id ASC
+                """,
+                (AllocationStatus.PENDING.value,),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def list_closed_allocations_for_cleanup(
         self,
