@@ -63,6 +63,7 @@ FEA_HARD_PRESSURE_RECLAIM_SAMPLE_SETTING_PREFIX = (
 )
 FEA_HARD_PRESSURE_EPISODE_COOLDOWN_SECONDS = 300
 TASK_COUNT_SAMPLE_INTERVAL_SECONDS = 60
+<<<<<<< HEAD
 TERMINAL_AEDT_WORKSPACE_ROOT = "/gpfs/tmp_cpu2/mft_pool"
 TERMINAL_AEDT_WORKSPACE_SWEEP_INTERVAL_SECONDS = 60
 TERMINAL_AEDT_WORKSPACE_RETRY_SECONDS = 60
@@ -139,6 +140,7 @@ _RESERVATION_ACTIVE_TASK_FIT_FIELDS = (
     "project",
     "exclusive_node",
 )
+TASK_TIMEOUT_CANCEL_MAX_PER_TICK = 8
 
 
 LMSTAT_FEATURE_RE = re.compile(
@@ -543,7 +545,9 @@ class Scheduler:
         self._fea_overload_since_by_node: dict[str, float] = {}
         self._fea_overload_scaled_nodes: set[str] = set()
         self.task_refresh_max_per_tick = max(1, int(task_refresh_max_per_tick))
+        self._non_fea_task_refresh_cursor_id = 0
         self._fea_task_refresh_cursor_id = 0
+        self._prefer_fea_for_single_task_refresh = False
         self._fea_project_last_claim = self.load_fea_project_claim_cursor()
         # Candidate selection and the queued -> attaching claim can also be
         # entered from a web request.  Serialize the final admission check so
@@ -3157,13 +3161,40 @@ class Scheduler:
                     self.retry_strict_node_cancellation(task, account)
                 continue
             candidates.append(task)
+        # Timeout enforcement is a local deadline decision and must not depend
+        # on the bounded remote-probe sample.  Previously a large, long-running
+        # standard population consumed that whole sample before any FEA task
+        # was considered, so expired FEA tasks could occupy slots forever.
+        expired = [task for task in candidates if self.task_timed_out(task)]
+        expired.sort(
+            key=lambda task: (
+                self._timestamp(
+                    task.get("started_at")
+                    or task.get("attached_at")
+                    or task.get("created_at")
+                )
+                or self._now(),
+                int(task.get("id") or 0),
+            )
+        )
+        timeout_cancel_limit = min(
+            TASK_TIMEOUT_CANCEL_MAX_PER_TICK,
+            self.task_refresh_max_per_tick if max_tasks is None else max(1, int(max_tasks)),
+        )
+        for task in expired[:timeout_cancel_limit]:
+            self._schedule_timed_out_task_cancellation(task)
+        expired_ids = {int(task.get("id") or 0) for task in expired}
+        refreshable = [
+            task
+            for task in candidates
+            if int(task.get("id") or 0) not in expired_ids
+            and not (
+                task["status"] == TaskStatus.ATTACHING.value
+                and not task.get("exit_code_path")
+            )
+        ]
         by_account: dict[str, list[dict]] = {}
-        for task in self.tasks_to_refresh(candidates, max_tasks=max_tasks):
-            if self.task_timed_out(task):
-                self._schedule_timed_out_task_cancellation(task)
-                continue
-            if task["status"] == TaskStatus.ATTACHING.value and not task.get("exit_code_path"):
-                continue
+        for task in self.tasks_to_refresh(refreshable, max_tasks=max_tasks):
             if not task.get("account_name") or task["account_name"] not in accounts_by_name:
                 continue
             by_account.setdefault(task["account_name"], []).append(task)
@@ -3255,22 +3286,57 @@ class Scheduler:
             [task for task in tasks if not self.task_is_fea_bursty(task)],
             key=lambda item: int(item.get("id") or 0),
         )
-        selected = non_fea[:limit]
-        remaining = limit - len(selected)
-        if remaining <= 0:
-            return selected
         fea = sorted(
             [task for task in tasks if self.task_is_fea_bursty(task)],
             key=lambda item: int(item.get("id") or 0),
         )
-        if not fea:
-            return selected
-        after_cursor = [task for task in fea if int(task.get("id") or 0) > self._fea_task_refresh_cursor_id]
-        before_cursor = [task for task in fea if int(task.get("id") or 0) <= self._fea_task_refresh_cursor_id]
-        fea_selected = (after_cursor + before_cursor)[:remaining]
+
+        def rotate(items: list[dict], cursor: int) -> list[dict]:
+            after = [task for task in items if int(task.get("id") or 0) > cursor]
+            before = [task for task in items if int(task.get("id") or 0) <= cursor]
+            return after + before
+
+        non_fea = rotate(non_fea, self._non_fea_task_refresh_cursor_id)
+        fea = rotate(fea, self._fea_task_refresh_cursor_id)
+        if not non_fea:
+            non_fea_selected: list[dict] = []
+            fea_selected = fea[:limit]
+        elif not fea:
+            non_fea_selected = non_fea[:limit]
+            fea_selected = []
+        elif limit == 1:
+            # Alternate the one available slot across classes.
+            if self._prefer_fea_for_single_task_refresh:
+                non_fea_selected = []
+                fea_selected = fea[:1]
+            else:
+                non_fea_selected = non_fea[:1]
+                fea_selected = []
+            self._prefer_fea_for_single_task_refresh = (
+                not self._prefer_fea_for_single_task_refresh
+            )
+        else:
+            # Reserve at least a quarter of the bounded probe budget for FEA.
+            # Unused quota immediately spills to the other class.
+            fea_quota = max(1, limit // 4)
+            non_fea_quota = limit - fea_quota
+            non_fea_selected = non_fea[:non_fea_quota]
+            fea_selected = fea[:fea_quota]
+            remaining = limit - len(non_fea_selected) - len(fea_selected)
+            if remaining > 0:
+                non_fea_extra = non_fea[len(non_fea_selected) : len(non_fea_selected) + remaining]
+                non_fea_selected.extend(non_fea_extra)
+                remaining -= len(non_fea_extra)
+            if remaining > 0:
+                fea_selected.extend(fea[len(fea_selected) : len(fea_selected) + remaining])
+
+        if non_fea_selected:
+            self._non_fea_task_refresh_cursor_id = int(
+                non_fea_selected[-1].get("id") or 0
+            )
         if fea_selected:
             self._fea_task_refresh_cursor_id = int(fea_selected[-1].get("id") or 0)
-        return selected + fea_selected
+        return non_fea_selected + fea_selected
 
     def task_result_failure_message(
         self, task: dict, client: SlurmAccountClient
