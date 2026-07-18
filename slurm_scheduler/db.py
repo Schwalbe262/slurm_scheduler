@@ -20,6 +20,26 @@ AEDT_WORKSPACE_TERMINAL_LEASE_STATES = (
     "expired",
 )
 
+# These are SQL fragments selected exclusively by trusted keys.  Keeping the
+# mapping next to the database query makes it impossible for dashboard/API
+# sort query parameters to become SQL identifiers directly.
+TASK_PAGE_SORT_COLUMNS = {
+    "id": "id",
+    "name": "LOWER(name)",
+    "status": "LOWER(status)",
+    "allocation": "COALESCE(allocation_id, 0)",
+    "scheduling": "LOWER(COALESCE(scheduling_profile, 'standard'))",
+    # Internal compatibility mode used by list_dashboard_tasks() callers that
+    # relied on running -> attaching -> queued grouping before paging.
+    "dashboard": (
+        "CASE status "
+        "WHEN 'running' THEN 0 "
+        "WHEN 'attaching' THEN 1 "
+        "WHEN 'queued' THEN 2 "
+        "ELSE 9 END"
+    ),
+}
+
 
 def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -1681,6 +1701,112 @@ class Database:
         escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         return " AND name LIKE ? ESCAPE '\\'", (f"%{escaped}%",)
 
+    def _task_page_where(
+        self,
+        *,
+        statuses: list[str] | None = None,
+        name_contains: str = "",
+        name_prefix: str = "",
+        project: str = "",
+        before_id: int = 0,
+    ) -> tuple[str, tuple[Any, ...]]:
+        """Build one literal-filtered WHERE clause for task list and count.
+
+        The same clause is used for COUNT and SELECT so pagination metadata
+        cannot describe a different population than the returned page.
+        """
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if statuses is not None:
+            if not statuses:
+                clauses.append("0")
+            else:
+                placeholders = ",".join("?" for _ in statuses)
+                clauses.append(f"status IN ({placeholders})")
+                params.extend(statuses)
+        needle = (name_contains or "").strip()
+        if needle:
+            escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append("name LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped}%")
+        prefix = (name_prefix or "").strip()
+        if prefix:
+            escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append("name LIKE ? ESCAPE '\\'")
+            params.append(f"{escaped}%")
+        project_name = (project or "").strip()
+        if project_name:
+            clauses.append("project = ?")
+            params.append(project_name)
+        if before_id:
+            clauses.append("id < ?")
+            params.append(max(0, int(before_id)))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, tuple(params)
+
+    def count_filtered_tasks(
+        self,
+        *,
+        statuses: list[str] | None = None,
+        name_contains: str = "",
+        name_prefix: str = "",
+        project: str = "",
+        before_id: int = 0,
+    ) -> int:
+        where, params = self._task_page_where(
+            statuses=statuses,
+            name_contains=name_contains,
+            name_prefix=name_prefix,
+            project=project,
+            before_id=before_id,
+        )
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM tasks{where}", params
+            ).fetchone()
+            return int(row["count"]) if row else 0
+
+    def list_filtered_tasks(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        statuses: list[str] | None = None,
+        name_contains: str = "",
+        name_prefix: str = "",
+        project: str = "",
+        before_id: int = 0,
+        sort_by: str = "id",
+        sort_order: str = "desc",
+    ) -> list[dict[str, Any]]:
+        """Filter and globally sort the task population before LIMIT/OFFSET."""
+
+        sort_column = TASK_PAGE_SORT_COLUMNS.get(str(sort_by or "").strip().lower())
+        if sort_column is None:
+            raise ValueError(f"unsupported task sort key: {sort_by}")
+        direction = str(sort_order or "").strip().lower()
+        if direction not in {"asc", "desc"}:
+            raise ValueError(f"unsupported task sort order: {sort_order}")
+        where, params = self._task_page_where(
+            statuses=statuses,
+            name_contains=name_contains,
+            name_prefix=name_prefix,
+            project=project,
+            before_id=before_id,
+        )
+        order_sql = f"{sort_column} {direction.upper()}"
+        if sort_by != "id":
+            # A stable tie-breaker prevents rows moving between pages when the
+            # primary sort value is shared by many tasks.
+            order_sql += ", id DESC"
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM tasks{where} ORDER BY {order_sql} LIMIT ? OFFSET ?",
+                (*params, max(0, int(limit)), max(0, int(offset))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
     def list_tasks_by_statuses(
         self,
         statuses: list[str],
@@ -1705,6 +1831,8 @@ class Database:
         *,
         name_contains: str = "",
         offset: int = 0,
+        sort_by: str = "dashboard",
+        sort_order: str = "asc",
     ) -> list[dict[str, Any]]:
         """Page active dashboard rows in their displayed status order.
 
@@ -1714,23 +1842,18 @@ class Database:
         SQL makes the same population available through bounded pages.
         """
 
-        name_filter, name_params = self._name_contains_filter(name_contains)
-        with self.connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT * FROM tasks
-                WHERE status IN ('running', 'attaching', 'queued'){name_filter}
-                ORDER BY CASE status
-                    WHEN 'running' THEN 0
-                    WHEN 'attaching' THEN 1
-                    WHEN 'queued' THEN 2
-                    ELSE 9
-                END ASC, id DESC
-                LIMIT ? OFFSET ?
-                """,
-                (*name_params, max(0, int(limit)), max(0, int(offset))),
-            ).fetchall()
-            return [dict(row) for row in rows]
+        return self.list_filtered_tasks(
+            limit=limit,
+            offset=offset,
+            statuses=[
+                TaskStatus.RUNNING.value,
+                TaskStatus.ATTACHING.value,
+                TaskStatus.QUEUED.value,
+            ],
+            name_contains=name_contains,
+            sort_by=sort_by,
+            sort_order=sort_order,
+        )
 
     def task_activity_summary(
         self,

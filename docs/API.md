@@ -389,9 +389,18 @@ The response is capped by `web_remote_file_default_max_bytes` unless `max_bytes`
 ```bash
 curl -sS "$SCHEDULER_URL/api/tasks"
 curl -sS "$SCHEDULER_URL/api/tasks?include_diagnostics=true"
+curl -sS "$SCHEDULER_URL/api/tasks?paged=true&page=1&page_size=100&name_contains=mft&status=running,queued&sort_by=name&sort_order=asc"
 ```
 
 By default this endpoint returns lightweight task metadata suitable for frequent polling. Use `include_diagnostics=true` only when you need queued capacity fields such as `queue_reason`, `ready_fit_slots`, `pending_fit_slots`, and `inflight_fit_slots`; that mode performs scheduler fit checks and is intentionally heavier.
+
+The default response remains the legacy JSON list. With `paged=true`, the
+database applies `project`, `name_prefix`, `name_contains`, repeated or
+comma-separated `status`, `sort_by`, and `sort_order` to the complete task
+population before selecting the requested page. The response is an object with
+`items`, `filtered_total`, `page`, `page_size`, `page_count`, `has_previous`,
+`has_next`, and the normalized filter/sort metadata. Supported sort keys are
+`id`, `name`, `status`, `allocation`, and `scheduling`.
 
 ### `POST /api/tasks`
 

@@ -37,7 +37,7 @@ from .campaign_mutation_lock import campaign_mutation_lock
 from .conda_sync import CondaEnvSyncManager, conda_bootstrap
 from .config import AppConfig, load_accounts, load_app_config
 from .control_plane_relay import ControlPlaneRelay
-from .db import Database
+from .db import Database, TASK_PAGE_SORT_COLUMNS
 from .git_auth import find_git_credential, git_task_payload
 from .models import AedtBackend, JobCreate, SchedulingProfile, TaskCreate, TaskStatus, normalize_aedt_backend, normalize_scheduling_profile
 from .inventory import partition_rank
@@ -648,6 +648,22 @@ def normalize_task_status_filters(values: list[str] | str | None) -> list[str] |
             detail=f"status must contain only {allowed_text}; invalid: {invalid_text}",
         )
     return normalized
+
+
+def normalize_task_sort(sort_by: str, sort_order: str) -> tuple[str, str]:
+    key = str(sort_by or "id").strip().lower()
+    # ``dashboard`` is an internal DB compatibility mode, not a public sort
+    # option.  Public callers get the same keys exposed by the task table UI.
+    allowed_keys = {item for item in TASK_PAGE_SORT_COLUMNS if item != "dashboard"}
+    if key not in allowed_keys:
+        raise HTTPException(
+            status_code=422,
+            detail=f"sort_by must be one of {', '.join(sorted(allowed_keys))}",
+        )
+    direction = str(sort_order or "desc").strip().lower()
+    if direction not in {"asc", "desc"}:
+        raise HTTPException(status_code=422, detail="sort_order must be asc or desc")
+    return key, direction
 
 
 def cleanup_local_temp_artifacts() -> None:
@@ -1957,6 +1973,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request) -> HTMLResponse:
         attached_task_name_filter = (request.query_params.get("task_name_contains") or "").strip()
+        task_sort_key, task_sort_direction = normalize_task_sort(
+            request.query_params.get("task_sort_key") or "id",
+            request.query_params.get("task_sort_direction") or "desc",
+        )
         active_page_size = 100
         finished_page_size = 50
         try:
@@ -2013,6 +2033,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             limit=active_page_size,
             name_contains=attached_task_name_filter,
             offset=active_page * active_page_size,
+            sort_by=task_sort_key,
+            sort_order=task_sort_direction,
         )
         aedt_dashboard_summary = aedt_pool.summary()
         # Queue reasons are shown on the task detail page only; computing them
@@ -2037,10 +2059,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                     ),
                 }
             )
-        active_tasks = sorted(
-            active_task_items,
-            key=task_display_sort_key,
-        )
+        # The database has already sorted the complete filtered population.
+        # Sorting this one page again would make the visible order disagree
+        # with the population from which the page was selected.
+        active_tasks = active_task_items
         terminal_task_statuses = ["completed", "failed", "cancelled"]
         finished_tasks = [
             {
@@ -2055,11 +2077,13 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 ),
             }
             for task in attach_task_elapsed(
-                db.list_tasks_by_statuses(
-                    terminal_task_statuses,
+                db.list_filtered_tasks(
+                    statuses=terminal_task_statuses,
                     limit=finished_page_size,
                     name_contains=attached_task_name_filter,
                     offset=finished_page * finished_page_size,
+                    sort_by=task_sort_key,
+                    sort_order=task_sort_direction,
                 )
             )
         ]
@@ -2092,6 +2116,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 "finished_page_size": finished_page_size,
                 "finished_page_count": max(1, ceil(finished_task_count / finished_page_size)),
                 "attached_task_name_filter": attached_task_name_filter,
+                "task_sort_key": task_sort_key,
+                "task_sort_direction": task_sort_direction,
                 "allocations": active_allocations,
                 "allocation_summary": allocation_summary,
                 "gpu_prewarm_enabled": scheduler.gpu_prewarm_enabled,
@@ -2589,12 +2615,65 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         before_id: int = 0,
         project: str = "",
         name_prefix: str = "",
+        name_contains: str = "",
         status: list[str] | None = Query(default=None),
-    ) -> list[dict]:
+        sort_by: str = "id",
+        sort_order: str = "desc",
+        paged: bool = False,
+        page: int = 1,
+        page_size: int = 100,
+    ) -> list[dict] | dict:
         if before_id < 0:
             raise HTTPException(status_code=422, detail="before_id must be non-negative")
         statuses = normalize_task_status_filters(status)
-        if compact:
+        task_sort_key, task_sort_direction = normalize_task_sort(sort_by, sort_order)
+        page_metadata: dict | None = None
+        if paged:
+            if page < 1:
+                raise HTTPException(status_code=422, detail="page must be at least 1")
+            if page_size < 1 or page_size > 10000:
+                raise HTTPException(
+                    status_code=422,
+                    detail="page_size must be between 1 and 10000",
+                )
+            filtered_total = db.count_filtered_tasks(
+                statuses=statuses,
+                name_contains=name_contains,
+                name_prefix=name_prefix,
+                project=project,
+                before_id=before_id,
+            )
+            page_count = max(1, ceil(filtered_total / page_size))
+            selected_page = min(int(page), page_count)
+            tasks = db.list_filtered_tasks(
+                limit=page_size,
+                offset=(selected_page - 1) * page_size,
+                statuses=statuses,
+                name_contains=name_contains,
+                name_prefix=name_prefix,
+                project=project,
+                before_id=before_id,
+                sort_by=task_sort_key,
+                sort_order=task_sort_direction,
+            )
+            page_metadata = {
+                "filtered_total": filtered_total,
+                "page": selected_page,
+                "page_size": int(page_size),
+                "page_count": page_count,
+                "has_previous": selected_page > 1,
+                "has_next": selected_page < page_count,
+                "sort_by": task_sort_key,
+                "sort_order": task_sort_direction,
+                "filters": {
+                    "project": project,
+                    "name_prefix": name_prefix,
+                    "name_contains": name_contains,
+                    "status": statuses,
+                    "before_id": int(before_id),
+                },
+            }
+        elif compact and not name_contains and task_sort_key == "id" and task_sort_direction == "desc":
             # Compact pages deliberately bypass task_json: that serializer
             # resolves allocation metadata per task, which turns a large
             # campaign reconciliation into thousands of database lookups.
@@ -2606,6 +2685,78 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 statuses=statuses,
                 before_id=before_id,
             )
+        elif compact:
+            # The legacy compact query is optimized for its original filters.
+            # New contains/sort options still filter and sort globally, then
+            # project the same compact response fields below.
+            task_limit = max(1, min(int(limit), 10000)) if limit else 2000
+            tasks = db.list_filtered_tasks(
+                limit=task_limit,
+                statuses=statuses,
+                name_contains=name_contains,
+                name_prefix=name_prefix,
+                project=project,
+                before_id=before_id,
+                sort_by=task_sort_key,
+                sort_order=task_sort_direction,
+            )
+        elif not paged and (
+            project
+            or name_prefix
+            or name_contains
+            or statuses is not None
+            or task_sort_key != "id"
+            or task_sort_direction != "desc"
+        ):
+            # A filtered campaign read defaults to the API cap.  The database
+            # applies every WHERE clause before LIMIT, so unrelated global
+            # history cannot hide matching rows.
+            task_limit = max(1, min(int(limit), 10000)) if limit else 10000
+            if not name_contains and task_sort_key == "id" and task_sort_direction == "desc":
+                # Keep the established filtered-list path intact for callers
+                # (and instrumentation) that depend on Database.list_tasks.
+                tasks = db.list_tasks(
+                    limit=task_limit,
+                    project=project,
+                    name_prefix=name_prefix,
+                    statuses=statuses,
+                )
+            else:
+                tasks = db.list_filtered_tasks(
+                    limit=task_limit,
+                    name_contains=name_contains,
+                    project=project,
+                    name_prefix=name_prefix,
+                    statuses=statuses,
+                    sort_by=task_sort_key,
+                    sort_order=task_sort_direction,
+                )
+        elif not paged and limit:
+            # Preserve the existing explicit-limit behavior for unfiltered reads.
+            tasks = db.list_filtered_tasks(
+                limit=max(1, min(int(limit), 10000)),
+                sort_by=task_sort_key,
+                sort_order=task_sort_direction,
+            )
+        elif not paged:
+            # Preserve the existing newest-plus-active behavior with no filters.
+            tasks = db.list_tasks_with_active()
+
+        if compact:
+            compact_items = [
+                {
+                    "id": int(task["id"]),
+                    "name": task.get("name") or "",
+                    "status": task.get("status") or "",
+                    "project": task.get("project") or "",
+                    "started_at": task.get("started_at"),
+                }
+                for task in tasks
+            ]
+            if page_metadata is not None:
+                return {**page_metadata, "items": compact_items}
+            return compact_items
+
         allocation_rows = None
         allocation_by_id = None
         active_task_allocation_ids = None
@@ -2614,24 +2765,6 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             allocation_rows = db.list_allocations_with_live(limit=500)
             allocation_by_id = {int(allocation["id"]): allocation for allocation in allocation_rows}
             active_task_allocation_ids, active_exclusive_allocation_ids = scheduler.active_task_allocation_sets()
-        filtered = bool(project or name_prefix or statuses is not None)
-        if filtered:
-            # A filtered campaign read defaults to the API cap.  The database
-            # applies every WHERE clause before LIMIT, so unrelated global
-            # history cannot hide matching rows.
-            task_limit = max(1, min(int(limit), 10000)) if limit else 10000
-            tasks = db.list_tasks(
-                limit=task_limit,
-                project=project,
-                name_prefix=name_prefix,
-                statuses=statuses,
-            )
-        elif limit:
-            # Preserve the existing explicit-limit behavior for unfiltered reads.
-            tasks = db.list_tasks(limit=max(1, min(int(limit), 10000)))
-        else:
-            # Preserve the existing newest-plus-active behavior with no filters.
-            tasks = db.list_tasks_with_active()
         if allocation_by_id is None:
             # The legacy/full serializer needs allocation fields, but doing a
             # get_allocation query twice per task turns one inventory request
@@ -2646,7 +2779,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 int(allocation["id"]): allocation
                 for allocation in db.list_allocations_by_ids(allocation_ids)
             }
-        return [
+        items = [
             task_json(
                 task,
                 derive_failure_message=False,
@@ -2658,6 +2791,9 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             )
             for task in tasks
         ]
+        if page_metadata is not None:
+            return {**page_metadata, "items": items}
+        return items
 
     @app.get("/api/tasks/summary")
     def api_tasks_summary(name_prefix: str = "") -> dict:

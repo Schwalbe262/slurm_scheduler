@@ -1937,6 +1937,68 @@ class SchedulerTests(unittest.TestCase):
             set(matching_ids),
         )
 
+    def test_filtered_task_page_filters_and_sorts_before_limit(self) -> None:
+        matching_ids = []
+        for index in range(153):
+            if index % 3 == 0:
+                matching_ids.append(
+                    self.db.create_task(
+                        TaskCreate(
+                            f"global-match-{52 - (index // 3):03d}",
+                            "~/work",
+                            "run",
+                            project="mft",
+                        )
+                    )
+                )
+            else:
+                self.db.create_task(
+                    TaskCreate(
+                        f"unrelated-{index:03d}",
+                        "~/work",
+                        "run",
+                        project="other",
+                    )
+                )
+
+        filtered_total = self.db.count_filtered_tasks(
+            statuses=[TaskStatus.QUEUED.value],
+            name_contains="global-match",
+            project="mft",
+        )
+        page = self.db.list_filtered_tasks(
+            limit=100,
+            statuses=[TaskStatus.QUEUED.value],
+            name_contains="global-match",
+            project="mft",
+            sort_by="name",
+            sort_order="asc",
+        )
+
+        self.assertEqual(filtered_total, 51)
+        self.assertEqual(len(page), 51)
+        self.assertEqual(
+            [row["name"] for row in page],
+            sorted(row["name"] for row in page),
+        )
+        self.assertEqual(
+            {int(row["id"]) for row in page},
+            set(matching_ids),
+        )
+
+    def test_filtered_task_page_escapes_contains_wildcards(self) -> None:
+        literal_id = self.db.create_task(
+            TaskCreate("page_100%-literal", "~/work", "run")
+        )
+        self.db.create_task(TaskCreate("pageX100Y-lookalike", "~/work", "run"))
+
+        rows = self.db.list_filtered_tasks(
+            limit=100,
+            name_contains="page_100%",
+        )
+
+        self.assertEqual([int(row["id"]) for row in rows], [literal_id])
+
     def test_list_allocations_by_ids_deduplicates_one_batch(self) -> None:
         first = self.db.create_allocation(
             account_name="a",

@@ -500,6 +500,101 @@ class TaskCountHistoryRouteTests(unittest.TestCase):
         self.assertGreater(marker, first_html.index('id="attached-tasks-table"'))
         self.assertLess(marker, first_html.index("<summary>Finished tasks:"))
 
+    def test_dashboard_searches_and_sorts_full_population_before_paging(self) -> None:
+        expected_names = []
+        for index in range(159):
+            if index % 3 == 0:
+                name = f"whole-search-{52 - (index // 3):03d}"
+                expected_names.append(name)
+            else:
+                name = f"page-noise-{index:03d}"
+            self.app.state.db.create_task(TaskCreate(name, "~/case", "run"))
+
+        dashboard = self.route_endpoint("/", "GET")
+        html = dashboard(
+            self.dashboard_request(
+                b"task_name_contains=whole-search&task_sort_key=name&task_sort_direction=asc"
+            )
+        ).body.decode("utf-8")
+
+        self.assertEqual(len(re.findall(r"<tr\s+data-task-row", html)), 53)
+        self.assertIn("Active page 1 / 1 (53 tasks, 100 per page)", html)
+        positions = [html.index(f">{name}</a>") for name in sorted(expected_names)]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn(
+            "Search and sorting are applied to all matching tasks before the 100-row page",
+            html,
+        )
+        self.assertIn('const serverSortKey = "name";', html)
+        self.assertIn('url.searchParams.set("task_sort_key", state.sortKey)', html)
+        self.assertIn("window.setTimeout(navigateToCurrentState, 350)", html)
+        self.assertIn('filterInput.addEventListener("compositionstart"', html)
+        self.assertIn("event.isComposing", html)
+        self.assertNotIn("const sortedRows = [...rowSet]", html)
+
+    def test_paged_tasks_api_returns_filtered_metadata_and_keeps_legacy_list(self) -> None:
+        for index in range(159):
+            is_match = index % 3 == 0
+            self.app.state.db.create_task(
+                TaskCreate(
+                    (
+                        f"api-whole-search-{52 - (index // 3):03d}"
+                        if is_match
+                        else f"api-page-noise-{index:03d}"
+                    ),
+                    "~/case",
+                    "run",
+                    project="mft" if is_match else "other",
+                )
+            )
+
+        endpoint = self.route_endpoint("/api/tasks", "GET")
+        payload = endpoint(
+            include_diagnostics=False,
+            compact=True,
+            limit=0,
+            before_id=0,
+            project="mft",
+            name_prefix="",
+            name_contains="api-whole-search",
+            status=[TaskStatus.QUEUED.value],
+            sort_by="name",
+            sort_order="asc",
+            paged=True,
+            page=1,
+            page_size=100,
+        )
+
+        self.assertEqual(payload["filtered_total"], 53)
+        self.assertEqual(payload["page"], 1)
+        self.assertEqual(payload["page_size"], 100)
+        self.assertEqual(payload["page_count"], 1)
+        self.assertFalse(payload["has_previous"])
+        self.assertFalse(payload["has_next"])
+        self.assertEqual(len(payload["items"]), 53)
+        self.assertEqual(
+            [item["name"] for item in payload["items"]],
+            sorted(item["name"] for item in payload["items"]),
+        )
+
+        legacy = endpoint(
+            include_diagnostics=False,
+            compact=True,
+            limit=100,
+            before_id=0,
+            project="mft",
+            name_prefix="",
+            name_contains="",
+            status=[TaskStatus.QUEUED.value],
+            sort_by="id",
+            sort_order="desc",
+            paged=False,
+            page=1,
+            page_size=100,
+        )
+        self.assertIsInstance(legacy, list)
+        self.assertEqual(len(legacy), 53)
+
     def test_dashboard_template_accepts_previous_generation_context_during_staging(self) -> None:
         response = self.route_endpoint("/", "GET")(self.dashboard_request())
         legacy_context = dict(response.context)

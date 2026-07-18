@@ -1881,6 +1881,8 @@
     {% set active_page_count_value = active_page_count|default(1) %}
     {% set active_task_count_value = active_task_count|default(tasks|length) %}
     {% set active_page_size_value = active_page_size|default(5000) %}
+    {% set task_sort_key_value = task_sort_key|default("id") %}
+    {% set task_sort_direction_value = task_sort_direction|default("desc") %}
     <div class="title-row">
       <h2>Attached Tasks</h2>
       <span class="muted" data-live-updated-at></span>
@@ -1945,18 +1947,18 @@
       <div>
         <label for="attached-task-sort-key">Sort by</label>
         <select id="attached-task-sort-key">
-          <option value="id">ID</option>
-          <option value="name">Name</option>
-          <option value="status">Status</option>
-          <option value="allocation">Allocation</option>
-          <option value="scheduling">Scheduling</option>
+          <option value="id"{% if task_sort_key_value == "id" %} selected{% endif %}>ID</option>
+          <option value="name"{% if task_sort_key_value == "name" %} selected{% endif %}>Name</option>
+          <option value="status"{% if task_sort_key_value == "status" %} selected{% endif %}>Status</option>
+          <option value="allocation"{% if task_sort_key_value == "allocation" %} selected{% endif %}>Allocation</option>
+          <option value="scheduling"{% if task_sort_key_value == "scheduling" %} selected{% endif %}>Scheduling</option>
         </select>
       </div>
       <div>
         <label for="attached-task-sort-direction">Order</label>
         <select id="attached-task-sort-direction">
-          <option value="desc">Descending</option>
-          <option value="asc">Ascending</option>
+          <option value="desc"{% if task_sort_direction_value == "desc" %} selected{% endif %}>Descending</option>
+          <option value="asc"{% if task_sort_direction_value == "asc" %} selected{% endif %}>Ascending</option>
         </select>
       </div>
       <div class="actions">
@@ -1965,6 +1967,7 @@
         <button type="button" class="danger" id="cancel-selected-tasks" disabled>Cancel selected</button>
       </div>
     </div>
+    <p class="muted">Search and sorting are applied to all matching tasks before the 100-row page is selected.</p>
     <div class="table-scroll">
       <table id="attached-tasks-table">
         <thead><tr><th><input type="checkbox" id="select-all-tasks" aria-label="Select all visible tasks"></th><th>ID</th><th>Name</th><th>Status</th><th>Prio</th><th>Alloc</th><th>Env</th><th>Resources</th><th>Elapsed</th><th>Action</th></tr></thead>
@@ -2041,11 +2044,11 @@
     </div>
     <div class="section-gap" style="display: flex; gap: 10px; align-items: center;">
       {% if active_page_value > 0 %}
-        <a class="button" href="/?active_page={{ active_page_value - 1 }}{% if finished_page > 0 %}&finished_page={{ finished_page }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">&laquo; Prev active</a>
+        <a class="button" href="/?active_page={{ active_page_value - 1 }}{% if finished_page > 0 %}&finished_page={{ finished_page }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}{% if task_sort_key_value != 'id' %}&task_sort_key={{ task_sort_key_value|urlencode }}{% endif %}{% if task_sort_direction_value != 'desc' %}&task_sort_direction={{ task_sort_direction_value|urlencode }}{% endif %}">&laquo; Prev active</a>
       {% endif %}
       <span class="muted">Active page {{ active_page_value + 1 }} / {{ active_page_count_value }} ({{ active_task_count_value }} tasks, {{ active_page_size_value }} per page)</span>
       {% if active_page_value + 1 < active_page_count_value %}
-        <a class="button" href="/?active_page={{ active_page_value + 1 }}{% if finished_page > 0 %}&finished_page={{ finished_page }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">Next active &raquo;</a>
+        <a class="button" href="/?active_page={{ active_page_value + 1 }}{% if finished_page > 0 %}&finished_page={{ finished_page }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}{% if task_sort_key_value != 'id' %}&task_sort_key={{ task_sort_key_value|urlencode }}{% endif %}{% if task_sort_direction_value != 'desc' %}&task_sort_direction={{ task_sort_direction_value|urlencode }}{% endif %}">Next active &raquo;</a>
       {% endif %}
     </div>
     <details class="section-gap">
@@ -2098,17 +2101,16 @@
       </div>
       <div class="section-gap" style="display: flex; gap: 10px; align-items: center;">
         {% if finished_page > 0 %}
-          <a class="button" href="/?finished_page={{ finished_page - 1 }}{% if active_page_value > 0 %}&active_page={{ active_page_value }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">&laquo; Prev</a>
+          <a class="button" href="/?finished_page={{ finished_page - 1 }}{% if active_page_value > 0 %}&active_page={{ active_page_value }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}{% if task_sort_key_value != 'id' %}&task_sort_key={{ task_sort_key_value|urlencode }}{% endif %}{% if task_sort_direction_value != 'desc' %}&task_sort_direction={{ task_sort_direction_value|urlencode }}{% endif %}">&laquo; Prev</a>
         {% endif %}
         <span class="muted">Page {{ finished_page + 1 }} / {{ finished_page_count }} ({{ finished_task_count }} tasks)</span>
         {% if finished_page + 1 < finished_page_count %}
-          <a class="button" href="/?finished_page={{ finished_page + 1 }}{% if active_page_value > 0 %}&active_page={{ active_page_value }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}">Next &raquo;</a>
+          <a class="button" href="/?finished_page={{ finished_page + 1 }}{% if active_page_value > 0 %}&active_page={{ active_page_value }}{% endif %}{% if attached_task_name_filter %}&task_name_contains={{ attached_task_name_filter|urlencode }}{% endif %}{% if task_sort_key_value != 'id' %}&task_sort_key={{ task_sort_key_value|urlencode }}{% endif %}{% if task_sort_direction_value != 'desc' %}&task_sort_direction={{ task_sort_direction_value|urlencode }}{% endif %}">Next &raquo;</a>
         {% endif %}
       </div>
     </details>
     <script>
       (() => {
-        const storageKey = "slurmScheduler.attachedTasks.tableState";
         const filterInput = document.getElementById("attached-task-name-filter");
         const sortKeySelect = document.getElementById("attached-task-sort-key");
         const sortDirectionSelect = document.getElementById("attached-task-sort-direction");
@@ -2122,17 +2124,11 @@
 
         const rows = Array.from(tbody.querySelectorAll("[data-task-row]"));
         const finishedRows = finishedTbody ? Array.from(finishedTbody.querySelectorAll("[data-finished-task-row]")) : [];
-        const defaultState = { filter: "", sortKey: "id", direction: "desc" };
         const serverFilter = {{ attached_task_name_filter|tojson }};
+        const serverSortKey = {{ task_sort_key_value|tojson }};
+        const serverSortDirection = {{ task_sort_direction_value|tojson }};
         const activePageCount = {{ active_page_count_value }};
-
-        function loadState() {
-          try {
-            return { ...defaultState, ...JSON.parse(localStorage.getItem(storageKey) || "{}") };
-          } catch {
-            return { ...defaultState };
-          }
-        }
+        let filterCompositionActive = false;
 
         function currentState() {
           return {
@@ -2140,10 +2136,6 @@
             sortKey: sortKeySelect.value,
             direction: sortDirectionSelect.value,
           };
-        }
-
-        function saveState() {
-          localStorage.setItem(storageKey, JSON.stringify(currentState()));
         }
 
         function numericValue(row, key) {
@@ -2155,31 +2147,16 @@
           return (row.dataset[key] || "").toLowerCase();
         }
 
-        function compareRows(a, b, key) {
-          if (key === "id" || key === "allocation") {
-            return numericValue(a, key) - numericValue(b, key);
-          }
-          const left = stringValue(a, key);
-          const right = stringValue(b, key);
-          return left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
-        }
-
-        function applyRows(rowSet, rowTbody, noRow, state, filter, direction) {
-          const sortedRows = [...rowSet].sort((a, b) => {
-            const primary = compareRows(a, b, state.sortKey);
-            if (primary !== 0) return primary * direction;
-            return compareRows(a, b, "id") * -1;
-          });
+        function applyRows(rowSet, noRow, filter) {
           let visibleCount = 0;
           const visibleRows = [];
-          for (const row of sortedRows) {
+          for (const row of rowSet) {
             const visible = !filter || stringValue(row, "name").includes(filter);
             row.hidden = !visible;
             if (visible) {
               visibleCount += 1;
               visibleRows.push(row);
             }
-            rowTbody.insertBefore(row, noRow);
           }
           noRow.hidden = rowSet.length === 0 || visibleCount > 0;
           return visibleRows;
@@ -2247,43 +2224,83 @@
           } else {
             url.searchParams.delete("task_name_contains");
           }
+          if (state.sortKey && state.sortKey !== "id") {
+            url.searchParams.set("task_sort_key", state.sortKey);
+          } else {
+            url.searchParams.delete("task_sort_key");
+          }
+          if (state.direction && state.direction !== "desc") {
+            url.searchParams.set("task_sort_direction", state.direction);
+          } else {
+            url.searchParams.delete("task_sort_direction");
+          }
           url.searchParams.delete("active_page");
+          url.searchParams.delete("finished_page");
           return url.toString();
         }
 
         function applyTableState() {
-          const state = currentState();
-          const filter = state.filter.trim().toLowerCase();
-          const direction = state.direction === "asc" ? 1 : -1;
-          const visibleRows = applyRows(rows, tbody, noMatchRow, state, filter, direction);
+          const filter = currentState().filter.trim().toLowerCase();
+          const visibleRows = applyRows(rows, noMatchRow, filter);
           updateAttachedSummary(visibleRows);
           if (finishedTbody && finishedNoMatchRow) {
-            applyRows(finishedRows, finishedTbody, finishedNoMatchRow, state, filter, direction);
+            applyRows(finishedRows, finishedNoMatchRow, filter);
           }
-          saveState();
         }
 
-        const saved = loadState();
-        filterInput.value = serverFilter || saved.filter || "";
-        sortKeySelect.value = saved.sortKey || "id";
-        sortDirectionSelect.value = saved.direction || "desc";
+        // The URL/rendered query is authoritative.  Using a saved client-side
+        // filter here would once again search only the current 100-row DOM.
+        filterInput.value = serverFilter;
+        sortKeySelect.value = serverSortKey || "id";
+        sortDirectionSelect.value = serverSortDirection || "desc";
 
-        filterInput.addEventListener("input", applyTableState);
-        sortKeySelect.addEventListener("change", applyTableState);
-        sortDirectionSelect.addEventListener("change", applyTableState);
-        refreshButton?.addEventListener("click", () => {
-          saveState();
+        let searchTimer = 0;
+        const navigateToCurrentState = () => {
           window.location.assign(urlForState(currentState()));
+        };
+        filterInput.addEventListener("compositionstart", () => {
+          filterCompositionActive = true;
+          window.clearTimeout(searchTimer);
+        });
+        filterInput.addEventListener("compositionend", () => {
+          filterCompositionActive = false;
+          window.clearTimeout(searchTimer);
+          searchTimer = window.setTimeout(navigateToCurrentState, 350);
+        });
+        filterInput.addEventListener("input", () => {
+          if (filterCompositionActive) return;
+          window.clearTimeout(searchTimer);
+          searchTimer = window.setTimeout(navigateToCurrentState, 350);
+        });
+        filterInput.addEventListener("keydown", (event) => {
+          if (event.key !== "Enter" || filterCompositionActive || event.isComposing) return;
+          event.preventDefault();
+          window.clearTimeout(searchTimer);
+          navigateToCurrentState();
+        });
+        sortKeySelect.addEventListener("change", navigateToCurrentState);
+        sortDirectionSelect.addEventListener("change", navigateToCurrentState);
+        refreshButton?.addEventListener("click", () => {
+          window.clearTimeout(searchTimer);
+          navigateToCurrentState();
         });
         clearButton?.addEventListener("click", () => {
           filterInput.value = "";
           sortKeySelect.value = "id";
           sortDirectionSelect.value = "desc";
-          saveState();
           const url = new URL(window.location.href);
-          if (url.searchParams.has("task_name_contains")) {
+          if (
+            url.searchParams.has("task_name_contains")
+            || url.searchParams.has("task_sort_key")
+            || url.searchParams.has("task_sort_direction")
+            || url.searchParams.has("active_page")
+            || url.searchParams.has("finished_page")
+          ) {
             url.searchParams.delete("task_name_contains");
+            url.searchParams.delete("task_sort_key");
+            url.searchParams.delete("task_sort_direction");
             url.searchParams.delete("active_page");
+            url.searchParams.delete("finished_page");
             window.location.assign(url.toString());
             return;
           }
