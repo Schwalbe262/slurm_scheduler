@@ -3617,6 +3617,243 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(blocked["status"], TaskStatus.QUEUED.value)
         self.assertEqual(ready["status"], TaskStatus.RUNNING.value)
 
+    def test_ready_non_fea_plan_excludes_pending_capacity(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=4,
+            total_memory_mb=8192,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.PENDING.value,
+            slurm_job_id="pending-ready-plan",
+        )
+        task_id = self.db.create_task(
+            TaskCreate(
+                "ready-plan-standard",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=2048,
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+        )
+
+        self.assertEqual(
+            scheduler.ready_non_fea_assignment_candidate_ids(),
+            frozenset(),
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+        )
+        self.assertEqual(
+            scheduler.ready_non_fea_assignment_candidate_ids(),
+            frozenset({task_id}),
+        )
+
+    def test_ready_non_fea_plan_reserves_priority_order_and_capacity(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=4,
+            total_memory_mb=8192,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="ready-plan-priority",
+        )
+        low_id = self.db.create_task(
+            TaskCreate(
+                "ready-plan-low",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=2048,
+                priority=0,
+            )
+        )
+        high_id = self.db.create_task(
+            TaskCreate(
+                "ready-plan-high",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=2048,
+                priority=10,
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+        )
+
+        eligible = scheduler.ready_non_fea_assignment_candidate_ids()
+
+        self.assertEqual(eligible, frozenset({high_id}))
+        self.assertNotIn(low_id, eligible)
+
+    def test_ready_non_fea_plan_honors_active_node_worker_cap(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=131072,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="ready-plan-worker-cap",
+        )
+        for index in range(4):
+            running_id = self.db.create_task(
+                TaskCreate(
+                    f"ready-plan-running-{index}",
+                    "~/case",
+                    "run",
+                    cpus=1,
+                    memory_mb=512,
+                    max_workers_per_node=4,
+                )
+            )
+            self.db.update_task(
+                running_id,
+                status=TaskStatus.RUNNING.value,
+                allocation_id=allocation_id,
+                account_name="a",
+                started_at="CURRENT_TIMESTAMP",
+            )
+        queued_id = self.db.create_task(
+            TaskCreate(
+                "ready-plan-worker-cap-queued",
+                "~/case",
+                "run",
+                cpus=1,
+                memory_mb=512,
+                max_workers_per_node=4,
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+        )
+
+        eligible = scheduler.ready_non_fea_assignment_candidate_ids()
+
+        self.assertNotIn(queued_id, eligible)
+
+    def test_ready_non_fea_plan_reserves_remaining_worker_slot_once(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n001",
+            total_cpus=64,
+            total_memory_mb=131072,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="ready-plan-worker-reservation",
+        )
+        for index in range(3):
+            running_id = self.db.create_task(
+                TaskCreate(
+                    f"ready-plan-worker-reservation-running-{index}",
+                    "~/case",
+                    "run",
+                    max_workers_per_node=4,
+                )
+            )
+            self.db.update_task(
+                running_id,
+                status=TaskStatus.RUNNING.value,
+                allocation_id=allocation_id,
+                account_name="a",
+                started_at="CURRENT_TIMESTAMP",
+            )
+        low_id = self.db.create_task(
+            TaskCreate(
+                "ready-plan-worker-reservation-low",
+                "~/case",
+                "run",
+                max_workers_per_node=4,
+                priority=0,
+            )
+        )
+        high_id = self.db.create_task(
+            TaskCreate(
+                "ready-plan-worker-reservation-high",
+                "~/case",
+                "run",
+                max_workers_per_node=4,
+                priority=10,
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+        )
+
+        eligible = scheduler.ready_non_fea_assignment_candidate_ids()
+
+        self.assertEqual(eligible, frozenset({high_id}))
+        self.assertNotIn(low_id, eligible)
+
+    def test_ready_assignment_filters_skip_non_candidates_before_exact_check(self) -> None:
+        first_id = self.db.create_task(
+            TaskCreate("ready-filter-first", "~/case", "run")
+        )
+        second_id = self.db.create_task(
+            TaskCreate("ready-filter-second", "~/case", "run")
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+        )
+
+        with mock.patch.object(
+            scheduler,
+            "assign_queued_task",
+            return_value=False,
+        ) as assign:
+            scheduler.assign_ready_standard_tasks(frozenset({second_id}))
+        self.assertEqual(
+            [int(call.args[0]["id"]) for call in assign.call_args_list],
+            [second_id],
+        )
+
+        with mock.patch.object(
+            scheduler,
+            "assign_queued_task",
+            return_value=False,
+        ) as assign:
+            scheduler.assign_queued_tasks(
+                include_fea=False,
+                eligible_task_ids=frozenset({first_id}),
+            )
+        self.assertEqual(
+            [int(call.args[0]["id"]) for call in assign.call_args_list],
+            [first_id],
+        )
+
     def test_assign_queued_tasks_prefers_higher_priority(self) -> None:
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, allocation_cpus=4)
         scheduler.maintain_allocation_pool()

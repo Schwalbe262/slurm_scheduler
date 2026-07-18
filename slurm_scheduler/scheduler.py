@@ -1280,9 +1280,19 @@ class Scheduler:
                 run_stage("license_refresh", self.refresh_license_usage_if_due)
                 run_stage("update_fea_overload_before", self.update_fea_overload_state)
                 run_stage("alloc_utilization", self.refresh_allocation_utilization_if_due)
+                ready_non_fea_ids = run_stage(
+                    "plan_ready_non_fea",
+                    self.ready_non_fea_assignment_candidate_ids,
+                )
                 run_stage("assign_ready_same_node", self.assign_ready_same_node_tasks)
-                run_stage("assign_ready_gpu", self.assign_ready_gpu_tasks)
-                run_stage("assign_ready_standard", self.assign_ready_standard_tasks)
+                run_stage(
+                    "assign_ready_gpu",
+                    lambda: self.assign_ready_gpu_tasks(ready_non_fea_ids),
+                )
+                run_stage(
+                    "assign_ready_standard",
+                    lambda: self.assign_ready_standard_tasks(ready_non_fea_ids),
+                )
                 run_stage("assign_ready_fea", lambda: self.assign_ready_fea_tasks(background=True))
                 run_stage("refresh_cluster_state", self.refresh_cluster_state_if_due)
                 run_stage("refresh_allocations", self.refresh_allocations)
@@ -1295,7 +1305,17 @@ class Scheduler:
                 run_stage("fea_memory_pressure", self.handle_fea_memory_pressure)
                 run_stage("fea_cpu_cap", self.enforce_fea_node_cpu_cap)
                 run_stage("update_fea_overload_after", self.update_fea_overload_state)
-                run_stage("assign_queued_standard", lambda: self.assign_queued_tasks(include_fea=False))
+                refreshed_non_fea_ids = run_stage(
+                    "plan_refreshed_non_fea",
+                    self.ready_non_fea_assignment_candidate_ids,
+                )
+                run_stage(
+                    "assign_queued_standard",
+                    lambda: self.assign_queued_tasks(
+                        include_fea=False,
+                        eligible_task_ids=refreshed_non_fea_ids,
+                    ),
+                )
                 run_stage("maintain_allocation_pool", self.maintain_allocation_pool)
                 run_stage("refresh_submitted_jobs", self.refresh_submitted_jobs)
                 run_stage("submit_next_job", self.submit_next_queued_job)
@@ -3724,7 +3744,122 @@ class Scheduler:
             if allocation.get("state") in live_states and str(allocation.get("node_name") or "")
         }
 
-    def assign_queued_tasks(self, include_fea: bool = True) -> None:
+    def ready_non_fea_assignment_candidate_ids(self) -> frozenset[int]:
+        """Return the queued non-FEA tasks that fit the current ready pool.
+
+        The exact assignment path still reloads and revalidates every returned
+        task under ``_task_assignment_lock``.  This is only a conservative
+        in-memory prefilter that prevents two serial scheduler stages from
+        reopening the network-backed database for every task/allocation pair
+        when no compatible ready allocation exists.  Pending allocations are
+        deliberately excluded: they are useful to demand planning, but cannot
+        accept a task yet.
+
+        A stale positive is harmless because ``assign_queued_task`` fails
+        closed.  A concurrent capacity increase can defer a task until the
+        refreshed plan later in the same tick or the next tick; it can never
+        launch a task without the normal admission checks.
+        """
+
+        queued = self.db.list_tasks(
+            limit=5000,
+            statuses=[TaskStatus.QUEUED.value],
+        )
+        gpu_tasks = sorted(
+            [
+                task
+                for task in queued
+                if task["status"] == TaskStatus.QUEUED.value
+                and not self.same_node_as_task_id(task)
+                and not self.task_is_fea_bursty(task)
+                and self.task_requires_gpu(task)
+            ],
+            key=lambda item: (
+                -int(item.get("priority") or 0),
+                -int(item.get("gpus") or 0),
+                int(item["id"]),
+            ),
+        )
+        standard_tasks = sorted(
+            [
+                task
+                for task in queued
+                if task["status"] == TaskStatus.QUEUED.value
+                and not self.same_node_as_task_id(task)
+                and not self.task_is_fea_bursty(task)
+                and not self.task_requires_gpu(task)
+            ],
+            key=lambda item: (
+                -int(item.get("priority") or 0),
+                -int(item.get("cpus") or 0),
+                int(item["id"]),
+            ),
+        )
+        if not gpu_tasks and not standard_tasks:
+            return frozenset()
+
+        remaining_allocations = [
+            dict(allocation)
+            for allocation in self.db.list_allocations_with_live(limit=500)
+            if allocation["state"]
+            in {
+                AllocationStatus.WARM.value,
+                AllocationStatus.ACTIVE.value,
+            }
+        ]
+        if not remaining_allocations:
+            return frozenset()
+
+        # ``include_pending=False`` must honor node worker and exclusivity
+        # limits.  Load those facts once for the whole plan instead of making
+        # one full active-task query for every queued-task/allocation pair.
+        active_tasks = [
+            task
+            for task in self.db.list_tasks_by_statuses(
+                [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value],
+                limit=5000,
+            )
+            if task.get("status")
+            in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}
+        ]
+        worker_counts: dict[int, int] = {}
+        active_task_allocation_ids: set[int] = set()
+        active_exclusive_allocation_ids: set[int] = set()
+        for active_task in active_tasks:
+            allocation_id = int(active_task.get("allocation_id") or 0)
+            if allocation_id <= 0:
+                continue
+            worker_counts[allocation_id] = worker_counts.get(allocation_id, 0) + 1
+            active_task_allocation_ids.add(allocation_id)
+            if int(active_task.get("exclusive_node") or 0):
+                active_exclusive_allocation_ids.add(allocation_id)
+        for allocation in remaining_allocations:
+            allocation["_allocation_worker_count"] = worker_counts.get(
+                int(allocation["id"]),
+                0,
+            )
+
+        eligible: set[int] = set()
+        # Match the real tick order: GPU tasks are offered before ordinary
+        # standard tasks.  Each successful simulated reservation decrements
+        # the copied allocation capacity, so the set is an upper bound on the
+        # exact claims that can succeed in the following assignment stages.
+        for task in [*gpu_tasks, *standard_tasks]:
+            if self.reserve_inflight_capacity_for_task(
+                remaining_allocations,
+                task,
+                include_pending=False,
+                active_task_allocation_ids=active_task_allocation_ids,
+                active_exclusive_allocation_ids=active_exclusive_allocation_ids,
+            ):
+                eligible.add(int(task["id"]))
+        return frozenset(eligible)
+
+    def assign_queued_tasks(
+        self,
+        include_fea: bool = True,
+        eligible_task_ids: frozenset[int] | set[int] | None = None,
+    ) -> None:
         queued_tasks = sorted(
             [
                 task
@@ -3741,6 +3876,11 @@ class Scheduler:
         )
         fea_attached_this_loop = 0
         for task in queued_tasks:
+            if (
+                eligible_task_ids is not None
+                and int(task["id"]) not in eligible_task_ids
+            ):
+                continue
             if self.task_is_fea_bursty(task) and not include_fea:
                 continue
             if self.task_is_fea_bursty(task) and fea_attached_this_loop >= self.fea_max_attach_per_loop:
@@ -3762,7 +3902,10 @@ class Scheduler:
         ):
             self.assign_queued_task(task)
 
-    def assign_ready_standard_tasks(self) -> None:
+    def assign_ready_standard_tasks(
+        self,
+        eligible_task_ids: frozenset[int] | set[int] | None = None,
+    ) -> None:
         attached = 0
         for task in sorted(
             [
@@ -3774,6 +3917,10 @@ class Scheduler:
                 and not self.same_node_as_task_id(item)
                 and not self.task_is_fea_bursty(item)
                 and not self.task_requires_gpu(item)
+                and (
+                    eligible_task_ids is None
+                    or int(item["id"]) in eligible_task_ids
+                )
             ],
             key=lambda item: (-int(item.get("priority") or 0), -int(item.get("cpus") or 0), int(item["id"])),
         ):
@@ -3782,7 +3929,10 @@ class Scheduler:
             if self.assign_queued_task(task):
                 attached += 1
 
-    def assign_ready_gpu_tasks(self) -> None:
+    def assign_ready_gpu_tasks(
+        self,
+        eligible_task_ids: frozenset[int] | set[int] | None = None,
+    ) -> None:
         attached = 0
         for task in sorted(
             [
@@ -3794,6 +3944,10 @@ class Scheduler:
                 and not self.same_node_as_task_id(item)
                 and not self.task_is_fea_bursty(item)
                 and self.task_requires_gpu(item)
+                and (
+                    eligible_task_ids is None
+                    or int(item["id"]) in eligible_task_ids
+                )
             ],
             key=lambda item: (-int(item.get("priority") or 0), -int(item.get("gpus") or 0), int(item["id"])),
         ):
@@ -4775,6 +4929,8 @@ class Scheduler:
             if "_node_worker_count" in allocation:
                 return int(allocation.get("_node_worker_count") or 0)
             return self.node_fea_worker_counts().get(node_name, 0)
+        if "_allocation_worker_count" in allocation:
+            return int(allocation.get("_allocation_worker_count") or 0)
         return self.allocation_worker_count(int(allocation["id"]))
 
     def reserved_fea_slots_for_node(self, allocations: list[dict] | None, node_name: str) -> int:
@@ -8350,13 +8506,22 @@ class Scheduler:
         task: dict,
         *,
         reservation_steps: list[_QueuedTaskAllocationReservationStep] | None = None,
+        include_pending: bool = True,
+        active_task_allocation_ids: set[int] | None = None,
+        active_exclusive_allocation_ids: set[int] | None = None,
     ) -> dict | None:
         candidates = []
         effective_task = task
         for candidate_task, _relaxed in self.effective_task_variants(task):
             candidates = []
             for allocation in allocations:
-                if not self.allocation_can_run_task(allocation, candidate_task, include_pending=True):
+                if not self.allocation_can_run_task(
+                    allocation,
+                    candidate_task,
+                    include_pending=include_pending,
+                    active_task_allocation_ids=active_task_allocation_ids,
+                    active_exclusive_allocation_ids=active_exclusive_allocation_ids,
+                ):
                     continue
                 if self.fit_slots_for_allocation(allocation, candidate_task, allocations) <= 0:
                     continue
@@ -8392,6 +8557,14 @@ class Scheduler:
                 )
             )
         self.apply_inflight_capacity_reservation(allocation, effective_task)
+        if not include_pending and active_task_allocation_ids is not None:
+            allocation_id = int(allocation["id"])
+            active_task_allocation_ids.add(allocation_id)
+            if (
+                active_exclusive_allocation_ids is not None
+                and int(effective_task.get("exclusive_node") or 0)
+            ):
+                active_exclusive_allocation_ids.add(allocation_id)
         return allocation
 
     def apply_inflight_capacity_reservation(self, allocation: dict, effective_task: dict) -> None:
@@ -8409,6 +8582,10 @@ class Scheduler:
             return
         allocation["free_memory_mb"] = max(0, int(allocation.get("free_memory_mb") or 0) - int(effective_task.get("memory_mb") or 0))
         allocation["free_cpus"] = max(0, int(allocation.get("free_cpus") or 0) - int(effective_task.get("cpus") or 0))
+        if "_allocation_worker_count" in allocation:
+            allocation["_allocation_worker_count"] = int(
+                allocation.get("_allocation_worker_count") or 0
+            ) + 1
         if self.task_requires_gpu(effective_task):
             allocation["free_gpus"] = max(0, int(allocation.get("free_gpus") or 0) - int(effective_task.get("gpus") or 0))
 
