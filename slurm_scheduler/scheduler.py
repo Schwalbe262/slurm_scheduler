@@ -511,6 +511,7 @@ class Scheduler:
         self._alloc_cpu_util: dict[int, dict[str, float]] = {}
         self._last_alloc_util_at = 0.0
         self._tick_attach_workers_by_node: dict[str, int] = {}
+        self._fea_worker_counts_cache: tuple[int, dict[str, int]] | None = None
         self._fea_pressures_cache: tuple[int, dict[str, dict[str, int]]] | None = None
         self._fea_alloc_pressures_cache: tuple[int, dict[int, dict[str, int]]] | None = None
         self._fea_node_resources_cache: tuple[int, dict[str, dict[str, int]]] | None = None
@@ -1229,10 +1230,19 @@ class Scheduler:
         with self._tick_caches_lock:
             self._tick_caches.add(cache)
         self._tick_local.cache = cache
+        # Account environment overlays are scheduling metadata.  A large FEA
+        # fit pass calls account_supports() once per task/allocation pair; on a
+        # network-backed SQLite database, reopening and re-reading the same
+        # rows thousands of times can dominate the whole tick.  Keep one
+        # coherent, scheduler-thread-local view for this tick.  Web/control
+        # threads do not inherit this thread-local cache, so overlay updates
+        # remain immediately visible outside the in-progress scheduling pass.
+        self._tick_local.account_env_overlay_capabilities = {}
         try:
             yield cache
         finally:
             self._tick_local.cache = None
+            self._tick_local.account_env_overlay_capabilities = None
             with self._tick_caches_lock:
                 self._tick_caches.discard(cache)
             cache.close_all()
@@ -2601,9 +2611,21 @@ class Scheduler:
             return False
         capability = (required_capability or "").strip()
         profile = (env_profile or "").strip()
-        overlays = self.db.list_account_env_overlays(account.name)
-        overlay_capabilities = {str(item.get("capability") or "") for item in overlays}
-        overlay_profiles = {str(item.get("env_profile") or "") for item in overlays}
+        tick_cache = getattr(
+            self._tick_local,
+            "account_env_overlay_capabilities",
+            None,
+        )
+        overlay_sets = tick_cache.get(account.name) if tick_cache is not None else None
+        if overlay_sets is None:
+            overlays = self.db.list_account_env_overlays(account.name)
+            overlay_sets = (
+                frozenset(str(item.get("capability") or "") for item in overlays),
+                frozenset(str(item.get("env_profile") or "") for item in overlays),
+            )
+            if tick_cache is not None:
+                tick_cache[account.name] = overlay_sets
+        overlay_capabilities, overlay_profiles = overlay_sets
         if capability and capability not in (account.capabilities or []) and capability not in overlay_capabilities:
             return False
         if profile and profile not in (account.env_profiles or {}) and profile not in overlay_profiles:
@@ -2949,6 +2971,10 @@ class Scheduler:
         # a single bounded wait preserves prompt terminalization without ever
         # making a real remote reap part of the tick's critical path.
         self._drain_timed_out_task_cancellations(wait_seconds=0.1)
+        # Assignment may have populated the tick-local node worker snapshot.
+        # Refresh can terminalize tasks or change allocation/node membership,
+        # so the later demand-planning stage must rebuild from the new rows.
+        self._fea_worker_counts_cache = None
         self.recalculate_allocation_capacity()
 
     def _apply_task_probe(self, task: dict, probe: TaskProbe, client) -> None:
@@ -4685,6 +4711,14 @@ class Scheduler:
         return counts
 
     def node_fea_worker_counts(self) -> dict[str, int]:
+        cached = self._fea_worker_counts_cache
+        scheduler_tick_thread = getattr(self._tick_local, "cache", None) is not None
+        if (
+            scheduler_tick_thread
+            and cached is not None
+            and cached[0] == self._tick_seq
+        ):
+            return cached[1]
         allocation_node_by_id = {
             int(allocation["id"]): str(allocation.get("node_name") or "")
             for allocation in self.db.list_allocations_with_live(limit=500)
@@ -4724,6 +4758,8 @@ class Scheduler:
             counts[node_name] = counts.get(node_name, 0) + int(
                 usage.get("workers") or 0
             )
+        if scheduler_tick_thread:
+            self._fea_worker_counts_cache = (self._tick_seq, counts)
         return counts
 
     def annotate_fea_node_worker_counts(self, allocations: list[dict]) -> None:
@@ -5696,6 +5732,7 @@ class Scheduler:
             while ledger and ledger[0] < horizon:
                 ledger.popleft()
         # New ATTACHING rows change both the pressure and young-footprint views.
+        self._fea_worker_counts_cache = None
         self._fea_pressures_cache = None
         self._fea_alloc_pressures_cache = None
         self._fea_node_resources_cache = None
@@ -6984,6 +7021,7 @@ class Scheduler:
     def requeue_task_for_rebalance(self, task: dict, reason: str) -> None:
         """Requeue without touching attempt_count: the worker was placed by a
         policy the scheduler has since corrected, not by its own failure."""
+        self._fea_worker_counts_cache = None
         self._fea_pressures_cache = None
         self._fea_alloc_pressures_cache = None
         self._fea_node_resources_cache = None
@@ -7292,6 +7330,7 @@ class Scheduler:
             attempts,
             self.fea_pressure_max_attempts,
         )
+        self._fea_worker_counts_cache = None
         self._fea_pressures_cache = None
         self._fea_alloc_pressures_cache = None
         self._fea_node_resources_cache = None

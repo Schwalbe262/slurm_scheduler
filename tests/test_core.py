@@ -1914,6 +1914,29 @@ class SchedulerTests(unittest.TestCase):
             list(reversed(attaching_ids)),
         )
 
+    def test_dashboard_task_name_filter_is_applied_before_page_limit(self) -> None:
+        matching_ids = [
+            self.db.create_task(
+                TaskCreate(f"global-filter-match-{index:03d}", "~/work", "run")
+            )
+            for index in range(53)
+        ]
+        for index in range(153):
+            self.db.create_task(
+                TaskCreate(f"newer-page-noise-{index:03d}", "~/work", "run")
+            )
+
+        filtered = self.db.list_dashboard_tasks(
+            limit=100,
+            name_contains="global-filter-match",
+        )
+
+        self.assertEqual(len(filtered), 53)
+        self.assertEqual(
+            {int(row["id"]) for row in filtered},
+            set(matching_ids),
+        )
+
     def test_list_allocations_by_ids_deduplicates_one_batch(self) -> None:
         first = self.db.create_allocation(
             account_name="a",
@@ -2053,6 +2076,104 @@ class SchedulerTests(unittest.TestCase):
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
         account = scheduler.choose_account(required_capability="conda:pyaedt", env_profile="pyaedt")
         self.assertEqual(account.name, "b")
+
+    def test_account_supports_caches_overlay_rows_only_for_scheduler_tick(self) -> None:
+        self.db.upsert_account_env_overlay(
+            "a",
+            "pyaedt",
+            "/work/miniconda3/envs/pyaedt",
+            sync_job_id=1,
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        original = self.db.list_account_env_overlays
+        calls: list[str] = []
+
+        def counted(account_name: str = "") -> list[dict]:
+            calls.append(account_name)
+            return original(account_name)
+
+        with mock.patch.object(
+            self.db,
+            "list_account_env_overlays",
+            side_effect=counted,
+        ):
+            with scheduler._tick_client_cache():
+                for _ in range(100):
+                    self.assertTrue(
+                        scheduler.account_supports(
+                            self.accounts[0],
+                            "conda:pyaedt",
+                            "pyaedt",
+                        )
+                    )
+                    self.assertTrue(scheduler.account_supports(self.accounts[1]))
+
+            self.assertEqual(calls, ["a", "b"])
+            self.assertTrue(
+                scheduler.account_supports(
+                    self.accounts[0],
+                    "conda:pyaedt",
+                    "pyaedt",
+                )
+            )
+            self.assertEqual(calls, ["a", "b", "a"])
+
+    def test_account_overlay_tick_cache_is_thread_local_and_bounded(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        account = self.accounts[0]
+        capability = "conda:newenv"
+        profile = "newenv"
+
+        with scheduler._tick_client_cache():
+            self.assertFalse(scheduler.account_supports(account, capability, profile))
+            self.db.upsert_account_env_overlay(
+                "a",
+                profile,
+                "/work/miniconda3/envs/newenv",
+                sync_job_id=2,
+            )
+            concurrent_result: list[bool] = []
+            reader = threading.Thread(
+                target=lambda: concurrent_result.append(
+                    scheduler.account_supports(account, capability, profile)
+                )
+            )
+            reader.start()
+            reader.join(timeout=5)
+            self.assertFalse(reader.is_alive())
+            self.assertEqual(concurrent_result, [True])
+            # A scheduling pass keeps one coherent capability view rather
+            # than changing placement semantics halfway through its scan.
+            self.assertFalse(scheduler.account_supports(account, capability, profile))
+
+        self.assertTrue(scheduler.account_supports(account, capability, profile))
+
+    def test_account_overlay_tick_cache_removes_repeated_io_latency(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        account = self.accounts[0]
+        original = self.db.list_account_env_overlays
+
+        def delayed(account_name: str = "") -> list[dict]:
+            time.sleep(0.002)
+            return original(account_name)
+
+        with mock.patch.object(
+            self.db,
+            "list_account_env_overlays",
+            side_effect=delayed,
+        ):
+            uncached_started = time.perf_counter()
+            for _ in range(20):
+                self.assertTrue(scheduler.account_supports(account))
+            uncached_seconds = time.perf_counter() - uncached_started
+
+            cached_started = time.perf_counter()
+            with scheduler._tick_client_cache():
+                for _ in range(20):
+                    self.assertTrue(scheduler.account_supports(account))
+            cached_seconds = time.perf_counter() - cached_started
+
+        self.assertLess(cached_seconds, uncached_seconds / 4)
 
     def test_dynamic_env_profile_prepends_synced_overlay_setup(self) -> None:
         self.db.upsert_account_env_overlay("a", "pyaedt", "/work/miniconda3/envs/pyaedt", sync_job_id=1)
@@ -7781,6 +7902,47 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertEqual(chosen["id"], allocation_id)
         self.assertEqual(worker_counts.call_count, 1)
+
+    def test_fea_worker_count_snapshot_reuses_tick_read_and_invalidates_on_attach(self) -> None:
+        allocation_id = self.create_fea_allocation(node_name="n001")
+        self.create_running_fea_tasks(allocation_id, 2)
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+        )
+        allocation = self.db.get_allocation(allocation_id)
+        task = {
+            "id": 999,
+            "cpus": 4,
+            "memory_mb": 32768,
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+        }
+        scheduler._tick_seq = 1
+        scheduler._tick_started_at = time.monotonic()
+
+        original = self.db.list_tasks_by_statuses
+        with mock.patch.object(
+            self.db,
+            "list_tasks_by_statuses",
+            wraps=original,
+        ) as active_reads:
+            with scheduler._tick_client_cache():
+                first = scheduler.node_fea_worker_counts()
+                second = scheduler.node_fea_worker_counts()
+                self.assertEqual(first, second)
+                self.assertEqual(active_reads.call_count, 1)
+
+                scheduler._record_attach_delta(allocation, task)
+                scheduler.node_fea_worker_counts()
+                self.assertEqual(active_reads.call_count, 2)
+
+                scheduler._tick_seq += 1
+                scheduler.node_fea_worker_counts()
+                self.assertEqual(active_reads.call_count, 3)
+
+        scheduler._tick_started_at = None
 
     def test_scoped_capacity_recalculation_uses_allocation_index(self) -> None:
         allocation_id = self.db.create_allocation(
