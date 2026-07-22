@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import logging.handlers
 import os
@@ -57,6 +58,25 @@ def _reserve_listener(host: str, port: int) -> socket.socket:
         raise
 
 
+def _run_uvicorn_server(server: uvicorn.Server, listener: socket.socket) -> None:
+    """Run Windows HTTP accepts on a selector loop, not IOCP AcceptEx.
+
+    CPython's Windows proactor closes the listening socket after any accept
+    ``OSError``.  A client-side ``ERROR_NETNAME_DELETED`` (WinError 64) can
+    therefore make a healthy Uvicorn process permanently unreachable.  The
+    scheduler does not use asyncio subprocess transports, and its configured
+    HTTP concurrency is bounded, so the selector loop is the safer serving
+    primitive on Windows.  Keep Uvicorn's normal runner everywhere else.
+    """
+
+    if os.name != "nt":
+        server.run(sockets=[listener])
+        return
+    server.config.setup_event_loop()
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+        runner.run(server.serve(sockets=[listener]))
+
+
 def run_uvicorn_worker(config) -> None:
     try:
         listener = _reserve_listener(config.bind_host, config.bind_port)
@@ -84,7 +104,7 @@ def run_uvicorn_worker(config) -> None:
         )
         server = uvicorn.Server(uvicorn_config)
         try:
-            server.run(sockets=[listener])
+            _run_uvicorn_server(server, listener)
         except KeyboardInterrupt:
             pass
     finally:

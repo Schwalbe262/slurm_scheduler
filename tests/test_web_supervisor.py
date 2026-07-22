@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import socket
 import sys
@@ -120,6 +121,48 @@ class WebWorkerSupervisorTests(unittest.TestCase):
             owner.close()
         self.assertEqual(raised.exception.code, scheduler_main.DUPLICATE_LISTENER_EXIT_CODE)
         server.assert_not_called()
+
+    def test_windows_worker_uses_selector_loop_for_http_accepts(self) -> None:
+        class Config:
+            setup_calls = 0
+
+            def setup_event_loop(self) -> None:
+                self.setup_calls += 1
+
+        class Server:
+            def __init__(self) -> None:
+                self.config = Config()
+                self.loop = None
+                self.sockets = None
+
+            async def serve(self, *, sockets) -> None:
+                self.loop = asyncio.get_running_loop()
+                self.sockets = sockets
+
+            def run(self, *, sockets) -> None:
+                raise AssertionError("Windows must not enter Uvicorn's proactor runner")
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server = Server()
+        try:
+            with mock.patch.object(scheduler_main.os, "name", "nt"):
+                scheduler_main._run_uvicorn_server(server, listener)
+        finally:
+            listener.close()
+        self.assertIsInstance(server.loop, asyncio.SelectorEventLoop)
+        self.assertEqual(server.sockets, [listener])
+        self.assertEqual(server.config.setup_calls, 1)
+
+    def test_non_windows_worker_keeps_uvicorn_runner(self) -> None:
+        server = mock.Mock()
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            with mock.patch.object(scheduler_main.os, "name", "posix"):
+                scheduler_main._run_uvicorn_server(server, listener)
+        finally:
+            listener.close()
+        server.run.assert_called_once_with(sockets=[listener])
+        server.serve.assert_not_called()
 
 
 if __name__ == "__main__":

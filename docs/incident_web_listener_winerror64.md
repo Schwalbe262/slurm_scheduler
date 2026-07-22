@@ -13,6 +13,8 @@ half-alive WEB process.
 - `python -m slurm_scheduler` starts a parent listener monitor and one Uvicorn child.
 - The parent probes the local TCP listener independently of `/api/health` and scheduler tick state.
 - After startup grace, three consecutive listener failures stop the child and exit the parent.
+- Windows workers serve HTTP on `SelectorEventLoop`, avoiding the IOCP `AcceptEx` path where a
+  client-side WinError 64 closes the process-wide listener instead of only that connection.
 - The external service launcher is the only restart authority, preventing a dying Python generation
   and `start_web.cmd` from both creating replacements. SQLite and remote Slurm steps remain
   authoritative when the new generation reconciles.
@@ -46,5 +48,7 @@ codes retain the delay so persistent startup failures cannot create a tight rest
 4. Confirm killing only the child exits the parent and the external launcher starts one new generation.
 5. Fault-inject a failed listener probe while the fake child remains alive; confirm thresholded
    parent exit, not an exit on a single transient failure.
-6. Confirm pre-existing fake/live allocation rows and Slurm jobs are not cancelled.
-7. Deploy only in a maintenance window; do not restart the active campaign scheduler during recovery.
+6. Confirm the Windows Uvicorn worker is using `SelectorEventLoop` and survives aborted connection
+   bursts on a disposable port.
+7. Confirm pre-existing fake/live allocation rows and Slurm jobs are not cancelled.
+8. Deploy only in a maintenance window; do not restart the active campaign scheduler during recovery.
