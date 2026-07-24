@@ -852,6 +852,80 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("path.write_text", script)
         self.assertLess(script.index("path.write_text"), script.index("cd $HOME/case"))
 
+    def test_attached_task_script_projects_task_cpu_contract_from_wider_step(self) -> None:
+        script = build_task_script(
+            {
+                "remote_cwd": "~/case",
+                "env_setup": "export SLURM_CPUS_PER_TASK=999",
+                "command": "python run.py",
+                "cpus": 8,
+            },
+            slurm_step_cpus=64,
+        )
+        self.assertIn("export SLURM_SCHEDULER_STEP_CPUS=64", script)
+        self.assertIn("export SLURM_SCHEDULER_TASK_CPUS=8", script)
+        self.assertIn("export SLURM_CPUS_PER_TASK=8", script)
+        self.assertLess(
+            script.rfind("export SLURM_CPUS_PER_TASK=999"),
+            script.rfind("export SLURM_CPUS_PER_TASK=8"),
+        )
+        self.assertLess(
+            script.rfind("export SLURM_CPUS_PER_TASK=8"),
+            script.rfind("python run.py"),
+        )
+
+    def test_attach_task_keeps_fea_step_envelope_but_writes_task_cpu_contract(self) -> None:
+        class CaptureSession:
+            def __init__(self) -> None:
+                self.commands: list[str] = []
+                self.files: dict[str, str] = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def run(self, command: str, timeout: float | None = None) -> CommandResult:
+                self.commands.append(command)
+                return CommandResult("4321\n" if "nohup setsid" in command else "", "", 0)
+
+            def write_text_file(self, path: str, content: str) -> None:
+                self.files[path] = content
+
+        account = AccountConfig("a", "host", 22, "a", "key", "/work")
+        client = SlurmAccountClient(account)
+        session = CaptureSession()
+        task = {
+            "id": 42,
+            "remote_cwd": "/work/case",
+            "env_setup": "",
+            "command": "python run.py",
+            "cpus": 8,
+            "memory_mb": 32768,
+            "gpus": 0,
+            "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
+            "aedt_backend": AedtBackend.STANDALONE.value,
+        }
+        allocation = {
+            "slurm_job_id": "824575",
+            "total_cpus": 64,
+            "gpu_model": "",
+        }
+
+        with mock.patch.object(client, "_open_session", return_value=session):
+            result = client.attach_task(task, allocation)
+
+        script = session.files[result["remote_dir"] + "/task.sh"]
+        self.assertIn("export SLURM_SCHEDULER_STEP_CPUS=64", script)
+        self.assertIn("export SLURM_SCHEDULER_TASK_CPUS=8", script)
+        self.assertIn("export SLURM_CPUS_PER_TASK=8", script)
+        self.assertIn("--cpus-per-task=64", session.commands[-1])
+        self.assertIn("--overlap", session.commands[-1])
+        self.assertIn("--cpu-bind=none", session.commands[-1])
+        self.assertNotIn("--exact", session.commands[-1])
+        self.assertNotIn("--exclusive", session.commands[-1])
+
     def test_srun_attach_command_targets_existing_allocation(self) -> None:
         task = {"cpus": 4, "memory_mb": 8192}
         allocation = {"slurm_job_id": "12345"}
@@ -870,6 +944,36 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("--mem=8192M", command)
         self.assertIn("--exact", command)
         self.assertIn("--exclusive", command)
+
+    def test_standard_attached_task_keeps_exact_exclusive_cpu_semantics(self) -> None:
+        task = {
+            "remote_cwd": "~/case",
+            "env_setup": "",
+            "command": "python run.py",
+            "cpus": 8,
+            "memory_mb": 32768,
+            "scheduling_profile": SchedulingProfile.STANDARD.value,
+        }
+        allocation = {"slurm_job_id": "824575", "total_cpus": 64}
+        script = build_task_script(task, slurm_step_cpus=8)
+        command = build_srun_attach_command(
+            task,
+            allocation,
+            "/remote/task.sh",
+            "/remote/stdout.log",
+            "/remote/stderr.log",
+            "/remote/exit_code",
+        )
+
+        self.assertIn("export SLURM_SCHEDULER_STEP_CPUS=8", script)
+        self.assertIn("export SLURM_SCHEDULER_TASK_CPUS=8", script)
+        self.assertIn("export SLURM_CPUS_PER_TASK=8", script)
+        self.assertIn("--cpus-per-task=8", command)
+        self.assertIn("--mem=32768M", command)
+        self.assertIn("--exact", command)
+        self.assertIn("--exclusive", command)
+        self.assertNotIn("--overlap", command)
+        self.assertNotIn("--cpu-bind=none", command)
 
     def test_srun_attach_command_keeps_gpu_task_exclusive_when_cpu_is_tight(self) -> None:
         task = {"cpus": 4, "memory_mb": 8192, "gpus": 1}

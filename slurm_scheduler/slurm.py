@@ -703,11 +703,29 @@ def resolve_task_placeholders(task: dict, account: AccountConfig) -> dict:
     return {**task, "command": command, "remote_cwd": remote_cwd}
 
 
-def build_task_script(task: dict) -> str:
+def build_task_script(task: dict, *, slurm_step_cpus: int | None = None) -> str:
     lines = [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
     ]
+    task_cpu_exports: list[str] = []
+    if slurm_step_cpus is not None:
+        task_cpus = int(task.get("cpus") or 0)
+        step_cpus = int(slurm_step_cpus)
+        if task_cpus <= 0 or step_cpus <= 0:
+            raise ValueError("attached task and Slurm step CPU counts must be positive")
+        # ``fea_bursty`` steps deliberately span the allocation's full CPU
+        # envelope so several overlapping solver phases can spread across the
+        # owned node.  That step envelope is not the solver's core contract.
+        # Preserve the real envelope under a scheduler-specific name, then
+        # project the task request through both the scheduler-specific contract
+        # and the legacy Slurm variable consumed by existing solver launchers.
+        task_cpu_exports = [
+            f"export SLURM_SCHEDULER_STEP_CPUS={step_cpus}",
+            f"export SLURM_SCHEDULER_TASK_CPUS={task_cpus}",
+            f"export SLURM_CPUS_PER_TASK={task_cpus}",
+        ]
+        lines.extend(task_cpu_exports)
     if task.get("id") is not None and str(task.get("id")).strip():
         # Marker inherited by every descendant (incl. daemonized AEDT/solver
         # grandchildren that leave the wrapper's process group) so cancel and
@@ -741,8 +759,23 @@ def build_task_script(task: dict) -> str:
     lines.append(
         f"export MFT_AEDT_BACKEND={shlex.quote(normalize_aedt_backend(task.get('aedt_backend')))}"
     )
+    # env_setup is also not authoritative for attached-task CPU ownership.
+    # Re-assert the split step/task contract immediately before the command.
+    lines.extend(task_cpu_exports)
     lines.append(task["command"])
     return "\n".join(lines) + "\n"
+
+
+def srun_attach_step_cpus(task: dict, allocation: dict) -> int:
+    fea_bursty_task = (
+        normalize_scheduling_profile(str(task.get("scheduling_profile") or ""))
+        == SchedulingProfile.FEA_BURSTY.value
+    )
+    return (
+        int(allocation.get("total_cpus") or task["cpus"])
+        if fea_bursty_task
+        else int(task["cpus"])
+    )
 
 
 def build_srun_attach_command(
@@ -760,11 +793,8 @@ def build_srun_attach_command(
     # Bursty FEA deliberately overcommits by average measured load. Give every
     # overlapping step the allocation's complete CPU pool so Linux can spread
     # its serial and parallel phases across all owned cores. The solver still
-    # receives the task's requested core count (currently four) from PyAEDT.
-    step_cpus = (
-        int(allocation.get("total_cpus") or task["cpus"])
-        if fea_bursty_task else int(task["cpus"])
-    )
+    # receives the task's requested core count from PyAEDT.
+    step_cpus = srun_attach_step_cpus(task, allocation)
     srun_parts = [
         "srun",
         f"--jobid={shlex.quote(str(allocation['slurm_job_id']))}",
@@ -1269,7 +1299,10 @@ class SlurmAccountClient:
             if known_hosts_path:
                 ssh_options.append(f"-o UserKnownHostsFile={shlex.quote(known_hosts_path)}")
             task = {**task, "git_ssh_command": "ssh " + " ".join(ssh_options)}
-        script = build_task_script(task)
+        script = build_task_script(
+            task,
+            slurm_step_cpus=srun_attach_step_cpus(task, allocation),
+        )
         wrapper = build_srun_attach_command(
             task,
             allocation,
