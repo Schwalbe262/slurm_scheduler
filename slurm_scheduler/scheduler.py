@@ -25,6 +25,12 @@ from .db import Database
 from .inventory import CPU_PROFILES_BY_PARTITION, GPU_PRIORITY, gpu_model_candidates, normalize_gpu_model, parse_scontrol_nodes, parse_sinfo_nodes, partition_rank
 from .models import AedtBackend, AccountSnapshot, AllocationStatus, JobStatus, SchedulingProfile, TaskStatus, normalize_aedt_backend, normalize_scheduling_profile
 from .pestat import PestatNode, parse_pestat
+from .retention import (
+    WORKSPACE_PRUNE_PROTECTION_MARKER,
+    WORKSPACE_PRUNE_PROTECTION_MAX_BYTES,
+    parse_workspace_prune_protection_manifest,
+    workspace_prune_protection_marker_paths,
+)
 from .slurm import (
     AllocationSubmissionNotCreated,
     JobStateInfo,
@@ -1488,17 +1494,15 @@ class Scheduler:
             if not workspace:
                 continue
             list_command = (
-                f"find {shlex.quote(workspace)} -mindepth 1 \\( {name_expr} \\) -prune -print 2>/dev/null | "
-                "while IFS= read -r d; do "
-                f"if [ -z \"$(find \"$d\" -mmin -{minutes} -print -quit 2>/dev/null)\" ]; "
-                "then printf '%s\\n' \"$d\"; fi; done"
+                f"find {shlex.quote(workspace)} -mindepth 1 "
+                f"\\( {name_expr} \\) -prune -print 2>/dev/null"
             )
             try:
                 with SSHSession(account, default_timeout=600) as ssh:
                     result = ssh.run(list_command)
                     if result.exit_code != 0:
                         continue
-                    candidates = []
+                    candidates: list[str] = []
                     workspace_prefix = self._normalize_remote_path(workspace).rstrip("/") + "/"
                     for line in result.stdout.splitlines():
                         path = line.strip()
@@ -1510,23 +1514,194 @@ class Scheduler:
                         basename = posixpath.basename(normalized.rstrip("/"))
                         if not any(fnmatch.fnmatch(basename, g) for g in globs):
                             continue
-                        candidates.append(path)
+                        if normalized not in candidates:
+                            candidates.append(normalized)
                     if not candidates:
                         continue
+                    deleted: list[str] = []
+                    protected: list[tuple[str, str]] = []
+                    recent: list[str] = []
+                    failed: list[str] = []
                     for index in range(0, len(candidates), 20):
                         chunk = candidates[index : index + 20]
-                        ssh.run("rm -rf -- " + " ".join(shlex.quote(path) for path in chunk), timeout=600)
+                        delete_result = ssh.run(
+                            self._workspace_prune_delete_command(
+                                workspace, chunk, minutes
+                            ),
+                            timeout=600,
+                        )
+                        if delete_result.exit_code != 0:
+                            failed.extend(chunk)
+                            continue
+                        reported: set[str] = set()
+                        for raw_line in delete_result.stdout.splitlines():
+                            fields = raw_line.split("\t")
+                            if len(fields) < 2:
+                                continue
+                            status, reported_path = fields[0], fields[1]
+                            normalized_path = self._normalize_remote_path(
+                                reported_path
+                            )
+                            if (
+                                normalized_path not in chunk
+                                or normalized_path in reported
+                            ):
+                                continue
+                            reported.add(normalized_path)
+                            if status == "D" and len(fields) == 2:
+                                deleted.append(normalized_path)
+                            elif status == "P" and len(fields) == 3:
+                                try:
+                                    expected_markers = (
+                                        workspace_prune_protection_marker_paths(
+                                            workspace, normalized_path
+                                        )
+                                    )
+                                except ValueError:
+                                    expected_markers = ()
+                                marker_path = (
+                                    fields[2]
+                                    if fields[2] in expected_markers
+                                    else "__unsafe_path__"
+                                )
+                                protected.append(
+                                    (normalized_path, marker_path)
+                                )
+                            elif status in {"R", "M"} and len(fields) == 2:
+                                recent.append(normalized_path)
+                            else:
+                                failed.append(normalized_path)
+                        failed.extend(path for path in chunk if path not in reported)
+                    marker_validity: dict[str, tuple[bool, str]] = {}
+                    for _artifact, marker_path in protected:
+                        if marker_path in marker_validity:
+                            continue
+                        marker_validity[marker_path] = (
+                            self._validate_remote_workspace_prune_marker(
+                                ssh, marker_path
+                            )
+                        )
             except Exception as exc:
                 LOGGER.warning("workspace prune failed on %s: %s", account.name, exc)
                 continue
-            LOGGER.info("workspace prune removed %d artifacts on %s", len(candidates), account.name)
+            invalid_markers = [
+                marker
+                for marker, (valid, _reason) in marker_validity.items()
+                if not valid
+            ]
+            for marker in invalid_markers:
+                LOGGER.warning(
+                    "workspace prune preserved marker %s on %s but its "
+                    "manifest is invalid: %s",
+                    marker,
+                    account.name,
+                    marker_validity[marker][1],
+                )
+            LOGGER.info(
+                "workspace prune removed %d, preserved %d, recent/missing %d, "
+                "and failed closed on %d artifacts on %s",
+                len(deleted),
+                len(protected),
+                len(recent),
+                len(failed),
+                account.name,
+            )
             self.record_event(
                 "workspace_prune",
-                f"removed {len(candidates)} disposable artifacts matching {', '.join(globs)}",
+                f"removed {len(deleted)} disposable artifacts matching "
+                f"{', '.join(globs)}; preserved {len(protected)} via "
+                f"{WORKSPACE_PRUNE_PROTECTION_MARKER} "
+                f"({len(invalid_markers)} invalid manifest(s), still "
+                f"fail-closed); skipped {len(recent)} recent/missing; "
+                f"failed closed on {len(failed)}",
                 entity_type="account",
                 entity_id=account.name,
                 account_name=account.name,
             )
+
+    @staticmethod
+    def _workspace_prune_delete_command(
+        workspace: str,
+        candidates: list[str],
+        minutes: int,
+    ) -> str:
+        """Build a marker-aware deletion command for already-vetted paths.
+
+        Marker existence, including a broken symlink or malformed JSON file,
+        protects the candidate. The marker check is repeated after the mtime
+        scan so a manifest added during a large-tree scan still wins before
+        ``rm``.
+        """
+
+        commands: list[str] = []
+        for candidate in candidates:
+            marker_paths = workspace_prune_protection_marker_paths(
+                workspace, candidate
+            )
+            marker_args = " ".join(
+                shlex.quote(path) for path in marker_paths
+            )
+            marker_check = (
+                "protected_marker=; "
+                f"for marker_path in {marker_args}; do "
+                'if [ -e "$marker_path" ] || [ -L "$marker_path" ]; then '
+                'protected_marker="$marker_path"; break; fi; done'
+            )
+            quoted_candidate = shlex.quote(candidate)
+            commands.append(
+                f"target={quoted_candidate}; "
+                f"{marker_check}; "
+                'if [ -n "$protected_marker" ]; then '
+                'printf "P\\t%s\\t%s\\n" "$target" "$protected_marker"; '
+                'elif [ ! -e "$target" ] && [ ! -L "$target" ]; then '
+                'printf "M\\t%s\\n" "$target"; '
+                "else "
+                f'recent=$(find "$target" -mmin -{int(minutes)} '
+                "-print -quit 2>/dev/null); find_status=$?; "
+                'if [ "$find_status" -ne 0 ]; then '
+                'printf "E\\t%s\\n" "$target"; '
+                'elif [ -n "$recent" ]; then '
+                'printf "R\\t%s\\n" "$target"; '
+                f"else {marker_check}; "
+                'if [ -n "$protected_marker" ]; then '
+                'printf "P\\t%s\\t%s\\n" "$target" "$protected_marker"; '
+                'elif rm -rf -- "$target"; then '
+                'printf "D\\t%s\\n" "$target"; '
+                'else printf "E\\t%s\\n" "$target"; fi; fi; fi'
+            )
+        return "; ".join(commands)
+
+    @staticmethod
+    def _validate_remote_workspace_prune_marker(
+        ssh: SSHSession, marker_path: str
+    ) -> tuple[bool, str]:
+        if marker_path == "__unsafe_path__":
+            return False, "unsafe marker ancestry"
+        quoted = shlex.quote(marker_path)
+        try:
+            result = ssh.run(
+                f"marker={quoted}; "
+                'if [ -L "$marker" ] || [ ! -f "$marker" ]; then '
+                "exit 2; fi; "
+                'size=$(wc -c < "$marker") || exit 3; '
+                f'if [ "$size" -gt '
+                f"{WORKSPACE_PRUNE_PROTECTION_MAX_BYTES} ]; "
+                "then exit 4; fi; "
+                'cat -- "$marker"',
+                timeout=30,
+            )
+        except Exception as exc:
+            return False, f"marker read raised {type(exc).__name__}: {exc}"
+        if result.exit_code != 0:
+            return (
+                False,
+                f"marker read failed with exit code {result.exit_code}",
+            )
+        try:
+            parse_workspace_prune_protection_manifest(result.stdout)
+        except ValueError as exc:
+            return False, str(exc)
+        return True, ""
 
     def prune_project_sim_artifacts(self) -> None:
         """For each deployed project, sweep its

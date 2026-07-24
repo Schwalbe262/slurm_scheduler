@@ -196,6 +196,44 @@ Meanings:
 - `workspace_prune_globs`: name patterns of disposable artifacts that user jobs leave anywhere in the workspace — e.g. `["*.aedtresults"]` for ANSYS AEDT solution directories, which otherwise grow tens of GB per campaign. Only these explicit basename globs are deleted (never bare `*`, never paths), every `workspace_prune_interval_seconds` (default 6h), and only when nothing inside was modified within `workspace_prune_min_age_seconds` (default 24h) — so running simulations are never touched. Empty by default.
 - `event_ttl_seconds`: retention for `scheduler_events` rows.
 
+### Protecting sealed workspace artifacts
+
+Before publishing a sealed source or result tree, place
+`.slurm-scheduler-preserve.json` in the artifact directory or any ancestor up
+to the configured account workspace. Global `workspace_prune_globs` pruning
+checks the candidate and every such ancestor immediately before deletion. A
+marker at a sealed-run root therefore protects nested `*.aedtresults`
+directories without disabling cleanup elsewhere.
+
+The v1 marker is a UTF-8 JSON object no larger than 16 KiB:
+
+```json
+{
+  "schema": "slurm-scheduler-prune-protection-v1",
+  "preserve": true,
+  "created_at": "2026-07-24T12:00:00Z",
+  "reason": "Manifest-sealed source and solver-result tree",
+  "owner": "simulation-campaign",
+  "artifact_manifest": {
+    "path": "manifest.json",
+    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  }
+}
+```
+
+`schema`, `preserve`, timezone-qualified `created_at`, and non-empty `reason`
+are required. `owner` is optional. `artifact_manifest` is optional, but when
+present it must contain exactly a safe relative `path` and a 64-character
+lowercase SHA-256 digest. The complete example is
+`examples/workspace-prune-protection-v1.json`.
+
+Marker presence is authoritative and fail-closed: a partial, malformed,
+oversized, symlinked, or otherwise unreadable marker still prevents deletion
+and emits an invalid-manifest warning. Removing the marker deliberately opts
+the tree back into age/glob-based pruning. The marker affects only global
+workspace artifact pruning; explicit task cleanup and normal TTL cleanup keep
+their existing ownership semantics.
+
 Cleanup clears the DB log path fields after deleting the remote directory. If a client needs stdout, stderr, or result files, read them through the API before the TTL expires.
 
 Conda env-sync also cleans after itself: the remote pack/install directories are deleted on success, only the newest `<env>.bak.<timestamp>` backup is kept per environment, and orphaned local sync tarballs are removed at service startup.
