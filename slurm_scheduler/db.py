@@ -418,6 +418,28 @@ class Database:
                 (key, value),
             )
 
+    def claim_newer_setting_value(self, key: str, value: str) -> bool:
+        """Atomically advance a lexicographically ordered durable watermark.
+
+        Scheduler observation timestamps use SQLite's sortable UTC text
+        format.  The conditional upsert makes a side-effect claim once for a
+        new timestamp across ticks, process restarts, and overlapping process
+        generations; an equal or older observation cannot claim again.
+        """
+
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO scheduler_settings(key, value, updated_at)
+                VALUES(?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE
+                SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+                WHERE excluded.value > scheduler_settings.value
+                """,
+                (key, value),
+            )
+            return cursor.rowcount == 1
+
     def allocation_has_aedt_pool_claim(self, allocation_id: int) -> bool:
         """Fail-safe ownership check for the opt-in AEDT session pool.
 

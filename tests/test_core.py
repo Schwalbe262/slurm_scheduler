@@ -11769,6 +11769,58 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.db.get_task(newer)["status"], TaskStatus.QUEUED.value)
         self.assertEqual(FakeClient.cancelled_tasks, [newer])
 
+        # The same persisted pestat row must not reclaim another worker on a
+        # later tick or after a scheduler process restart.
+        scheduler.handle_fea_memory_pressure()
+        restarted = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+        )
+        restarted.handle_fea_memory_pressure()
+        self.assertEqual(self.db.get_task(older)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(FakeClient.cancelled_tasks, [newer])
+
+        # Only a strictly newer hard-pressure observation authorizes the next
+        # single reclaim on this node.
+        with self.db.connect() as conn:
+            current_sample = str(
+                conn.execute(
+                    "SELECT observed_at FROM pestat_nodes WHERE hostname = 'n001'"
+                ).fetchone()["observed_at"]
+            )
+            newer_sample = (
+                datetime.fromisoformat(current_sample) + timedelta(seconds=1)
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                "UPDATE pestat_nodes SET observed_at = ? WHERE hostname = 'n001'",
+                (newer_sample,),
+            )
+        restarted.handle_fea_memory_pressure()
+        self.assertEqual(self.db.get_task(older)["status"], TaskStatus.QUEUED.value)
+        self.assertEqual(FakeClient.cancelled_tasks, [newer, older])
+
+    def test_durable_observation_claim_only_advances_to_newer_value(self) -> None:
+        key = "observation_claim:test:n001"
+
+        self.assertTrue(
+            self.db.claim_newer_setting_value(key, "2026-07-25 10:00:00")
+        )
+        self.assertFalse(
+            self.db.claim_newer_setting_value(key, "2026-07-25 10:00:00")
+        )
+        self.assertFalse(
+            self.db.claim_newer_setting_value(key, "2026-07-25 09:59:59")
+        )
+        self.assertTrue(
+            self.db.claim_newer_setting_value(key, "2026-07-25 10:00:01")
+        )
+        self.assertEqual(
+            self.db.get_setting(key),
+            "2026-07-25 10:00:01",
+        )
+
     def test_fea_hard_memory_pressure_fails_task_at_attempt_cap(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",

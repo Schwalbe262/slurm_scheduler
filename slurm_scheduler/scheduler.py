@@ -58,6 +58,9 @@ from .slurm import (
 LOGGER = logging.getLogger(__name__)
 ClientFactory = Callable[[AccountConfig], SlurmAccountClient]
 FEA_PROJECT_CURSOR_SETTING = "fea_project_last_claim_by_priority"
+FEA_HARD_PRESSURE_RECLAIM_SAMPLE_SETTING_PREFIX = (
+    "observation_claim:fea_memory_pressure_reclaim:"
+)
 TASK_COUNT_SAMPLE_INTERVAL_SECONDS = 60
 TERMINAL_AEDT_WORKSPACE_ROOT = "/gpfs/tmp_cpu2/mft_pool"
 TERMINAL_AEDT_WORKSPACE_SWEEP_INTERVAL_SECONDS = 60
@@ -6382,6 +6385,22 @@ class Scheduler:
             return "soft_blocked"
         return "ok"
 
+    def fea_hard_pressure_observation(self, allocation: dict) -> str:
+        """Return the fresh hard-pressure sample timestamp for an allocation."""
+
+        row = self.pestat_node_for_allocation(allocation)
+        if not row:
+            return ""
+        total = int(row.get("memory_mb") or 0)
+        if total <= 0:
+            return ""
+        free_percent = (
+            int(row.get("free_memory_mb") or 0) / total
+        ) * 100.0
+        if free_percent >= self.fea_hard_memory_free_percent:
+            return ""
+        return str(row.get("observed_at") or "").strip()
+
     def _alloc_util_max_age_seconds(self) -> float:
         # Samples land once per tick, and heavy ticks stretch well past the
         # nominal interval; utilization drifts slowly, so a sample within ten
@@ -7866,7 +7885,7 @@ class Scheduler:
 
     def handle_fea_memory_pressure(self) -> None:
         reclaimed = False
-        pressured_allocations_by_node: dict[str, list[dict]] = {}
+        pressured_allocations_by_node: dict[str, dict[str, Any]] = {}
         for allocation in self.db.list_allocations_with_live(limit=500):
             if allocation["state"] not in {
                 AllocationStatus.WARM.value,
@@ -7874,19 +7893,30 @@ class Scheduler:
                 AllocationStatus.DRAINING.value,
             }:
                 continue
-            if self.fea_memory_pressure_state(allocation) != "hard_pressure":
+            observed_at = self.fea_hard_pressure_observation(allocation)
+            if not observed_at:
                 continue
             node_name = str(allocation.get("node_name") or "")
             if not node_name:
                 continue
-            pressured_allocations_by_node.setdefault(node_name, []).append(allocation)
+            pressure = pressured_allocations_by_node.setdefault(
+                node_name,
+                {"observed_at": observed_at, "allocations": []},
+            )
+            pressure["observed_at"] = max(
+                str(pressure.get("observed_at") or ""),
+                observed_at,
+            )
+            pressure["allocations"].append(allocation)
 
         # Memory pressure is measured by pestat for the whole node.  Several
         # scheduler allocations can share that node, so reclaiming once per
-        # allocation would kill a burst of otherwise recoverable simulations
-        # from a single pressure sample.  Reclaim only the newest standalone
-        # FEA worker on each pressured node during this tick.
-        for allocations in pressured_allocations_by_node.values():
+        # allocation or once per tick would kill a burst of otherwise
+        # recoverable simulations from one stale sample. Reclaim only the
+        # newest standalone FEA worker once for each newer persisted
+        # node-observation timestamp.
+        for node_name, pressure in pressured_allocations_by_node.items():
+            allocations = list(pressure["allocations"])
             allocation_by_id = {
                 int(allocation["id"]): allocation for allocation in allocations
             }
@@ -7908,6 +7938,18 @@ class Scheduler:
                 ),
             )
             allocation = allocation_by_id[int(task.get("allocation_id") or 0)]
+            observed_at = str(pressure.get("observed_at") or "")
+            if not self.db.claim_newer_setting_value(
+                f"{FEA_HARD_PRESSURE_RECLAIM_SAMPLE_SETTING_PREFIX}{node_name}",
+                observed_at,
+            ):
+                LOGGER.info(
+                    "skipping repeated FEA memory-pressure reclaim on %s "
+                    "for pestat observation %s",
+                    node_name,
+                    observed_at,
+                )
+                continue
             account = self.account_by_name(str(task.get("account_name") or allocation.get("account_name") or ""))
             if account:
                 try:

@@ -320,3 +320,9 @@
 - Review finding: pooled capacity also needs node/partition- and slot-aware demand accounting. A full same-family session on the requested node cannot satisfy a queued strict project merely because its family matches.
 - Review finding: if a post-launch placement rejection cannot be cancelled, declaring the task terminal can release ownership around a possible orphan.
 - Final behavior: strict pooled requests consume compatible free slots once, open exact-node/partition capacity before generic requests, and never fall back. A failed post-launch cancellation remains durably `attaching` and capacity-owning until a refresh retry confirms cancellation.
+
+## 2026-07-25 10:45 KST
+
+- Incident: the FEA hard-memory-pressure handler limited reclaim to one task per node per invocation, but successive ticks could reuse the same unchanged `pestat` row and reclaim another task every 30 seconds.
+- Root cause: no durable record connected a reclaim side effect to the `pestat_nodes.observed_at` sample that authorized it.
+- Improvement: atomically advance a per-node observation watermark in `scheduler_settings` before reclaim. Equal or older samples cannot authorize another reclaim, including after restart; only a newer hard-pressure sample permits one additional victim.
