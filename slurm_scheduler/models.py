@@ -38,6 +38,11 @@ class SchedulingProfile(StrEnum):
     FEA_BURSTY = "fea_bursty"
 
 
+class NodeNamePolicy(StrEnum):
+    PREFERRED = "preferred"
+    STRICT = "strict"
+
+
 class AedtBackend(StrEnum):
     STANDALONE = "standalone"
     POOLED = "pooled"
@@ -57,6 +62,22 @@ def normalize_scheduling_profile(value: str | None) -> str:
     if raw == SchedulingProfile.FEA_BURSTY.value:
         return SchedulingProfile.FEA_BURSTY.value
     return SchedulingProfile.STANDARD.value
+
+
+def normalize_node_name_policy(value: str | None) -> str:
+    """Normalize an explicit per-task node policy.
+
+    An empty value deliberately means "inherit the scheduler's legacy
+    behavior".  This keeps existing rows and callers byte-for-byte compatible
+    while allowing a submitted task to opt into the stronger strict contract.
+    """
+
+    raw = (value or "").strip().lower()
+    if not raw:
+        return ""
+    if raw in {NodeNamePolicy.PREFERRED.value, NodeNamePolicy.STRICT.value}:
+        return raw
+    raise ValueError("node_name_policy must be preferred or strict")
 
 
 @dataclass(frozen=True)
@@ -119,6 +140,7 @@ class TaskCreate:
     project: str = ""
     entrypoint: str = ""
     requested_allocation_id: int = 0
+    node_name_policy: str = ""
 
 
 @dataclass(frozen=True)

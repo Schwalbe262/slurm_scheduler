@@ -32,6 +32,7 @@
         <tr><th>CPU / Memory</th><td>{{ task.cpus }} CPUs / {{ task.memory_mb }} MB</td></tr>
         <tr><th>GPU</th><td>{{ task.gpus or 0 }} {{ task.gpu_model or "" }}</td></tr>
         <tr><th>Partition / Requested node</th><td>{{ task.partition or "" }} / {{ task.requested_node_name or "" }}</td></tr>
+        <tr><th>Node policy</th><td>{{ task.node_name_policy or "" }}{% if task.requested_node_name_policy %} (explicit {{ task.requested_node_name_policy }}){% endif %}</td></tr>
         <tr><th>Allocation node</th><td>{{ task.allocation_node_name or "" }}</td></tr>
         <tr><th>Same node as task</th><td>{{ task.same_node_as_task_id or "" }}{% if task.same_node_as_node_name %} / {{ task.same_node_as_node_name }}{% endif %}</td></tr>
         <tr><th>Queue state / reason</th><td>{{ task.queue_state or "" }} / {{ task.queue_reason or "" }}</td></tr>

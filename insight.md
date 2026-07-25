@@ -311,3 +311,12 @@
 - After: exclusive allocations request Slurm exclusivity, both flag directions must match, and exclusive shapes accept only idle/unused nodes while shared FEA behavior is unchanged.
 - Evidence: focused 6/6 and full scheduler core 331/331 tests passed.
 - Remaining risk: 28774/28808 were cancelled before execution so IPMSM Stage2 could own all 100 project slots; Slurm runtime evidence remains pending.
+
+## 2026-07-25 10:04 KST
+
+- Problem: the global FEA `preferred` node policy could not express a fail-closed requirement for one task, and demand-pool creation did not carry the task's requested node.
+- Discovery: preventing the preferred-node relaxation alone is insufficient; exact placement must survive demand allocation creation, pooled pre-admission, the final DB claim, the Slurm job readback, and the nested `srun` boundary.
+- Improvement: add an opt-in durable per-task `node_name_policy=strict` contract while leaving legacy rows on the configured default. Strict tasks retain their requested node, open only exact-node capacity, validate allocation and Slurm node identity before and after attach, and enforce the contract again inside the compute-node script.
+- Review finding: pooled capacity also needs node/partition- and slot-aware demand accounting. A full same-family session on the requested node cannot satisfy a queued strict project merely because its family matches.
+- Review finding: if a post-launch placement rejection cannot be cancelled, declaring the task terminal can release ownership around a possible orphan.
+- Final behavior: strict pooled requests consume compatible free slots once, open exact-node/partition capacity before generic requests, and never fall back. A failed post-launch cancellation remains durably `attaching` and capacity-owning until a refresh retry confirms cancellation.

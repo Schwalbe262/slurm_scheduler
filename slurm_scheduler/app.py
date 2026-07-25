@@ -39,7 +39,16 @@ from .config import AppConfig, load_accounts, load_app_config
 from .control_plane_relay import ControlPlaneRelay
 from .db import Database, TASK_PAGE_SORT_COLUMNS
 from .git_auth import find_git_credential, git_task_payload
-from .models import AedtBackend, JobCreate, SchedulingProfile, TaskCreate, TaskStatus, normalize_aedt_backend, normalize_scheduling_profile
+from .models import (
+    AedtBackend,
+    JobCreate,
+    SchedulingProfile,
+    TaskCreate,
+    TaskStatus,
+    normalize_aedt_backend,
+    normalize_node_name_policy,
+    normalize_scheduling_profile,
+)
 from .inventory import partition_rank
 from .mft_pipeline_status import MftPipelineStatusReader
 from .pestat import PestatNode, plan_dynamic_allocations
@@ -60,6 +69,23 @@ def parse_aedt_backend(value: object) -> str:
         return normalize_aedt_backend(str(value or ""))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def parse_node_name_policy(value: object) -> str:
+    try:
+        return normalize_node_name_policy(str(value or ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def validate_node_name_policy(node_name: object, value: object) -> str:
+    policy = parse_node_name_policy(value)
+    if policy == "strict" and not str(node_name or "").strip():
+        raise HTTPException(
+            status_code=422,
+            detail="node_name is required when node_name_policy is strict",
+        )
+    return policy
 
 
 def _literal_shell_assignments(text: str, *, leading_only: bool) -> dict[str, str]:
@@ -1394,6 +1420,25 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             allocation = allocation_by_id.get(allocation_id) if allocation_by_id is not None else db.get_allocation(allocation_id)
         requested_node_name = task.get("node_name") or ""
         allocation_node_name = allocation.get("node_name") if allocation else ""
+        node_name_policy = scheduler.task_node_name_policy(task)
+        explicit_node_name_policy = (
+            scheduler.explicit_task_node_name_policy(task)
+        )
+        strict_node_placement = scheduler.task_has_strict_node_contract(task)
+        placement_contract_satisfied = bool(
+            not strict_node_placement
+            or (
+                allocation
+                and int(task.get("allocation_id") or 0)
+                == int(allocation.get("id") or 0)
+                and requested_node_name
+                and requested_node_name == allocation_node_name
+                # started_at is written only after both pre- and post-launch
+                # Slurm node readbacks pass. DB node equality alone is not
+                # proof of a successfully verified strict placement.
+                and task.get("started_at")
+            )
+        )
         same_node_as_task_id = int(task.get("same_node_as_task_id") or task.get("same_node_as") or 0)
         same_node_target = scheduler.same_node_target_for_task(task) if same_node_as_task_id else None
         preferred_node_relaxed = (
@@ -1427,6 +1472,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "partition": task.get("partition") or "auto",
             "node_name": requested_node_name,
             "requested_node_name": requested_node_name,
+            "node_name_policy": node_name_policy,
+            "requested_node_name_policy": explicit_node_name_policy,
+            "strict_node_placement": strict_node_placement,
+            "placement_contract_satisfied": placement_contract_satisfied,
             "allocation_node_name": allocation_node_name,
             "actual_node_name": allocation_node_name,
             "same_node_as_task_id": same_node_as_task_id,
@@ -1559,6 +1608,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "gpu_model": task.get("gpu_model") or "",
             "partition": task.get("partition") or "auto",
             "node_name": task.get("node_name") or "",
+            "node_name_policy": task.get("node_name_policy") or "",
             "exclusive_node": bool(task.get("exclusive_node") or False),
             "priority": int(task.get("priority") or 0),
             "timeout_seconds": int(task.get("timeout_seconds") or 0),
@@ -1888,10 +1938,25 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
 
     def create_task_record(payload: dict) -> tuple[int, bool]:
         payload = apply_project_to_payload(payload)
+        node_name = str(payload.get("node_name") or "").strip()
+        node_name_policy = validate_node_name_policy(
+            node_name, payload.get("node_name_policy")
+        )
         dedupe_key = str(payload.get("dedupe_key") or "").strip()
         if dedupe_key:
             existing = db.find_active_task_by_dedupe_key(dedupe_key)
             if existing:
+                if node_name_policy == "strict" and (
+                    str(existing.get("node_name_policy") or "") != "strict"
+                    or str(existing.get("node_name") or "") != node_name
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "dedupe_key belongs to an active task with a different "
+                            "strict node placement contract"
+                        ),
+                    )
                 return int(existing["id"]), True
         raw_payload = payload.get("payload_json", "")
         if isinstance(raw_payload, (dict, list)):
@@ -1924,7 +1989,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             gpus=max(0, int(payload.get("gpus") or 0)),
             gpu_model=str(payload.get("gpu_model") or ""),
             partition=str(payload.get("partition") or "auto"),
-            node_name=str(payload.get("node_name") or ""),
+            node_name=node_name,
+            node_name_policy=node_name_policy,
             exclusive_node=bool(payload.get("exclusive_node") or False),
             priority=int(payload.get("priority") or 0),
             timeout_seconds=max(0, int(payload.get("timeout_seconds") or payload.get("timeout") or 0)),
@@ -2351,6 +2417,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         gpu_model: str = Form(""),
         partition: str = Form("auto"),
         node_name: str = Form(""),
+        node_name_policy: str = Form(""),
         exclusive_node: bool = Form(False),
         same_node_as_task_id: int = Form(0),
         priority: int = Form(0),
@@ -2372,7 +2439,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 gpus=max(0, gpus),
                 gpu_model=gpu_model,
                 partition=partition,
-                node_name=node_name,
+                node_name=str(node_name or "").strip(),
+                node_name_policy=validate_node_name_policy(
+                    node_name, node_name_policy
+                ),
                 exclusive_node=exclusive_node,
                 same_node_as_task_id=max(0, same_node_as_task_id),
                 priority=priority,
@@ -2402,6 +2472,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         gpus: int = Form(0),
         gpu_model: str = Form(""),
         node_name: str = Form(""),
+        node_name_policy: str = Form(""),
         exclusive_node: bool = Form(False),
         same_node_as_task_id: int = Form(0),
         priority: int = Form(0),
@@ -2424,7 +2495,10 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 gpus=max(0, gpus),
                 gpu_model=gpu_model,
                 partition=partition,
-                node_name=node_name,
+                node_name=str(node_name or "").strip(),
+                node_name_policy=validate_node_name_policy(
+                    node_name, node_name_policy
+                ),
                 exclusive_node=exclusive_node,
                 same_node_as_task_id=max(0, same_node_as_task_id),
                 payload_json=payload_json,
@@ -2859,6 +2933,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "gpu_model": str(payload.get("gpu_model") or ""),
             "partition": str(payload.get("partition") or "auto"),
             "node_name": str(payload.get("node_name") or ""),
+            "node_name_policy": str(payload.get("node_name_policy") or ""),
             "exclusive_node": bool(payload.get("exclusive_node") or False),
             "priority": int(payload.get("priority") or 0),
             "timeout_seconds": max(0, int(payload.get("timeout_seconds") or payload.get("timeout") or 0)),
@@ -2950,8 +3025,12 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         account_name: str = "",
         partition: str = "auto",
         node_name: str = "",
+        node_name_policy: str = "",
         max_workers_per_node: int = 0,
     ) -> dict:
+        parsed_node_name_policy = validate_node_name_policy(
+            node_name, node_name_policy
+        )
         task = {
             "cpus": max(1, cpus),
             "memory_mb": max(1, memory_mb),
@@ -2968,6 +3047,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             "account_name": account_name,
             "partition": partition,
             "node_name": node_name,
+            "node_name_policy": parsed_node_name_policy,
             "exclusive_node": 0,
             "max_workers_per_node": max(0, max_workers_per_node),
         }

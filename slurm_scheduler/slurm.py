@@ -15,7 +15,15 @@ import paramiko
 from .config import AccountConfig, GitCredentialConfig
 from .git_auth import git_credential_id_from_payload
 from .inventory import normalize_gpu_model
-from .models import AccountSnapshot, JobStatus, SchedulingProfile, normalize_aedt_backend, normalize_scheduling_profile
+from .models import (
+    AccountSnapshot,
+    JobStatus,
+    NodeNamePolicy,
+    SchedulingProfile,
+    normalize_aedt_backend,
+    normalize_node_name_policy,
+    normalize_scheduling_profile,
+)
 from .task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, TASK_ID_PLACEHOLDER
 
 
@@ -731,6 +739,38 @@ def build_task_script(task: dict, *, slurm_step_cpus: int | None = None) -> str:
         # grandchildren that leave the wrapper's process group) so cancel and
         # the orphan-process sweep can attribute and kill them on the node.
         lines.append(f"export SLURM_SCHED_TASK_ID={shlex.quote(str(task['id']))}")
+    try:
+        node_name_policy = normalize_node_name_policy(
+            str(task.get("node_name_policy") or "")
+        )
+    except ValueError:
+        # A corrupt durable row must fail closed at the compute-node boundary.
+        node_name_policy = NodeNamePolicy.STRICT.value
+    if node_name_policy == NodeNamePolicy.STRICT.value:
+        expected_node = str(task.get("node_name") or "").strip()
+        expected_job_id = str(
+            task.get("_strict_allocation_job_id") or ""
+        ).strip()
+        if not expected_node or not expected_job_id:
+            raise ValueError(
+                "strict node placement requires node_name and allocation job id"
+            )
+        lines.extend(
+            [
+                (
+                    f"if [ \"${{SLURMD_NODENAME:-}}\" != "
+                    f"{shlex.quote(expected_node)} ]; then "
+                    f"echo {shlex.quote(f'strict node placement mismatch: expected {expected_node}')} "
+                    ">&2; exit 97; fi"
+                ),
+                (
+                    f"if [ \"${{SLURM_JOB_ID:-}}\" != "
+                    f"{shlex.quote(expected_job_id)} ]; then "
+                    f"echo {shlex.quote(f'strict allocation mismatch: expected {expected_job_id}')} "
+                    ">&2; exit 98; fi"
+                ),
+            ]
+        )
     lines.append(f"export MFT_AEDT_BACKEND={shlex.quote(normalize_aedt_backend(task.get('aedt_backend')))}")
     if task.get("payload_json") and task.get("payload_path"):
         lines.extend(
@@ -802,6 +842,20 @@ def build_srun_attach_command(
         "--ntasks=1",
         f"--cpus-per-task={step_cpus}",
     ]
+    try:
+        node_name_policy = normalize_node_name_policy(
+            str(task.get("node_name_policy") or "")
+        )
+    except ValueError:
+        node_name_policy = NodeNamePolicy.STRICT.value
+    if node_name_policy == NodeNamePolicy.STRICT.value:
+        strict_node = str(task.get("node_name") or "").strip()
+        allocation_node = str(allocation.get("node_name") or "").strip()
+        if not strict_node or allocation_node != strict_node:
+            raise ValueError(
+                "strict node placement allocation does not match requested node"
+            )
+        srun_parts.append(f"--nodelist={shlex.quote(strict_node)}")
     if not fea_bursty_task:
         # Standard tasks retain their per-step Slurm memory reservation and
         # cgroup ceiling.  Bursty FEA steps intentionally share the parent
@@ -1286,7 +1340,13 @@ class SlurmAccountClient:
             "exit_code_path": exit_code_path,
         }
         task = resolve_task_placeholders(apply_env_profile(task, self.account), self.account)
-        task = {**task, "payload_path": posixpath.join(remote_dir, "payload.json")}
+        task = {
+            **task,
+            "payload_path": posixpath.join(remote_dir, "payload.json"),
+            "_strict_allocation_job_id": str(
+                allocation.get("slurm_job_id") or ""
+            ),
+        }
         credential = self.git_credential_for_task(task)
         if credential:
             key_path = posixpath.join(remote_dir, "git-auth", f"{credential.id}.key")

@@ -15,7 +15,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from .db import Database
-from .models import SchedulingProfile, TaskCreate, TaskStatus
+from .models import (
+    NodeNamePolicy,
+    SchedulingProfile,
+    TaskCreate,
+    TaskStatus,
+    normalize_node_name_policy,
+)
 from .aedt_session_host import (
     EXPECTED_AEDT_VERSION,
     EXPECTED_SESSION_PROFILE_JSON,
@@ -493,6 +499,16 @@ def _normalized_family(value: str, project_name: str) -> str:
 
 def _short_node_name(value: str) -> str:
     return str(value or "").strip().lower().split(".", 1)[0]
+
+
+def _partition_spec_names(value: str) -> list[str]:
+    names = [item.strip() for item in str(value or "").split(",") if item.strip()]
+    return [] if not names or "auto" in names else names
+
+
+def _partition_spec_allows(spec: str, partition: str) -> bool:
+    names = _partition_spec_names(spec)
+    return not names or str(partition or "") in names
 
 
 def _bool_setting(value: str | None) -> bool:
@@ -1763,6 +1779,29 @@ class AedtPoolService:
                 return None
             if str(task["aedt_backend"] or "").strip().lower() != "pooled":
                 raise ValueError("pooled pre-admission requires a pooled task")
+            try:
+                explicit_node_policy = normalize_node_name_policy(
+                    str(task["node_name_policy"] or "")
+                )
+            except ValueError:
+                explicit_node_policy = NodeNamePolicy.STRICT.value
+            strict_requested_node = (
+                str(task["node_name"] or "").strip()
+                if explicit_node_policy == NodeNamePolicy.STRICT.value
+                else ""
+            )
+            strict_requested_partition = (
+                str(task["partition"] or "auto").strip() or "auto"
+                if explicit_node_policy == NodeNamePolicy.STRICT.value
+                else "auto"
+            )
+            if (
+                explicit_node_policy == NodeNamePolicy.STRICT.value
+                and not strict_requested_node
+            ):
+                # API writers reject this shape.  Keep a corrupt/manual row
+                # queued rather than silently assigning any Desktop.
+                return None
             if config.target_projects <= 0 or self._admitted_project_count(
                 conn, exclude_task_id=task_id
             ) >= int(config.target_projects):
@@ -1818,7 +1857,8 @@ class AedtPoolService:
                        s.last_heartbeat_at, s.reuse_blocked_at,
                        s.solve_batch_sealed_at, s.drain_requested_at,
                        a.state AS allocation_state,
-                       a.account_name AS allocation_account_name
+                       a.account_name AS allocation_account_name,
+                       a.partition AS allocation_partition
                 FROM aedt_exact_session_reservations r
                 LEFT JOIN aedt_sessions s ON s.id = r.session_id
                 LEFT JOIN allocations a ON a.id = s.allocation_id
@@ -1862,6 +1902,18 @@ class AedtPoolService:
                         or str(latest["allocation_account_name"] or "")
                         in requested_accounts
                     )
+                    and (
+                        not strict_requested_node
+                        or str(latest["node_name"] or "")
+                        == strict_requested_node
+                    )
+                    and (
+                        not strict_requested_node
+                        or _partition_spec_allows(
+                            strict_requested_partition,
+                            str(latest["allocation_partition"] or ""),
+                        )
+                    )
                     and metadata_matches
                 )
                 if target_is_usable:
@@ -1898,7 +1950,11 @@ class AedtPoolService:
             ):
                 conn.execute(
                     """
-                    UPDATE tasks SET requested_allocation_id = 0, node_name = '',
+                    UPDATE tasks
+                    SET requested_allocation_id = 0,
+                        node_name = CASE
+                            WHEN node_name_policy = 'strict' THEN node_name
+                            ELSE '' END,
                         updated_at = ?
                     WHERE id = ? AND status = 'queued'
                     """,
@@ -1920,6 +1976,20 @@ class AedtPoolService:
                 placeholders = ",".join("?" for _ in candidate_accounts)
                 account_predicate = f" AND a.account_name IN ({placeholders})"
                 params.extend(sorted(candidate_accounts))
+            node_predicate = ""
+            if strict_requested_node:
+                node_predicate = " AND s.node_name = ?"
+                params.append(strict_requested_node)
+            partition_predicate = ""
+            strict_partition_names = _partition_spec_names(
+                strict_requested_partition
+            )
+            if strict_requested_node and strict_partition_names:
+                placeholders = ",".join("?" for _ in strict_partition_names)
+                partition_predicate = (
+                    f" AND a.partition IN ({placeholders})"
+                )
+                params.extend(strict_partition_names)
             candidates = conn.execute(
                 f"""
                 SELECT s.*,
@@ -1944,6 +2014,8 @@ class AedtPoolService:
                   AND s.drain_requested_at IS NULL
                   {allocation_predicate}
                   {account_predicate}
+                  {node_predicate}
+                  {partition_predicate}
                 ORDER BY (used_slots + held_slots) DESC,
                          COALESCE(s.idle_since, s.created_at) ASC, s.id ASC
                 """,
@@ -1984,7 +2056,11 @@ class AedtPoolService:
             if selected is None:
                 conn.execute(
                     """
-                    UPDATE tasks SET requested_allocation_id = 0, node_name = '',
+                    UPDATE tasks
+                    SET requested_allocation_id = 0,
+                        node_name = CASE
+                            WHEN node_name_policy = 'strict' THEN node_name
+                            ELSE '' END,
                         updated_at = ?
                     WHERE id = ? AND status = 'queued'
                     """,
@@ -6588,11 +6664,17 @@ class AedtPoolService:
 
         live_project_rows = conn.execute(
             """
-            SELECT l.id AS lease_id, l.task_id, l.exclusive_session,
+            SELECT l.id AS lease_id, l.task_id, l.session_id AS placement_session_id,
+                   s.node_name AS placement_node_name,
+                   sa.partition AS placement_partition,
+                   l.exclusive_session,
                    l.placement_group, l.workload_family, l.isolation_policy,
                    COALESCE(sa.account_name, ra.account_name, '') AS reserved_account,
                    t.name, t.project, t.requested_account_name,
                    t.account_name AS task_account_name,
+                   t.node_name AS task_node_name,
+                   t.node_name_policy AS task_node_name_policy,
+                   t.partition AS task_partition,
                    t.required_capability, t.env_profile,
                    t.env_setup, t.command
             FROM aedt_project_leases l
@@ -6609,13 +6691,19 @@ class AedtPoolService:
         live_projects = len(live_project_rows)
         queued_backlog_rows = conn.execute(
             """
-            SELECT t.id AS task_id, t.name, t.project,
+            SELECT t.id AS task_id, r.session_id AS placement_session_id,
+                   s.node_name AS placement_node_name,
+                   a.partition AS placement_partition,
+                   t.name, t.project,
                    t.requested_account_name,
                    t.account_name AS task_account_name,
                    t.required_capability, t.env_profile,
                    COALESCE(r.workload_family, '') AS reserved_family,
                    COALESCE(r.isolation_policy, '') AS reserved_policy,
                    COALESCE(a.account_name, '') AS reserved_account,
+                   t.node_name AS task_node_name,
+                   t.node_name_policy AS task_node_name_policy,
+                   t.partition AS task_partition,
                    t.env_setup, t.command
             FROM tasks t
             LEFT JOIN aedt_exact_session_reservations r
@@ -6635,7 +6723,38 @@ class AedtPoolService:
             """
         ).fetchall()
         queued_pooled_task_backlog = len(queued_backlog_rows)
-        demand_entries: list[tuple[str, str, bool, bool, bool]] = []
+
+        def strict_route_for_row(row: Any) -> tuple[str, str]:
+            try:
+                policy = normalize_node_name_policy(
+                    str(row["task_node_name_policy"] or "")
+                )
+            except ValueError:
+                policy = NodeNamePolicy.STRICT.value
+            if policy != NodeNamePolicy.STRICT.value:
+                return "", "auto"
+            node_name = str(row["task_node_name"] or "").strip()
+            if not node_name:
+                # API/DB writers reject this shape.  Do not turn a corrupt
+                # strict row into generic capacity demand.
+                return "", "auto"
+            partition = str(row["task_partition"] or "auto").strip() or "auto"
+            return node_name, partition
+
+        demand_entries: list[
+            tuple[
+                str,
+                str,
+                bool,
+                bool,
+                bool,
+                str,
+                str,
+                int,
+                str,
+                str,
+            ]
+        ] = []
         for row in live_project_rows:
             family = str(
                 row["workload_family"] or row["placement_group"] or ""
@@ -6643,6 +6762,8 @@ class AedtPoolService:
             if not family:
                 family = f"__legacy_lease_{int(row['lease_id'])}"
             account, durable_route, actionable_route = planned_account_route(row)
+            strict_node, strict_partition = strict_route_for_row(row)
+            placement_session_id = int(row["placement_session_id"] or 0)
             demand_entries.append(
                 (
                     account,
@@ -6651,6 +6772,11 @@ class AedtPoolService:
                     or str(row["isolation_policy"] or "") == "exclusive",
                     durable_route,
                     actionable_route,
+                    strict_node,
+                    strict_partition,
+                    placement_session_id,
+                    str(row["placement_node_name"] or ""),
+                    str(row["placement_partition"] or ""),
                 )
             )
         for row in queued_backlog_rows:
@@ -6660,6 +6786,8 @@ class AedtPoolService:
                     "", str(row["project"] or row["name"] or "")
                 )
             account, durable_route, actionable_route = planned_account_route(row)
+            strict_node, strict_partition = strict_route_for_row(row)
+            placement_session_id = int(row["placement_session_id"] or 0)
             demand_entries.append(
                 (
                     account,
@@ -6667,13 +6795,29 @@ class AedtPoolService:
                     str(row["reserved_policy"] or "") == "exclusive",
                     durable_route,
                     actionable_route,
+                    strict_node,
+                    strict_partition,
+                    placement_session_id,
+                    str(row["placement_node_name"] or ""),
+                    str(row["placement_partition"] or ""),
                 )
             )
         demand_entries = demand_entries[: config.target_projects]
         desired_projects = len(demand_entries)
         desired_exclusive = sum(
             1
-            for _account, _family, exclusive, _durable, _actionable in demand_entries
+            for (
+                _account,
+                _family,
+                exclusive,
+                _durable,
+                _actionable,
+                _strict_node,
+                _strict_partition,
+                _placement_session_id,
+                _placement_node_name,
+                _placement_partition,
+            ) in demand_entries
             if exclusive
         )
         shared_counts: dict[tuple[str, str], int] = {}
@@ -6693,6 +6837,13 @@ class AedtPoolService:
         durable_group_demand: dict[tuple[str, str], int] = {}
         exclusive_counts_by_account: dict[str, int] = {}
         durable_exclusive_counts_by_account: dict[str, int] = {}
+        strict_project_counts_by_route_group: dict[
+            tuple[str, str, str, str], int
+        ] = {}
+        strict_placed_projects_by_session_route_group: dict[
+            tuple[int, str, str, str, str], int
+        ] = {}
+        durable_strict_route_groups: set[tuple[str, str, str, str]] = set()
         unrouted_exclusive_count = 0
         for (
             account,
@@ -6700,6 +6851,11 @@ class AedtPoolService:
             exclusive,
             durable_route,
             actionable_route,
+            strict_node,
+            strict_partition,
+            placement_session_id,
+            placement_node_name,
+            placement_partition,
         ) in demand_entries:
             if not actionable_route:
                 if exclusive:
@@ -6724,6 +6880,35 @@ class AedtPoolService:
                     durable_shared_counts[key] = (
                         durable_shared_counts.get(key, 0) + 1
                     )
+            if strict_node:
+                strict_group = (
+                    "__exclusive__" if exclusive else f"family:{family}"
+                )
+                strict_key = (
+                    account,
+                    strict_node,
+                    strict_partition,
+                    strict_group,
+                )
+                strict_project_counts_by_route_group[strict_key] = (
+                    strict_project_counts_by_route_group.get(strict_key, 0) + 1
+                )
+                if (
+                    placement_session_id > 0
+                    and placement_node_name == strict_node
+                    and _partition_spec_allows(
+                        strict_partition, placement_partition
+                    )
+                ):
+                    placed_key = (placement_session_id, *strict_key)
+                    strict_placed_projects_by_session_route_group[placed_key] = (
+                        strict_placed_projects_by_session_route_group.get(
+                            placed_key, 0
+                        )
+                        + 1
+                    )
+                if durable_route:
+                    durable_strict_route_groups.add(strict_key)
         for account, count in exclusive_counts_by_account.items():
             group_demand[(account, "__exclusive__")] = count
         for account, count in durable_exclusive_counts_by_account.items():
@@ -6742,11 +6927,11 @@ class AedtPoolService:
         }
         if unrouted_exclusive_count:
             unrouted_group_demand["__exclusive__"] = unrouted_exclusive_count
-
         bound_contracts: dict[tuple[int, str], dict[str, Any]] = {}
         for row in conn.execute(
             """
-            SELECT s.id AS session_id, a.account_name,
+            SELECT s.id AS session_id, a.account_name, s.node_name,
+                   a.partition AS allocation_partition,
                    l.workload_family, l.placement_group,
                    l.isolation_policy, l.exclusive_session
             FROM aedt_sessions s
@@ -6771,7 +6956,13 @@ class AedtPoolService:
             key = (int(row["session_id"]), str(row["account_name"] or ""))
             contract = bound_contracts.setdefault(
                 key,
-                {"families": set(), "policies": set(), "exclusive": False},
+                {
+                    "families": set(),
+                    "policies": set(),
+                    "exclusive": False,
+                    "node_name": str(row["node_name"] or ""),
+                    "partition": str(row["allocation_partition"] or ""),
+                },
             )
             family = str(
                 row["workload_family"] or row["placement_group"] or ""
@@ -6786,7 +6977,8 @@ class AedtPoolService:
             )
         for row in conn.execute(
             """
-            SELECT s.id AS session_id, a.account_name,
+            SELECT s.id AS session_id, a.account_name, s.node_name,
+                   a.partition AS allocation_partition,
                    r.workload_family, r.isolation_policy
             FROM aedt_sessions s
             JOIN allocations a ON a.id = s.allocation_id
@@ -6804,7 +6996,13 @@ class AedtPoolService:
             key = (int(row["session_id"]), str(row["account_name"] or ""))
             contract = bound_contracts.setdefault(
                 key,
-                {"families": set(), "policies": set(), "exclusive": False},
+                {
+                    "families": set(),
+                    "policies": set(),
+                    "exclusive": False,
+                    "node_name": str(row["node_name"] or ""),
+                    "partition": str(row["allocation_partition"] or ""),
+                },
             )
             family = str(row["workload_family"] or "").strip().lower()
             if family:
@@ -6817,6 +7015,7 @@ class AedtPoolService:
             )
         bound_sessions_by_group: dict[tuple[str, str], int] = {}
         bound_sessions_by_account: dict[str, int] = {}
+        bound_session_records: list[dict[str, Any]] = []
         for (session_id, account), contract in bound_contracts.items():
             if contract["exclusive"]:
                 group = "__exclusive__"
@@ -6831,6 +7030,15 @@ class AedtPoolService:
             bound_sessions_by_group[key] = bound_sessions_by_group.get(key, 0) + 1
             bound_sessions_by_account[account] = (
                 bound_sessions_by_account.get(account, 0) + 1
+            )
+            bound_session_records.append(
+                {
+                    "session_id": session_id,
+                    "account_name": account,
+                    "node_name": str(contract.get("node_name") or ""),
+                    "partition": str(contract.get("partition") or ""),
+                    "group": group,
+                }
             )
         required_sessions_by_group = {
             key: max(group_demand.get(key, 0), bound_sessions_by_group.get(key, 0))
@@ -6928,6 +7136,184 @@ class AedtPoolService:
             for account in set(usable_sessions_by_account)
             | set(unsatisfied_group_sessions_by_account)
         }
+        bound_group_by_session_id = {
+            int(record["session_id"]): str(record.get("group") or "")
+            for record in bound_session_records
+        }
+        strict_capacity_session_records = [
+            {
+                "session_id": int(row["session_id"]),
+                "account_name": str(row["account_name"] or ""),
+                "node_name": str(row["node_name"] or ""),
+                "partition": str(row["allocation_partition"] or ""),
+                "group": bound_group_by_session_id.get(
+                    int(row["session_id"]), ""
+                ),
+                "free_slots": max(
+                    0,
+                    int(row["slots_total"] or 0)
+                    - int(row["used_slots"] or 0)
+                    - int(row["held_slots"] or 0),
+                ),
+            }
+            for row in conn.execute(
+                """
+                SELECT s.id AS session_id, a.account_name, s.node_name,
+                       a.partition AS allocation_partition, s.slots_total,
+                       (SELECT COUNT(*)
+                        FROM aedt_project_leases l
+                        WHERE l.session_id = s.id
+                          AND l.state IN (
+                              'offered','leased','attaching',
+                              'active','releasing'
+                          )) AS used_slots,
+                       (SELECT COUNT(*)
+                        FROM aedt_exact_session_reservations r
+                        WHERE r.session_id = s.id
+                          AND r.state IN ('reserved','claimed')) AS held_slots
+                FROM aedt_sessions s
+                JOIN allocations a ON a.id = s.allocation_id
+                WHERE (
+                        s.state = 'starting'
+                        AND a.state IN ('warm','active')
+                        AND s.drain_requested_at IS NULL
+                      )
+                   OR (
+                        s.state IN ('ready','busy')
+                        AND a.state IN ('warm','active')
+                        AND s.solve_batch_sealed_at IS NULL
+                        AND s.drain_requested_at IS NULL
+                        AND s.reuse_blocked_at IS NULL
+                        AND s.last_heartbeat_at >= ?
+                      )
+                ORDER BY s.id
+                """,
+                (session_heartbeat_cutoff,),
+            ).fetchall()
+        ]
+
+        def strict_route_matches(
+            *,
+            account: str,
+            node_name: str,
+            requested_partition: str,
+            record: dict[str, Any],
+        ) -> bool:
+            return bool(
+                str(record.get("account_name") or "") == account
+                and str(record.get("node_name") or "") == node_name
+                and _partition_spec_allows(
+                    requested_partition,
+                    str(record.get("partition") or ""),
+                )
+            )
+
+        remaining_free_slots_by_session = {
+            int(record["session_id"]): int(record["free_slots"])
+            for record in strict_capacity_session_records
+        }
+        assigned_group_by_session = {
+            int(record["session_id"]): str(record.get("group") or "")
+            for record in strict_capacity_session_records
+        }
+        strict_start_needed_by_route_group: dict[
+            tuple[str, str, str, str], int
+        ] = {}
+        # Specific partitions consume matching capacity before ``auto`` routes.
+        # Free project slots are consumed once, and an initially empty session
+        # becomes family-bound after its first virtual placement.
+        strict_route_group_order = sorted(
+            strict_project_counts_by_route_group,
+            key=lambda key: (
+                key[0],
+                key[1],
+                1 if key[2] in {"", "auto"} else 0,
+                key[2],
+                key[3],
+            ),
+        )
+        for route_group in strict_route_group_order:
+            account, node_name, partition, group = route_group
+            remaining_projects = int(
+                strict_project_counts_by_route_group[route_group]
+            )
+            for record in strict_capacity_session_records:
+                session_id = int(record["session_id"])
+                if (
+                    remaining_projects <= 0
+                    or not strict_route_matches(
+                        account=account,
+                        node_name=node_name,
+                        requested_partition=partition,
+                        record=record,
+                    )
+                ):
+                    continue
+                placed_projects = (
+                    strict_placed_projects_by_session_route_group.get(
+                        (session_id, *route_group), 0
+                    )
+                )
+                remaining_projects = max(
+                    0, remaining_projects - placed_projects
+                )
+            for record in strict_capacity_session_records:
+                session_id = int(record["session_id"])
+                assigned_group = assigned_group_by_session.get(session_id, "")
+                if (
+                    remaining_projects <= 0
+                    or not strict_route_matches(
+                        account=account,
+                        node_name=node_name,
+                        requested_partition=partition,
+                        record=record,
+                    )
+                    or assigned_group not in {"", group}
+                ):
+                    continue
+                free_slots = remaining_free_slots_by_session.get(session_id, 0)
+                if free_slots <= 0:
+                    continue
+                available_projects = (
+                    min(1, free_slots)
+                    if group == "__exclusive__"
+                    else free_slots
+                )
+                consumed = min(remaining_projects, available_projects)
+                if consumed <= 0:
+                    continue
+                remaining_projects -= consumed
+                remaining_free_slots_by_session[session_id] = (
+                    free_slots - consumed
+                )
+                assigned_group_by_session[session_id] = group
+            if remaining_projects > 0:
+                strict_start_needed_by_route_group[route_group] = (
+                    remaining_projects
+                    if group == "__exclusive__"
+                    else math.ceil(
+                        remaining_projects / config.projects_per_session
+                    )
+                )
+        strict_start_needed_by_route: dict[tuple[str, str, str], int] = {}
+        durable_strict_start_needed_by_account: dict[str, int] = {}
+        for route_group, count in strict_start_needed_by_route_group.items():
+            route = route_group[:3]
+            strict_start_needed_by_route[route] = (
+                strict_start_needed_by_route.get(route, 0) + count
+            )
+            if route_group in durable_strict_route_groups:
+                durable_strict_start_needed_by_account[route[0]] = (
+                    durable_strict_start_needed_by_account.get(route[0], 0)
+                    + count
+                )
+        strict_start_needed_by_account: dict[str, int] = {}
+        for (account, _node_name, _partition), count in (
+            strict_start_needed_by_route.items()
+        ):
+            strict_start_needed_by_account[account] = (
+                strict_start_needed_by_account.get(account, 0) + count
+            )
         demand_start_needed_by_account = {
             account: max(
                 0,
@@ -6940,6 +7326,11 @@ class AedtPoolService:
             for account, count in demand_start_needed_by_account.items()
             if count > 0
         }
+        for account, strict_count in strict_start_needed_by_account.items():
+            demand_start_needed_by_account[account] = max(
+                demand_start_needed_by_account.get(account, 0),
+                strict_count,
+            )
         durable_unsatisfied_group_sessions_by_account: dict[str, int] = {}
         for (account, group), required in durable_group_demand.items():
             durable_unsatisfied_group_sessions_by_account[account] = (
@@ -6961,6 +7352,13 @@ class AedtPoolService:
             for account, count in durable_demand_start_needed_by_account.items()
             if count > 0
         }
+        for account, strict_count in (
+            durable_strict_start_needed_by_account.items()
+        ):
+            durable_demand_start_needed_by_account[account] = max(
+                durable_demand_start_needed_by_account.get(account, 0),
+                strict_count,
+            )
         demand_start_needed = sum(demand_start_needed_by_account.values())
         spare_capacity_after_demand = sum(
             max(
@@ -7130,29 +7528,83 @@ class AedtPoolService:
             for account, count in start_needed_by_account.items()
             if account in excluded_start_accounts and count > 0
         }
-        if excluded_start_accounts:
-            start_needed_by_account = {
-                account: count
-                for account, count in start_needed_by_account.items()
-                if account not in excluded_start_accounts and count > 0
-            }
-            start_needed = sum(start_needed_by_account.values())
-        if start_needed > global_start_budget:
-            remaining = dict(start_needed_by_account)
-            limited: dict[str, int] = {}
-            order = sorted(remaining)
-            while sum(limited.values()) < global_start_budget and any(
-                remaining.values()
-            ):
-                for account in order:
-                    if remaining.get(account, 0) <= 0:
-                        continue
-                    limited[account] = limited.get(account, 0) + 1
-                    remaining[account] -= 1
-                    if sum(limited.values()) >= global_start_budget:
-                        break
-            start_needed_by_account = limited
-            start_needed = sum(start_needed_by_account.values())
+        eligible_start_needed_by_account = {
+            account: count
+            for account, count in start_needed_by_account.items()
+            if account not in excluded_start_accounts and count > 0
+        }
+        eligible_strict_start_needed_by_route = {
+            route: count
+            for route, count in strict_start_needed_by_route.items()
+            if route[0] not in excluded_start_accounts and count > 0
+        }
+        limited_strict_start_needed_by_route: dict[
+            tuple[str, str, str], int
+        ] = {}
+        remaining_global_start_budget = global_start_budget
+        for route, count in sorted(
+            eligible_strict_start_needed_by_route.items(),
+            key=lambda item: (
+                item[0][0],
+                item[0][1],
+                1 if item[0][2] in {"", "auto"} else 0,
+                item[0][2],
+            ),
+        ):
+            granted = min(max(0, int(count)), remaining_global_start_budget)
+            if granted:
+                limited_strict_start_needed_by_route[route] = granted
+                remaining_global_start_budget -= granted
+            if remaining_global_start_budget <= 0:
+                break
+        requested_strict_by_account: dict[str, int] = {}
+        limited_strict_by_account: dict[str, int] = {}
+        for (account, _node_name, _partition), count in (
+            eligible_strict_start_needed_by_route.items()
+        ):
+            requested_strict_by_account[account] = (
+                requested_strict_by_account.get(account, 0) + count
+            )
+        for (account, _node_name, _partition), count in (
+            limited_strict_start_needed_by_route.items()
+        ):
+            limited_strict_by_account[account] = (
+                limited_strict_by_account.get(account, 0) + count
+            )
+        generic_start_needed_by_account = {
+            account: max(
+                0,
+                count - requested_strict_by_account.get(account, 0),
+            )
+            for account, count in eligible_start_needed_by_account.items()
+        }
+        generic_start_needed_by_account = {
+            account: count
+            for account, count in generic_start_needed_by_account.items()
+            if count > 0
+        }
+        limited_generic_start_needed_by_account: dict[str, int] = {}
+        remaining_generic = dict(generic_start_needed_by_account)
+        generic_order = sorted(remaining_generic)
+        while remaining_global_start_budget > 0 and any(
+            remaining_generic.values()
+        ):
+            for account in generic_order:
+                if remaining_generic.get(account, 0) <= 0:
+                    continue
+                limited_generic_start_needed_by_account[account] = (
+                    limited_generic_start_needed_by_account.get(account, 0) + 1
+                )
+                remaining_generic[account] -= 1
+                remaining_global_start_budget -= 1
+                if remaining_global_start_budget <= 0:
+                    break
+        start_needed_by_account = dict(limited_strict_by_account)
+        for account, count in limited_generic_start_needed_by_account.items():
+            start_needed_by_account[account] = (
+                start_needed_by_account.get(account, 0) + count
+            )
+        start_needed = sum(start_needed_by_account.values())
         idle_cutoff = _sql_time(self._now() - timedelta(seconds=config.idle_ttl_seconds))
         idle_drainable = int(
             conn.execute(
@@ -7241,17 +7693,90 @@ class AedtPoolService:
             ).fetchall()
         }
         placements: list[dict[str, Any]] = []
-        remaining_starts_by_account = dict(start_needed_by_account)
-        for allocation in sorted(
+        ordered_allocations = sorted(
             allocations,
-            key=lambda row: (current_by_allocation.get(int(row["id"]), 0), int(row["id"])),
+            key=lambda row: (
+                current_by_allocation.get(int(row["id"]), 0),
+                int(row["id"]),
+            ),
+        )
+        planned_sessions_by_allocation: dict[int, int] = {}
+
+        def allocation_matches_strict_route(
+            allocation: dict[str, Any],
+            route: tuple[str, str, str],
+        ) -> bool:
+            account, node_name, requested_partition = route
+            return bool(
+                str(allocation.get("account_name") or "") == account
+                and str(allocation.get("node_name") or "") == node_name
+                and _partition_spec_allows(
+                    requested_partition,
+                    str(allocation.get("partition") or ""),
+                )
+            )
+
+        remaining_strict_starts_by_route = dict(
+            limited_strict_start_needed_by_route
+        )
+        for route in sorted(
+            remaining_strict_starts_by_route,
+            key=lambda item: (
+                item[0],
+                item[1],
+                1 if item[2] in {"", "auto"} else 0,
+                item[2],
+            ),
         ):
+            route_need = remaining_strict_starts_by_route[route]
+            for allocation in ordered_allocations:
+                if route_need <= 0:
+                    break
+                if not allocation_matches_strict_route(allocation, route):
+                    continue
+                allocation_id = int(allocation["id"])
+                current_sessions = (
+                    current_by_allocation.get(allocation_id, 0)
+                    + planned_sessions_by_allocation.get(allocation_id, 0)
+                )
+                capacity = self._allocation_session_capacity(
+                    allocation, config, current_sessions=current_sessions
+                )
+                free = max(0, capacity - current_sessions)
+                granted = min(free, route_need)
+                for _ in range(granted):
+                    placements.append(
+                        {
+                            "allocation_id": allocation_id,
+                            "account_name": route[0],
+                            "node_name": route[1],
+                            "strict_node_placement": True,
+                            "requested_partition": route[2],
+                        }
+                    )
+                if granted:
+                    planned_sessions_by_allocation[allocation_id] = (
+                        planned_sessions_by_allocation.get(allocation_id, 0)
+                        + granted
+                    )
+                    route_need -= granted
+            remaining_strict_starts_by_route[route] = route_need
+
+        remaining_generic_starts_by_account = dict(
+            limited_generic_start_needed_by_account
+        )
+        for allocation in ordered_allocations:
             account_name = str(allocation.get("account_name") or "")
-            account_need = remaining_starts_by_account.get(account_name, 0)
+            account_need = remaining_generic_starts_by_account.get(
+                account_name, 0
+            )
             if account_need <= 0:
                 continue
             allocation_id = int(allocation["id"])
-            current_sessions = current_by_allocation.get(allocation_id, 0)
+            current_sessions = (
+                current_by_allocation.get(allocation_id, 0)
+                + planned_sessions_by_allocation.get(allocation_id, 0)
+            )
             capacity = self._allocation_session_capacity(
                 allocation, config, current_sessions=current_sessions
             )
@@ -7265,34 +7790,125 @@ class AedtPoolService:
                         "node_name": str(allocation.get("node_name") or ""),
                     }
                 )
-            remaining_starts_by_account[account_name] = account_need - granted
-            if not any(remaining_starts_by_account.values()):
+            if granted:
+                planned_sessions_by_allocation[allocation_id] = (
+                    planned_sessions_by_allocation.get(allocation_id, 0)
+                    + granted
+                )
+            remaining_generic_starts_by_account[account_name] = (
+                account_need - granted
+            )
+            if not any(remaining_generic_starts_by_account.values()):
                 break
-        unplaced_by_account = {
-            account: count
-            for account, count in remaining_starts_by_account.items()
-            if count > 0
-        }
+        unplaced_strict_by_account: dict[str, int] = {}
+        for (account, _node_name, _partition), count in (
+            remaining_strict_starts_by_route.items()
+        ):
+            if count > 0:
+                unplaced_strict_by_account[account] = (
+                    unplaced_strict_by_account.get(account, 0) + count
+                )
+        unplaced_by_account = dict(unplaced_strict_by_account)
+        for account, count in remaining_generic_starts_by_account.items():
+            if count <= 0:
+                continue
+            unplaced_by_account[account] = (
+                unplaced_by_account.get(account, 0) + count
+            )
         unplaced = sum(unplaced_by_account.values())
         # Pending dedicated nodes already consume a Slurm request/account slot.
-        # Count their future session capacity so every runtime tick does not
-        # request another batch while Slurm is still queueing the first one.
+        # Strict demand consumes only exact-node/partition future capacity
+        # first; generic demand may then use the unconsumed remainder.
         pending_capacity_by_account: dict[str, int] = {}
+        pending_capacity_by_allocation: dict[int, int] = {}
         for allocation in pending_allocations:
             account_name = str(allocation.get("account_name") or "")
+            capacity = self._allocation_session_capacity(allocation, config)
+            pending_capacity_by_allocation[int(allocation["id"])] = capacity
             pending_capacity_by_account[account_name] = (
                 pending_capacity_by_account.get(account_name, 0)
-                + self._allocation_session_capacity(allocation, config)
+                + capacity
             )
         pending_capacity = sum(pending_capacity_by_account.values())
-        unplaced_after_pending_by_account = {
+        remaining_pending_capacity_by_allocation = dict(
+            pending_capacity_by_allocation
+        )
+        strict_pending_capacity_by_route: dict[
+            tuple[str, str, str], int
+        ] = {}
+        strict_unplaced_after_pending_by_route: dict[
+            tuple[str, str, str], int
+        ] = {}
+        for route in sorted(
+            remaining_strict_starts_by_route,
+            key=lambda item: (
+                item[0],
+                item[1],
+                1 if item[2] in {"", "auto"} else 0,
+                item[2],
+            ),
+        ):
+            remaining = max(0, int(remaining_strict_starts_by_route[route]))
+            for allocation in sorted(
+                pending_allocations, key=lambda item: int(item["id"])
+            ):
+                allocation_id = int(allocation["id"])
+                available = remaining_pending_capacity_by_allocation.get(
+                    allocation_id, 0
+                )
+                if (
+                    remaining <= 0
+                    or available <= 0
+                    or not allocation_matches_strict_route(allocation, route)
+                ):
+                    continue
+                consumed = min(remaining, available)
+                remaining -= consumed
+                remaining_pending_capacity_by_allocation[allocation_id] = (
+                    available - consumed
+                )
+                strict_pending_capacity_by_route[route] = (
+                    strict_pending_capacity_by_route.get(route, 0) + consumed
+                )
+            if remaining > 0:
+                strict_unplaced_after_pending_by_route[route] = remaining
+        remaining_pending_capacity_by_account: dict[str, int] = {}
+        pending_allocation_by_id = {
+            int(allocation["id"]): allocation
+            for allocation in pending_allocations
+        }
+        for allocation_id, capacity in (
+            remaining_pending_capacity_by_allocation.items()
+        ):
+            allocation = pending_allocation_by_id[allocation_id]
+            account_name = str(allocation.get("account_name") or "")
+            remaining_pending_capacity_by_account[account_name] = (
+                remaining_pending_capacity_by_account.get(account_name, 0)
+                + capacity
+            )
+        generic_unplaced_after_pending_by_account = {
             account: max(
                 0,
-                count - pending_capacity_by_account.get(account, 0),
+                count
+                - remaining_pending_capacity_by_account.get(account, 0),
             )
-            for account, count in unplaced_by_account.items()
+            for account, count in remaining_generic_starts_by_account.items()
+            if count > 0
         }
-        unplaced_after_pending = sum(unplaced_after_pending_by_account.values())
+        unplaced_after_pending_by_account: dict[str, int] = {}
+        for (account, _node_name, _partition), count in (
+            strict_unplaced_after_pending_by_route.items()
+        ):
+            unplaced_after_pending_by_account[account] = (
+                unplaced_after_pending_by_account.get(account, 0) + count
+            )
+        for account, count in (
+            generic_unplaced_after_pending_by_account.items()
+        ):
+            if count > 0:
+                unplaced_after_pending_by_account[account] = (
+                    unplaced_after_pending_by_account.get(account, 0) + count
+                )
         shape_cpus = max(
             [
                 int(row.get("total_cpus") or 0)
@@ -7321,18 +7937,48 @@ class AedtPoolService:
         )
         node_requests_by_account = {
             account: math.ceil(count / sessions_per_new_node)
-            for account, count in unplaced_after_pending_by_account.items()
+            for account, count in (
+                generic_unplaced_after_pending_by_account.items()
+            )
             if count > 0
         }
         node_request_session_counts_by_account: dict[str, list[int]] = {}
         for account, request_count in node_requests_by_account.items():
-            sessions = unplaced_after_pending_by_account[account]
+            sessions = generic_unplaced_after_pending_by_account[account]
             whole, extra = divmod(sessions, request_count)
             node_request_session_counts_by_account[account] = [
                 whole + (1 if index < extra else 0)
                 for index in range(request_count)
             ]
-        node_requests = sum(node_requests_by_account.values())
+        strict_node_request_specs: list[dict[str, Any]] = []
+        for (
+            account,
+            node_name,
+            partition,
+        ), sessions in sorted(
+            strict_unplaced_after_pending_by_route.items(),
+            key=lambda item: (
+                item[0][0],
+                item[0][1],
+                1 if item[0][2] in {"", "auto"} else 0,
+                item[0][2],
+            ),
+        ):
+            request_count = math.ceil(sessions / sessions_per_new_node)
+            whole, extra = divmod(sessions, request_count)
+            strict_node_request_specs.extend(
+                {
+                    "account_name": account,
+                    "node_name": node_name,
+                    "partition": partition,
+                    "session_count": whole + (1 if index < extra else 0),
+                }
+                for index in range(request_count)
+            )
+        node_requests = (
+            sum(node_requests_by_account.values())
+            + len(strict_node_request_specs)
+        )
         if warm_spare_deficit and not warm_spare_status_reason:
             if demand_sessions + config.min_idle_sessions > config.max_sessions:
                 warm_spare_status_reason = (
@@ -7384,10 +8030,45 @@ class AedtPoolService:
             "rebalance_drains_by_account": rebalance_drains_by_account,
             "idle_drainable_sessions": idle_drainable,
             "placements": placements,
+            "strict_node_start_needed": [
+                {
+                    "account_name": account,
+                    "node_name": node_name,
+                    "partition": partition,
+                    "session_count": count,
+                }
+                for (account, node_name, partition), count in sorted(
+                    limited_strict_start_needed_by_route.items()
+                )
+            ],
+            "strict_node_unplaced_sessions": [
+                {
+                    "account_name": account,
+                    "node_name": node_name,
+                    "partition": partition,
+                    "session_count": count,
+                }
+                for (account, node_name, partition), count in sorted(
+                    remaining_strict_starts_by_route.items()
+                )
+                if count > 0
+            ],
             "unplaced_sessions": unplaced,
             "unplaced_sessions_by_account": unplaced_by_account,
             "pending_node_session_capacity": pending_capacity,
             "pending_node_session_capacity_by_account": pending_capacity_by_account,
+            "strict_node_pending_capacity": [
+                {
+                    "account_name": account,
+                    "node_name": node_name,
+                    "partition": partition,
+                    "session_count": count,
+                }
+                for (account, node_name, partition), count in sorted(
+                    strict_pending_capacity_by_route.items()
+                )
+                if count > 0
+            ],
             "pending_replan_allocation_ids": sorted(
                 pending_replan_reasons_by_id
             ),
@@ -7406,6 +8087,7 @@ class AedtPoolService:
             "node_request_session_counts_by_account": (
                 node_request_session_counts_by_account
             ),
+            "strict_node_request_specs": strict_node_request_specs,
             "sessions_per_new_node": sessions_per_new_node,
             "state_counts": state_counts,
             "lease_counts": lease_counts,
@@ -9232,14 +9914,30 @@ class AedtPoolRuntime:
         plan["hard_pending_replan_closed_count"] = len(
             pending_replan["closed_ids"]
         )
-        raw_requests_by_account = plan.get("node_requests_by_account") or {
-            config.account_name: int(plan.get("node_requests") or 0)
-        }
+        raw_requests_by_account = plan.get("node_requests_by_account")
+        if not isinstance(raw_requests_by_account, dict):
+            raw_requests_by_account = {
+                config.account_name: int(plan.get("node_requests") or 0)
+            }
         request_counts = {
             str(account_name or ""): max(0, int(count))
             for account_name, count in raw_requests_by_account.items()
             if int(count) > 0
         }
+        strict_request_specs = [
+            {
+                "account_name": str(spec.get("account_name") or ""),
+                "node_name": str(spec.get("node_name") or "").strip(),
+                "partition": str(spec.get("partition") or "auto").strip()
+                or "auto",
+                "session_count": max(
+                    1, int(spec.get("session_count") or 1)
+                ),
+            }
+            for spec in (plan.get("strict_node_request_specs") or [])
+            if isinstance(spec, dict)
+            and str(spec.get("node_name") or "").strip()
+        ]
         # Never cancel and immediately recreate the same hard-pending account
         # request in one tick. Flexible cohorts have already been rerouted by
         # the batch planner; explicit pinned demand gets a fresh Slurm snapshot
@@ -9256,11 +9954,24 @@ class AedtPoolRuntime:
             account: request_counts.pop(account)
             for account in sorted(set(request_counts) & suppressed_accounts)
         }
+        suppressed_strict_request_specs = [
+            spec
+            for spec in strict_request_specs
+            if spec["account_name"] in suppressed_accounts
+        ]
+        strict_request_specs = [
+            spec
+            for spec in strict_request_specs
+            if spec["account_name"] not in suppressed_accounts
+        ]
         plan["hard_pending_replan_suppressed_node_requests_by_account"] = (
             suppressed_request_counts
         )
+        plan["hard_pending_replan_suppressed_strict_node_request_specs"] = (
+            suppressed_strict_request_specs
+        )
         request_budget = min(
-            sum(request_counts.values()),
+            len(strict_request_specs) + sum(request_counts.values()),
             int(plan.get("node_requests") or 0),
             config.scale_step_nodes,
         )
@@ -9274,8 +9985,12 @@ class AedtPoolRuntime:
         if account_order:
             offset = self._account_request_cursor % len(account_order)
             account_order = account_order[offset:] + account_order[:offset]
-        requests_by_account: list[tuple[str, int]] = []
-        while len(requests_by_account) < request_budget and any(
+        request_specs: list[dict[str, Any]] = [
+            {**spec, "strict_node_placement": True}
+            for spec in strict_request_specs[:request_budget]
+        ]
+        generic_request_count = 0
+        while len(request_specs) < request_budget and any(
             request_counts.values()
         ):
             for account_name in account_order:
@@ -9283,17 +9998,31 @@ class AedtPoolRuntime:
                     continue
                 quotas = session_counts_by_account.get(account_name, [])
                 session_quota = quotas.pop(0) if quotas else 0
-                requests_by_account.append((account_name, session_quota))
+                request_specs.append(
+                    {
+                        "account_name": account_name,
+                        "node_name": "",
+                        "partition": "auto",
+                        "session_count": session_quota,
+                        "strict_node_placement": False,
+                    }
+                )
+                generic_request_count += 1
                 request_counts[account_name] -= 1
-                if len(requests_by_account) >= request_budget:
+                if len(request_specs) >= request_budget:
                     break
-        if account_order and requests_by_account:
+        if account_order and generic_request_count:
             self._account_request_cursor = (
-                self._account_request_cursor + len(requests_by_account)
+                self._account_request_cursor + generic_request_count
             ) % len(account_order)
         opened = 0
         opened_by_account: dict[str, int] = {}
-        for account_name, session_quota in requests_by_account:
+        opened_strict_specs: list[dict[str, Any]] = []
+        for request_spec in request_specs:
+            account_name = str(request_spec["account_name"])
+            session_quota = int(request_spec["session_count"])
+            requested_node_name = str(request_spec["node_name"])
+            requested_partition = str(request_spec["partition"])
             allocation = self.scheduler.open_allocation_record(
                 "AEDT pool project demand",
                 resource_pool="cpu",
@@ -9326,6 +10055,8 @@ class AedtPoolRuntime:
                 # may borrow idle GPU nodes, but the long-lived AEDT pool must
                 # not consume GPU partitions as a fallback.
                 cpu_only_nodes=True,
+                requested_node_name=requested_node_name,
+                requested_partition=requested_partition,
             )
             if not allocation:
                 continue
@@ -9334,8 +10065,11 @@ class AedtPoolRuntime:
             opened_by_account[actual_account] = (
                 opened_by_account.get(actual_account, 0) + 1
             )
+            if bool(request_spec.get("strict_node_placement")):
+                opened_strict_specs.append(dict(request_spec))
         plan["node_allocations_opened"] = opened
         plan["node_allocations_opened_by_account"] = opened_by_account
+        plan["strict_node_allocations_opened"] = opened_strict_specs
         if control_plane_just_published:
             # Publishing precedes full tunnel readiness.  One normal tick is a
             # small, bounded grace that avoids launching into that half-up gap.

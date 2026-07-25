@@ -163,7 +163,7 @@ Meanings:
 - `cpu_footprint_maturity_seconds`: short fallback grace while load samples catch up. Fresh allocation-local `sstat` utilization is already authoritative and is not charged this declaration again. Set `0` to disable the CPU grace.
 - `load_target`: attach only while `pestat` CPU load is at or below `cpu_total * load_target`. For `fea_bursty`, the scheduler may exceed a task's `max_workers_per_node` baseline when both load budget and free-memory budget are still healthy.
 - `max_attach_per_loop`: maximum new `fea_bursty` tasks the scheduler starts in one tick.
-- `node_name_policy`: `preferred` treats `node_name` on CPU `fea_bursty` tasks as a preferred node with healthy-node fallback; `strict` preserves exact-node matching.
+- `node_name_policy`: `preferred` treats `node_name` on CPU `fea_bursty` tasks as a preferred node with healthy-node fallback; `strict` preserves exact-node matching. This remains the default for existing/API-omitted tasks. An individual `POST /api/tasks` request can set `"node_name_policy": "strict"` with a non-empty `node_name` to opt into a durable fail-closed exact-node contract without changing this global default.
 - `overload_scale_out_load_factor`: when scheduler-owned running/attaching FEA requested CPU on a physical node is greater than owned CPU by this factor, the node is considered overloaded for FEA scale-out. This does not use node-wide `pestat` load, because that includes other users.
 - `overload_scale_out_seconds`: sustained overload duration before opening one additional CPU pool for FEA distribution.
 

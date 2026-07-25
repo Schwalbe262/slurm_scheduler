@@ -6943,6 +6943,103 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
             session_id = int(cursor.lastrowid)
         return allocation_id, session_id
 
+    def test_strict_node_preadmission_filters_sessions_and_never_clears_request(
+        self,
+    ) -> None:
+        matching_task = self.db.create_task(
+            TaskCreate(
+                name="strict-pooled-match",
+                remote_cwd="/work/strict-pooled-match",
+                command="true",
+                aedt_backend="pooled",
+                node_name="cpu-01",
+                node_name_policy="strict",
+            )
+        )
+        matching = self.service.prepare_pooled_task_session(
+            task_id=matching_task,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="strict-family",
+            isolation_policy="family",
+        )
+        self.assertIsNotNone(matching)
+        matching_row = self.db.get_task(matching_task)
+        self.assertEqual(matching_row["node_name"], "cpu-01")
+        self.assertEqual(matching_row["node_name_policy"], "strict")
+
+        missing_task = self.db.create_task(
+            TaskCreate(
+                name="strict-pooled-missing",
+                remote_cwd="/work/strict-pooled-missing",
+                command="true",
+                aedt_backend="pooled",
+                node_name="cpu-99",
+                node_name_policy="strict",
+            )
+        )
+        missing = self.service.prepare_pooled_task_session(
+            task_id=missing_task,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="strict-family",
+            isolation_policy="family",
+        )
+        self.assertIsNone(missing)
+        missing_row = self.db.get_task(missing_task)
+        self.assertEqual(int(missing_row["requested_allocation_id"] or 0), 0)
+        self.assertEqual(missing_row["node_name"], "cpu-99")
+        self.assertEqual(missing_row["node_name_policy"], "strict")
+
+    def test_strict_node_preadmission_rejects_same_node_wrong_partition(
+        self,
+    ) -> None:
+        task_id = self.db.create_task(
+            TaskCreate(
+                name="strict-pooled-wrong-partition",
+                remote_cwd="/work/strict-pooled-wrong-partition",
+                command="true",
+                aedt_backend="pooled",
+                partition="cpu-other",
+                node_name="cpu-01",
+                node_name_policy="strict",
+            )
+        )
+
+        reservation = self.service.prepare_pooled_task_session(
+            task_id=task_id,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="strict-family",
+            isolation_policy="family",
+        )
+
+        self.assertIsNone(reservation)
+        task = self.db.get_task(task_id)
+        self.assertEqual(int(task["requested_allocation_id"] or 0), 0)
+        self.assertEqual(task["node_name"], "cpu-01")
+        self.assertEqual(task["partition"], "cpu-other")
+
+        matching_task_id = self.db.create_task(
+            TaskCreate(
+                name="strict-pooled-partition-spec-match",
+                remote_cwd="/work/strict-pooled-partition-spec-match",
+                command="true",
+                aedt_backend="pooled",
+                partition="cpu-other,cpu",
+                node_name="cpu-01",
+                node_name_policy="strict",
+            )
+        )
+        matching = self.service.prepare_pooled_task_session(
+            task_id=matching_task_id,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            workload_family="strict-family",
+            isolation_policy="family",
+        )
+        self.assertIsNotNone(matching)
+        self.assertEqual(
+            int(self.db.get_task(matching_task_id)["requested_allocation_id"]),
+            int(matching["allocation_id"]),
+        )
+
     def test_flexible_preadmission_uses_storage_selected_account_outside_lock(
         self,
     ) -> None:
@@ -8131,6 +8228,327 @@ class AedtRuntimeCapacityTests(AedtPoolTestCase):
         self.assertEqual(plan["node_request_session_counts_by_account"], {"": [2]})
         self.assertEqual(plan["node_allocations_opened"], 1)
         self.assertEqual(fake.open_calls[0]["aedt_pool_max_sessions"], 2)
+
+    def test_strict_pooled_demand_opens_only_requested_node_and_partition(
+        self,
+    ) -> None:
+        self.service.set_operator_limits(
+            max_sessions=4,
+            target_projects=3,
+            projects_per_session=3,
+        )
+        self.make_operational()
+        self.db.create_task(
+            TaskCreate(
+                name="strict-targeted-pool",
+                remote_cwd="/work/strict-targeted-pool",
+                command="true",
+                account_name="a",
+                aedt_backend="pooled",
+                project="strict-placement-project",
+                partition="cpu2",
+                node_name="cpu-09",
+                node_name_policy="strict",
+            )
+        )
+        fake = FakeRuntimeScheduler()
+        runtime = AedtPoolRuntime(self.service, fake, interval_seconds=30)
+
+        plan = runtime.tick()
+
+        self.assertEqual(plan["node_requests_by_account"], {})
+        self.assertEqual(
+            plan["strict_node_request_specs"],
+            [
+                {
+                    "account_name": "a",
+                    "node_name": "cpu-09",
+                    "partition": "cpu2",
+                    "session_count": 1,
+                }
+            ],
+        )
+        self.assertEqual(plan["node_allocations_opened"], 1)
+        self.assertEqual(fake.open_calls[0]["account_name"], "a")
+        self.assertEqual(fake.open_calls[0]["requested_node_name"], "cpu-09")
+        self.assertEqual(fake.open_calls[0]["requested_partition"], "cpu2")
+
+    def test_full_generic_sibling_session_does_not_mask_strict_route_deficit(
+        self,
+    ) -> None:
+        self.service.set_operator_limits(
+            max_sessions=4,
+            target_projects=3,
+            projects_per_session=2,
+        )
+        self.make_operational()
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        allocation_id = self.db.create_allocation(
+            "a", "cpu2", "cpu-09", 9, 2 * 32 * 1024
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state="active",
+            slurm_job_id="strict-full-sibling",
+            drain_reason="AEDT pool project demand",
+            submitted_at=now,
+            started_at=now,
+        )
+        with self.db.connect() as conn:
+            session_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO aedt_sessions (
+                        session_key, allocation_id, account_name, node_name,
+                        endpoint, process_id, session_profile, slots_total,
+                        state, last_heartbeat_at, started_at, created_at,
+                        updated_at
+                    ) VALUES (
+                        'strict-full-sibling-session', ?, 'a', 'cpu-09',
+                        'cpu-09:53001', '53001', ?, 2, 'busy',
+                        ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        allocation_id,
+                        EXPECTED_SESSION_PROFILE_JSON,
+                        now,
+                        now,
+                        now,
+                        now,
+                    ),
+                ).lastrowid
+            )
+            for index in range(2):
+                conn.execute(
+                    """
+                    INSERT INTO aedt_project_leases (
+                        request_key, project_name, placement_group,
+                        workload_family, session_profile, project_namespace,
+                        isolation_policy, protocol_version, session_id,
+                        slot_index, state, client_token_hash, expires_at
+                    ) VALUES (?, ?, 'strict-family', 'strict-family', ?,
+                              'strict-family', 'family', 2,
+                              ?, ?, 'active', 'token',
+                              '2099-01-01 00:00:00')
+                    """,
+                    (
+                        f"strict-full-sibling-{index}",
+                        f"generic-sibling-{index}",
+                        EXPECTED_SESSION_PROFILE_JSON,
+                        session_id,
+                        index,
+                    ),
+                )
+        self.db.create_task(
+            TaskCreate(
+                name="strict-after-full-siblings",
+                remote_cwd="/work/strict-after-full-siblings",
+                command="true",
+                account_name="a",
+                aedt_backend="pooled",
+                project="strict-project",
+                partition="cpu2",
+                node_name="cpu-09",
+                node_name_policy="strict",
+            )
+        )
+
+        plan = self.service.dry_run()
+
+        self.assertEqual(plan["node_requests_by_account"], {})
+        self.assertEqual(
+            plan["strict_node_request_specs"],
+            [
+                {
+                    "account_name": "a",
+                    "node_name": "cpu-09",
+                    "partition": "cpu2",
+                    "session_count": 1,
+                }
+            ],
+        )
+
+    def test_live_strict_project_satisfies_full_strict_route_capacity(
+        self,
+    ) -> None:
+        self.service.set_operator_limits(
+            max_sessions=2,
+            target_projects=1,
+            projects_per_session=1,
+        )
+        self.make_operational()
+        strict_task_id = self.db.create_task(
+            TaskCreate(
+                name="strict-live-full",
+                remote_cwd="/work/strict-live-full",
+                command="true",
+                account_name="a",
+                aedt_backend="pooled",
+                project="strict-live-project",
+                partition="cpu2",
+                node_name="cpu-09",
+                node_name_policy="strict",
+            )
+        )
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        allocation_id = self.db.create_allocation(
+            "a", "cpu2", "cpu-09", 5, 32 * 1024
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state="active",
+            slurm_job_id="strict-live-full",
+            drain_reason="AEDT pool project demand",
+            submitted_at=now,
+            started_at=now,
+        )
+        with self.db.connect() as conn:
+            session_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO aedt_sessions (
+                        session_key, allocation_id, account_name, node_name,
+                        endpoint, process_id, session_profile, slots_total,
+                        state, last_heartbeat_at, started_at, created_at,
+                        updated_at
+                    ) VALUES (
+                        'strict-live-full-session', ?, 'a', 'cpu-09',
+                        'cpu-09:53002', '53002', ?, 1, 'busy',
+                        ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        allocation_id,
+                        EXPECTED_SESSION_PROFILE_JSON,
+                        now,
+                        now,
+                        now,
+                        now,
+                    ),
+                ).lastrowid
+            )
+            conn.execute(
+                """
+                INSERT INTO aedt_project_leases (
+                    request_key, project_name, task_id, placement_group,
+                    workload_family, session_profile, project_namespace,
+                    isolation_policy, protocol_version, session_id,
+                    slot_index, state, client_token_hash, expires_at
+                ) VALUES (
+                    'strict-live-full-lease', 'strict-live-project', ?,
+                    'strict-family', 'strict-family', ?, 'strict-family',
+                    'family', 2, ?, 0, 'active', 'token',
+                    '2099-01-01 00:00:00'
+                )
+                """,
+                (
+                    strict_task_id,
+                    EXPECTED_SESSION_PROFILE_JSON,
+                    session_id,
+                ),
+            )
+
+        plan = self.service.dry_run()
+
+        self.assertEqual(plan["strict_node_request_specs"], [])
+        self.assertEqual(plan["start_needed"], 0)
+
+    def test_strict_pooled_pending_capacity_is_charged_only_on_exact_route(
+        self,
+    ) -> None:
+        self.service.set_operator_limits(
+            max_sessions=4,
+            target_projects=3,
+            projects_per_session=3,
+        )
+        self.make_operational()
+        self.db.create_task(
+            TaskCreate(
+                name="strict-pending-route",
+                remote_cwd="/work/strict-pending-route",
+                command="true",
+                account_name="a",
+                aedt_backend="pooled",
+                project="strict-placement-project",
+                partition="cpu2",
+                node_name="cpu-09",
+                node_name_policy="strict",
+            )
+        )
+        now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
+        wrong_node = self.db.create_allocation(
+            "a", "cpu2", "cpu-08", 13, 3 * 32 * 1024
+        )
+        self.db.update_allocation(
+            wrong_node,
+            state="pending",
+            slurm_job_id=f"pending-{wrong_node}",
+            drain_reason="AEDT pool project demand",
+            submitted_at=now,
+        )
+
+        wrong_only = self.service.dry_run()
+
+        self.assertEqual(len(wrong_only["strict_node_request_specs"]), 1)
+        matching = self.db.create_allocation(
+            "a", "cpu2", "cpu-09", 13, 3 * 32 * 1024
+        )
+        self.db.update_allocation(
+            matching,
+            state="pending",
+            slurm_job_id=f"pending-{matching}",
+            drain_reason="AEDT pool project demand",
+            submitted_at=now,
+        )
+
+        exact_pending = self.service.dry_run()
+
+        self.assertEqual(exact_pending["strict_node_request_specs"], [])
+        self.assertEqual(
+            exact_pending["strict_node_pending_capacity"],
+            [
+                {
+                    "account_name": "a",
+                    "node_name": "cpu-09",
+                    "partition": "cpu2",
+                    "session_count": 1,
+                }
+            ],
+        )
+
+    def test_strict_node_request_precedes_generic_request_under_tick_budget(
+        self,
+    ) -> None:
+        self.make_operational()
+        self.db.set_setting("aedt_pool_scale_step_nodes", "1")
+        self.service._invalidate_config()
+        fake = FakeRuntimeScheduler()
+        runtime = AedtPoolRuntime(self.service, fake, interval_seconds=30)
+        plan = {
+            "node_requests": 2,
+            "node_requests_by_account": {"generic": 1},
+            "node_request_session_counts_by_account": {"generic": [1]},
+            "strict_node_request_specs": [
+                {
+                    "account_name": "strict",
+                    "node_name": "cpu-09",
+                    "partition": "cpu2",
+                    "session_count": 1,
+                }
+            ],
+            "placements": [],
+            "drain_needed": 0,
+            "rebalance_drains_by_account": {},
+        }
+
+        with patch.object(self.service, "reconcile", return_value=plan):
+            runtime.tick()
+
+        self.assertEqual(len(fake.open_calls), 1)
+        self.assertEqual(fake.open_calls[0]["account_name"], "strict")
+        self.assertEqual(fake.open_calls[0]["requested_node_name"], "cpu-09")
+        self.assertEqual(fake.open_calls[0]["requested_partition"], "cpu2")
 
     def test_runtime_interleaves_account_scale_out_across_ticks(self) -> None:
         self.make_operational()

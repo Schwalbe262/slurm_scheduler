@@ -252,6 +252,15 @@
         </div>
 
         <div>
+          <label for="task_node_name_policy">Node policy</label>
+          <select id="task_node_name_policy" name="node_name_policy">
+            <option value="">configured default</option>
+            <option value="preferred">preferred</option>
+            <option value="strict">strict (fail closed)</option>
+          </select>
+        </div>
+
+        <div>
           <label for="task_same_node_as_task_id">Same node as task ID</label>
           <input id="task_same_node_as_task_id" name="same_node_as_task_id" type="number" min="0" value="0">
         </div>
@@ -328,6 +337,7 @@
         task_gpu_model: ["GPU 모델", "특정 GPU가 필요하면 a6000ada 또는 a6000처럼 입력합니다. 여러 후보는 a6000ada,a6000처럼 입력합니다. 비워두면 모델을 고정하지 않습니다."],
         task_partition: ["파티션", "auto이면 스케줄러가 인벤토리를 보고 고릅니다. 특정 파티션이 필요하면 입력합니다."],
         task_node_name: ["노드 이름", "특정 노드에서만 실행해야 할 때만 입력합니다. 비워두면 스케줄러가 선택합니다."],
+        task_node_name_policy: ["노드 정책", "기본값은 설정을 따릅니다. strict는 요청 노드 이외의 배치나 검증 불가능한 배치를 실패 처리합니다."],
         task_same_node_as_task_id: ["Same node as task ID", "지정한 running task와 같은 노드에 붙입니다. 서비스 task의 localhost endpoint를 같은 노드에서 호출할 때 사용합니다."],
         task_exclusive_node: ["노드 독점", "Yes이면 빈 전용 allocation에만 붙습니다. 공유 가능한 작업이면 No를 유지합니다."]
       };

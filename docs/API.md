@@ -427,6 +427,14 @@ curl -sS -X POST "$SCHEDULER_URL/api/tasks" \
   }'
 ```
 
+Opt one task into fail-closed exact-node placement:
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/tasks" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"node-bound-work","remote_cwd":"/remote/project","command":"python run.py","cpus":8,"memory_mb":32768,"scheduling_profile":"fea_bursty","node_name":"n114","node_name_policy":"strict"}'
+```
+
 Co-locate a client task with a running service task's node:
 
 ```bash
@@ -465,6 +473,7 @@ Fields:
 - `timeout_seconds`: nonzero value marks a running task failed with exit code `124` after timeout.
 - `dedupe_key`: if another non-terminal task has the same key, the API returns that task instead of creating a duplicate.
 - `max_workers_per_node`: baseline per-node worker limit. For `fea_bursty`, the scheduler can exceed this baseline when live `pestat` CPU load and free-memory budget show the node can safely accept more tasks.
+- `node_name_policy`: optional per-task placement contract. Omit it to preserve the configured legacy behavior (`fea_bursty.node_name_policy`, normally `preferred`). Set it to `strict` together with a non-empty `node_name` to disable fallback. A strict task opens only exact-node capacity, checks the allocation id and node again immediately before attach, verifies the Slurm job's node immediately before and after launch, pins the nested `srun` step with `--nodelist`, and fails instead of running on an unverified or different node. If a post-launch rejection cannot be cancelled, the task remains durably `attaching` and capacity-owning while cancellation is retried. `preferred` is also accepted as an explicit FEA override.
 - `same_node_as_task_id`: co-locates this task with the referenced running task's actual node. `same_node_as` is accepted as a shorter alias.
 - `cleanup_globs`: list (or comma string) of basename patterns, e.g. `["simulation", "aedt_temp"]`. When the task reaches ANY terminal state — completed, failed, cancelled, timed out, or its allocation was lost — the scheduler deletes matching entries directly under the task's working directory. Use this instead of shell-level `rm` at the end of your command: a killed process never reaches its trailing cleanup, but the scheduler sees every exit path. Bare wildcards and path separators are rejected.
 
@@ -476,7 +485,7 @@ curl -sS "$SCHEDULER_URL/api/tasks/123?include_output=true"
 curl -sS "$SCHEDULER_URL/api/tasks/123?include_diagnostics=true"
 ```
 
-The JSON includes `state`, `status`, `exit_code`, `failure_message`, `assigned_allocation`, `slurm_job_id`, stdout/stderr paths, requested `node_name`, actual `allocation_node_name`/`actual_node_name`, `same_node_as_task_id`, and timestamps. With `include_diagnostics=true`, queued tasks also include computed capacity diagnostics and `queue_reason`. With `include_output=true`, it also includes `stdout`, `stderr`, and `result_json`, where `result_json` is parsed from the final JSON object or array in stdout. Included output is read with the requested `output_limit` and the configured web remote-file caps.
+The JSON includes `state`, `status`, `exit_code`, `failure_message`, `assigned_allocation`, `slurm_job_id`, stdout/stderr paths, requested `node_name`, effective `node_name_policy`, durable `requested_node_name_policy`, `strict_node_placement`, `placement_contract_satisfied`, actual `allocation_node_name`/`actual_node_name`, `same_node_as_task_id`, and timestamps. For a strict task, `placement_contract_satisfied` becomes true only after both live Slurm readbacks passed and the task entered `running`; matching DB node strings alone are not sufficient. With `include_diagnostics=true`, queued tasks also include computed capacity diagnostics and `queue_reason`. With `include_output=true`, it also includes `stdout`, `stderr`, and `result_json`, where `result_json` is parsed from the final JSON object or array in stdout. Included output is read with the requested `output_limit` and the configured web remote-file caps.
 
 The Web UI task detail page is available at `/tasks/{task_id}`. It shows the stored task fields and equivalent JSON/curl/Python examples for submitting the same task again.
 

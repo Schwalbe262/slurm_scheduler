@@ -945,6 +945,56 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertIn("--exact", command)
         self.assertIn("--exclusive", command)
 
+    def test_strict_node_attach_pins_srun_and_checks_compute_node_contract(self) -> None:
+        task = {
+            "cpus": 4,
+            "memory_mb": 8192,
+            "remote_cwd": "~/case",
+            "command": "true",
+            "node_name": "n114",
+            "node_name_policy": "strict",
+            "_strict_allocation_job_id": "12345",
+        }
+        allocation = {
+            "slurm_job_id": "12345",
+            "node_name": "n114",
+        }
+        command = build_srun_attach_command(
+            task,
+            allocation,
+            "/remote/task.sh",
+            "/remote/stdout.log",
+            "/remote/stderr.log",
+            "/remote/exit_code",
+        )
+        script = build_task_script(task)
+
+        self.assertIn("--jobid=12345", command)
+        self.assertIn("--nodelist=n114", command)
+        self.assertIn('${SLURMD_NODENAME:-}', script)
+        self.assertIn("strict node placement mismatch: expected n114", script)
+        self.assertIn('${SLURM_JOB_ID:-}', script)
+        self.assertIn("strict allocation mismatch: expected 12345", script)
+
+    def test_strict_node_attach_builder_rejects_different_allocation_node(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "strict node placement allocation does not match requested node",
+        ):
+            build_srun_attach_command(
+                {
+                    "cpus": 4,
+                    "memory_mb": 8192,
+                    "node_name": "n114",
+                    "node_name_policy": "strict",
+                },
+                {"slurm_job_id": "12345", "node_name": "n115"},
+                "/remote/task.sh",
+                "/remote/stdout.log",
+                "/remote/stderr.log",
+                "/remote/exit_code",
+            )
+
     def test_standard_attached_task_keeps_exact_exclusive_cpu_semantics(self) -> None:
         task = {
             "remote_cwd": "~/case",
@@ -1278,6 +1328,27 @@ class FakeClient:
         return out
 
 
+class NodeReadbackClient(FakeClient):
+    allocation_nodes: dict[str, str] = {}
+    allocation_node_sequences: dict[str, list[str]] = {}
+
+    def allocation_node_name(self, slurm_job_id: str) -> str:
+        sequence = self.allocation_node_sequences.get(slurm_job_id)
+        if sequence:
+            return sequence.pop(0)
+        return self.allocation_nodes.get(slurm_job_id, "")
+
+
+class FailingNodeReadbackCancelClient(NodeReadbackClient):
+    cancel_failures_remaining = 0
+
+    def cancel_task(self, task: dict, allocation_job_id: str = "") -> None:
+        if self.cancel_failures_remaining > 0:
+            type(self).cancel_failures_remaining -= 1
+            raise RuntimeError("temporary task cancellation failure")
+        super().cancel_task(task, allocation_job_id)
+
+
 class QuotaProbeClient(FakeClient):
     quota_probe_calls = 0
     quota_probe_value = StorageQuotaProbe("ext2/ext3")
@@ -1359,6 +1430,9 @@ class SchedulerTests(unittest.TestCase):
         FakeClient.live_steps = {}
         FakeClient.removed = []
         FakeClient.allocation_submission_matches = {}
+        NodeReadbackClient.allocation_nodes = {}
+        NodeReadbackClient.allocation_node_sequences = {}
+        FailingNodeReadbackCancelClient.cancel_failures_remaining = 0
         FakeClient.snapshots = {
             "a": AccountSnapshot("a", running=3, pending=0, max_running=4, max_pending=10, max_total=10),
             "b": AccountSnapshot("b", running=1, pending=1, max_running=4, max_pending=10, max_total=10),
@@ -2652,6 +2726,46 @@ class SchedulerTests(unittest.TestCase):
                             ),
                             task_exclusive == allocation_exclusive,
                         )
+
+    def test_task_partition_constraint_accepts_matching_comma_spec(self) -> None:
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+        allocation = {
+            "id": 1,
+            "account_name": "a",
+            "partition": "cpu2",
+            "node_name": "n009",
+            "total_cpus": 64,
+            "free_cpus": 64,
+            "total_memory_mb": 262144,
+            "free_memory_mb": 262144,
+            "total_gpus": 0,
+            "free_gpus": 0,
+            "resource_pool": "cpu",
+            "exclusive_node": 0,
+        }
+        task = {
+            "cpus": 4,
+            "memory_mb": 8192,
+            "gpus": 0,
+            "partition": "cpu1,cpu2",
+            "node_name": "n009",
+            "exclusive_node": 0,
+        }
+
+        self.assertTrue(
+            scheduler.allocation_matches_task_constraints(
+                allocation,
+                task,
+                include_pending=True,
+            )
+        )
+        self.assertFalse(
+            scheduler.allocation_matches_task_constraints(
+                allocation,
+                {**task, "partition": "cpu3,cpu4"},
+                include_pending=True,
+            )
+        )
 
     def test_dedicated_aedt_allocation_only_admits_pool_owned_tasks(
         self,
@@ -10833,8 +10947,341 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(task["status"], TaskStatus.RUNNING.value)
         self.assertEqual(task["allocation_id"], healthy_id)
         self.assertEqual(task["node_name"], "n114")
+        self.assertEqual(task["node_name_policy"], "")
+        self.assertEqual(scheduler.task_node_name_policy(task), "preferred")
         diagnostics = scheduler.task_queue_diagnostics({**task, "status": TaskStatus.QUEUED.value})
         self.assertTrue(diagnostics["preferred_node_relaxed"])
+
+    def test_fea_bursty_per_task_strict_policy_overrides_preferred_default(self) -> None:
+        blocked_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n114",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        healthy_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n115",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        self.db.update_allocation(
+            blocked_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="blocked",
+        )
+        self.db.update_allocation(
+            healthy_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="healthy",
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n114 cpu1 mix 8 64 12.0 100000 55000 some_job\n"
+                "n115 cpu1 mix 8 64 12.0 100000 95000 some_job\n"
+            )
+        )
+        task_id = self.db.create_task(
+            TaskCreate(
+                "strict-fea",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                node_name="n114",
+                node_name_policy="strict",
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+
+        scheduler.assign_queued_tasks()
+
+        task = self.db.get_task(task_id)
+        self.assertEqual(task["status"], TaskStatus.QUEUED.value)
+        self.assertEqual(scheduler.task_node_name_policy(task), "strict")
+        self.assertFalse(scheduler.task_can_relax_preferred_node(task))
+        self.assertEqual(FakeClient.attached_tasks, [])
+
+    def test_per_task_strict_attach_requires_matching_slurm_node_readback(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n114",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="strict-allocation",
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n114 cpu1 mix 8 64 12.0 100000 95000 some_job\n"
+            )
+        )
+        task_id = self.db.create_task(
+            TaskCreate(
+                "strict-fea",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                node_name="n114",
+                node_name_policy="strict",
+            )
+        )
+        NodeReadbackClient.allocation_nodes["strict-allocation"] = "n114"
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=NodeReadbackClient,
+        )
+
+        scheduler.assign_queued_tasks()
+
+        task = self.db.get_task(task_id)
+        self.assertEqual(task["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(task["allocation_id"], allocation_id)
+        self.assertEqual(NodeReadbackClient.attached_tasks, [task_id])
+
+    def test_per_task_strict_pre_attach_readback_mismatch_fails_without_launch(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n114",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="wrong-node-allocation",
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n114 cpu1 mix 8 64 12.0 100000 95000 some_job\n"
+            )
+        )
+        task_id = self.db.create_task(
+            TaskCreate(
+                "strict-fea",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                node_name="n114",
+                node_name_policy="strict",
+            )
+        )
+        NodeReadbackClient.allocation_nodes["wrong-node-allocation"] = "n115"
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=NodeReadbackClient,
+        )
+
+        scheduler.assign_queued_tasks()
+
+        task = self.db.get_task(task_id)
+        self.assertEqual(task["status"], TaskStatus.FAILED.value)
+        self.assertIn("Slurm readback mismatch", task["failure_message"])
+        self.assertEqual(NodeReadbackClient.attached_tasks, [])
+
+    def test_per_task_strict_attach_rejects_different_allocation_readback(self) -> None:
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=NodeReadbackClient,
+        )
+        error = scheduler.strict_node_attach_readback_error(
+            {
+                "id": 10,
+                "allocation_id": 22,
+                "node_name": "n114",
+                "node_name_policy": "strict",
+            },
+            {
+                "id": 21,
+                "slurm_job_id": "strict-allocation",
+                "node_name": "n114",
+            },
+            expected_allocation_id=21,
+            client=NodeReadbackClient(self.accounts[0]),
+        )
+        self.assertIn("allocation mismatch", error)
+        self.assertIn("expected 21", error)
+        self.assertIn("task 22", error)
+
+    def test_per_task_strict_post_attach_readback_mismatch_cancels_worker(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n114",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="moving-allocation",
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n114 cpu1 mix 8 64 12.0 100000 95000 some_job\n"
+            )
+        )
+        task_id = self.db.create_task(
+            TaskCreate(
+                "strict-fea",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                node_name="n114",
+                node_name_policy="strict",
+            )
+        )
+        NodeReadbackClient.allocation_node_sequences["moving-allocation"] = [
+            "n114",
+            "n115",
+        ]
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=NodeReadbackClient,
+        )
+
+        scheduler.assign_queued_tasks()
+
+        task = self.db.get_task(task_id)
+        self.assertEqual(task["status"], TaskStatus.FAILED.value)
+        self.assertIn("Slurm readback mismatch", task["failure_message"])
+        self.assertEqual(NodeReadbackClient.attached_tasks, [task_id])
+        self.assertEqual(NodeReadbackClient.cancelled_tasks, [task_id])
+
+    def test_per_task_strict_cancel_failure_keeps_durable_attach_claim_until_retry(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n114",
+            total_cpus=64,
+            total_memory_mb=100000,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="moving-allocation",
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n114 cpu1 mix 8 64 12.0 100000 95000 some_job\n"
+            )
+        )
+        task_id = self.db.create_task(
+            TaskCreate(
+                "strict-fea-cancel-retry",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                node_name="n114",
+                node_name_policy="strict",
+            )
+        )
+        NodeReadbackClient.allocation_node_sequences["moving-allocation"] = [
+            "n114",
+            "n115",
+        ]
+        FailingNodeReadbackCancelClient.cancel_failures_remaining = 1
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FailingNodeReadbackCancelClient,
+        )
+
+        scheduler.assign_queued_tasks()
+
+        held = self.db.get_task(task_id)
+        self.assertEqual(held["status"], TaskStatus.ATTACHING.value)
+        self.assertIsNotNone(held["launch_started_at"])
+        self.assertTrue(held["exit_code_path"])
+        self.assertIn(
+            "strict node placement cancellation pending",
+            held["failure_message"],
+        )
+        self.assertEqual(FakeClient.cancelled_tasks, [])
+
+        scheduler.refresh_tasks()
+
+        failed = self.db.get_task(task_id)
+        self.assertEqual(failed["status"], TaskStatus.FAILED.value)
+        self.assertIn("Slurm readback mismatch", failed["failure_message"])
+        self.assertNotIn("cancellation pending", failed["failure_message"])
+        self.assertEqual(FakeClient.cancelled_tasks, [task_id])
+
+    def test_per_task_strict_demand_shape_never_falls_back_or_clears_node(self) -> None:
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n114 cpu1 idle 0 64 0.0 100000 95000\n"
+                "n115 cpu1 idle 0 64 0.0 100000 95000\n"
+            )
+        )
+        task_id = self.db.create_task(
+            TaskCreate(
+                "strict-demand",
+                "~/case",
+                "run",
+                cpus=8,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                node_name="n115",
+                node_name_policy="strict",
+            )
+        )
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
+
+        allocation = scheduler.open_allocation_for_task_record(
+            self.db.get_task(task_id),
+            submit=False,
+        )
+
+        self.assertIsNotNone(allocation)
+        self.assertEqual(allocation["node_name"], "n115")
+        self.assertEqual(allocation["partition"], "cpu1")
+
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n114 cpu1 idle 0 64 0.0 100000 95000\n"
+            )
+        )
+        missing_target = scheduler.choose_allocation_shape(
+            resource_pool="cpu",
+            requested_cpus=8,
+            require_fea_eligible_node=True,
+            requested_node_name="n999",
+            requested_partition="cpu1",
+        )
+        self.assertIsNone(missing_target)
 
     def test_fea_bursty_queue_reason_reports_node_worker_limit(self) -> None:
         allocation_id = self.db.create_allocation(
@@ -13716,6 +14163,154 @@ class ProjectApiTests(unittest.TestCase):
         self.assertEqual(
             raised.exception.detail,
             "requested_allocation_id is not accepted for new tasks",
+        )
+
+    def test_task_api_round_trips_strict_node_policy_and_preserves_preferred_default(self) -> None:
+        preferred_response = asyncio.run(
+            self.create_task(
+                self._request(
+                    {
+                        "name": "legacy-preferred",
+                        "remote_cwd": "~/w",
+                        "command": "true",
+                        "scheduling_profile": "fea_bursty",
+                        "node_name": "n114",
+                    }
+                )
+            )
+        )
+        preferred = json.loads(preferred_response.body)
+        self.assertEqual(preferred["node_name_policy"], "preferred")
+        self.assertEqual(preferred["requested_node_name_policy"], "")
+        self.assertFalse(preferred["strict_node_placement"])
+        preferred_row = self.app.state.db.get_task(preferred["id"])
+        self.assertEqual(preferred_row["node_name_policy"], "")
+
+        strict_response = asyncio.run(
+            self.create_task(
+                self._request(
+                    {
+                        "name": "strict-node",
+                        "remote_cwd": "~/w",
+                        "command": "true",
+                        "scheduling_profile": "fea_bursty",
+                        "node_name": "n115",
+                        "node_name_policy": "STRICT",
+                        "dedupe_key": "strict-node-contract",
+                    }
+                )
+            )
+        )
+        strict = json.loads(strict_response.body)
+        self.assertEqual(strict_response.status_code, 201)
+        self.assertEqual(strict["node_name"], "n115")
+        self.assertEqual(strict["node_name_policy"], "strict")
+        self.assertEqual(strict["requested_node_name_policy"], "strict")
+        self.assertTrue(strict["strict_node_placement"])
+        self.assertFalse(strict["placement_contract_satisfied"])
+        readback = self.get_task(strict["id"], include_output=False)
+        self.assertEqual(readback["node_name_policy"], "strict")
+        self.assertTrue(readback["strict_node_placement"])
+
+        allocation_id = self.app.state.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n115",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.app.state.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="strict-api-allocation",
+        )
+        self.app.state.db.update_task(
+            strict["id"],
+            status=TaskStatus.FAILED.value,
+            allocation_id=allocation_id,
+            failure_message="strict node placement Slurm readback failed",
+            finished_at="CURRENT_TIMESTAMP",
+        )
+        rejected = self.get_task(strict["id"], include_output=False)
+        self.assertFalse(rejected["placement_contract_satisfied"])
+
+    def test_task_api_strict_node_policy_validation_is_fail_closed(self) -> None:
+        from fastapi import HTTPException
+
+        with self.assertRaises(HTTPException) as missing_node:
+            asyncio.run(
+                self.create_task(
+                    self._request(
+                        {
+                            "name": "strict-without-node",
+                            "remote_cwd": "~/w",
+                            "command": "true",
+                            "node_name_policy": "strict",
+                        }
+                    )
+                )
+            )
+        self.assertEqual(missing_node.exception.status_code, 422)
+        self.assertEqual(
+            missing_node.exception.detail,
+            "node_name is required when node_name_policy is strict",
+        )
+
+        with self.assertRaises(HTTPException) as invalid_policy:
+            asyncio.run(
+                self.create_task(
+                    self._request(
+                        {
+                            "name": "invalid-policy",
+                            "remote_cwd": "~/w",
+                            "command": "true",
+                            "node_name": "n114",
+                            "node_name_policy": "fallback",
+                        }
+                    )
+                )
+            )
+        self.assertEqual(invalid_policy.exception.status_code, 422)
+        self.assertEqual(
+            invalid_policy.exception.detail,
+            "node_name_policy must be preferred or strict",
+        )
+
+    def test_task_api_dedupe_cannot_downgrade_strict_node_contract(self) -> None:
+        from fastapi import HTTPException
+
+        asyncio.run(
+            self.create_task(
+                self._request(
+                    {
+                        "name": "legacy-task",
+                        "remote_cwd": "~/w",
+                        "command": "true",
+                        "node_name": "n114",
+                        "dedupe_key": "same-logical-task",
+                    }
+                )
+            )
+        )
+        with self.assertRaises(HTTPException) as conflict:
+            asyncio.run(
+                self.create_task(
+                    self._request(
+                        {
+                            "name": "strict-retry",
+                            "remote_cwd": "~/w",
+                            "command": "true",
+                            "node_name": "n114",
+                            "node_name_policy": "strict",
+                            "dedupe_key": "same-logical-task",
+                        }
+                    )
+                )
+            )
+        self.assertEqual(conflict.exception.status_code, 409)
+        self.assertIn(
+            "different strict node placement contract",
+            conflict.exception.detail,
         )
 
     def test_project_aedt_backend_is_inherited_and_invalid_task_value_is_rejected(self) -> None:

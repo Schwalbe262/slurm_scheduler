@@ -8,7 +8,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from .models import AedtBackend, AllocationStatus, JobCreate, JobStatus, SchedulingProfile, TaskCreate, TaskStatus, normalize_aedt_backend
+from .models import (
+    AedtBackend,
+    AllocationStatus,
+    JobCreate,
+    JobStatus,
+    SchedulingProfile,
+    TaskCreate,
+    TaskStatus,
+    normalize_aedt_backend,
+    normalize_node_name_policy,
+)
 
 
 TASK_COUNT_SAMPLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -189,6 +199,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     gpu_model TEXT NOT NULL DEFAULT '',
     partition TEXT NOT NULL DEFAULT 'auto',
     node_name TEXT NOT NULL DEFAULT '',
+    node_name_policy TEXT NOT NULL DEFAULT '',
     exclusive_node INTEGER NOT NULL DEFAULT 0,
     priority INTEGER NOT NULL DEFAULT 0,
     timeout_seconds INTEGER NOT NULL DEFAULT 0,
@@ -1375,6 +1386,7 @@ class Database:
                 "gpu_model": "TEXT NOT NULL DEFAULT ''",
                 "partition": "TEXT NOT NULL DEFAULT 'auto'",
                 "node_name": "TEXT NOT NULL DEFAULT ''",
+                "node_name_policy": "TEXT NOT NULL DEFAULT ''",
                 "exclusive_node": "INTEGER NOT NULL DEFAULT 0",
                 "priority": "INTEGER NOT NULL DEFAULT 0",
                 "timeout_seconds": "INTEGER NOT NULL DEFAULT 0",
@@ -1545,10 +1557,10 @@ class Database:
                 INSERT INTO tasks (
                     name, remote_cwd, command, env_setup, required_capability, env_profile,
                     account_name, requested_account_name, cpus, memory_mb,
-                    scheduling_profile, aedt_backend, gpus, gpu_model, partition, node_name, exclusive_node, priority, timeout_seconds, dedupe_key,
+                    scheduling_profile, aedt_backend, gpus, gpu_model, partition, node_name, node_name_policy, exclusive_node, priority, timeout_seconds, dedupe_key,
                     max_workers_per_node, same_node_as_task_id, requested_allocation_id,
                     payload_json, cleanup_globs, project, entrypoint, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.name,
@@ -1567,6 +1579,7 @@ class Database:
                     task.gpu_model,
                     task.partition,
                     task.node_name,
+                    normalize_node_name_policy(task.node_name_policy),
                     int(task.exclusive_node),
                     task.priority,
                     task.timeout_seconds,

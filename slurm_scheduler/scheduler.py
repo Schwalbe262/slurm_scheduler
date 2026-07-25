@@ -23,7 +23,18 @@ from typing import Any, Callable
 from .config import AccountConfig
 from .db import Database
 from .inventory import CPU_PROFILES_BY_PARTITION, GPU_PRIORITY, gpu_model_candidates, normalize_gpu_model, parse_scontrol_nodes, parse_sinfo_nodes, partition_rank
-from .models import AedtBackend, AccountSnapshot, AllocationStatus, JobStatus, SchedulingProfile, TaskStatus, normalize_aedt_backend, normalize_scheduling_profile
+from .models import (
+    AedtBackend,
+    AccountSnapshot,
+    AllocationStatus,
+    JobStatus,
+    NodeNamePolicy,
+    SchedulingProfile,
+    TaskStatus,
+    normalize_aedt_backend,
+    normalize_node_name_policy,
+    normalize_scheduling_profile,
+)
 from .pestat import PestatNode, parse_pestat
 from .retention import (
     WORKSPACE_PRUNE_PROTECTION_MARKER,
@@ -59,6 +70,9 @@ TERMINAL_AEDT_WORKSPACE_ABSENT_MARKER = "SLURM_AEDT_WORKSPACE_ABSENT"
 ALLOCATION_SUBMISSION_RESERVED = "scheduler allocation submission reserved"
 ALLOCATION_SUBMISSION_IN_PROGRESS = "scheduler allocation submission in progress"
 ALLOCATION_SUBMISSION_RECOVERY_GRACE_SECONDS = 120
+STRICT_NODE_CANCELLATION_PENDING_PREFIX = (
+    "strict node placement cancellation pending: "
+)
 _STDERR_FAILURE_SIGNAL_RE = re.compile(
     r"(?:^|[\s\[])(?:error|critical|fatal)(?=[:\]\s-])"
     r"|(?:^|\s)(?:[A-Za-z_][\w.]*?(?:Error|Exception)):",
@@ -3124,13 +3138,21 @@ class Scheduler:
     def refresh_tasks(self, max_tasks: int | None = None) -> None:
         self._drain_timed_out_task_cancellations()
         accounts_by_name = {account.name: account for account in self.accounts}
-        candidates = [
+        active_candidates = [
             task
             for task in self.db.list_tasks_by_statuses(
                 [TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value], limit=5000
             )
             if task["status"] in {TaskStatus.ATTACHING.value, TaskStatus.RUNNING.value}
         ]
+        candidates = []
+        for task in active_candidates:
+            if self.strict_node_cancellation_is_pending(task):
+                account = accounts_by_name.get(str(task.get("account_name") or ""))
+                if account:
+                    self.retry_strict_node_cancellation(task, account)
+                continue
+            candidates.append(task)
         by_account: dict[str, list[dict]] = {}
         for task in self.tasks_to_refresh(candidates, max_tasks=max_tasks):
             if self.task_timed_out(task):
@@ -4813,12 +4835,156 @@ class Scheduler:
         with self._background_attach_semaphore:
             return self.finish_reserved_task_attach(task, allocation, account)
 
+    def strict_node_attach_readback_error(
+        self,
+        task: dict,
+        allocation: dict,
+        *,
+        expected_allocation_id: int,
+        client: Any,
+    ) -> str:
+        """Validate an explicit strict placement at the last remote boundary."""
+
+        if not self.task_has_strict_node_contract(task):
+            return ""
+        expected_node = self.strict_task_node_name(task)
+        if not expected_node:
+            return "strict node placement has no requested node"
+        assigned_allocation_id = int(task.get("allocation_id") or 0)
+        actual_allocation_id = int(allocation.get("id") or 0)
+        if (
+            assigned_allocation_id != expected_allocation_id
+            or actual_allocation_id != expected_allocation_id
+        ):
+            return (
+                "strict node placement allocation mismatch "
+                f"(expected {expected_allocation_id}, task {assigned_allocation_id}, "
+                f"readback {actual_allocation_id})"
+            )
+        allocation_node = str(allocation.get("node_name") or "").strip()
+        if allocation_node != expected_node:
+            return (
+                "strict node placement DB readback mismatch "
+                f"(requested {expected_node}, allocation on {allocation_node or 'unknown'})"
+            )
+        slurm_job_id = str(allocation.get("slurm_job_id") or "").strip()
+        if not slurm_job_id:
+            return "strict node placement allocation has no Slurm job id"
+        try:
+            slurm_node = str(client.allocation_node_name(slurm_job_id) or "").strip()
+        except Exception as exc:
+            return f"strict node placement Slurm readback failed: {exc}"
+        if slurm_node != expected_node:
+            return (
+                "strict node placement Slurm readback mismatch "
+                f"(requested {expected_node}, job {slurm_job_id} on "
+                f"{slurm_node or 'unknown'})"
+            )
+        return ""
+
+    def strict_node_cancellation_is_pending(self, task: dict) -> bool:
+        return bool(
+            str(task.get("status") or "") == TaskStatus.ATTACHING.value
+            and self.task_has_strict_node_contract(task)
+            and str(task.get("failure_message") or "").startswith(
+                STRICT_NODE_CANCELLATION_PENDING_PREFIX
+            )
+        )
+
+    def retry_strict_node_cancellation(
+        self,
+        task: dict,
+        account: AccountConfig,
+    ) -> bool:
+        """Retry a durable post-launch rejection until the worker is stopped.
+
+        A task whose exact-node readback changed after launch must not be
+        declared terminal while cancellation itself is unconfirmed. Keeping it
+        ATTACHING preserves ownership and makes the retry survive restarts
+        instead of releasing capacity around a possible orphan.
+        """
+
+        if not self.strict_node_cancellation_is_pending(task):
+            return False
+        allocation_id = int(task.get("allocation_id") or 0)
+        allocation = (
+            self.db.get_allocation(allocation_id) if allocation_id else None
+        )
+        allocation_job_id = str(
+            (allocation or {}).get("slurm_job_id")
+            or self._task_allocation_job_id(task)
+            or ""
+        )
+        try:
+            self._client(account).cancel_task(task, allocation_job_id)
+        except Exception as exc:
+            message = str(task.get("failure_message") or "")
+            detail = message.split("; last cancel error:", 1)[0]
+            self.db.update_task_if_attach_claim(
+                int(task["id"]),
+                str(task.get("attach_token") or ""),
+                failure_message=f"{detail}; last cancel error: {exc}",
+            )
+            LOGGER.warning(
+                "strict-placement cancellation remains pending for task %s: %s",
+                task["id"],
+                exc,
+            )
+            return False
+        pending_message = str(task.get("failure_message") or "")
+        placement_error = pending_message.removeprefix(
+            STRICT_NODE_CANCELLATION_PENDING_PREFIX
+        ).split("; last cancel error:", 1)[0]
+        if self.db.update_task_if_attach_claim(
+            int(task["id"]),
+            str(task.get("attach_token") or ""),
+            status=TaskStatus.FAILED.value,
+            failure_message=placement_error,
+            finished_at="CURRENT_TIMESTAMP",
+        ):
+            self.on_task_terminal(task, "strict placement rejected")
+        self.recalculate_allocation_capacity(
+            {allocation_id} if allocation_id else None
+        )
+        return True
+
     def finish_reserved_task_attach(self, task: dict, allocation: dict, account: AccountConfig) -> bool:
         """Complete a reserved attach. All task updates are conditional on the
         exact attach token still owning the ATTACHING row. Persisting the launch
         boundary before the remote side effect lets startup distinguish a safe,
         unlaunched reservation from an ambiguous launch that must not be rerun."""
         attach_token = str(task.get("attach_token") or "")
+        expected_allocation_id = int(allocation.get("id") or 0)
+        current_task = self.db.get_task(int(task["id"])) or task
+        current_allocation = (
+            self.db.get_allocation(expected_allocation_id)
+            if expected_allocation_id
+            else None
+        )
+        client = self._client(account)
+        strict_error = (
+            self.strict_node_attach_readback_error(
+                current_task,
+                current_allocation or {},
+                expected_allocation_id=expected_allocation_id,
+                client=client,
+            )
+            if self.task_has_strict_node_contract(current_task)
+            else ""
+        )
+        if strict_error:
+            if self.db.update_task_if_attach_claim(
+                task["id"],
+                attach_token,
+                status=TaskStatus.FAILED.value,
+                failure_message=strict_error,
+                finished_at="CURRENT_TIMESTAMP",
+            ):
+                self.on_task_terminal(current_task, "strict placement rejected")
+            self.recalculate_allocation_capacity(
+                {expected_allocation_id} if expected_allocation_id else None
+            )
+            return False
         if not self.db.update_task_if_attach_claim(
             task["id"],
             attach_token,
@@ -4831,7 +4997,7 @@ class Scheduler:
             return False
         self._license_mark_launch_started(task)
         try:
-            result = self._client(account).attach_task(task, allocation)
+            result = client.attach_task(task, current_allocation or allocation)
         except RemoteExecutionError as exc:
             if self.db.update_task_if_attach_claim(
                 task["id"],
@@ -4858,6 +5024,66 @@ class Scheduler:
             else:
                 LOGGER.info("attach failure for task %s ignored; task already transitioned", task["id"])
             self.recalculate_allocation_capacity({int(allocation["id"])})
+            return False
+        current_task = self.db.get_task(int(task["id"])) or current_task
+        current_allocation = (
+            self.db.get_allocation(expected_allocation_id)
+            if expected_allocation_id
+            else None
+        )
+        strict_error = (
+            self.strict_node_attach_readback_error(
+                current_task,
+                current_allocation or {},
+                expected_allocation_id=expected_allocation_id,
+                client=client,
+            )
+            if self.task_has_strict_node_contract(current_task)
+            else ""
+        )
+        if strict_error:
+            cancel_error = ""
+            try:
+                client.cancel_task(
+                    {**current_task, **result},
+                    str((current_allocation or allocation).get("slurm_job_id") or ""),
+                )
+            except Exception as exc:
+                cancel_error = str(exc) or type(exc).__name__
+                LOGGER.warning(
+                    "failed to cancel strict-placement mismatch for task %s: %s",
+                    task["id"],
+                    exc,
+                )
+            if cancel_error:
+                # Do not release an ambiguous remote worker by declaring its
+                # task terminal. ATTACHING + launch_started_at is the durable
+                # recovery hold, and refresh_tasks retries the cancellation.
+                self.db.update_task_if_attach_claim(
+                    task["id"],
+                    attach_token,
+                    failure_message=(
+                        f"{STRICT_NODE_CANCELLATION_PENDING_PREFIX}{strict_error}; "
+                        f"last cancel error: {cancel_error}"
+                    ),
+                    **result,
+                )
+                self.recalculate_allocation_capacity(
+                    {expected_allocation_id} if expected_allocation_id else None
+                )
+                return False
+            if self.db.update_task_if_attach_claim(
+                task["id"],
+                attach_token,
+                status=TaskStatus.FAILED.value,
+                failure_message=strict_error,
+                finished_at="CURRENT_TIMESTAMP",
+                **result,
+            ):
+                self.on_task_terminal(current_task, "strict placement rejected")
+            self.recalculate_allocation_capacity(
+                {expected_allocation_id} if expected_allocation_id else None
+            )
             return False
         if not self.db.update_task_if_attach_claim(
             task["id"],
@@ -5691,6 +5917,12 @@ class Scheduler:
             resource_pool="cpu",
             requested_cpus=requested_cpus,
             require_fea_eligible_node=self.task_is_fea_bursty(task),
+            requested_node_name=self.strict_task_node_name(task),
+            requested_partition=(
+                str(task.get("partition") or "auto")
+                if self.task_has_strict_node_contract(task)
+                else "auto"
+            ),
         ):
             return ""
 
@@ -5982,9 +6214,49 @@ class Scheduler:
             and self.task_can_share_dedicated_aedt_pool(allocation, task)
         )
 
+    def explicit_task_node_name_policy(self, task: dict) -> str:
+        """Return only the durable per-task override, never the global default."""
+
+        try:
+            return normalize_node_name_policy(
+                str(task.get("node_name_policy") or "")
+            )
+        except ValueError:
+            # Database/API writers validate this field.  A hand-edited or
+            # corrupt row must not accidentally gain preferred-node fallback.
+            return NodeNamePolicy.STRICT.value
+
+    def task_node_name_policy(self, task: dict) -> str:
+        """Return the effective node policy without changing legacy behavior."""
+
+        explicit = self.explicit_task_node_name_policy(task)
+        if explicit:
+            return explicit
+        if self.task_is_fea_bursty(task):
+            return self.fea_node_name_policy
+        # Historically node_name is a hard constraint outside fea_bursty.
+        return (
+            NodeNamePolicy.STRICT.value
+            if str(task.get("node_name") or "").strip()
+            else ""
+        )
+
+    def task_has_strict_node_contract(self, task: dict) -> bool:
+        """Whether the API caller explicitly opted into fail-closed placement."""
+
+        return bool(
+            self.explicit_task_node_name_policy(task)
+            == NodeNamePolicy.STRICT.value
+        )
+
+    def strict_task_node_name(self, task: dict) -> str:
+        if not self.task_has_strict_node_contract(task):
+            return ""
+        return str(task.get("node_name") or "").strip()
+
     def task_can_relax_preferred_node(self, task: dict) -> bool:
         return (
-            self.fea_node_name_policy == "preferred"
+            self.task_node_name_policy(task) == NodeNamePolicy.PREFERRED.value
             and self.task_is_fea_bursty(task)
             and bool(str(task.get("node_name") or "").strip())
             and not int(task.get("same_node_as_task_id") or 0)
@@ -8046,7 +8318,14 @@ class Scheduler:
             )
             if has_active_exclusive_task:
                 return False
-        if (task.get("partition") or "auto") not in {"", "auto"} and allocation.get("partition") != task.get("partition"):
+        task_partition = str(task.get("partition") or "auto")
+        if (
+            task_partition not in {"", "auto"}
+            and not self.partition_spec_allows(
+                task_partition,
+                str(allocation.get("partition") or ""),
+            )
+        ):
             return False
         if task.get("node_name") and allocation.get("node_name") != task.get("node_name"):
             return False
@@ -8882,6 +9161,12 @@ class Scheduler:
     ) -> dict | None:
         if self.same_node_as_task_id(task) or self.task_requested_allocation_id(task):
             return None
+        strict_node_name = self.strict_task_node_name(task)
+        strict_partition = (
+            str(task.get("partition") or "auto")
+            if strict_node_name
+            else "auto"
+        )
         if self.task_requires_gpu(task):
             model = self.choose_gpu_model_for_task(task) or self.choose_gpu_model_for_prewarm()
             resource_pool = f"gpu:{model}" if model else ""
@@ -8903,6 +9188,8 @@ class Scheduler:
                 requested_cpus=int(task.get("cpus") or 0),
                 requested_memory_mb=int(task.get("memory_mb") or 0),
                 require_fea_eligible_node=self.task_is_fea_bursty(task),
+                requested_node_name=strict_node_name,
+                requested_partition=strict_partition,
                 submit=submit,
             )
         if self.allocation_pool_in_backoff("cpu"):
@@ -8922,6 +9209,8 @@ class Scheduler:
             requested_cpus=int(task.get("cpus") or 0) if exclusive_node or not self.task_is_fea_bursty(task) else 0,
             requested_memory_mb=int(task.get("memory_mb") or 0) if exclusive_node else 0,
             require_fea_eligible_node=self.task_is_fea_bursty(task),
+            requested_node_name=strict_node_name,
+            requested_partition=strict_partition,
             submit=submit,
         )
 
@@ -9243,6 +9532,8 @@ class Scheduler:
         cpu_only_nodes: bool = False,
         aedt_pool_node_sharing: bool = False,
         aedt_pool_max_sessions: int = 0,
+        requested_node_name: str = "",
+        requested_partition: str = "auto",
     ) -> bool:
         return self.open_allocation_record(
             reason=reason,
@@ -9260,6 +9551,8 @@ class Scheduler:
             cpu_only_nodes=cpu_only_nodes,
             aedt_pool_node_sharing=aedt_pool_node_sharing,
             aedt_pool_max_sessions=aedt_pool_max_sessions,
+            requested_node_name=requested_node_name,
+            requested_partition=requested_partition,
         ) is not None
 
     def open_allocation_record(
@@ -9279,6 +9572,8 @@ class Scheduler:
         cpu_only_nodes: bool = False,
         aedt_pool_node_sharing: bool = False,
         aedt_pool_max_sessions: int = 0,
+        requested_node_name: str = "",
+        requested_partition: str = "auto",
         submit: bool = True,
     ) -> dict | None:
         account = self.choose_account_for_allocation(
@@ -9301,6 +9596,8 @@ class Scheduler:
             cpu_only_nodes=cpu_only_nodes,
             aedt_pool_node_sharing=aedt_pool_node_sharing,
             aedt_pool_max_sessions=aedt_pool_max_sessions,
+            requested_node_name=requested_node_name,
+            requested_partition=requested_partition,
         )
         if not shape:
             return None
@@ -9312,7 +9609,11 @@ class Scheduler:
         allocation_id = self.db.create_allocation(
             account_name=account.name,
             partition=shape["partition"],
-            node_name=shape["node_name"] if (resource_pool or "cpu") == "cpu" else "",
+            node_name=(
+                shape["node_name"]
+                if (resource_pool or "cpu") == "cpu" or requested_node_name
+                else ""
+            ),
             total_cpus=shape["cpus"],
             total_memory_mb=shape["memory_mb"],
             total_gpus=shape["gpus"],
@@ -10001,7 +10302,11 @@ class Scheduler:
         cpu_only_nodes: bool = False,
         aedt_pool_node_sharing: bool = False,
         aedt_pool_max_sessions: int = 0,
+        requested_node_name: str = "",
+        requested_partition: str = "auto",
     ) -> dict | None:
+        requested_node_name = str(requested_node_name or "").strip()
+        requested_partition = str(requested_partition or "auto").strip() or "auto"
         inventory_by_node = {row["node_name"]: row for row in self.db.list_node_inventory()}
         nodes = [
             PestatNode(
@@ -10085,7 +10390,13 @@ class Scheduler:
         target_gpu_count = max(1, int(gpus or self.gpu_prewarm_gpus_per_allocation))
         minimum_gpu_count = max(1, self.gpu_prewarm_min_gpus_per_allocation) if dynamic_warm_gpu_count else max(1, int(gpus or 1))
         target_models = gpu_model_candidates(gpu_model)
-        target_partition = self.gpu_prewarm_partition if wants_gpu else self.allocation_partition
+        target_partition = (
+            requested_partition
+            if requested_partition not in {"", "auto"}
+            else self.gpu_prewarm_partition
+            if wants_gpu
+            else self.allocation_partition
+        )
         preferred_full_gpu_partitions = (
             self.preferred_full_gpu_partitions(
                 ",".join(target_models) if target_models else gpu_model,
@@ -10093,13 +10404,17 @@ class Scheduler:
                 allow_multi=dynamic_warm_gpu_count,
                 require_current_fit=not dynamic_warm_gpu_count,
             )
-            if wants_gpu and target_partition == "auto"
+            if wants_gpu
+            and target_partition == "auto"
+            and not requested_node_name
             else []
         )
         preferred_full_gpu_partition_set = set(preferred_full_gpu_partitions)
         occupied_by_partition: dict[str, set[str]] = {}
         reserved_nodes = self.reserved_allocation_nodes()
         for node in nodes:
+            if requested_node_name and node.hostname != requested_node_name:
+                continue
             node_free_cpus_for_shape = node.sched_free_cpus if wants_gpu else node.effective_free_cpus
             node_free_memory_for_shape = max(0, int(node.free_memory_mb))
             if aedt_pool_node_sharing:
@@ -10168,7 +10483,11 @@ class Scheduler:
             node_gpu_used = int(inventory.get("gpu_used_count") or 0)
             node_gpu_model = normalize_gpu_model(str(inventory.get("gpu_model") or ""))
             node_is_gpu_partition = node.partition.startswith("gpu") or node_gpu_count > 0
-            pins_to_node = dynamic_warm_gpu_count or (wants_shared_cpu_pool and node_is_gpu_partition)
+            pins_to_node = (
+                bool(requested_node_name and wants_gpu)
+                or dynamic_warm_gpu_count
+                or (wants_shared_cpu_pool and node_is_gpu_partition)
+            )
             if pins_to_node and node.hostname in reserved_nodes:
                 continue
             if pins_to_node and self.allocation_node_in_backoff(resource_pool, node.hostname):
@@ -10308,7 +10627,8 @@ class Scheduler:
                 chosen_gpus = min(target_gpu_count, gpu_free) if wants_gpu else 0
                 node_name = node.hostname
                 if (
-                    not wants_gpu
+                    not requested_node_name
+                    and not wants_gpu
                     and not self.is_single_job_partition(node.partition)
                     and not _node_is_gpu_partition
                     and not require_fea_eligible_node
@@ -10326,7 +10646,8 @@ class Scheduler:
                 shape = single_partition_shape
                 used_partition_spread = False
                 if (
-                    wants_shared_cpu_pool
+                    not requested_node_name
+                    and wants_shared_cpu_pool
                     and _node_is_gpu_partition
                     and self.cpu_pool_partition_spread
                     and target_partition == "auto"
@@ -10363,6 +10684,11 @@ class Scheduler:
                         return single_partition_shape
                     continue
                 return shape
+            return None
+        if requested_node_name:
+            # A strict per-task request is fail-closed.  Inventory staleness,
+            # pressure, backoff, or insufficient capacity must leave the task
+            # queued; a partition-only fallback would violate the contract.
             return None
         if require_fea_eligible_node and nodes and not aedt_pool_node_sharing:
             return None
