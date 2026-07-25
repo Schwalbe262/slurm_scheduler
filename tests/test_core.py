@@ -11558,6 +11558,73 @@ class SchedulerTests(unittest.TestCase):
         )
         self.assertIsNone(missing_target)
 
+    def test_warm_strict_fea_demand_pool_waits_through_transient_node_pressure(
+        self,
+    ) -> None:
+        task_id = self.db.create_task(
+            TaskCreate(
+                "strict-demand-waits-for-pressure",
+                "~/case",
+                "run",
+                cpus=8,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                node_name="n114",
+                node_name_policy="strict",
+            )
+        )
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n114",
+            total_cpus=64,
+            total_memory_mb=262144,
+            drain_reason="queued FEA CPU demand",
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.WARM.value,
+            slurm_job_id="strict-demand-pool",
+            started_at="2000-01-01 00:00:00",
+        )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname  Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n114 cpu1 mix 64 64 1.0 100000 20000 some_job\n"
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+        )
+        task = self.db.get_task(task_id)
+
+        # The live attach gate remains fail-closed under hard node pressure.
+        self.assertEqual(scheduler.task_fit_capacity(task)["fit_slots"], 0)
+        self.assertFalse(scheduler.assign_queued_task(task))
+        self.assertEqual(
+            self.db.get_task(task_id)["status"],
+            TaskStatus.QUEUED.value,
+        )
+
+        # Planning nevertheless retains the exact-node demand pool, so the
+        # next tick does not cancel and recreate identical Slurm capacity.
+        queued_tasks = scheduler.queued_tasks_for_allocation_reservations()
+        plan = scheduler.queued_task_allocation_reservation_plan(queued_tasks)
+        self.assertEqual(plan.reservations, {allocation_id: [task_id]})
+        scheduler.scale_in_idle_allocations(
+            reservation_plan=plan,
+            queued_tasks=queued_tasks,
+        )
+        self.assertEqual(
+            self.db.get_allocation(allocation_id)["state"],
+            AllocationStatus.WARM.value,
+        )
+        self.assertEqual(FakeClient.cancelled, [])
+
     def test_fea_bursty_queue_reason_reports_node_worker_limit(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",
@@ -14013,6 +14080,63 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertEqual(selected.name, "b")
         self.assertEqual(checks, [("a", True, 3), ("b", True, 3)])
+
+    def test_standalone_fea_demand_account_reserves_first_future_project(
+        self,
+    ) -> None:
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            storage_guard_min_free_gb=5.0,
+            aedt_storage_reservation_per_project_gb=4.0,
+        )
+        observed_at = time.time()
+        scheduler._storage_quota_cache["a"] = (
+            observed_at,
+            StorageQuotaProbe(
+                "gpfs",
+                GpfsBlockQuota("gpfs", 92.0, 0.0, 100.0),
+            ),
+        )
+        scheduler._storage_quota_cache["b"] = (
+            observed_at,
+            StorageQuotaProbe(
+                "gpfs",
+                GpfsBlockQuota("gpfs", 50.0, 0.0, 100.0),
+            ),
+        )
+        shape = {
+            "partition": "cpu1",
+            "node_name": "n114",
+            "cpus": 64,
+            "memory_mb": 262144,
+            "gpus": 0,
+            "gpu_model": "",
+            "exclusive_node": False,
+        }
+
+        with mock.patch.object(
+            scheduler,
+            "choose_allocation_shape",
+            return_value=shape,
+        ):
+            allocation = scheduler.open_allocation_record(
+                "queued FEA CPU demand",
+                preferred_accounts=["a", "b"],
+                required_capability="",
+                env_profile="",
+                require_fea_eligible_node=True,
+                requested_node_name="n114",
+                requested_partition="cpu1",
+                submit=False,
+            )
+
+        self.assertIsNotNone(allocation)
+        # Account a has 8 GiB raw headroom, but only 4 GiB after the first
+        # project's shadow reservation, below the 5-GiB floor.
+        self.assertEqual(allocation["account_name"], "b")
 
     def test_fea_attach_capacity_excludes_gpfs_quota_blocked_allocation(self) -> None:
         allocation_id = self.db.create_allocation(

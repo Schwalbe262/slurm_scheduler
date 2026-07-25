@@ -9298,6 +9298,27 @@ class Scheduler:
             if candidates:
                 effective_task = candidate_task
                 break
+        if not candidates and include_pending:
+            # A strict-node FEA demand pool is opened on the only node the
+            # caller permits.  Once Slurm starts it, transient node pressure
+            # can make the ordinary ready-fit calculation return zero.  Do
+            # not then forget the reservation and close/reopen the same pool
+            # every two ticks: retain one structurally fitting, storage-safe
+            # pool while the exact queued task waits for the unchanged final
+            # memory/load/storage attach gates.
+            for candidate_task, _relaxed in self.effective_task_variants(task):
+                candidates = [
+                    allocation
+                    for allocation in allocations
+                    if self.warm_strict_fea_demand_pool_can_wait_for_task(
+                        allocation,
+                        candidate_task,
+                        allocations,
+                    )
+                ]
+                if candidates:
+                    effective_task = candidate_task
+                    break
         if not candidates:
             if reservation_steps is not None:
                 reservation_steps.append(
@@ -9357,6 +9378,57 @@ class Scheduler:
             ) + 1
         if self.task_requires_gpu(effective_task):
             allocation["free_gpus"] = max(0, int(allocation.get("free_gpus") or 0) - int(effective_task.get("gpus") or 0))
+
+    def warm_strict_fea_demand_pool_can_wait_for_task(
+        self,
+        allocation: dict,
+        task: dict,
+        reservation_allocations: list[dict] | None = None,
+    ) -> bool:
+        """Whether a warm strict FEA demand pool remains a durable reservation.
+
+        This is intentionally a planning-only structural check.  It must not
+        make a pressure-blocked pool attachable; ``assign_queued_task`` still
+        evaluates the real warm row and performs the serialized final storage
+        admission before changing the task claim.
+        """
+
+        if allocation.get("state") != AllocationStatus.WARM.value:
+            return False
+        if self.allocation_demand_profile(allocation) != "fea":
+            return False
+        if not self.task_is_fea_bursty(task):
+            return False
+        if not self.task_has_strict_node_contract(task):
+            return False
+        requested_node = self.strict_task_node_name(task)
+        if not requested_node or str(allocation.get("node_name") or "") != requested_node:
+            return False
+        if not str(allocation.get("slurm_job_id") or ""):
+            return False
+        account = self.account_by_name(str(allocation.get("account_name") or ""))
+        if account is None or self.account_storage_blocked(
+            account,
+            for_fea=True,
+            additional_future_projects=1,
+        ):
+            return False
+        pending_view = dict(allocation)
+        pending_view["state"] = AllocationStatus.PENDING.value
+        if not self.allocation_can_run_task(
+            pending_view,
+            task,
+            include_pending=True,
+        ):
+            return False
+        return (
+            self.fit_slots_for_allocation(
+                pending_view,
+                task,
+                reservation_allocations,
+            )
+            > 0
+        )
 
     def prewarm_exclusive_demand(self) -> bool:
         queued_tasks = sorted(
@@ -9841,6 +9913,14 @@ class Scheduler:
             env_profile=env_profile,
             account_name=account_name,
             require_fea_storage_headroom=require_fea_eligible_node,
+            # A standalone demand allocation is useful only if its account
+            # can safely admit the first project.  Reserve that project's
+            # storage growth now instead of selecting a near-floor account
+            # that the final queued -> attaching guard must immediately
+            # reject.
+            storage_additional_future_projects=(
+                1 if require_fea_eligible_node else 0
+            ),
         )
         if not account:
             return None
