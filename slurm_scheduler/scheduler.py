@@ -4743,17 +4743,21 @@ class Scheduler:
                 if self.fit_slots_for_allocation(allocation, task) <= 0:
                     return None
 
-            # This is the serialized, final quota admission point for pooled
-            # projects.  The prospective unit is evaluated before the row is
-            # changed to ATTACHING; once claimed, the next waiter sees that
-            # row in the DB-derived shadow ledger.  Thus many callers cannot
-            # all consume one cached GPFS free-space observation.
+            # This is the serialized, final quota admission point for every
+            # FEA task, including standalone pressure-requeues. Selection may
+            # have used the sub-second storage-shadow cache; refresh the
+            # DB-derived reservations and include this prospective project
+            # before changing the row to ATTACHING. Pooled session hosts
+            # already reserve their complete project capacity, so they need
+            # the refresh but not another prospective unit.
             if (
-                self.task_aedt_backend(task) == AedtBackend.POOLED.value
+                self.task_is_fea_bursty(task)
                 and self.account_storage_blocked(
                     account,
                     for_fea=True,
-                    additional_future_projects=1,
+                    additional_future_projects=(
+                        0 if self.task_is_fea_infra(task) else 1
+                    ),
                     refresh_reservations=True,
                 )
             ):

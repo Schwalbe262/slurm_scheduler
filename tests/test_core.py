@@ -13601,6 +13601,114 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(statuses.count(TaskStatus.ATTACHING.value), 2)
         self.assertEqual(statuses.count(TaskStatus.QUEUED.value), 1)
 
+    def test_standalone_fea_final_claim_refreshes_storage_shadow_fail_closed(
+        self,
+    ) -> None:
+        account = self.accounts[0]
+        allocation_id = self.db.create_allocation(
+            account_name=account.name,
+            partition="cpu1",
+            node_name="n109",
+            total_cpus=64,
+            total_memory_mb=262144,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="standalone-storage-race",
+        )
+        pooled_id = self.db.create_task(
+            TaskCreate(
+                "young-pooled-storage-shadow",
+                "~/case",
+                "run",
+                account_name=account.name,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                aedt_backend=AedtBackend.POOLED.value,
+            )
+        )
+        self.db.update_task(
+            pooled_id,
+            status=TaskStatus.RUNNING.value,
+            account_name=account.name,
+            started_at="CURRENT_TIMESTAMP",
+        )
+        standalone_id = self.db.create_task(
+            TaskCreate(
+                "pressure-requeued-standalone",
+                "~/case",
+                "run",
+                account_name=account.name,
+                cpus=8,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                aedt_backend=AedtBackend.STANDALONE.value,
+            )
+        )
+        observed_at = time.time()
+        scheduler = Scheduler(
+            self.db,
+            [account],
+            30,
+            client_factory=FakeClient,
+            storage_guard_min_free_gb=10.0,
+            aedt_storage_reservation_per_project_gb=4.0,
+            aedt_storage_reservation_maturity_seconds=900,
+        )
+        scheduler._storage_quota_cache[account.name] = (
+            observed_at,
+            StorageQuotaProbe(
+                "gpfs",
+                GpfsBlockQuota("gpfs", 99.4223, 0.0, 110.0),
+            ),
+        )
+        cutoff_text = (
+            datetime.fromtimestamp(observed_at, tz=timezone.utc)
+            - timedelta(seconds=scheduler.aedt_storage_reservation_maturity_seconds)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        # Selection can be inside the one-second reservation-cache window and
+        # see the raw 10.5777 GiB as eligible before the young 4-GiB shadow is
+        # refreshed. The serialized claim must not trust that stale decision.
+        scheduler._aedt_storage_growth_cache[cutoff_text] = (
+            time.monotonic(),
+            {},
+        )
+        self.assertFalse(
+            scheduler.account_storage_blocked(account, for_fea=True)
+        )
+        scheduler.allocation_profile_conflicts = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: False
+        )
+        scheduler.allocation_can_run_task = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: True
+        )
+        scheduler.fit_slots_for_allocation = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: 1
+        )
+
+        with mock.patch.object(
+            scheduler,
+            "account_storage_blocked",
+            wraps=scheduler.account_storage_blocked,
+        ) as storage_guard:
+            claimed = scheduler.reserve_task_on_allocation(
+                self.db.get_task(standalone_id),
+                self.db.get_allocation(allocation_id),
+                account,
+            )
+
+        self.assertIsNone(claimed)
+        self.assertEqual(
+            self.db.get_task(standalone_id)["status"],
+            TaskStatus.QUEUED.value,
+        )
+        storage_guard.assert_called_once_with(
+            account,
+            for_fea=True,
+            additional_future_projects=1,
+            refresh_reservations=True,
+        )
+
     def test_fea_storage_guard_holds_unavailable_account_without_aborting_tick(self) -> None:
         account = AccountConfig("a", "host", 22, "a", "key", "/work", 4, 10, 10)
         scheduler = Scheduler(
