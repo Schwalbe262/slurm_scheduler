@@ -3463,6 +3463,191 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(FakeClient.cancelled, ["pending-cpu-priority"])
         self.assertFalse(scheduler.allocation_pool_in_backoff("cpu"))
 
+    def test_stale_priority_fea_cpu_demand_claim_survives_timeout_without_duplicate(self) -> None:
+        task_id = self.db.create_task(
+            TaskCreate(
+                "queued-fea-priority-wait",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=32768,
+                scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+            )
+        )
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu2",
+            node_name="",
+            total_cpus=64,
+            total_memory_mb=262144,
+            resource_pool="cpu",
+            drain_reason="queued FEA CPU demand",
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.PENDING.value,
+            slurm_job_id="pending-fea-priority",
+            pending_reason="(Priority)",
+            submitted_at="2000-01-01 00:00:00",
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            allocation_pending_timeout_seconds=1800,
+        )
+
+        scheduler.apply_allocation_lifecycle()
+        self.assertEqual(
+            self.db.get_allocation(allocation_id)["state"],
+            AllocationStatus.PENDING.value,
+        )
+        scheduler.maintain_allocation_pool()
+        live = [
+            allocation
+            for allocation in self.db.list_allocations()
+            if allocation["state"]
+            in {
+                AllocationStatus.PENDING.value,
+                AllocationStatus.WARM.value,
+                AllocationStatus.ACTIVE.value,
+            }
+        ]
+        self.assertEqual([int(allocation["id"]) for allocation in live], [allocation_id])
+        self.assertEqual(FakeClient.allocation_submits, [])
+        self.assertEqual(FakeClient.cancelled, [])
+
+        result = scheduler.request_cancel_task(
+            task_id,
+            expected_statuses={TaskStatus.QUEUED.value},
+        )
+        self.assertTrue(result["cancelled"])
+        scheduler.scale_in_idle_allocations()
+        self.assertEqual(
+            self.db.get_allocation(allocation_id)["state"],
+            AllocationStatus.CLOSED.value,
+        )
+        self.assertEqual(FakeClient.cancelled, ["pending-fea-priority"])
+
+    def test_stale_fea_cpu_demand_non_priority_reasons_keep_timeout(self) -> None:
+        reasons = ["(Resources)", "(Dependency)", "(InvalidAccount)"]
+        allocation_ids: list[int] = []
+        for index, reason in enumerate(reasons):
+            allocation_id = self.db.create_allocation(
+                account_name="a",
+                partition="cpu2",
+                node_name="",
+                total_cpus=64,
+                total_memory_mb=262144,
+                resource_pool="cpu",
+                drain_reason="queued FEA CPU demand",
+            )
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.PENDING.value,
+                slurm_job_id=f"pending-fea-{index}",
+                pending_reason=reason,
+                submitted_at="2000-01-01 00:00:00",
+            )
+            self.db.create_task(
+                TaskCreate(
+                    f"queued-fea-{index}",
+                    "~/case",
+                    "run",
+                    cpus=4,
+                    memory_mb=32768,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                    requested_allocation_id=allocation_id,
+                )
+            )
+            allocation_ids.append(allocation_id)
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            allocation_pending_timeout_seconds=1800,
+        )
+
+        scheduler.apply_allocation_lifecycle()
+
+        for allocation_id in allocation_ids:
+            with self.subTest(allocation_id=allocation_id):
+                allocation = self.db.get_allocation(allocation_id)
+                self.assertEqual(allocation["state"], AllocationStatus.CLOSED.value)
+                self.assertIn("pending timeout", allocation["drain_reason"])
+        self.assertCountEqual(
+            FakeClient.cancelled,
+            ["pending-fea-0", "pending-fea-1", "pending-fea-2"],
+        )
+
+    def test_stale_priority_non_fea_and_orphan_fea_demand_keep_timeout(self) -> None:
+        standard_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu2",
+            node_name="",
+            total_cpus=64,
+            total_memory_mb=262144,
+            resource_pool="cpu",
+            drain_reason="queued CPU demand",
+        )
+        orphan_fea_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu2",
+            node_name="",
+            total_cpus=64,
+            total_memory_mb=262144,
+            resource_pool="cpu",
+            drain_reason="queued FEA CPU demand",
+        )
+        for allocation_id, job_id in (
+            (standard_id, "pending-standard-priority"),
+            (orphan_fea_id, "pending-orphan-fea-priority"),
+        ):
+            self.db.update_allocation(
+                allocation_id,
+                state=AllocationStatus.PENDING.value,
+                slurm_job_id=job_id,
+                pending_reason="(Priority)",
+                submitted_at="2000-01-01 00:00:00",
+            )
+        self.db.create_task(
+            TaskCreate(
+                "queued-standard-priority",
+                "~/case",
+                "run",
+                cpus=4,
+                memory_mb=32768,
+                requested_allocation_id=standard_id,
+            )
+        )
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=FakeClient,
+            min_warm_allocations=0,
+            allocation_pending_timeout_seconds=1800,
+        )
+
+        scheduler.apply_allocation_lifecycle()
+
+        self.assertEqual(
+            self.db.get_allocation(standard_id)["state"],
+            AllocationStatus.CLOSED.value,
+        )
+        self.assertEqual(
+            self.db.get_allocation(orphan_fea_id)["state"],
+            AllocationStatus.CLOSED.value,
+        )
+        self.assertCountEqual(
+            FakeClient.cancelled,
+            ["pending-standard-priority", "pending-orphan-fea-priority"],
+        )
+
     def test_assigns_task_to_warm_allocation(self) -> None:
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, allocation_cpus=8)
         scheduler.maintain_allocation_pool()

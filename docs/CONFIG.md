@@ -120,7 +120,7 @@ Field meanings:
 - `allocation_cpus`: CPU target/cap for shared CPU pool allocations. CPU-only nodes avoid tiny fragments by requiring this many usable CPUs when the node can provide it, smaller CPU-only nodes use their full node size, and GPU nodes use their currently free CPUs after leaving `gpu_cpu_reserve` cores unrequested for other GPU users.
 - `allocation_memory`: memory for CPU warm pool allocations. `0` means Slurm partition default/all available behavior depending on cluster policy.
 - `allocation_attach_stop_before_drain_seconds`: stop attaching new tasks to an allocation this many seconds before `allocation_drain_after_seconds`.
-- `allocation_pending_timeout_seconds`: how long an allocation job may stay Slurm `PENDING` before the scheduler cancels it.
+- `allocation_pending_timeout_seconds`: how long an allocation job may stay Slurm `PENDING` before the scheduler cancels it. A CPU allocation durably tagged `queued FEA CPU demand` is retained beyond this timeout only while Slurm reports the exact `Priority` reason and the current queued-task reservation plan still assigns compatible standalone FEA CPU demand to it. Removing that demand makes the allocation immediately eligible for normal demand scale-in; all other pending reasons, profiles, and orphan rows retain the timeout.
 - `allocation_pending_backoff_seconds`: cooldown before the same resource pool is submitted again after a pending timeout.
 - `allocation_max_new_per_loop`: maximum demand allocations the scheduler may submit in one loop while walking queued tasks.
 - `cpu_pool_allow_gpu_partitions`: allows CPU pools to use GPU partitions when their CPU profile is stronger.

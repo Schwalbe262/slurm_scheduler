@@ -3505,9 +3505,18 @@ class Scheduler:
         self.db.update_allocation_capacities(capacity_rows)
 
     def apply_allocation_lifecycle(self) -> None:
-        for allocation in self.db.list_allocations_with_live(limit=500):
+        allocations = self.db.list_allocations_with_live(limit=500)
+        protected_pending_fea_ids = (
+            self.pending_fea_cpu_demand_timeout_protected_allocation_ids(
+                allocations
+            )
+        )
+        for allocation in allocations:
             if allocation["state"] == AllocationStatus.PENDING.value:
-                self.expire_pending_allocation_if_stale(allocation)
+                self.expire_pending_allocation_if_stale(
+                    allocation,
+                    protected_pending_fea_ids=protected_pending_fea_ids,
+                )
                 continue
             if allocation["state"] not in {
                 AllocationStatus.WARM.value,
@@ -3533,7 +3542,88 @@ class Scheduler:
                 self.fail_running_tasks(allocation["id"], "allocation force-cancelled near walltime")
                 self.close_allocation(allocation, "force timeout", force=True)
 
-    def expire_pending_allocation_if_stale(self, allocation: dict) -> None:
+    def pending_fea_cpu_demand_timeout_protected_allocation_ids(
+        self,
+        allocations: list[dict],
+    ) -> set[int]:
+        """Return stale Priority waits with a current queued FEA CPU claim."""
+
+        if self.allocation_pending_timeout_seconds <= 0:
+            return set()
+        now = self._now()
+        candidates = {
+            int(allocation["id"])
+            for allocation in allocations
+            if self.stale_priority_fea_cpu_demand_allocation(allocation, now)
+        }
+        if not candidates:
+            return set()
+
+        queued_tasks = self.queued_tasks_for_allocation_reservations()
+        if not queued_tasks:
+            return set()
+        plan = self.queued_task_allocation_reservation_plan(queued_tasks)
+        if not plan.reusable:
+            # A concurrent allocation/task/pressure change means this pass
+            # cannot prove that the old PENDING row still owns demand.
+            return set()
+        protected: set[int] = set()
+        for allocation_id, task_ids in plan.reservations.items():
+            if int(allocation_id) not in candidates:
+                continue
+            current_allocation = self.db.get_allocation(int(allocation_id))
+            if not current_allocation or not self.stale_priority_fea_cpu_demand_allocation(
+                current_allocation,
+                self._now(),
+            ):
+                continue
+            for task_id in task_ids:
+                task = self.db.get_task(int(task_id))
+                if (
+                    not task
+                    or plan.task_signatures_by_id.get(int(task_id))
+                    != self._reservation_record_signature(task)
+                    or task["status"] != TaskStatus.QUEUED.value
+                    or not self.task_aedt_backend_admitted(task)
+                    or self.task_aedt_backend(task)
+                    != AedtBackend.STANDALONE.value
+                    or not self.task_is_fea_bursty(task)
+                    or self.task_requires_gpu(task)
+                ):
+                    continue
+                protected.add(int(allocation_id))
+                break
+        return protected
+
+    def stale_priority_fea_cpu_demand_allocation(
+        self,
+        allocation: dict,
+        now: datetime,
+    ) -> bool:
+        if (
+            allocation.get("state") != AllocationStatus.PENDING.value
+            or str(allocation.get("resource_pool") or "cpu") != "cpu"
+            or self.allocation_demand_profile(allocation) != "fea"
+            or not self.pending_reason_is_priority(
+                str(allocation.get("pending_reason") or "")
+            )
+        ):
+            return False
+        submitted_at = self._timestamp(
+            allocation.get("submitted_at") or allocation.get("created_at")
+        )
+        return bool(
+            submitted_at is not None
+            and (now - submitted_at).total_seconds()
+            >= self.allocation_pending_timeout_seconds
+        )
+
+    def expire_pending_allocation_if_stale(
+        self,
+        allocation: dict,
+        *,
+        protected_pending_fea_ids: set[int] | None = None,
+    ) -> None:
         if self.allocation_pending_timeout_seconds <= 0:
             return
         if self.allocation_is_dedicated_aedt_pool(allocation):
@@ -3555,7 +3645,11 @@ class Scheduler:
         if age < self.allocation_pending_timeout_seconds:
             return
         pool = allocation.get("resource_pool") or "cpu"
-        if self.pending_allocation_timeout_exempt(allocation, reason):
+        if self.pending_allocation_timeout_exempt(
+            allocation,
+            reason,
+            protected_pending_fea_ids=protected_pending_fea_ids,
+        ):
             return
         normalized_reason = (reason or "").strip().lower()
         if pool != "cpu" or "priority" not in normalized_reason:
@@ -3582,7 +3676,25 @@ class Scheduler:
         self.close_allocation(allocation, f"pinned warm pool retry after {int(age)}s: {reason}")
         return True
 
-    def pending_allocation_timeout_exempt(self, allocation: dict, reason: str) -> bool:
+    @staticmethod
+    def pending_reason_is_priority(reason: str) -> bool:
+        return (reason or "").strip().lower() in {"priority", "(priority)"}
+
+    def pending_allocation_timeout_exempt(
+        self,
+        allocation: dict,
+        reason: str,
+        *,
+        protected_pending_fea_ids: set[int] | None = None,
+    ) -> bool:
+        if (
+            self.pending_reason_is_priority(reason)
+            and str(allocation.get("resource_pool") or "cpu") == "cpu"
+            and self.allocation_demand_profile(allocation) == "fea"
+            and int(allocation.get("id") or 0)
+            in (protected_pending_fea_ids or ())
+        ):
+            return True
         normalized_reason = (reason or "").strip().lower()
         if "priority" not in normalized_reason:
             return False
