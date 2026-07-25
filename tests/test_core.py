@@ -11052,6 +11052,96 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(task["allocation_id"], allocation_id)
         self.assertEqual(NodeReadbackClient.attached_tasks, [task_id])
 
+    def test_strict_same_node_fea_stops_at_allocation_owned_cpu_capacity(self) -> None:
+        allocation_id = self.db.create_allocation(
+            account_name="a",
+            partition="cpu1",
+            node_name="n110",
+            total_cpus=64,
+            total_memory_mb=1_000_000,
+        )
+        self.db.update_allocation(
+            allocation_id,
+            state=AllocationStatus.ACTIVE.value,
+            slurm_job_id="same-node-allocation",
+        )
+        base_task_ids = self.create_running_fea_tasks(
+            allocation_id,
+            count=5,
+            cpus=8,
+        )
+        for task_id in base_task_ids:
+            self.db.update_task(
+                task_id,
+                attached_at=days_ago(1),
+                started_at=days_ago(1),
+            )
+        self.db.replace_pestat_nodes(
+            parse_pestat(
+                "Hostname Partition Node Num_CPU CPUload Memsize Freemem Joblist\n"
+                "n110 cpu1 mix 8 64 0.0 1000000 900000 same-node-allocation\n"
+            )
+        )
+        strict_task_ids = [
+            self.db.create_task(
+                TaskCreate(
+                    f"strict-same-node-{index}",
+                    "~/case",
+                    "run",
+                    cpus=8,
+                    memory_mb=32768,
+                    scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
+                    node_name="n110",
+                    node_name_policy="strict",
+                    same_node_as_task_id=base_task_ids[0],
+                )
+            )
+            for index in range(4)
+        ]
+        NodeReadbackClient.allocation_nodes["same-node-allocation"] = "n110"
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=NodeReadbackClient,
+            fea_node_requested_cpu_factor=2.0,
+        )
+
+        scheduler.assign_ready_same_node_tasks()
+        # The per-tick FEA ramp happens to stop at the 1x boundary in the
+        # first pass.  A later scheduling pass must still derive capacity from
+        # the durable attached-task CPU ledger rather than reopening the 2x
+        # burst allowance for this exact-allocation contract.
+        scheduler = Scheduler(
+            self.db,
+            self.accounts,
+            30,
+            client_factory=NodeReadbackClient,
+            fea_node_requested_cpu_factor=2.0,
+        )
+        scheduler.assign_ready_same_node_tasks()
+
+        self.assertEqual(
+            [self.db.get_task(task_id)["status"] for task_id in strict_task_ids],
+            [
+                TaskStatus.RUNNING.value,
+                TaskStatus.RUNNING.value,
+                TaskStatus.RUNNING.value,
+                TaskStatus.QUEUED.value,
+            ],
+        )
+        self.assertEqual(NodeReadbackClient.attached_tasks, strict_task_ids[:3])
+        pressure = scheduler.fea_allocation_pressures()[allocation_id]
+        self.assertEqual(pressure["requested_cpus"], 64)
+        held_task = self.db.get_task(strict_task_ids[3])
+        allocation = self.db.get_allocation(allocation_id)
+        self.assertEqual(allocation["free_cpus"], 64)
+        self.assertEqual(
+            scheduler.fea_node_cpu_cap_remaining(allocation, held_task),
+            0,
+        )
+        self.assertIsNone(scheduler.best_allocation_for_task(held_task))
+
     def test_per_task_strict_pre_attach_readback_mismatch_fails_without_launch(self) -> None:
         allocation_id = self.db.create_allocation(
             account_name="a",

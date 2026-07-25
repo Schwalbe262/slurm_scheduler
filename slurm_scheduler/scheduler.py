@@ -7717,9 +7717,12 @@ class Scheduler:
     def fea_node_cpu_cap_remaining(self, allocation: dict, task: dict) -> int | None:
         """How many more workers of this task fit under the per-ALLOCATION cap:
         FEA-requested CPUs in this Slurm allocation <= its reserved cores
-        (total_cpus) * fea_node_requested_cpu_factor. Per-allocation, not
-        per-node, so several cpu2 allocations sharing a node each stay bounded to
-        their own reservation. None = no cap applicable."""
+        (total_cpus) * fea_node_requested_cpu_factor. Explicit strict
+        same-node requests are exact-allocation contracts, so they use the
+        allocation's owned 1x CPUs instead of the general burst allowance.
+        Per-allocation, not per-node, so several cpu2 allocations sharing a
+        node each stay bounded to their own reservation. None = no cap
+        applicable."""
         if self.task_is_fea_infra(task) or self.task_uses_reserved_aedt_pool_capacity(
             allocation, task
         ):
@@ -7734,7 +7737,13 @@ class Scheduler:
         # attach), so it already includes this tick's attaches.
         pressure = self.fea_allocation_pressures().get(alloc_id, {})
         requested = int(pressure.get("requested_cpus") or 0)
-        budget = owned * self.fea_node_requested_cpu_factor - requested
+        capacity_factor = (
+            1.0
+            if self.task_has_strict_node_contract(task)
+            and self.same_node_as_task_id(task)
+            else self.fea_node_requested_cpu_factor
+        )
+        budget = owned * capacity_factor - requested
         return max(0, int(budget // max(1, int(task.get("cpus") or 1))))
 
     def fea_node_resource_pressures(self) -> dict[str, dict[str, int]]:

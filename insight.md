@@ -327,3 +327,10 @@
 - Root cause: no durable pressure-episode state connected a reclaim side effect to the physical node-memory fingerprint. A timestamp watermark was insufficient because `pestat` could republish identical total/free memory under a new timestamp.
 - Improvement: persist a per-node pressure episode in `scheduler_settings`. An identical fingerprint never reclaims twice across ticks or restarts; healthy observations rearm, and sustained hard pressure permits another reclaim only after 300 seconds and a meaningful worsening of free memory.
 - Upgrade safety: migrate the prior timestamp-only watermark by seeding the current hard fingerprint without reclaiming. Reject older or equal observations before any state mutation so stale healthy rows cannot rearm a newer hard episode.
+
+## 2026-07-25 12:21 KST
+
+- Incident: a 64-CPU allocation already carrying five 8-CPU FEA workers accepted three strict `same_node_as` retries to reach 64 requested CPUs, then accepted more retries on later scheduling passes.
+- Root cause: FEA deliberately leaves allocation `free_cpus` undecremented and derives admission from the attached-task pressure ledger, but strict exact-allocation requests inherited the general 2x burst factor. The per-tick ramp stopped briefly at 1x and then reopened on a later pass.
+- Improvement: explicit strict `same_node_as` FEA requests now use the durable per-allocation pressure ledger with a 1x owned-CPU cap at both selection and the final serialized reservation boundary. General FEA burst behavior is unchanged.
+- Evidence: the regression starts with 40/64 CPUs requested, admits exactly three 8-CPU strict retries, keeps the fourth queued across a fresh scheduling pass, and verifies the misleading legacy `free_cpus=64` value cannot bypass the pressure-ledger gate.
