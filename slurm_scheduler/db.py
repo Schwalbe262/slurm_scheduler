@@ -440,6 +440,187 @@ class Database:
             )
             return cursor.rowcount == 1
 
+    def claim_fea_pressure_episode(
+        self,
+        key: str,
+        *,
+        observed_at: str,
+        total_memory_mb: int,
+        free_memory_mb: int,
+        hard_pressure: bool,
+        cooldown_seconds: int = 300,
+    ) -> bool:
+        """Durably claim at most one reclaim for a node pressure episode.
+
+        A healthy sample rearms the node.  While pressure remains hard, an
+        identical memory fingerprint can never reclaim again; a meaningfully
+        changed fingerprint may start a new bounded episode only after the
+        cooldown.  The transaction serializes competing scheduler processes.
+
+        Values written by the former timestamp-watermark implementation are
+        migrated fail-safe: the current hard fingerprint is seeded as already
+        reclaimed, so a process upgrade cannot immediately kill another task.
+        """
+
+        observed_at = str(observed_at or "").strip()
+        total_memory_mb = max(0, int(total_memory_mb or 0))
+        free_memory_mb = max(0, int(free_memory_mb or 0))
+        cooldown_seconds = max(0, int(cooldown_seconds or 0))
+        fingerprint = f"{total_memory_mb}:{free_memory_mb}"
+
+        def observation_seconds(value: str) -> float | None:
+            try:
+                parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                return None
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+
+        def write_state(conn: sqlite3.Connection, state: dict[str, Any]) -> None:
+            conn.execute(
+                """
+                INSERT INTO scheduler_settings(key, value, updated_at)
+                VALUES(?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE
+                SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+                """,
+                (key, json.dumps(state, sort_keys=True, separators=(",", ":"))),
+            )
+
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT value FROM scheduler_settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+            raw_value = str(row["value"]) if row else ""
+            state: dict[str, Any] | None = None
+            if raw_value:
+                try:
+                    candidate = json.loads(raw_value)
+                except (TypeError, ValueError):
+                    candidate = None
+                if (
+                    isinstance(candidate, dict)
+                    and int(candidate.get("version") or 0) == 1
+                ):
+                    state = candidate
+
+            if state is not None and state.get("last_observed_at"):
+                incoming_seconds = observation_seconds(observed_at)
+                stored_seconds = observation_seconds(
+                    str(state.get("last_observed_at") or "")
+                )
+                # Observation order, not process arrival order, controls the
+                # episode. Equal samples cannot change their metrics after the
+                # fact, and an older healthy row must never rearm a newer hard
+                # episode.
+                if (
+                    incoming_seconds is None
+                    or stored_seconds is None
+                    or incoming_seconds <= stored_seconds
+                ):
+                    return False
+
+            if not hard_pressure:
+                # A fresh sample at or above the hard threshold ends the
+                # episode and permits one future reclaim.
+                if raw_value and (
+                    state is None or not bool(state.get("armed", False))
+                ):
+                    if state is None:
+                        state = {"version": 1}
+                    state.update(
+                        {
+                            "armed": True,
+                            "claimed_fingerprints": [],
+                            "last_observed_at": observed_at,
+                            "last_total_memory_mb": total_memory_mb,
+                            "last_free_memory_mb": free_memory_mb,
+                        }
+                    )
+                    write_state(conn, state)
+                return False
+
+            if state is None and raw_value:
+                # Upgrade from the old timestamp-only watermark (or an
+                # unreadable value) without authorizing another side effect.
+                write_state(
+                    conn,
+                    {
+                        "version": 1,
+                        "armed": False,
+                        "claimed_fingerprints": [fingerprint],
+                        "last_observed_at": observed_at,
+                        "last_reclaim_observed_at": observed_at,
+                        "last_total_memory_mb": total_memory_mb,
+                        "last_free_memory_mb": free_memory_mb,
+                        "last_reclaim_total_memory_mb": total_memory_mb,
+                        "last_reclaim_free_memory_mb": free_memory_mb,
+                    },
+                )
+                return False
+
+            claim = state is None or bool(state.get("armed", False))
+            if state is None:
+                state = {"version": 1, "claimed_fingerprints": []}
+
+            claimed_fingerprints = {
+                str(item)
+                for item in state.get("claimed_fingerprints", [])
+                if str(item)
+            }
+            if not claim and fingerprint not in claimed_fingerprints:
+                previous_total = max(
+                    0, int(state.get("last_reclaim_total_memory_mb") or 0)
+                )
+                previous_free = max(
+                    0, int(state.get("last_reclaim_free_memory_mb") or 0)
+                )
+                meaningful_delta_mb = max(1024, total_memory_mb // 100)
+                # An improving-but-still-hard reading is not evidence for
+                # killing another worker.  A changed total is also ambiguous,
+                # so require a healthy sample to rearm after that transition.
+                meaningfully_worsened = (
+                    total_memory_mb == previous_total
+                    and free_memory_mb
+                    <= previous_free - meaningful_delta_mb
+                )
+                current_seconds = observation_seconds(observed_at)
+                previous_seconds = observation_seconds(
+                    str(state.get("last_reclaim_observed_at") or "")
+                )
+                cooldown_elapsed = (
+                    current_seconds is not None
+                    and previous_seconds is not None
+                    and current_seconds - previous_seconds >= cooldown_seconds
+                )
+                claim = meaningfully_worsened and cooldown_elapsed
+
+            if claim:
+                claimed_fingerprints.add(fingerprint)
+                state.update(
+                    {
+                        "armed": False,
+                        "claimed_fingerprints": sorted(claimed_fingerprints),
+                        "last_reclaim_observed_at": observed_at,
+                        "last_reclaim_total_memory_mb": total_memory_mb,
+                        "last_reclaim_free_memory_mb": free_memory_mb,
+                    }
+                )
+
+            state.update(
+                {
+                    "version": 1,
+                    "last_observed_at": observed_at,
+                    "last_total_memory_mb": total_memory_mb,
+                    "last_free_memory_mb": free_memory_mb,
+                }
+            )
+            write_state(conn, state)
+            return claim
+
     def allocation_has_aedt_pool_claim(self, allocation_id: int) -> bool:
         """Fail-safe ownership check for the opt-in AEDT session pool.
 

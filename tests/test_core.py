@@ -11782,8 +11782,8 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.db.get_task(older)["status"], TaskStatus.RUNNING.value)
         self.assertEqual(FakeClient.cancelled_tasks, [newer])
 
-        # Only a strictly newer hard-pressure observation authorizes the next
-        # single reclaim on this node.
+        # A new timestamp with the identical physical sample remains in the
+        # same pressure episode and must not authorize another reclaim.
         with self.db.connect() as conn:
             current_sample = str(
                 conn.execute(
@@ -11796,6 +11796,38 @@ class SchedulerTests(unittest.TestCase):
             conn.execute(
                 "UPDATE pestat_nodes SET observed_at = ? WHERE hostname = 'n001'",
                 (newer_sample,),
+            )
+        restarted.handle_fea_memory_pressure()
+        self.assertEqual(self.db.get_task(older)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(FakeClient.cancelled_tasks, [newer])
+
+        # A fresh sample at or above the hard threshold rearms the node.  A
+        # later hard sample can then reclaim one worker, even if its physical
+        # fingerprint matches the prior episode.
+        with self.db.connect() as conn:
+            healthy_sample = (
+                datetime.fromisoformat(newer_sample) + timedelta(seconds=1)
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                """
+                UPDATE pestat_nodes
+                SET observed_at = ?, free_memory_mb = 50000
+                WHERE hostname = 'n001'
+                """,
+                (healthy_sample,),
+            )
+        restarted.handle_fea_memory_pressure()
+        with self.db.connect() as conn:
+            hard_again_sample = (
+                datetime.fromisoformat(healthy_sample) + timedelta(seconds=1)
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                """
+                UPDATE pestat_nodes
+                SET observed_at = ?, free_memory_mb = 35000
+                WHERE hostname = 'n001'
+                """,
+                (hard_again_sample,),
             )
         restarted.handle_fea_memory_pressure()
         self.assertEqual(self.db.get_task(older)["status"], TaskStatus.QUEUED.value)
@@ -11819,6 +11851,140 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(
             self.db.get_setting(key),
             "2026-07-25 10:00:01",
+        )
+
+    def test_pressure_episode_changed_hard_sample_requires_cooldown(self) -> None:
+        key = "observation_claim:fea_memory_pressure_reclaim:n001"
+
+        self.assertTrue(
+            self.db.claim_fea_pressure_episode(
+                key,
+                observed_at="2026-07-25 00:00:00",
+                total_memory_mb=100000,
+                free_memory_mb=35000,
+                hard_pressure=True,
+            )
+        )
+        # A newer timestamp with an identical fingerprint never reclaims.
+        self.assertFalse(
+            self.db.claim_fea_pressure_episode(
+                key,
+                observed_at="2026-07-25 00:01:00",
+                total_memory_mb=100000,
+                free_memory_mb=35000,
+                hard_pressure=True,
+            )
+        )
+        # A meaningfully different hard sample remains gated until 300s from
+        # the prior reclaim, then starts one bounded follow-on episode.
+        self.assertFalse(
+            self.db.claim_fea_pressure_episode(
+                key,
+                observed_at="2026-07-25 00:04:59",
+                total_memory_mb=100000,
+                free_memory_mb=30000,
+                hard_pressure=True,
+            )
+        )
+        # Improvement that remains below the hard threshold is never a reason
+        # to reclaim again, even after the cooldown.
+        self.assertFalse(
+            self.db.claim_fea_pressure_episode(
+                key,
+                observed_at="2026-07-25 00:05:00",
+                total_memory_mb=100000,
+                free_memory_mb=38000,
+                hard_pressure=True,
+            )
+        )
+        self.assertTrue(
+            self.db.claim_fea_pressure_episode(
+                key,
+                observed_at="2026-07-25 00:05:01",
+                total_memory_mb=100000,
+                free_memory_mb=30000,
+                hard_pressure=True,
+            )
+        )
+        self.assertFalse(
+            self.db.claim_fea_pressure_episode(
+                key,
+                observed_at="2026-07-25 01:00:00",
+                total_memory_mb=100000,
+                free_memory_mb=30000,
+                hard_pressure=True,
+            )
+        )
+
+    def test_pressure_episode_migrates_timestamp_watermark_without_reclaim(self) -> None:
+        key = "observation_claim:fea_memory_pressure_reclaim:n001"
+        self.db.set_setting(key, "2026-07-25 00:00:00")
+
+        self.assertFalse(
+            self.db.claim_fea_pressure_episode(
+                key,
+                observed_at="2026-07-25 00:01:00",
+                total_memory_mb=1031519,
+                free_memory_mb=251153,
+                hard_pressure=True,
+            )
+        )
+        migrated = json.loads(str(self.db.get_setting(key)))
+        self.assertFalse(migrated["armed"])
+        self.assertEqual(
+            migrated["claimed_fingerprints"],
+            ["1031519:251153"],
+        )
+        self.assertFalse(
+            self.db.claim_fea_pressure_episode(
+                key,
+                observed_at="2026-07-25 00:20:00",
+                total_memory_mb=1031519,
+                free_memory_mb=251153,
+                hard_pressure=True,
+            )
+        )
+
+    def test_pressure_episode_rejects_older_or_equal_observation(self) -> None:
+        key = "observation_claim:fea_memory_pressure_reclaim:n001"
+        self.assertTrue(
+            self.db.claim_fea_pressure_episode(
+                key,
+                observed_at="2026-07-25 00:10:00",
+                total_memory_mb=100000,
+                free_memory_mb=35000,
+                hard_pressure=True,
+            )
+        )
+        claimed_state = self.db.get_setting(key)
+
+        # Neither an equal/older healthy row nor equal/older changed hard
+        # metrics may mutate or rearm the durable episode.
+        for observed_at, free_memory_mb, hard_pressure in [
+            ("2026-07-25 00:10:00", 50000, False),
+            ("2026-07-25 00:09:59", 50000, False),
+            ("2026-07-25 00:10:00", 30000, True),
+            ("2026-07-25 00:09:59", 30000, True),
+        ]:
+            self.assertFalse(
+                self.db.claim_fea_pressure_episode(
+                    key,
+                    observed_at=observed_at,
+                    total_memory_mb=100000,
+                    free_memory_mb=free_memory_mb,
+                    hard_pressure=hard_pressure,
+                )
+            )
+            self.assertEqual(self.db.get_setting(key), claimed_state)
+
+        self.assertFalse(
+            self.db.claim_fea_pressure_episode(
+                key,
+                observed_at="2026-07-25 00:10:01",
+                total_memory_mb=100000,
+                free_memory_mb=35000,
+                hard_pressure=True,
+            )
         )
 
     def test_fea_hard_memory_pressure_fails_task_at_attempt_cap(self) -> None:

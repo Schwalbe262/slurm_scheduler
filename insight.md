@@ -324,5 +324,6 @@
 ## 2026-07-25 10:45 KST
 
 - Incident: the FEA hard-memory-pressure handler limited reclaim to one task per node per invocation, but successive ticks could reuse the same unchanged `pestat` row and reclaim another task every 30 seconds.
-- Root cause: no durable record connected a reclaim side effect to the `pestat_nodes.observed_at` sample that authorized it.
-- Improvement: atomically advance a per-node observation watermark in `scheduler_settings` before reclaim. Equal or older samples cannot authorize another reclaim, including after restart; only a newer hard-pressure sample permits one additional victim.
+- Root cause: no durable pressure-episode state connected a reclaim side effect to the physical node-memory fingerprint. A timestamp watermark was insufficient because `pestat` could republish identical total/free memory under a new timestamp.
+- Improvement: persist a per-node pressure episode in `scheduler_settings`. An identical fingerprint never reclaims twice across ticks or restarts; healthy observations rearm, and sustained hard pressure permits another reclaim only after 300 seconds and a meaningful worsening of free memory.
+- Upgrade safety: migrate the prior timestamp-only watermark by seeding the current hard fingerprint without reclaiming. Reject older or equal observations before any state mutation so stale healthy rows cannot rearm a newer hard episode.

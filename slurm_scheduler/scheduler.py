@@ -61,6 +61,7 @@ FEA_PROJECT_CURSOR_SETTING = "fea_project_last_claim_by_priority"
 FEA_HARD_PRESSURE_RECLAIM_SAMPLE_SETTING_PREFIX = (
     "observation_claim:fea_memory_pressure_reclaim:"
 )
+FEA_HARD_PRESSURE_EPISODE_COOLDOWN_SECONDS = 300
 TASK_COUNT_SAMPLE_INTERVAL_SECONDS = 60
 TERMINAL_AEDT_WORKSPACE_ROOT = "/gpfs/tmp_cpu2/mft_pool"
 TERMINAL_AEDT_WORKSPACE_SWEEP_INTERVAL_SECONDS = 60
@@ -6385,21 +6386,28 @@ class Scheduler:
             return "soft_blocked"
         return "ok"
 
-    def fea_hard_pressure_observation(self, allocation: dict) -> str:
-        """Return the fresh hard-pressure sample timestamp for an allocation."""
+    def fea_memory_pressure_observation(
+        self, allocation: dict
+    ) -> dict[str, Any] | None:
+        """Return a fresh node-memory sample and its hard-pressure state."""
 
         row = self.pestat_node_for_allocation(allocation)
         if not row:
-            return ""
+            return None
         total = int(row.get("memory_mb") or 0)
         if total <= 0:
-            return ""
-        free_percent = (
-            int(row.get("free_memory_mb") or 0) / total
-        ) * 100.0
-        if free_percent >= self.fea_hard_memory_free_percent:
-            return ""
-        return str(row.get("observed_at") or "").strip()
+            return None
+        free = int(row.get("free_memory_mb") or 0)
+        observed_at = str(row.get("observed_at") or "").strip()
+        if not observed_at:
+            return None
+        return {
+            "observed_at": observed_at,
+            "total_memory_mb": total,
+            "free_memory_mb": free,
+            "hard_pressure": (free / total) * 100.0
+            < self.fea_hard_memory_free_percent,
+        }
 
     def _alloc_util_max_age_seconds(self) -> float:
         # Samples land once per tick, and heavy ticks stretch well past the
@@ -7893,29 +7901,41 @@ class Scheduler:
                 AllocationStatus.DRAINING.value,
             }:
                 continue
-            observed_at = self.fea_hard_pressure_observation(allocation)
-            if not observed_at:
+            observation = self.fea_memory_pressure_observation(allocation)
+            if not observation:
                 continue
             node_name = str(allocation.get("node_name") or "")
             if not node_name:
                 continue
             pressure = pressured_allocations_by_node.setdefault(
                 node_name,
-                {"observed_at": observed_at, "allocations": []},
+                {**observation, "allocations": []},
             )
-            pressure["observed_at"] = max(
-                str(pressure.get("observed_at") or ""),
-                observed_at,
-            )
+            if str(observation["observed_at"]) > str(
+                pressure.get("observed_at") or ""
+            ):
+                pressure.update(observation)
             pressure["allocations"].append(allocation)
 
         # Memory pressure is measured by pestat for the whole node.  Several
         # scheduler allocations can share that node, so reclaiming once per
         # allocation or once per tick would kill a burst of otherwise
-        # recoverable simulations from one stale sample. Reclaim only the
-        # newest standalone FEA worker once for each newer persisted
-        # node-observation timestamp.
+        # recoverable simulations from one stale pressure episode. Reclaim
+        # only the newest standalone FEA worker once per durable node episode.
         for node_name, pressure in pressured_allocations_by_node.items():
+            setting_key = (
+                f"{FEA_HARD_PRESSURE_RECLAIM_SAMPLE_SETTING_PREFIX}{node_name}"
+            )
+            if not bool(pressure.get("hard_pressure")):
+                self.db.claim_fea_pressure_episode(
+                    setting_key,
+                    observed_at=str(pressure.get("observed_at") or ""),
+                    total_memory_mb=int(pressure.get("total_memory_mb") or 0),
+                    free_memory_mb=int(pressure.get("free_memory_mb") or 0),
+                    hard_pressure=False,
+                    cooldown_seconds=FEA_HARD_PRESSURE_EPISODE_COOLDOWN_SECONDS,
+                )
+                continue
             allocations = list(pressure["allocations"])
             allocation_by_id = {
                 int(allocation["id"]): allocation for allocation in allocations
@@ -7939,15 +7959,21 @@ class Scheduler:
             )
             allocation = allocation_by_id[int(task.get("allocation_id") or 0)]
             observed_at = str(pressure.get("observed_at") or "")
-            if not self.db.claim_newer_setting_value(
-                f"{FEA_HARD_PRESSURE_RECLAIM_SAMPLE_SETTING_PREFIX}{node_name}",
-                observed_at,
+            if not self.db.claim_fea_pressure_episode(
+                setting_key,
+                observed_at=observed_at,
+                total_memory_mb=int(pressure.get("total_memory_mb") or 0),
+                free_memory_mb=int(pressure.get("free_memory_mb") or 0),
+                hard_pressure=True,
+                cooldown_seconds=FEA_HARD_PRESSURE_EPISODE_COOLDOWN_SECONDS,
             ):
                 LOGGER.info(
                     "skipping repeated FEA memory-pressure reclaim on %s "
-                    "for pestat observation %s",
+                    "for pressure episode sample %s (%s/%s MB free)",
                     node_name,
                     observed_at,
+                    int(pressure.get("free_memory_mb") or 0),
+                    int(pressure.get("total_memory_mb") or 0),
                 )
                 continue
             account = self.account_by_name(str(task.get("account_name") or allocation.get("account_name") or ""))
