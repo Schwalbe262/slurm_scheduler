@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import sys
 import threading
 import time
 import urllib.error
+from types import ModuleType
 
 import pytest
 
@@ -18,6 +20,9 @@ from slurm_scheduler.aedt_attach_client import (
 from slurm_scheduler.aedt_session_host import (
     AedtSessionHost,
     ControlPlaneClient,
+    EXPECTED_PYAEDT_VERSION,
+    EXPECTED_SESSION_PROFILE,
+    EXPECTED_SESSION_PROFILE_JSON,
 )
 
 
@@ -30,6 +35,9 @@ class FakeDesktop:
         self.closed: list[str] = []
         self.odesktop = self
 
+    def GetVersion(self):
+        return "2025.2"
+
     def GetProjectList(self):
         return list(self.projects)
 
@@ -38,6 +46,40 @@ class FakeDesktop:
         self.closed.append(project_name)
         if project_name in self.projects:
             self.projects.remove(project_name)
+
+
+def _v2_lease_fields(tmp_path, task_id):
+    workspace = tmp_path / f"lease-{task_id}"
+    workspace.mkdir()
+    return {
+        "protocol_version": 2,
+        "task_id": task_id,
+        "workload_family": "unit-shared-pilot",
+        "session_profile": EXPECTED_SESSION_PROFILE_JSON,
+        "isolation_policy": "family",
+        "workspace_path": str(workspace),
+    }
+
+
+def _install_attested_runtime(monkeypatch):
+    ansys = ModuleType("ansys")
+    aedt = ModuleType("ansys.aedt")
+    core = ModuleType("ansys.aedt.core")
+    core.__version__ = EXPECTED_PYAEDT_VERSION
+    ansys.aedt = aedt
+    aedt.core = core
+    monkeypatch.setitem(sys.modules, "ansys", ansys)
+    monkeypatch.setitem(sys.modules, "ansys.aedt", aedt)
+    monkeypatch.setitem(sys.modules, "ansys.aedt.core", core)
+    monkeypatch.setenv(
+        "CONDA_DEFAULT_ENV",
+        EXPECTED_SESSION_PROFILE["python_environment"],
+    )
+
+
+def _activate_without_solve_wait(lease):
+    status = lease._call_with_retry("POST", "/activate", {})
+    lease._apply_status(status)
 
 
 def _wait(predicate, seconds=3):
@@ -49,7 +91,10 @@ def _wait(predicate, seconds=3):
     raise AssertionError("condition did not become true")
 
 
-def test_shared_loopback_closes_aborted_project_without_stopping_sibling(monkeypatch):
+def test_shared_loopback_closes_aborted_project_without_stopping_sibling(
+    monkeypatch, tmp_path
+):
+    _install_attested_runtime(monkeypatch)
     state = SharedPilotControlPlane()
     server, server_thread, scheduler_url = start_control_plane(state)
     desktop = FakeDesktop()
@@ -58,9 +103,16 @@ def test_shared_loopback_closes_aborted_project_without_stopping_sibling(monkeyp
         allocation_id=1,
         node_name="node-test",
         heartbeat_seconds=5,
+        artifact_root=str(tmp_path / "host-artifacts"),
+        session_profile=EXPECTED_SESSION_PROFILE_JSON,
     )
     host.heartbeat_seconds = 0.05
     monkeypatch.setattr(host, "_start_desktop", lambda: desktop)
+    monkeypatch.setattr(
+        host,
+        "_desktop_process_listener_liveness_proof",
+        lambda: (True, ""),
+    )
     bounded_close_calls = []
 
     def close_desktop(*, global_stop, timeout_seconds=30):
@@ -75,17 +127,21 @@ def test_shared_loopback_closes_aborted_project_without_stopping_sibling(monkeyp
     try:
         _wait(lambda: bool(state.session["endpoint"]))
         leases = []
-        for label in ("A", "B"):
+        for task_id, label in enumerate(("A", "B"), start=1):
             lease = acquire_project_lease(
                 scheduler_url,
                 f"pending-{label}",
                 request_key=f"unit-shared-{label}",
                 exclusive_session=False,
+                **_v2_lease_fields(tmp_path, task_id),
             )
             lease.wait_until_leased(timeout_seconds=3, heartbeat_seconds=5)
             lease.bind_project_name(f"simulation_{label}")
             desktop.projects.append(f"simulation_{label}")
             leases.append(lease)
+
+        for lease in leases:
+            _activate_without_solve_wait(lease)
 
         leases[0].report_fault(
             "pre_solve",
@@ -120,7 +176,10 @@ def test_shared_loopback_closes_aborted_project_without_stopping_sibling(monkeyp
         server_thread.join(timeout=3)
 
 
-def test_shared_loopback_timeout_quarantines_then_recycles_after_sibling(monkeypatch):
+def test_shared_loopback_timeout_quarantines_then_recycles_after_sibling(
+    monkeypatch, tmp_path
+):
+    _install_attested_runtime(monkeypatch)
     state = SharedPilotControlPlane()
     server, server_thread, scheduler_url = start_control_plane(state)
     desktop = FakeDesktop()
@@ -129,9 +188,16 @@ def test_shared_loopback_timeout_quarantines_then_recycles_after_sibling(monkeyp
         allocation_id=1,
         node_name="node-test",
         heartbeat_seconds=5,
+        artifact_root=str(tmp_path / "host-artifacts"),
+        session_profile=EXPECTED_SESSION_PROFILE_JSON,
     )
     host.heartbeat_seconds = 0.05
     monkeypatch.setattr(host, "_start_desktop", lambda: desktop)
+    monkeypatch.setattr(
+        host,
+        "_desktop_process_listener_liveness_proof",
+        lambda: (True, ""),
+    )
     bounded_close_calls = []
 
     def close_desktop(*, global_stop, timeout_seconds=30):
@@ -146,17 +212,21 @@ def test_shared_loopback_timeout_quarantines_then_recycles_after_sibling(monkeyp
     leases = []
     try:
         _wait(lambda: bool(state.session["endpoint"]))
-        for label in ("A", "B"):
+        for task_id, label in enumerate(("A", "B"), start=1):
             lease = acquire_project_lease(
                 scheduler_url,
                 f"pending-{label}",
                 request_key=f"unit-timeout-{label}",
                 exclusive_session=False,
+                **_v2_lease_fields(tmp_path, task_id),
             )
             lease.wait_until_leased(timeout_seconds=3, heartbeat_seconds=5)
             lease.bind_project_name(f"simulation_{label}")
             desktop.projects.append(f"simulation_{label}")
             leases.append(lease)
+
+        for lease in leases:
+            _activate_without_solve_wait(lease)
 
         leases[0].report_fault(
             "solver_timeout",
@@ -179,6 +249,7 @@ def test_shared_loopback_timeout_quarantines_then_recycles_after_sibling(monkeyp
                     "request_key": "unit-timeout-C",
                     "project_name": "simulation_C",
                     "exclusive_session": False,
+                    **_v2_lease_fields(tmp_path, 3),
                 },
             )
         assert third.value.code == 409
@@ -205,7 +276,7 @@ def test_shared_loopback_timeout_quarantines_then_recycles_after_sibling(monkeyp
         server_thread.join(timeout=3)
 
 
-def test_shared_loopback_rejects_exclusive_or_third_lease():
+def test_shared_loopback_rejects_exclusive_or_third_lease(tmp_path):
     state = SharedPilotControlPlane()
     server, server_thread, scheduler_url = start_control_plane(state)
     try:
@@ -214,20 +285,35 @@ def test_shared_loopback_rejects_exclusive_or_third_lease():
             http.request(
                 "POST",
                 "/api/aedt-pool/leases",
-                {"project_name": "unsafe", "exclusive_session": True},
+                {
+                    "request_key": "unit-exclusive",
+                    "project_name": "unsafe",
+                    "exclusive_session": True,
+                    **_v2_lease_fields(tmp_path, 1),
+                },
             )
         assert exclusive.value.code == 422
-        for label in ("A", "B"):
+        for task_id, label in enumerate(("A", "B"), start=2):
             http.request(
                 "POST",
                 "/api/aedt-pool/leases",
-                {"project_name": label, "exclusive_session": False},
+                {
+                    "request_key": f"unit-shared-{label}",
+                    "project_name": label,
+                    "exclusive_session": False,
+                    **_v2_lease_fields(tmp_path, task_id),
+                },
             )
         with pytest.raises(urllib.error.HTTPError) as third:
             http.request(
                 "POST",
                 "/api/aedt-pool/leases",
-                {"project_name": "C", "exclusive_session": False},
+                {
+                    "request_key": "unit-shared-C",
+                    "project_name": "C",
+                    "exclusive_session": False,
+                    **_v2_lease_fields(tmp_path, 4),
+                },
             )
         assert third.value.code == 409
     finally:

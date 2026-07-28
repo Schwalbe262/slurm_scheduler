@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
+import sys
 import threading
 import time
+import types
 import urllib.error
 
 import pytest
@@ -19,17 +22,23 @@ from slurm_scheduler.aedt_attach_client import (
 from slurm_scheduler.aedt_session_host import (
     AedtSessionHost,
     ControlPlaneClient,
+    EXPECTED_AEDT_VERSION,
+    EXPECTED_PYAEDT_VERSION,
+    EXPECTED_SESSION_PROFILE,
+    EXPECTED_SESSION_PROFILE_JSON,
 )
 
 
 class FakeDesktop:
-    port = 50051
-    aedt_process_id = 987654321
-
-    def __init__(self) -> None:
+    def __init__(self, port=50051) -> None:
+        self.port = port
+        self.aedt_process_id = os.getpid()
         self.projects: list[str] = []
         self.closed: list[str] = []
         self.odesktop = self
+
+    def GetVersion(self):
+        return "Ansys Electronics Desktop 2025.2.0"
 
     def GetProjectList(self):
         return list(self.projects)
@@ -41,10 +50,29 @@ class FakeDesktop:
             self.projects.remove(project_name)
 
 
-def test_loopback_pilot_performs_exclusive_attach_and_close_ack(monkeypatch):
+def test_loopback_pilot_performs_exclusive_attach_and_close_ack(
+    monkeypatch, tmp_path
+):
     state = PilotControlPlane()
     server, server_thread, scheduler_url = start_control_plane(state)
-    desktop = FakeDesktop()
+    desktop = FakeDesktop(port=int(server.server_address[1]))
+    ansys_module = types.ModuleType("ansys")
+    ansys_module.__path__ = []
+    aedt_module = types.ModuleType("ansys.aedt")
+    aedt_module.__path__ = []
+    pyaedt_core = types.ModuleType("ansys.aedt.core")
+    pyaedt_core.__version__ = EXPECTED_PYAEDT_VERSION
+    ansys_module.aedt = aedt_module
+    aedt_module.core = pyaedt_core
+    monkeypatch.setitem(sys.modules, "ansys", ansys_module)
+    monkeypatch.setitem(sys.modules, "ansys.aedt", aedt_module)
+    monkeypatch.setitem(sys.modules, "ansys.aedt.core", pyaedt_core)
+    monkeypatch.setenv(
+        "CONDA_DEFAULT_ENV",
+        str(EXPECTED_SESSION_PROFILE["python_environment"]),
+    )
+    workspace = tmp_path / "aedt-task-1"
+    workspace.mkdir()
     host = AedtSessionHost(
         ControlPlaneClient(
             scheduler_url,
@@ -53,6 +81,9 @@ def test_loopback_pilot_performs_exclusive_attach_and_close_ack(monkeypatch):
         allocation_id=1,
         node_name="node-test",
         heartbeat_seconds=5,
+        aedt_version=EXPECTED_AEDT_VERSION,
+        artifact_root=str(tmp_path / "host-artifacts"),
+        session_profile=EXPECTED_SESSION_PROFILE_JSON,
     )
     host.heartbeat_seconds = 0.05
     monkeypatch.setattr(host, "_start_desktop", lambda: desktop)
@@ -76,12 +107,19 @@ def test_loopback_pilot_performs_exclusive_attach_and_close_ack(monkeypatch):
             scheduler_url,
             "pending",
             request_key="unit-exclusive",
+            task_id=1,
             exclusive_session=True,
+            workload_family="mft",
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
+            isolation_policy="exclusive",
+            workspace_path=str(workspace),
+            protocol_version=2,
         )
         lease.wait_until_leased(timeout_seconds=3, heartbeat_seconds=5)
         attach_calls = []
         attached = lease.connect_desktop(
-            desktop_factory=lambda **kwargs: attach_calls.append(kwargs) or object()
+            desktop_factory=lambda **kwargs: attach_calls.append(kwargs) or desktop,
+            endpoint_probe=lambda _machine, port: port == desktop.port,
         )
         assert attached is not None
         assert attach_calls == [{
@@ -89,7 +127,8 @@ def test_loopback_pilot_performs_exclusive_attach_and_close_ack(monkeypatch):
             "non_graphical": True,
             "close_on_exit": False,
             "machine": state.session["endpoint"].rsplit(":", 1)[0],
-            "port": 50051,
+            "port": desktop.port,
+            "version": EXPECTED_AEDT_VERSION,
         }]
 
         lease.bind_project_name("simulation_pilot")
@@ -113,16 +152,27 @@ def test_loopback_pilot_performs_exclusive_attach_and_close_ack(monkeypatch):
         server_thread.join(timeout=3)
 
 
-def test_loopback_pilot_rejects_nonexclusive_lease():
+def test_loopback_pilot_rejects_nonexclusive_lease(tmp_path):
     state = PilotControlPlane()
     server, server_thread, scheduler_url = start_control_plane(state)
+    workspace = tmp_path / "aedt-task-2"
+    workspace.mkdir()
     try:
         http = AedtPoolHttpClient(scheduler_url)
         with pytest.raises(urllib.error.HTTPError) as error:
             http.request(
                 "POST",
                 "/api/aedt-pool/leases",
-                {"project_name": "unsafe", "exclusive_session": False},
+                {
+                    "project_name": "unsafe",
+                    "task_id": 2,
+                    "exclusive_session": False,
+                    "protocol_version": 2,
+                    "workload_family": "mft",
+                    "session_profile": EXPECTED_SESSION_PROFILE_JSON,
+                    "isolation_policy": "exclusive",
+                    "workspace_path": str(workspace),
+                },
             )
         assert error.value.code == 422
     finally:

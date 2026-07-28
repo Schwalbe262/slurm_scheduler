@@ -31,10 +31,39 @@
   증상: `state.session["endpoint"]`가 빈 문자열(세션 호스트 endpoint 등록 실패). 순수
   `1559a7c`에서도 동일 재현 — 260725 라인의 aedt_pool.py 진화가 pilot 프로토콜과 어긋남.
 
+## Phase 2 결과 (2026-07-28)
+
+- MFT 캠페인 레이어 전체 제거 — `docs/improvement_mft_decoupling_20260728.md` 참조.
+  커밋 `ab23569`. 880 passed, MFT 토큰 grep 0건.
+
+## Phase 3 결과 (2026-07-28~29)
+
+- `aedt_pool.module_enabled` feature flag(기본 false) 도입: flag off면 AEDT 풀
+  서비스/런타임/relay/router가 아예 생성되지 않고(`app.py` None-게이트), aedt DB 테이블도
+  만들어지지 않으며, pooled task 제출은 422 "AEDT pooled backend module is disabled"로
+  명시 거부. flag on이면 기존 triple-gate(enabled/adapter_ready/validation_passed) 그대로.
+- 회귀 테스트: `tests/test_aedt_pool_module_flag.py` (전부 통과).
+- 주의: Y: RaiDrive 마운트 사고(2026-07-28 밤)로 작업이 중단됐다가
+  `2e30e8d`(salvage 커밋)로 보전됨. 이후 정식 작업본을 `C:\Users\peets\work\slurm_scheduler`
+  클론으로 전환(Y:는 참조용) — `docs/y_snapshot_sha256_20260713.md`의 교훈 재확인.
+
+## Phase 4a 결과 (2026-07-29)
+
+- pilot loopback 실패 4건(위 3건 + salvage 후 `rejects_exclusive_or_third_lease`)의 근본
+  원인: **전부 harness 드리프트, 프로덕션 결함 아님** — base 라인이 fail-closed 런타임
+  attestation(`_attest_runtime_profile`, Desktop `GetVersion` 요구)과 protocol_version=2
+  lease 게이트를 도입했는데 pilot 스크립트/테스트가 구식이었음 (원인 커밋 `3702677`,
+  `ef81118` — 통합 이전부터 존재).
+- 수리: pilot 스크립트는 v2 프로토콜로 갱신(salvage분), 테스트 fakes에 attestation/liveness/
+  v2 lease 필드 보강. 프로덕션 모듈 무변경. 집중 스위트 303 passed.
+
 ## 시도 (attempts)
 
-- (추가 예정)
+- 2026-07-28 Phase 1: 40개 브랜치 서베이 → base 확정 (`docs/aedt_branch_survey_20260728.md`)
+- 2026-07-28 Phase 2: MFT 디커플링 (`docs/improvement_mft_decoupling_20260728.md`)
+- 2026-07-28~29 Phase 3/4a: 모듈 게이팅 + pilot v2 수리 (Y: 사고로 salvage `2e30e8d` 경유)
 
 ## 개선 (improvements)
 
-- (추가 예정)
+- MFT 디커플링: `docs/improvement_mft_decoupling_20260728.md` (+ insight.md 항목)
+- AEDT 모듈 flag 게이팅 + pilot harness v2 정합: 이 문서 Phase 3/4a 절 참조

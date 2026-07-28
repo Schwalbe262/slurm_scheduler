@@ -432,3 +432,16 @@ Remaining verification:
   async design (now green); 3 pilot loopback failures are pre-existing on pure
   1559a7c (endpoint registration) -> Phase 4 fix list.
 - Next: Phase 2 MFT decoupling (incl. campaign layer now present in base).
+
+## 2026-07-29 consolidation Phase 3/4a closeout (Claude orchestrator + codex/codex2)
+- Part: AEDT module-flag gating + pilot harness v2 alignment.
+- Events: Y: RaiDrive mount outage stranded in-progress work; salvaged as 2e30e8d;
+  canonical working copy moved to local clone C:\Users\peets\work\slurm_scheduler.
+- Phase 3: aedt_pool.module_enabled (default false) gates service/router/thread/tables;
+  pooled submissions 422 when off; regression tests test_aedt_pool_module_flag.py green.
+- Phase 4a: 4 pilot loopback failures were harness drift vs fail-closed runtime
+  attestation (GetVersion) + protocol_version=2 lease gates (origin commits 3702677,
+  ef81118, predate consolidation). Fixed fakes/requests in the two pilot test files;
+  production modules and pilot scripts unchanged in this pass.
+- Validation: focused suite 303 passed; full suite green (see commit).
+- Next: Phase 4b live 1:2 pilot (cluster/license prerequisites), Phase 5 finalize.
