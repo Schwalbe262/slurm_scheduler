@@ -95,7 +95,7 @@ def aedt_pool_hard_pending_reason(value: object) -> bool:
 
     Resource and priority waits may legitimately benefit from accumulated
     Slurm queue age.  Association job ceilings and QOS policy rejects do not
-    provide usable near-term AEDT capacity under a continuously full campaign;
+    provide usable near-term AEDT capacity under a continuously full workload;
     after a bounded grace they must stop suppressing an alternative route.
     """
 
@@ -151,7 +151,7 @@ def aedt_pool_pending_replan_reason(
 # Families for which a rolling build may enable concurrent native solves.  The
 # emergency ``serial`` mode ignores this allowlist; ``validated_parallel``
 # restores it without requiring another code rollout.
-PARALLEL_SAFE_NATIVE_SOLVE_FAMILIES = frozenset({"mft_validated_async"})
+PARALLEL_SAFE_NATIVE_SOLVE_FAMILIES = frozenset({"fea_validated_async"})
 NATIVE_SOLVE_MODE_ENV = "SLURM_AEDT_POOL_NATIVE_SOLVE_MODE"
 NATIVE_SOLVE_MODE_SERIAL = "serial"
 NATIVE_SOLVE_MODE_VALIDATED_PARALLEL = "validated_parallel"
@@ -321,7 +321,7 @@ CREATE TABLE IF NOT EXISTS aedt_pool_validations (
     sibling_field_solution_passed INTEGER NOT NULL DEFAULT 0,
     fault_checkout_released_after_recycle_passed INTEGER NOT NULL DEFAULT 0,
     faulted_desktop_not_reused_passed INTEGER NOT NULL DEFAULT 0,
-    mixed_mft_ipmsm_isolation_passed INTEGER NOT NULL DEFAULT 0,
+    mixed_family_isolation_passed INTEGER NOT NULL DEFAULT 0,
     evidence_json TEXT NOT NULL DEFAULT '{}',
     failure_message TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -336,8 +336,8 @@ CREATE TABLE IF NOT EXISTS aedt_mixed_canary_admissions (
     session_id INTEGER NOT NULL,
     placement_group TEXT NOT NULL UNIQUE,
     session_profile TEXT NOT NULL,
-    expected_mft_projects INTEGER NOT NULL,
-    expected_ipmsm_projects INTEGER NOT NULL,
+    expected_family_a_projects INTEGER NOT NULL,
+    expected_family_b_projects INTEGER NOT NULL,
     state TEXT NOT NULL DEFAULT 'open',
     expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -459,10 +459,10 @@ def _token_hash(token: str) -> str:
 
 def _derive_placement_group(project_name: str) -> str:
     normalized = project_name.strip().lower()
-    if "ipmsm" in normalized:
-        return "ipmsm"
-    if normalized.startswith(("mft", "simulation")):
-        return "mft"
+    if "fea_b" in normalized or "fea-b" in normalized:
+        return "fea_b"
+    if normalized.startswith(("fea", "simulation")):
+        return "fea"
     token_end = 0
     while token_end < len(normalized) and normalized[token_end].isalnum():
         token_end += 1
@@ -476,8 +476,8 @@ def canonical_workload_family(value: str, project_name: str) -> str:
     if explicit:
         return explicit
     normalized = str(project_name or "").strip().lower()
-    if "pyaedt_motor" in normalized:
-        return "ipmsm"
+    if "example_fea_b" in normalized:
+        return "fea_b"
     return _derive_placement_group(normalized)
 
 
@@ -920,7 +920,7 @@ class AedtPoolService:
                 "sibling_field_solution_passed",
                 "fault_checkout_released_after_recycle_passed",
                 "faulted_desktop_not_reused_passed",
-                "mixed_mft_ipmsm_isolation_passed",
+                "mixed_family_isolation_passed",
             ):
                 if name not in validation_columns:
                     conn.execute(
@@ -1126,7 +1126,7 @@ class AedtPoolService:
         """Operator knob for liveness windows.
 
         Client/host heartbeats land as SQLite writes and serialize behind the
-        scheduler tick's own write transactions; a heavy campaign tick can
+        scheduler tick's own write transactions; a heavy workload tick can
         stall them for minutes.  The expiry windows must ride out the longest
         realistic tick, otherwise a busy scheduler kills its own pool.
         """
@@ -1318,8 +1318,8 @@ class AedtPoolService:
             for key in required_bools
         }
         mixed_isolation_passed = (
-            type(evidence.get("mixed_mft_ipmsm_isolation_passed")) is bool
-            and bool(evidence.get("mixed_mft_ipmsm_isolation_passed"))
+            type(evidence.get("mixed_family_isolation_passed")) is bool
+            and bool(evidence.get("mixed_family_isolation_passed"))
         )
         failures: list[str] = []
         if (baseline_desktops, baseline_projects) != (2, 2):
@@ -1358,7 +1358,7 @@ class AedtPoolService:
                     sibling_field_solution_passed,
                     fault_checkout_released_after_recycle_passed,
                     faulted_desktop_not_reused_passed,
-                    mixed_mft_ipmsm_isolation_passed,
+                    mixed_family_isolation_passed,
                     evidence_json, failure_message,
                     finished_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1749,7 +1749,7 @@ class AedtPoolService:
                 mixed_validation
                 and mixed_validation.get("status") == "passed"
                 and bool(
-                    mixed_validation.get("mixed_mft_ipmsm_isolation_passed")
+                    mixed_validation.get("mixed_family_isolation_passed")
                 )
             ):
                 # Otherwise the worker would launch with an exact reservation
@@ -2687,8 +2687,8 @@ class AedtPoolService:
         self,
         *,
         session_id: int,
-        mft_projects: int = 2,
-        ipmsm_projects: int = 1,
+        family_a_projects: int = 2,
+        family_b_projects: int = 1,
         ttl_seconds: int = 1800,
     ) -> dict[str, Any]:
         """Reserve one empty 3-slot session for one operator-authorized mixed canary.
@@ -2700,23 +2700,23 @@ class AedtPoolService:
 
         for value, name in (
             (session_id, "session_id"),
-            (mft_projects, "mft_projects"),
-            (ipmsm_projects, "ipmsm_projects"),
+            (family_a_projects, "family_a_projects"),
+            (family_b_projects, "family_b_projects"),
             (ttl_seconds, "ttl_seconds"),
         ):
             if type(value) is not int:
                 raise ValueError(f"{name} must be an integer")
         if session_id <= 0:
             raise ValueError("session_id must be positive")
-        if mft_projects < 1 or ipmsm_projects < 1:
-            raise ValueError("mixed canary requires at least one MFT and one IPMSM project")
-        if mft_projects + ipmsm_projects != 3:
+        if family_a_projects < 1 or family_b_projects < 1:
+            raise ValueError("mixed canary requires at least one FEA and one FEA-B project")
+        if family_a_projects + family_b_projects != 3:
             raise ValueError("mixed canary must reserve exactly three projects")
         if not 60 <= ttl_seconds <= 3600:
             raise ValueError("ttl_seconds must be between 60 and 3600")
         latest = self.latest_validation()
-        if latest and bool(latest.get("mixed_mft_ipmsm_isolation_passed")):
-            raise ValueError("mixed MFT/IPMSM isolation has already passed validation")
+        if latest and bool(latest.get("mixed_family_isolation_passed")):
+            raise ValueError("mixed FEA/FEA-B isolation has already passed validation")
 
         now_dt = self._now()
         now = _sql_time(now_dt)
@@ -2776,7 +2776,7 @@ class AedtPoolService:
                 """
                 INSERT INTO aedt_mixed_canary_admissions (
                     session_id, placement_group, session_profile,
-                    expected_mft_projects, expected_ipmsm_projects,
+                    expected_family_a_projects, expected_family_b_projects,
                     state, expires_at, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?)
                 """,
@@ -2784,8 +2784,8 @@ class AedtPoolService:
                     session_id,
                     placement_group,
                     session_profile,
-                    mft_projects,
-                    ipmsm_projects,
+                    family_a_projects,
+                    family_b_projects,
                     expires,
                     now,
                     now,
@@ -2794,8 +2794,8 @@ class AedtPoolService:
             admission_id = int(cursor.lastrowid)
             slots: list[tuple[str, str, str]] = []
             for family, namespace, count in (
-                ("mft", "mft", mft_projects),
-                ("ipmsm", "pyaedt_motor", ipmsm_projects),
+                ("fea", "fea", family_a_projects),
+                ("fea_b", "example_fea_b", family_b_projects),
             ):
                 for index in range(count):
                     dedupe_key = (
@@ -2980,7 +2980,7 @@ class AedtPoolService:
         admission = conn.execute(
             """
             SELECT ca.id, ca.state,
-                   ca.expected_mft_projects + ca.expected_ipmsm_projects
+                   ca.expected_family_a_projects + ca.expected_family_b_projects
                        AS expected_projects,
                    COUNT(cs.id) AS reserved_projects,
                    SUM(
@@ -3055,7 +3055,7 @@ class AedtPoolService:
     ) -> dict[str, Any]:
         if task_id <= 0:
             raise ValueError(
-                "shared_if_compatible requires passed mixed MFT/IPMSM isolation "
+                "shared_if_compatible requires passed mixed FEA/FEA-B isolation "
                 "validation or a bootstrap-issued canary task"
             )
         task = conn.execute(
@@ -3085,7 +3085,7 @@ class AedtPoolService:
         ).fetchone()
         if not slot:
             raise ValueError(
-                "shared_if_compatible requires passed mixed MFT/IPMSM isolation "
+                "shared_if_compatible requires passed mixed FEA/FEA-B isolation "
                 "validation or a bootstrap-issued canary task"
             )
         if str(slot["admission_state"]) not in {"open", "filled"}:
@@ -3191,7 +3191,7 @@ class AedtPoolService:
                 mixed_validation
                 and mixed_validation.get("status") == "passed"
                 and bool(
-                    mixed_validation.get("mixed_mft_ipmsm_isolation_passed")
+                    mixed_validation.get("mixed_family_isolation_passed")
                 )
             ):
                 mixed_canary_required = True
@@ -4261,11 +4261,11 @@ class AedtPoolService:
         for row in waiting:
             family = str(row["workload_family"] or "").strip().lower()
             families.setdefault(family, []).append(row)
-        # Keep mixed cohorts deterministic: finish MFT predecessors before the
+        # Keep mixed cohorts deterministic: finish FEA predecessors before the
         # motor family, but issue only one native permit unless a family is
         # explicitly restored to the proven-parallel allowlist above.
         selected_family = (
-            "mft" if "mft" in families else sorted(families)[0]
+            "fea" if "fea" in families else sorted(families)[0]
         )
         selected = families[selected_family]
         if selected_family not in self._parallel_safe_native_solve_families:
@@ -6019,7 +6019,7 @@ class AedtPoolService:
         self, states: set[str], *, conn: Any | None = None
     ) -> list[dict[str, Any]]:
         # Dedicated allocation ownership prevents this opt-in pool from
-        # silently placing AEDT hosts inside an unrelated production campaign.
+        # silently placing AEDT hosts inside an unrelated production workload.
         if conn is None:
             rows = self.db.list_allocations_with_live(limit=1000, live_limit=10000)
         elif states:

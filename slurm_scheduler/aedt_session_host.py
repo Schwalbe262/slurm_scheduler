@@ -1209,8 +1209,8 @@ class AedtSessionHost:
         namespace_text = str(lease.get("project_namespace") or "").strip()
         if namespace_text:
             # Namespace is a logical collision domain, not a required filename
-            # prefix (pyaedt_motor deliberately binds ``ipmsm-*`` projects in
-            # the ``pyaedt_motor`` namespace).
+            # prefix (example_fea_b deliberately binds ``fea_b-*`` projects in
+            # the ``example_fea_b`` namespace).
             self._released_project_component(
                 namespace_text, "project namespace"
             )

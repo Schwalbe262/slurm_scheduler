@@ -63,7 +63,6 @@ FEA_HARD_PRESSURE_RECLAIM_SAMPLE_SETTING_PREFIX = (
 )
 FEA_HARD_PRESSURE_EPISODE_COOLDOWN_SECONDS = 300
 TASK_COUNT_SAMPLE_INTERVAL_SECONDS = 60
-TERMINAL_AEDT_WORKSPACE_ROOT = "/gpfs/tmp_cpu2/mft_pool"
 TERMINAL_AEDT_WORKSPACE_SWEEP_INTERVAL_SECONDS = 60
 TERMINAL_AEDT_WORKSPACE_RETRY_SECONDS = 60
 TERMINAL_AEDT_WORKSPACE_CLAIM_STALE_SECONDS = 600
@@ -332,6 +331,7 @@ class Scheduler:
         cleanup_finished_task_log_max_bytes: int = 0,
         cleanup_finished_task_log_trim_after_seconds: int = 86400,
         storage_guard_min_free_gb: float = 0.0,
+        aedt_pool_terminal_workspace_root: str = "/gpfs/tmp_cpu2/aedt_pool",
         aedt_storage_reservation_per_project_gb: float = 4.0,
         aedt_storage_reservation_maturity_seconds: int = 900,
         license_monitor_enabled: bool = False,
@@ -580,6 +580,10 @@ class Scheduler:
         self.cleanup_finished_task_log_max_bytes = max(0, int(cleanup_finished_task_log_max_bytes))
         self.cleanup_finished_task_log_trim_after_seconds = max(3600, int(cleanup_finished_task_log_trim_after_seconds))
         self.storage_guard_min_free_gb = max(0.0, float(storage_guard_min_free_gb))
+        self.aedt_pool_terminal_workspace_root = (
+            posixpath.normpath(str(aedt_pool_terminal_workspace_root or "").strip())
+            or "/gpfs/tmp_cpu2/aedt_pool"
+        )
         self.aedt_storage_reservation_per_project_gb = max(
             0.0, float(aedt_storage_reservation_per_project_gb)
         )
@@ -608,24 +612,13 @@ class Scheduler:
         self.license_admission_settlement_seconds = max(
             0, int(license_admission_settlement_seconds)
         )
-        reserve_source = (
-            {"electronics_desktop": 32}
-            if license_admission_reserve_by_feature is None
-            else license_admission_reserve_by_feature
-        )
+        reserve_source = license_admission_reserve_by_feature or {}
         self.license_admission_reserve_by_feature = {
             str(feature): max(0, int(reserve))
             for feature, reserve in reserve_source.items()
             if str(feature).strip()
         }
-        cost_source = (
-            {
-                "MFT_1MW_2026v1": {"electronics_desktop": 1},
-                "PYAEDT_MOTOR_IPMSM_V2": {"electronics_desktop": 1},
-            }
-            if license_admission_persistent_cost_by_project is None
-            else license_admission_persistent_cost_by_project
-        )
+        cost_source = license_admission_persistent_cost_by_project or {}
         self.license_admission_persistent_cost_by_project = {
             str(project): {
                 str(feature): max(0, int(cost))
@@ -4758,7 +4751,7 @@ class Scheduler:
         """Return the exact standalone-AEDT cap scope for ``task``.
 
         Active includes ATTACHING because the Desktop launch has already been
-        reserved at that boundary.  Queued tasks remain logical campaign
+        reserved at that boundary.  Queued tasks remain logical workload
         capacity and do not consume this physical-AEDT limit.  An exact lane
         match takes precedence over the broad per-project compatibility cap.
         """
@@ -7492,11 +7485,10 @@ class Scheduler:
             ),
         )
 
-    @staticmethod
     def _validated_terminal_aedt_workspace_path(
-        task_id: int, workspace_path: str
+        self, task_id: int, workspace_path: str
     ) -> str:
-        """Accept only the one canonical MFT scratch leaf owned by a task."""
+        """Accept only the canonical AEDT scratch leaf owned by a task."""
 
         if int(task_id or 0) <= 0:
             raise ValueError("AEDT workspace cleanup task identity is unavailable")
@@ -7504,8 +7496,8 @@ class Scheduler:
         if not raw or "\x00" in raw or not raw.startswith("/"):
             raise ValueError("AEDT workspace cleanup path must be absolute")
         normalized = posixpath.normpath(raw)
-        root = posixpath.normpath(TERMINAL_AEDT_WORKSPACE_ROOT)
-        expected_leaf = f"mft-{int(task_id)}"
+        root = self.aedt_pool_terminal_workspace_root
+        expected_leaf = f"aedt-{int(task_id)}"
         expected = posixpath.join(root, expected_leaf)
         if raw != normalized:
             raise ValueError(
@@ -7523,14 +7515,13 @@ class Scheduler:
             )
         return normalized
 
-    @staticmethod
     def _terminal_aedt_workspace_remove_command(
-        task_id: int, workspace_path: str
+        self, task_id: int, workspace_path: str
     ) -> str:
         """Build a fail-closed, same-account removal of one exact GPFS leaf."""
 
-        root = posixpath.normpath(TERMINAL_AEDT_WORKSPACE_ROOT)
-        leaf = f"mft-{int(task_id)}"
+        root = self.aedt_pool_terminal_workspace_root
+        leaf = f"aedt-{int(task_id)}"
         script = "\n".join(
             [
                 "set -u",

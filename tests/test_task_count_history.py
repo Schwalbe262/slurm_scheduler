@@ -84,7 +84,7 @@ class TaskCountSamplerTests(unittest.TestCase):
     def test_dashboard_summary_preserves_filters_caps_and_tile_classifications(self) -> None:
         older_active = self.db.create_task(
             TaskCreate(
-                "campaign-older-active",
+                "workload-older-active",
                 "~/case",
                 "run",
                 scheduling_profile="fea_bursty",
@@ -93,7 +93,7 @@ class TaskCountSamplerTests(unittest.TestCase):
         )
         middle_active = self.db.create_task(
             TaskCreate(
-                "campaign-middle-active",
+                "workload-middle-active",
                 "~/case",
                 "run",
                 same_node_as_task_id=123,
@@ -101,7 +101,7 @@ class TaskCountSamplerTests(unittest.TestCase):
         )
         newer_active = self.db.create_task(
             TaskCreate(
-                "campaign-newer-active",
+                "workload-newer-active",
                 "~/case",
                 "run",
                 scheduling_profile="fea_bursty",
@@ -113,7 +113,7 @@ class TaskCountSamplerTests(unittest.TestCase):
         self.db.update_task(newer_active, status=TaskStatus.RUNNING.value)
         session_host = self.db.create_task(
             TaskCreate(
-                "campaign-session-host",
+                "workload-session-host",
                 "~/case",
                 "run",
                 scheduling_profile="fea_bursty",
@@ -121,13 +121,13 @@ class TaskCountSamplerTests(unittest.TestCase):
             )
         )
         self.db.update_task(session_host, status=TaskStatus.RUNNING.value)
-        self.db.create_task(TaskCreate("campaign-older-queued", "~/case", "run"))
-        self.db.create_task(TaskCreate("campaign-newer-queued", "~/case", "run"))
+        self.db.create_task(TaskCreate("workload-older-queued", "~/case", "run"))
+        self.db.create_task(TaskCreate("workload-newer-queued", "~/case", "run"))
         unrelated = self.db.create_task(TaskCreate("unrelated", "~/case", "run"))
         self.db.update_task(unrelated, status=TaskStatus.RUNNING.value)
 
         summary = self.db.task_activity_summary(
-            name_contains="campaign",
+            name_contains="workload",
             active_limit=3,
             queued_limit=1,
         )
@@ -544,7 +544,7 @@ class TaskCountHistoryRouteTests(unittest.TestCase):
                     ),
                     "~/case",
                     "run",
-                    project="mft" if is_match else "other",
+                    project="fea" if is_match else "other",
                 )
             )
 
@@ -554,7 +554,7 @@ class TaskCountHistoryRouteTests(unittest.TestCase):
             compact=True,
             limit=0,
             before_id=0,
-            project="mft",
+            project="fea",
             name_prefix="",
             name_contains="api-whole-search",
             status=[TaskStatus.QUEUED.value],
@@ -593,7 +593,7 @@ class TaskCountHistoryRouteTests(unittest.TestCase):
             compact=True,
             limit=100,
             before_id=0,
-            project="mft",
+            project="fea",
             name_prefix="",
             name_contains="",
             status=[TaskStatus.QUEUED.value],

@@ -771,7 +771,7 @@ def build_task_script(task: dict, *, slurm_step_cpus: int | None = None) -> str:
                 ),
             ]
         )
-    lines.append(f"export MFT_AEDT_BACKEND={shlex.quote(normalize_aedt_backend(task.get('aedt_backend')))}")
+    lines.append(f"export SLURM_AEDT_BACKEND={shlex.quote(normalize_aedt_backend(task.get('aedt_backend')))}")
     if task.get("payload_json") and task.get("payload_path"):
         lines.extend(
             [
@@ -797,7 +797,7 @@ def build_task_script(task: dict, *, slurm_step_cpus: int | None = None) -> str:
     # immediately before the command so it cannot switch a pooled task back to
     # a standalone ownership path (or vice versa).
     lines.append(
-        f"export MFT_AEDT_BACKEND={shlex.quote(normalize_aedt_backend(task.get('aedt_backend')))}"
+        f"export SLURM_AEDT_BACKEND={shlex.quote(normalize_aedt_backend(task.get('aedt_backend')))}"
     )
     # env_setup is also not authoritative for attached-task CPU ownership.
     # Re-assert the split step/task contract immediately before the command.

@@ -36,7 +36,7 @@ def valid_manifest() -> str:
             "preserve": True,
             "created_at": "2026-07-24T12:00:00Z",
             "reason": "sealed source",
-            "owner": "campaign",
+            "owner": "workload",
             "artifact_manifest": {
                 "path": "manifest.json",
                 "sha256": "a" * 64,

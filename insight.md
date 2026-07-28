@@ -338,3 +338,17 @@
 - Storage root cause: the final serialized storage revalidation was limited to pooled tasks. Standalone pressure-requeues could therefore claim `ATTACHING` between selection and a refreshed DB shadow.
 - Storage fix: every FEA final claim now refreshes the DB-derived storage reservations under the assignment lock and includes one prospective project growth unit; pooled session hosts refresh without double-counting the complete capacity already reserved for the host.
 - Pending-demand follow-on: the generic 1800-second allocation timeout ran before reservation-aware scale-in and could retire a `Priority`-queued FEA CPU pool that still had a live queued-task claim. The timeout now reuses a stable reservation plan and exempts only exact `Priority` waits with a durable FEA CPU demand tag and compatible queued standalone FEA CPU claim. Removing the demand immediately restores normal scale-in, while other Slurm reasons, standard tasks, and orphan pools retain the timeout.
+
+## 2026-07-28 MFT decoupling restores the generic scheduler
+- Source loop: consolidation Phase 2 (docs/improvement_mft_decoupling_20260728.md).
+- Improvement: campaign-specific layer (pipeline status, campaign lock, campaign/simulation
+  APIs, MFT dashboard panel, MFT_AEDT_* contract, hard-coded license cost maps) removed;
+  the pooled task contract generalized to SLURM_AEDT_* and the terminal workspace root made
+  a config knob (aedt_pool.terminal_workspace_root).
+- Before: scheduler shipped MFT project names/paths in code defaults; UI exposed
+  optimal-design campaign controls. After: zero MFT tokens in slurm_scheduler/, templates/,
+  config example; 27 files, +510/-8800.
+- Evidence: compileall clean; pytest 880 passed / 3 pre-existing pilot failures / 2 skipped;
+  grep gate 0 hits.
+- Remaining risk: MFT clients must host campaign logic in their own repo; pooled clients must
+  inject SLURM_AEDT_* names.

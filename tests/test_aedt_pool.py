@@ -442,11 +442,11 @@ class AedtPoolGateTests(AedtPoolTestCase):
         for index in range(500):
             self.db.create_task(
                 TaskCreate(
-                    name=f"mft-backlog-{index}",
+                    name=f"fea-backlog-{index}",
                     remote_cwd=f"/work/backlog/{index}",
                     command="true",
                     aedt_backend="pooled",
-                    project="MFT_1MW_2026v1",
+                    project="FEA_1MW_2026v1",
                 )
             )
         self.make_operational()
@@ -473,12 +473,12 @@ class AedtPoolGateTests(AedtPoolTestCase):
             for index in range(100):
                 self.db.create_task(
                     TaskCreate(
-                        name=f"mft-{account}-{index}",
+                        name=f"fea-{account}-{index}",
                         remote_cwd=f"/work/{account}/{index}",
                         command="true",
                         account_name=account,
                         aedt_backend="pooled",
-                        project="MFT_1MW_2026v1",
+                        project="FEA_1MW_2026v1",
                     )
                 )
         self.make_operational()
@@ -524,7 +524,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
         )
         self.assertEqual(plan["node_requests"], 45)
 
-    def test_busy_mft_sessions_do_not_mask_motor_family_session_demand(self) -> None:
+    def test_busy_fea_sessions_do_not_mask_motor_family_session_demand(self) -> None:
         allocation_id = self.add_dedicated_allocation()
         self.service.set_operator_limits(
             max_sessions=3,
@@ -570,12 +570,12 @@ class AedtPoolGateTests(AedtPoolTestCase):
                         workload_family, session_profile, project_namespace,
                         isolation_policy, protocol_version, session_id,
                         slot_index, state, client_token_hash, expires_at
-                    ) VALUES (?, ?, 'mft', 'mft', ?, 'mft', 'family', 2,
+                    ) VALUES (?, ?, 'fea', 'fea', ?, 'fea', 'family', 2,
                               ?, 0, 'active', 'token', '2099-01-01 00:00:00')
                     """,
                     (
                         f"family-bound-lease-{index}",
-                        f"mft-family-bound-{index}",
+                        f"fea-family-bound-{index}",
                         EXPECTED_SESSION_PROFILE_JSON,
                         session_id,
                     ),
@@ -583,12 +583,12 @@ class AedtPoolGateTests(AedtPoolTestCase):
         for index in range(3):
             self.db.create_task(
                 TaskCreate(
-                    name=f"ipmsm-family-demand-{index}",
-                    remote_cwd=f"/work/ipmsm/{index}",
+                    name=f"fea_b-family-demand-{index}",
+                    remote_cwd=f"/work/fea_b/{index}",
                     command="true",
                     account_name="a",
                     aedt_backend="pooled",
-                    project="pyaedt_motor",
+                    project="example_fea_b",
                 )
             )
         self.make_operational()
@@ -649,12 +649,12 @@ class AedtPoolGateTests(AedtPoolTestCase):
         for index in range(102):
             self.db.create_task(
                 TaskCreate(
-                    name=f"mft-rebalance-b-{index}",
+                    name=f"fea-rebalance-b-{index}",
                     remote_cwd=f"/work/b/{index}",
                     command="true",
                     account_name="b",
                     aedt_backend="pooled",
-                    project="MFT_1MW_2026v1",
+                    project="FEA_1MW_2026v1",
                 )
             )
         self.make_operational()
@@ -704,7 +704,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 cpus=4,
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 aedt_backend="pooled",
-                project="MFT_1MW_2026v1",
+                project="FEA_1MW_2026v1",
             )
         )
         remote_client_task_id = self.db.create_task(
@@ -715,7 +715,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 cpus=1,
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 aedt_backend="pooled",
-                project="MFT_1MW_2026v1",
+                project="FEA_1MW_2026v1",
             )
         )
         for task_id, allocation_id in (
@@ -787,10 +787,10 @@ class AedtPoolGateTests(AedtPoolTestCase):
 
     def test_placement_group_derivation_and_explicit_override(self) -> None:
         cases = {
-            "mft-pending-39812-stage": "mft",
-            "simulation_745147_2759990": "mft",
-            "IPMSM_v2_stage3_001": "ipmsm",
-            "motor-prototype-ipmsm-stage": "ipmsm",
+            "fea-pending-39812-stage": "fea",
+            "simulation_745147_2759990": "fea",
+            "FEA-B_v2_stage3_001": "fea_b",
+            "motor-prototype-fea_b-stage": "fea_b",
             "Alpha42-stage-7": "alpha42",
         }
         for project_name, expected in cases.items():
@@ -831,9 +831,9 @@ class AedtPoolGateTests(AedtPoolTestCase):
         self.assertEqual(validated.native_solve_mode, "validated_parallel")
         self.assertEqual(
             validated._parallel_safe_native_solve_families,
-            frozenset({"mft_validated_async"}),
+            frozenset({"fea_validated_async"}),
         )
-        self.assertNotIn("mft", validated._parallel_safe_native_solve_families)
+        self.assertNotIn("fea", validated._parallel_safe_native_solve_families)
         router = create_aedt_pool_router(validated)
         summary_endpoint = next(
             route.endpoint
@@ -844,7 +844,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
         self.assertEqual(validated_config["native_solve_mode"], "validated_parallel")
         self.assertEqual(
             validated_config["parallel_safe_native_solve_families"],
-            ["mft_validated_async"],
+            ["fea_validated_async"],
         )
         with self.assertRaisesRegex(ValueError, "must be one of"):
             AedtPoolService(self.db, native_solve_mode="unsafe")
@@ -899,7 +899,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 command="true",
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 aedt_backend="pooled",
-                project="MFT_1MW_2026v1",
+                project="FEA_1MW_2026v1",
             )
         )
         selected_task_ids: list[int] = []
@@ -952,7 +952,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 account_name="pinned-account",
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 aedt_backend="pooled",
-                project="MFT_1MW_2026v1",
+                project="FEA_1MW_2026v1",
             )
         )
         reserved_allocation_id = self.db.create_allocation(
@@ -975,7 +975,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 command="true",
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 aedt_backend="pooled",
-                project="MFT_1MW_2026v1",
+                project="FEA_1MW_2026v1",
             )
         )
         with self.db.connect() as conn:
@@ -1070,8 +1070,8 @@ class AedtPoolGateTests(AedtPoolTestCase):
                     session_profile, project_namespace, isolation_policy,
                     protocol_version, session_id, slot_index, state,
                     client_token_hash, expires_at
-                ) VALUES ('batch-existing-owner', 'mft-existing-owner', 'mft',
-                          ?, 'mft', 'family', 2, ?, 0, 'active',
+                ) VALUES ('batch-existing-owner', 'fea-existing-owner', 'fea',
+                          ?, 'fea', 'family', 2, ?, 0, 'active',
                           'token', '2099-01-01 00:00:00')
                 """,
                 (EXPECTED_SESSION_PROFILE_JSON, dhj_session),
@@ -1079,10 +1079,10 @@ class AedtPoolGateTests(AedtPoolTestCase):
 
         env_setup = "\n".join(
             (
-                "export MFT_AEDT_SESSION_PROFILE="
+                "export SLURM_AEDT_SESSION_PROFILE="
                 + shlex.quote(EXPECTED_SESSION_PROFILE_JSON),
-                "export MFT_AEDT_WORKLOAD_FAMILY=mft",
-                "export MFT_AEDT_ISOLATION_POLICY=family",
+                "export SLURM_AEDT_WORKLOAD_FAMILY=fea",
+                "export SLURM_AEDT_ISOLATION_POLICY=family",
             )
         )
         task_ids = [
@@ -1094,7 +1094,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                     env_setup=env_setup,
                     scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                     aedt_backend="pooled",
-                    project="MFT_1MW_2026v1",
+                    project="FEA_1MW_2026v1",
                 )
             )
             for index in range(18)
@@ -1208,7 +1208,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
             reservation = self.service.prepare_pooled_task_session(
                 task_id=task_id,
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
-                workload_family="mft",
+                workload_family="fea",
                 isolation_policy="family",
             )
             self.assertIsNotNone(reservation)
@@ -1272,7 +1272,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                     remote_cwd=f"/work/cold/{index}",
                     command="true",
                     aedt_backend="pooled",
-                    project="MFT_1MW_2026v1",
+                    project="FEA_1MW_2026v1",
                 )
             )
         calls = 0
@@ -1318,7 +1318,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 command="true",
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 aedt_backend="pooled",
-                project="MFT_1MW_2026v1",
+                project="FEA_1MW_2026v1",
             )
         )
         call_count = 0
@@ -1366,17 +1366,17 @@ class AedtPoolGateTests(AedtPoolTestCase):
         task = {
             "task_id": 101,
             "name": "batch-incompatible-busy",
-            "project": "MFT_1MW_2026v1",
+            "project": "FEA_1MW_2026v1",
             "requested_account_name": "",
             "task_account_name": "",
             "required_capability": "",
             "env_profile": "",
             "env_setup": "\n".join(
                 (
-                    "export MFT_AEDT_SESSION_PROFILE="
+                    "export SLURM_AEDT_SESSION_PROFILE="
                     + shlex.quote(EXPECTED_SESSION_PROFILE_JSON),
-                    "export MFT_AEDT_WORKLOAD_FAMILY=mft",
-                    "export MFT_AEDT_ISOLATION_POLICY=family",
+                    "export SLURM_AEDT_WORKLOAD_FAMILY=fea",
+                    "export SLURM_AEDT_ISOLATION_POLICY=family",
                 )
             ),
             "command": "true",
@@ -1392,7 +1392,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                     {
                         "protocol_version": 2,
                         "session_profile": EXPECTED_SESSION_PROFILE_JSON,
-                        "workload_family": "ipmsm",
+                        "workload_family": "fea_b",
                         "isolation_policy": "family",
                         "exclusive_session": 0,
                     }
@@ -1459,7 +1459,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 "occupants": [
                     {
                         **incompatible_busy[0]["occupants"][0],
-                        "workload_family": "mft",
+                        "workload_family": "fea",
                     }
                 ],
             }
@@ -1520,16 +1520,16 @@ class AedtPoolGateTests(AedtPoolTestCase):
         )
         env_setup = "\n".join(
             (
-                "export MFT_AEDT_SESSION_PROFILE="
+                "export SLURM_AEDT_SESSION_PROFILE="
                 + shlex.quote(EXPECTED_SESSION_PROFILE_JSON),
-                "export MFT_AEDT_WORKLOAD_FAMILY=mft",
-                "export MFT_AEDT_ISOLATION_POLICY=family",
+                "export SLURM_AEDT_WORKLOAD_FAMILY=fea",
+                "export SLURM_AEDT_ISOLATION_POLICY=family",
             )
         )
         flexible = {
             "task_id": 201,
             "name": "hard-pending-flexible",
-            "project": "MFT_1MW_2026v1",
+            "project": "FEA_1MW_2026v1",
             "requested_account_name": "",
             "task_account_name": "",
             "required_capability": "",
@@ -2389,8 +2389,8 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
     def activate_exact_cohort(self) -> tuple[list[dict], list[str]]:
         admission = self.service.create_mixed_canary_admission(
             session_id=int(self.session["id"]),
-            mft_projects=2,
-            ipmsm_projects=1,
+            family_a_projects=2,
+            family_b_projects=1,
         )
         leases = []
         tokens = []
@@ -2501,7 +2501,7 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         self.assertTrue(waiting["native_pipeline_barrier_broken"])
         self.assertEqual(waiting["native_pipeline_expected_count"], 1)
 
-        # Even after the permitted MFT project is physically closed, an
+        # Even after the permitted FEA project is physically closed, an
         # unmarked predecessor must never authorize the next waiting wave on a
         # potentially contaminated Desktop.
         self.service.complete_release(
@@ -2522,14 +2522,14 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
     def test_bootstrap_admission_forces_three_mixed_tasks_to_exact_empty_session(self) -> None:
         admission = self.service.create_mixed_canary_admission(
             session_id=int(self.session["id"]),
-            mft_projects=2,
-            ipmsm_projects=1,
+            family_a_projects=2,
+            family_b_projects=1,
         )
         self.assertEqual(admission["state"], "open")
         self.assertEqual(len(admission["slots"]), 3)
         self.assertEqual(
             {(slot["workload_family"], slot["project_namespace"]) for slot in admission["slots"]},
-            {("mft", "mft"), ("ipmsm", "pyaedt_motor")},
+            {("fea", "fea"), ("fea_b", "example_fea_b")},
         )
 
         leases = []
@@ -2561,20 +2561,20 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         permitted = [
             self.service.get_lease(int(lease["id"])) for lease in leases
         ]
-        mft_permitted = [
-            lease for lease in permitted if lease["workload_family"] == "mft"
+        fea_permitted = [
+            lease for lease in permitted if lease["workload_family"] == "fea"
         ]
         motor_waiting = [
-            lease for lease in permitted if lease["workload_family"] == "ipmsm"
+            lease for lease in permitted if lease["workload_family"] == "fea_b"
         ]
         self.assertEqual(
-            sum(bool(lease["solve_permit_granted"]) for lease in mft_permitted),
+            sum(bool(lease["solve_permit_granted"]) for lease in fea_permitted),
             1,
         )
         self.assertEqual(len(motor_waiting), 1)
         self.assertFalse(motor_waiting[0]["solve_permit_granted"])
         self.assertEqual(
-            sorted(int(lease["solve_permit_generation"]) for lease in mft_permitted),
+            sorted(int(lease["solve_permit_generation"]) for lease in fea_permitted),
             [0, 1],
         )
         self.assertTrue(
@@ -2585,7 +2585,7 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         # Admission authorizes only this experiment; it never forges the
         # production validation record before full mixed evidence exists.
         self.assertFalse(
-            bool(self.service.latest_validation()["mixed_mft_ipmsm_isolation_passed"])
+            bool(self.service.latest_validation()["mixed_family_isolation_passed"])
         )
 
     def test_underfilled_fallback_cannot_seal_open_mixed_admission(self) -> None:
@@ -2712,19 +2712,19 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
     def test_wrong_namespace_and_unreserved_clients_cannot_consume_canary(self) -> None:
         admission = self.service.create_mixed_canary_admission(
             session_id=int(self.session["id"]),
-            mft_projects=1,
-            ipmsm_projects=2,
+            family_a_projects=1,
+            family_b_projects=2,
         )
-        ipmsm_slot = next(
-            slot for slot in admission["slots"] if slot["workload_family"] == "ipmsm"
+        fea_b_slot = next(
+            slot for slot in admission["slots"] if slot["workload_family"] == "fea_b"
         )
-        task_id = self.create_task_for_slot(ipmsm_slot, "wrong-namespace")
+        task_id = self.create_task_for_slot(fea_b_slot, "wrong-namespace")
         with self.assertRaisesRegex(ValueError, "project_namespace"):
             self.request_slot(
-                ipmsm_slot,
+                fea_b_slot,
                 task_id=task_id,
                 suffix="wrong-namespace",
-                namespace="mft",
+                namespace="fea",
             )
 
         unreserved_task_id = self.db.create_task(
@@ -2742,9 +2742,9 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         with self.assertRaisesRegex(ValueError, "bootstrap-issued canary task"):
             self.service.request_lease(
                 request_key="unreserved-shared-client",
-                project_name="mft-unreserved-shared-client",
-                workload_family="mft",
-                project_namespace="mft",
+                project_name="fea-unreserved-shared-client",
+                workload_family="fea",
+                project_namespace="fea",
                 isolation_policy="shared_if_compatible",
                 workspace_path="/shared/unreserved",
                 protocol_version=2,
@@ -2754,9 +2754,9 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
 
         family_lease, _token = self.service.request_lease(
             request_key="normal-family-cannot-steal",
-            project_name="mft-normal-family-cannot-steal",
-            workload_family="mft",
-            project_namespace="mft",
+            project_name="fea-normal-family-cannot-steal",
+            workload_family="fea",
+            project_namespace="fea",
             isolation_policy="family",
             workspace_path="/shared/normal-family",
             protocol_version=2,
@@ -2774,7 +2774,7 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         with self.assertRaisesRegex(ValueError, "protocol_version=2"):
             self.service.request_lease(
                 request_key="mixed-canary-legacy-protocol",
-                project_name="mft-mixed-canary-legacy-protocol",
+                project_name="fea-mixed-canary-legacy-protocol",
                 workload_family=str(slot["workload_family"]),
                 project_namespace=str(slot["project_namespace"]),
                 isolation_policy="shared_if_compatible",
@@ -2811,10 +2811,10 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         def request_v2(suffix: str):
             return self.service.request_lease(
                 request_key=f"release-race-{suffix}",
-                project_name=f"mft-release-race-{suffix}",
-                workload_family="mft",
+                project_name=f"fea-release-race-{suffix}",
+                workload_family="fea",
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
-                project_namespace="mft",
+                project_namespace="fea",
                 isolation_policy="family",
                 workspace_path=f"/work/release-race/{suffix}",
                 protocol_version=2,
@@ -2904,15 +2904,15 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         with self.assertRaisesRegex(ValueError, "workspace_path"):
             self.service.request_lease(
                 request_key="v2-blank-workspace",
-                project_name="mft-v2-blank-workspace",
-                workload_family="mft",
+                project_name="fea-v2-blank-workspace",
+                workload_family="fea",
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
                 protocol_version=2,
             )
         with self.assertRaisesRegex(ValueError, "workload_family"):
             self.service.request_lease(
                 request_key="v2-blank-family",
-                project_name="mft-v2-blank-family",
+                project_name="fea-v2-blank-family",
                 workload_family="",
                 workspace_path="/shared/v2",
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
@@ -2923,38 +2923,38 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         with self.assertRaisesRegex(ValueError, "does not match"):
             self.service.request_lease(
                 request_key="v2-profile-drift",
-                project_name="mft-v2-profile-drift",
-                workload_family="mft",
+                project_name="fea-v2-profile-drift",
+                workload_family="fea",
                 workspace_path="/shared/v2",
                 session_profile=drifted,
                 protocol_version=2,
             )
 
-    def test_shared_mft_ipmsm_admission_requires_dedicated_mixed_validation(
+    def test_shared_fea_fea_b_admission_requires_dedicated_mixed_validation(
         self,
     ) -> None:
         request = {
             "request_key": "mixed-gated",
-            "project_name": "mft-ipmsm-mixed",
-            "workload_family": "mft",
-            "workspace_path": "/shared/mixed/mft",
+            "project_name": "fea-fea_b-mixed",
+            "workload_family": "fea",
+            "workspace_path": "/shared/mixed/fea",
             "session_profile": EXPECTED_SESSION_PROFILE_JSON,
             "protocol_version": 2,
             "isolation_policy": "shared_if_compatible",
         }
-        with self.assertRaisesRegex(ValueError, "mixed MFT/IPMSM"):
+        with self.assertRaisesRegex(ValueError, "mixed FEA/FEA-B"):
             self.service.request_lease(**request)
 
         mixed_validation = self.service.record_validation(
             {
                 **PASSING_EVIDENCE,
-                "mixed_mft_ipmsm_isolation_passed": True,
-                "mixed_validation_artifact": "mixed-mft-ipmsm.json",
+                "mixed_family_isolation_passed": True,
+                "mixed_validation_artifact": "mixed-fea-fea_b.json",
             }
         )
         self.assertEqual(mixed_validation["status"], "passed")
         self.assertEqual(
-            mixed_validation["mixed_mft_ipmsm_isolation_passed"], 1
+            mixed_validation["mixed_family_isolation_passed"], 1
         )
         lease, _token = self.service.request_lease(**request)
         self.assertEqual(lease["isolation_policy"], "shared_if_compatible")
@@ -2964,8 +2964,8 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
     ) -> None:
         lease, token = self.service.request_lease(
             request_key="v2-long-admission",
-            project_name="mft-v2-long-admission",
-            workload_family="mft",
+            project_name="fea-v2-long-admission",
+            workload_family="fea",
             workspace_path="/shared/v2-long",
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
             protocol_version=2,
@@ -3458,8 +3458,8 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         first_token = "first-client-token-0001"
         first, _ = self.service.request_lease(
             request_key="durable-intent",
-            project_name="mft-durable-intent",
-            workload_family="mft",
+            project_name="fea-durable-intent",
+            workload_family="fea",
             protocol_version=2,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
             workspace_path="/shared/test-v2",
@@ -3467,8 +3467,8 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         )
         replay, returned_token = self.service.request_lease(
             request_key="durable-intent",
-            project_name="mft-durable-intent",
-            workload_family="mft",
+            project_name="fea-durable-intent",
+            workload_family="fea",
             protocol_version=2,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
             workspace_path="/shared/test-v2",
@@ -3479,8 +3479,8 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         with self.assertRaisesRegex(ValueError, "owned by a live lease"):
             self.service.request_lease(
                 request_key="durable-intent",
-                project_name="mft-durable-intent",
-                workload_family="mft",
+                project_name="fea-durable-intent",
+                workload_family="fea",
                 protocol_version=2,
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
                 workspace_path="/shared/test-v2",
@@ -3490,8 +3490,8 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.service.cancel_lease(int(first["id"]), first_token)
         replacement, replacement_token = self.service.request_lease(
             request_key="durable-intent",
-            project_name="mft-durable-intent",
-            workload_family="mft",
+            project_name="fea-durable-intent",
+            workload_family="fea",
             protocol_version=2,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
             workspace_path="/shared/test-v2",
@@ -3506,8 +3506,8 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
 
         stale, _ = self.service.request_lease(
             request_key="abandoned-intent",
-            project_name="mft-abandoned-intent",
-            workload_family="mft",
+            project_name="fea-abandoned-intent",
+            workload_family="fea",
             protocol_version=2,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
             workspace_path="/shared/test-v2",
@@ -3516,8 +3516,8 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.clock.advance(self.service.config().admission_deadline_seconds + 1)
         recovered, _ = self.service.request_lease(
             request_key="abandoned-intent",
-            project_name="mft-abandoned-intent",
-            workload_family="mft",
+            project_name="fea-abandoned-intent",
+            workload_family="fea",
             protocol_version=2,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
             workspace_path="/shared/test-v2",
@@ -3565,11 +3565,11 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
     def test_protocol_v2_offer_accept_activate_and_cancel(self) -> None:
         lease, token = self.service.request_lease(
             request_key="v2-lifecycle",
-            project_name="mft-v2-unique",
-            workload_family="mft",
-            project_namespace="mft-v2",
+            project_name="fea-v2-unique",
+            workload_family="fea",
+            project_namespace="fea-v2",
             isolation_policy="family",
-            workspace_path="/shared/mft-v2",
+            workspace_path="/shared/fea-v2",
             protocol_version=2,
             task_id=39812,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
@@ -3592,9 +3592,9 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         close_command = self.service.session_commands(
             int(session["id"]), host_token
         )["close_projects"][0]
-        self.assertEqual(close_command["project_name"], "mft-v2-unique")
-        self.assertEqual(close_command["project_namespace"], "mft-v2")
-        self.assertEqual(close_command["workspace_path"], "/shared/mft-v2")
+        self.assertEqual(close_command["project_name"], "fea-v2-unique")
+        self.assertEqual(close_command["project_namespace"], "fea-v2")
+        self.assertEqual(close_command["workspace_path"], "/shared/fea-v2")
         self.assertEqual(int(close_command["protocol_version"]), 2)
         self.assertEqual(int(close_command["task_id"]), 39812)
         released = self.service.complete_release(
@@ -3610,8 +3610,8 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         leases = [
             self.service.request_lease(
                 request_key=f"solve-batch-{index}",
-                project_name=f"mft-solve-batch-{index}",
-                workload_family="mft",
+                project_name=f"fea-solve-batch-{index}",
+                workload_family="fea",
                 workspace_path=f"/shared/solve-batch/{index}",
                 protocol_version=2,
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
@@ -3678,8 +3678,8 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
     def test_underfilled_solve_permit_seals_session_against_late_attach(self) -> None:
         first, first_token = self.service.request_lease(
             request_key="underfilled-first",
-            project_name="mft-underfilled-first",
-            workload_family="mft",
+            project_name="fea-underfilled-first",
+            workload_family="fea",
             workspace_path="/shared/underfilled/first",
             protocol_version=2,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
@@ -3697,8 +3697,8 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
 
         late, _late_token = self.service.request_lease(
             request_key="underfilled-late",
-            project_name="mft-underfilled-late",
-            workload_family="mft",
+            project_name="fea-underfilled-late",
+            workload_family="fea",
             workspace_path="/shared/underfilled/late",
             protocol_version=2,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
@@ -3722,8 +3722,8 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
     def test_unaccepted_v2_offer_requeues_through_five_minute_outage(self) -> None:
         lease, token = self.service.request_lease(
             request_key="v2-abandoned-offer",
-            project_name="mft-v2-abandoned",
-            workload_family="mft",
+            project_name="fea-v2-abandoned",
+            workload_family="fea",
             protocol_version=2,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
             workspace_path="/shared/test-v2",
@@ -3758,8 +3758,8 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         )
         lease, _token = self.service.request_lease(
             request_key="dead-client-lease",
-            project_name="mft-dead-client",
-            workload_family="mft",
+            project_name="fea-dead-client",
+            workload_family="fea",
             protocol_version=2,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
             workspace_path="/shared/test-v2",
@@ -4053,31 +4053,31 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             drain_reason="operator maintenance",
             drain_at=self.clock.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
-        first_mft, _ = self.request(
-            "placement-mft-first",
+        first_fea, _ = self.request(
+            "placement-fea-first",
             allocation_id=self.allocation_id,
             node="cpu-01",
-            project_name="mft-pending-39812-stage",
+            project_name="fea-pending-39812-stage",
         )
-        simulation_mft, _ = self.request(
-            "placement-mft-simulation",
+        simulation_fea, _ = self.request(
+            "placement-fea-simulation",
             allocation_id=self.allocation_id,
             node="cpu-01",
             project_name="simulation_745147_2759990",
         )
-        ipmsm, _ = self.request(
-            "placement-ipmsm",
+        fea_b, _ = self.request(
+            "placement-fea_b",
             allocation_id=self.allocation_id,
             node="cpu-01",
-            project_name="ipmsm_v2_stage3_001",
+            project_name="fea_b_v2_stage3_001",
         )
-        third_mft, _ = self.request(
-            "placement-mft-third",
+        third_fea, _ = self.request(
+            "placement-fea-third",
             allocation_id=self.allocation_id,
             node="cpu-01",
-            project_name="mft-pending-39813-stage",
+            project_name="fea-pending-39813-stage",
         )
-        for lease in (first_mft, simulation_mft, ipmsm, third_mft):
+        for lease in (first_fea, simulation_fea, fea_b, third_fea):
             self.assertEqual(lease["state"], "queued")
 
         self.db.update_allocation(
@@ -4087,18 +4087,18 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             drain_at=None,
         )
         self.service.reconcile(execute=True)
-        first_mft = self.service.get_lease(int(first_mft["id"]))
-        simulation_mft = self.service.get_lease(int(simulation_mft["id"]))
-        ipmsm = self.service.get_lease(int(ipmsm["id"]))
-        third_mft = self.service.get_lease(int(third_mft["id"]))
+        first_fea = self.service.get_lease(int(first_fea["id"]))
+        simulation_fea = self.service.get_lease(int(simulation_fea["id"]))
+        fea_b = self.service.get_lease(int(fea_b["id"]))
+        third_fea = self.service.get_lease(int(third_fea["id"]))
 
-        first_session_id = int(first_mft["session_id"])
-        second_session_id = int(ipmsm["session_id"])
-        self.assertEqual(first_mft["placement_group"], "mft")
-        self.assertEqual(simulation_mft["placement_group"], "mft")
-        self.assertEqual(ipmsm["placement_group"], "ipmsm")
-        self.assertEqual(int(simulation_mft["session_id"]), first_session_id)
-        self.assertEqual(int(third_mft["session_id"]), first_session_id)
+        first_session_id = int(first_fea["session_id"])
+        second_session_id = int(fea_b["session_id"])
+        self.assertEqual(first_fea["placement_group"], "fea")
+        self.assertEqual(simulation_fea["placement_group"], "fea")
+        self.assertEqual(fea_b["placement_group"], "fea_b")
+        self.assertEqual(int(simulation_fea["session_id"]), first_session_id)
+        self.assertEqual(int(third_fea["session_id"]), first_session_id)
         self.assertNotEqual(second_session_id, first_session_id)
         self.assertEqual(
             {int(session["id"]) for session in sessions},
@@ -4123,8 +4123,8 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(
             occupants,
             {
-                (first_session_id, "mft", 3),
-                (second_session_id, "ipmsm", 1),
+                (first_session_id, "fea", 3),
+                (second_session_id, "fea_b", 1),
             },
         )
 
@@ -4376,7 +4376,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
                 account_name="blocked-account",
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 aedt_backend="pooled",
-                project="MFT_1MW_2026v1",
+                project="FEA_1MW_2026v1",
             )
         )
         now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -4816,7 +4816,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             "recovered-allocation-placement",
             allocation_id=self.allocation_id,
             node="cpu-01",
-            project_name="mft-pending-39812-stage",
+            project_name="fea-pending-39812-stage",
         )
         self.service.reconcile(execute=True)
         lease = self.service.get_lease(int(lease["id"]))
@@ -5009,7 +5009,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             "shared-first",
             allocation_id=self.allocation_id,
             node="cpu-01",
-            project_name="mft-pending-39812-stage",
+            project_name="fea-pending-39812-stage",
         )
         session, _host_token = self.start_one_session(self.allocation_id)
         current_shared = self.service.get_lease(int(shared["id"]))
@@ -5022,7 +5022,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             project_name="simulation_745147_2759990",
             exclusive_session=True,
         )
-        self.assertEqual(exclusive["placement_group"], "mft")
+        self.assertEqual(exclusive["placement_group"], "fea")
         self.assertEqual(exclusive["state"], "queued")
         with self.db.connect() as conn:
             live_on_session = conn.execute(
@@ -5052,12 +5052,12 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         )
         self.service.set_enabled(True)
         self.request(
-            "demand-mft",
-            project_name="mft-pending-39812-stage",
+            "demand-fea",
+            project_name="fea-pending-39812-stage",
         )
         self.request(
-            "demand-ipmsm",
-            project_name="ipmsm_v2_stage3_001",
+            "demand-fea_b",
+            project_name="fea_b_v2_stage3_001",
         )
 
         plan = self.service.dry_run()
@@ -5509,15 +5509,15 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             "temporary",
             allocation_id=self.allocation_id,
             node="cpu-01",
-            project_name="mft-pending-39812-stage",
+            project_name="fea-pending-39812-stage",
         )
-        self.assertEqual(lease["placement_group"], "mft")
+        self.assertEqual(lease["placement_group"], "fea")
         self.start_one_session(self.allocation_id)
         updated = self.service.bind_lease_project_name(
             int(lease["id"]), token, "simulation_745147_2759990"
         )
         self.assertEqual(updated["project_name"], "simulation_745147_2759990")
-        self.assertEqual(updated["placement_group"], "mft")
+        self.assertEqual(updated["placement_group"], "fea")
 
         custom, custom_token = self.request(
             "custom-bind-stability",
@@ -5769,10 +5769,10 @@ class AedtExactSessionReservationTests(AedtPoolTestCase):
     ):
         return self.service.request_lease(
             request_key=f"exact-pin-lease:{suffix}",
-            project_name=f"mft-exact-pin-{suffix}",
-            workload_family="mft",
+            project_name=f"fea-exact-pin-{suffix}",
+            workload_family="fea",
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            project_namespace="mft",
+            project_namespace="fea",
             isolation_policy="family",
             workspace_path=f"/work/{suffix}",
             protocol_version=2,
@@ -7065,7 +7065,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         reservation = self.service.prepare_pooled_task_session(
             task_id=task_id,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            workload_family="mft",
+            workload_family="fea",
             isolation_policy="family",
         )
 
@@ -7095,7 +7095,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
                 reservation = self.service.prepare_pooled_task_session(
                     task_id=task_id,
                     session_profile=EXPECTED_SESSION_PROFILE_JSON,
-                    workload_family="mft",
+                    workload_family="fea",
                     isolation_policy="family",
                 )
 
@@ -7127,7 +7127,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         explicit = self.service.prepare_pooled_task_session(
             task_id=explicit_task,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            workload_family="mft",
+            workload_family="fea",
             isolation_policy="family",
         )
         self.assertIsNotNone(explicit)
@@ -7142,7 +7142,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         operator = self.service.prepare_pooled_task_session(
             task_id=operator_task,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            workload_family="mft",
+            workload_family="fea",
             isolation_policy="family",
         )
         self.assertIsNotNone(operator)
@@ -7160,7 +7160,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
             self.service.prepare_pooled_task_session(
                 task_id=task_id,
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
-                workload_family="mft",
+                workload_family="fea",
                 isolation_policy="family",
             )
             for task_id in task_ids
@@ -7177,7 +7177,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         replay = self.service.prepare_pooled_task_session(
             task_id=task_ids[1],
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            workload_family="mft",
+            workload_family="fea",
             isolation_policy="family",
         )
 
@@ -7211,7 +7211,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         selected = self.service.prepare_pooled_task_session(
             task_id=selected_task,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            workload_family="mft",
+            workload_family="fea",
             isolation_policy="family",
         )
         self.assertIsNotNone(selected)
@@ -7222,7 +7222,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         blocked = self.service.prepare_pooled_task_session(
             task_id=outside_task,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            workload_family="mft",
+            workload_family="fea",
             isolation_policy="family",
         )
         self.assertIsNone(blocked)
@@ -7231,19 +7231,19 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
             0,
         )
 
-    def test_app_preadmission_uses_motor_clients_canonical_ipmsm_family(self) -> None:
+    def test_app_preadmission_uses_motor_clients_canonical_fea_b_family(self) -> None:
         from slurm_scheduler.aedt_pool import canonical_workload_family
 
         self.assertEqual(
-            canonical_workload_family("", "pyaedt_motor campaign"),
-            "ipmsm",
+            canonical_workload_family("", "example_fea_b workload"),
+            "fea_b",
         )
         self.assertEqual(
-            canonical_workload_family("", "IPMSM_v2_stage3_001"),
-            "ipmsm",
+            canonical_workload_family("", "FEA-B_v2_stage3_001"),
+            "fea_b",
         )
         self.assertEqual(
-            canonical_workload_family("custom-motor", "pyaedt_motor campaign"),
+            canonical_workload_family("custom-motor", "example_fea_b workload"),
             "custom-motor",
         )
 
@@ -7253,7 +7253,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         reservation = self.service.prepare_pooled_task_session(
             task_id=task_id,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            workload_family="mft",
+            workload_family="fea",
             isolation_policy="family",
         )
 
@@ -7283,7 +7283,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
             self.service.prepare_pooled_task_session(
                 task_id=task_id,
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
-                workload_family="mft",
+                workload_family="fea",
                 isolation_policy="family",
             )
             for task_id in task_ids
@@ -7319,7 +7319,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         blocked = self.service.prepare_pooled_task_session(
             task_id=task_id,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            workload_family="mft",
+            workload_family="fea",
             isolation_policy="shared_if_compatible",
         )
 
@@ -7331,15 +7331,15 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         self.service.record_validation(
             {
                 **PASSING_EVIDENCE,
-                "mixed_mft_ipmsm_isolation_passed": True,
-                "mixed_validation_artifact": "mixed-mft-ipmsm.json",
+                "mixed_family_isolation_passed": True,
+                "mixed_validation_artifact": "mixed-fea-fea_b.json",
             }
         )
         shared_task = self.create_pooled_task("shared-symmetric-contract")
         shared = self.service.prepare_pooled_task_session(
             task_id=shared_task,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            workload_family="mft",
+            workload_family="fea",
             isolation_policy="shared_if_compatible",
         )
         self.assertIsNotNone(shared)
@@ -7348,7 +7348,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         family = self.service.prepare_pooled_task_session(
             task_id=family_task,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            workload_family="mft",
+            workload_family="fea",
             isolation_policy="family",
         )
 
@@ -7368,7 +7368,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         blocked = self.service.prepare_pooled_task_session(
             task_id=task_id,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            workload_family="mft",
+            workload_family="fea",
             isolation_policy="family",
         )
         self.assertIsNone(blocked)
@@ -7408,35 +7408,35 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         admitted = self.service.prepare_pooled_task_session(
             task_id=task_id,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            workload_family="mft",
+            workload_family="fea",
             isolation_policy="family",
         )
         self.assertIsNotNone(admitted)
         self.assertEqual(admitted["allocation_id"], allocation_id)
 
-    def test_auto_preadmission_keeps_mft_and_motor_families_separate(self) -> None:
-        mft_sessions = []
+    def test_auto_preadmission_keeps_fea_and_motor_families_separate(self) -> None:
+        fea_sessions = []
         for index in range(3):
-            task_id = self.create_pooled_task(f"family-mft-{index}")
+            task_id = self.create_pooled_task(f"family-fea-{index}")
             reservation = self.service.prepare_pooled_task_session(
                 task_id=task_id,
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
-                workload_family="mft",
+                workload_family="fea",
                 isolation_policy="family",
             )
             self.assertIsNotNone(reservation)
-            mft_sessions.append(int(reservation["session_id"]))
-        self.assertEqual(len(set(mft_sessions)), 1)
+            fea_sessions.append(int(reservation["session_id"]))
+        self.assertEqual(len(set(fea_sessions)), 1)
 
         motor_task_id = self.create_pooled_task("family-pyaedt-motor")
         motor = self.service.prepare_pooled_task_session(
             task_id=motor_task_id,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            workload_family="ipmsm",
+            workload_family="fea_b",
             isolation_policy="family",
         )
         self.assertIsNotNone(motor)
-        self.assertNotEqual(int(motor["session_id"]), mft_sessions[0])
+        self.assertNotEqual(int(motor["session_id"]), fea_sessions[0])
 
     def test_underfilled_exact_cohort_status_keeps_active_owner_waiting(self) -> None:
         task_ids = [
@@ -7447,7 +7447,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
             self.service.prepare_pooled_task_session(
                 task_id=task_id,
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
-                workload_family="mft",
+                workload_family="fea",
                 isolation_policy="family",
             )
             for task_id in task_ids
@@ -7488,7 +7488,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
             self.service.prepare_pooled_task_session(
                 task_id=task_id,
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
-                workload_family="mft",
+                workload_family="fea",
                 isolation_policy="family",
             )
             for task_id in task_ids
@@ -7531,7 +7531,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
             self.service.prepare_pooled_task_session(
                 task_id=task_id,
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
-                workload_family="mft",
+                workload_family="fea",
                 isolation_policy="family",
                 ttl_seconds=60,
             )
@@ -7577,7 +7577,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
             self.service.prepare_pooled_task_session(
                 task_id=task_id,
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
-                workload_family="mft",
+                workload_family="fea",
                 isolation_policy="family",
             )
             for task_id in task_ids
@@ -7703,7 +7703,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
             self.service.prepare_pooled_task_session(
                 task_id=task_id,
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
-                workload_family="mft",
+                workload_family="fea",
                 isolation_policy="family",
             )
             for task_id in task_ids
@@ -7829,7 +7829,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
             self.service.prepare_pooled_task_session(
                 task_id=task_id,
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
-                workload_family="mft",
+                workload_family="fea",
                 isolation_policy="family",
             )
             for task_id in task_ids
@@ -7940,7 +7940,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
             self.service.prepare_pooled_task_session(
                 task_id=task_id,
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
-                workload_family="mft",
+                workload_family="fea",
                 isolation_policy="family",
             )
             for task_id in task_ids
@@ -7984,11 +7984,11 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         self.assertEqual(reservation["slots"][0]["state"], "failed")
 
     def test_generic_placement_honors_pending_exact_family_reservation(self) -> None:
-        task_id = self.create_pooled_task("pending-family-mft")
+        task_id = self.create_pooled_task("pending-family-fea")
         reserved = self.service.prepare_pooled_task_session(
             task_id=task_id,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            workload_family="mft",
+            workload_family="fea",
             isolation_policy="family",
         )
         self.assertIsNotNone(reserved)
@@ -7996,9 +7996,9 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         motor, _ = self.service.request_lease(
             request_key="pending-family-motor-lease",
             project_name="pyaedt-motor-pending-family",
-            workload_family="ipmsm",
+            workload_family="fea_b",
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            project_namespace="pyaedt_motor",
+            project_namespace="example_fea_b",
             isolation_policy="family",
             workspace_path="/work/pending-family-motor",
             protocol_version=2,
@@ -8013,7 +8013,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
         reserved = self.service.prepare_pooled_task_session(
             task_id=task_id,
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
-            workload_family="mft",
+            workload_family="fea",
             isolation_policy="family",
         )
         self.assertIsNotNone(reserved)
@@ -8055,7 +8055,7 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
             reservation = self.service.prepare_pooled_task_session(
                 task_id=task_id,
                 session_profile=EXPECTED_SESSION_PROFILE_JSON,
-                workload_family="mft",
+                workload_family="fea",
                 isolation_policy="family",
             )
             self.assertIsNotNone(reservation)
@@ -9057,7 +9057,7 @@ class AttachClientTests(unittest.TestCase):
             response = client.request_with_retry(
                 "POST",
                 "/api/aedt-pool/leases",
-                {"request_key": "mft-case"},
+                {"request_key": "fea-case"},
             )
 
         self.assertGreaterEqual(clock.seconds, 900)
@@ -9095,7 +9095,7 @@ class AttachClientTests(unittest.TestCase):
                 http,
                 1,
                 "token",
-                "mft-project",
+                "fea-project",
             )
         lease._keepalive_process = SimpleNamespace(is_alive=lambda: True)
         with (
@@ -9152,7 +9152,7 @@ class AttachClientTests(unittest.TestCase):
                 control,
                 2,
                 "token",
-                "mft-project",
+                "fea-project",
                 state="active",
                 endpoint="cpu-01:50001",
             )
@@ -9193,7 +9193,7 @@ class AttachClientTests(unittest.TestCase):
             terminal_http,
             3,
             "token",
-            "mft-project",
+            "fea-project",
             state="active",
         )
         with patch("slurm_scheduler.aedt_attach_client.time.sleep") as sleep:
@@ -9219,7 +9219,7 @@ class AttachClientTests(unittest.TestCase):
             terminal_lease,
             4,
             "token",
-            "mft-project",
+            "fea-project",
         )
         with patch("slurm_scheduler.aedt_attach_client.time.sleep") as sleep:
             with self.assertRaisesRegex(AedtLeaseError, "lease expired"):
@@ -9589,7 +9589,7 @@ class AttachClientTests(unittest.TestCase):
             protocol_version=2,
         )
         with patch.dict(
-            os.environ, {"MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS": "0"}, clear=False
+            os.environ, {"SLURM_AEDT_POOL_FILL_TIMEOUT_SECONDS": "0"}, clear=False
         ):
             activated = lease.activate()
 
@@ -9663,7 +9663,7 @@ class AttachClientTests(unittest.TestCase):
             protocol_version=2,
         )
         with patch.dict(
-            os.environ, {"MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS": "0"}, clear=False
+            os.environ, {"SLURM_AEDT_POOL_FILL_TIMEOUT_SECONDS": "0"}, clear=False
         ), patch("slurm_scheduler.aedt_attach_client.time.sleep", return_value=None):
             activated = lease.activate()
 
@@ -9751,7 +9751,7 @@ class AttachClientTests(unittest.TestCase):
         with self.assertRaisesRegex(AedtLeaseError, "generation drift"):
             lease.wait_for_solve_permit(fill_timeout_seconds=0)
 
-    def test_solve_permit_fill_timeout_accepts_campaign_7200_seconds(self) -> None:
+    def test_solve_permit_fill_timeout_accepts_workload_7200_seconds(self) -> None:
         class Http:
             @staticmethod
             def request(method, path, payload=None, **_kwargs):
@@ -9777,14 +9777,14 @@ class AttachClientTests(unittest.TestCase):
         )
         self.assertEqual(MAX_POOL_FILL_TIMEOUT_SECONDS, 7200.0)
         with patch.dict(
-            os.environ, {"MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS": "7200"}, clear=False
+            os.environ, {"SLURM_AEDT_POOL_FILL_TIMEOUT_SECONDS": "7200"}, clear=False
         ):
             status = lease.wait_for_solve_permit()
 
         self.assertTrue(status["solve_permit_granted"])
         self.assertEqual(lease.solve_permit_generation, 14)
 
-    def test_solve_permit_fill_timeout_rejects_above_campaign_deadline(self) -> None:
+    def test_solve_permit_fill_timeout_rejects_above_workload_deadline(self) -> None:
         lease = AedtProjectLease(
             AedtPoolHttpClient("http://scheduler.invalid"),
             15,
@@ -10038,9 +10038,9 @@ class AttachClientTests(unittest.TestCase):
         class PooledDesktop(Desktop):
             pass
 
-        # The production MFT factory is likewise a subclass declared in the
+        # The production FEA factory is likewise a subclass declared in the
         # runner module, not ansys.aedt.core.desktop itself.
-        PooledDesktop.__module__ = "mft.runner"
+        PooledDesktop.__module__ = "fea.runner"
 
         ansys_module = ModuleType("ansys")
         aedt_module = ModuleType("ansys.aedt")
@@ -10228,7 +10228,7 @@ class AttachClientTests(unittest.TestCase):
         self.assertEqual(set(methods), {"GET"})
         lease._keepalive_process = None
 
-    def test_mft_pilot_can_request_an_exclusive_session(self) -> None:
+    def test_fea_pilot_can_request_an_exclusive_session(self) -> None:
         calls = []
 
         class Http:
@@ -10248,7 +10248,7 @@ class AttachClientTests(unittest.TestCase):
             client_factory.return_value = Http()
             lease = acquire_project_lease(
                 "http://scheduler",
-                "mft-pilot",
+                "fea-pilot",
                 bootstrap_token="bootstrap",
                 request_key="pilot-1to1",
                 requested_session_id=526,
@@ -10766,14 +10766,14 @@ class SessionHostTests(unittest.TestCase):
         host._journal = lambda event, **_fields: events.append(event)
         result = host._close_and_prepare_project_release({
             "id": 31,
-            "project_name": "mft-task-31",
+            "project_name": "fea-task-31",
         })
 
         self.assertEqual(result["state"], "prepared")
         self.assertEqual(
             events,
             [
-                "close:mft-task-31",
+                "close:fea-task-31",
                 "prepare",
                 "released_project_workspace_prepared",
             ],
@@ -10788,7 +10788,7 @@ class SessionHostTests(unittest.TestCase):
         release_holder = threading.Event()
         holder_released = threading.Event()
         holder_errors: list[BaseException] = []
-        lease = {"id": 71, "project_name": "mft-task-71"}
+        lease = {"id": 71, "project_name": "fea-task-71"}
 
         class ReleaseRetryControl(FakeHostControlPlane):
             def __init__(self) -> None:
@@ -10918,12 +10918,12 @@ class SessionHostTests(unittest.TestCase):
             control.release_acks,
             [{"success": True, "failure_message": ""}],
         )
-        self.assertEqual(events.count("close:mft-task-71"), 1)
+        self.assertEqual(events.count("close:fea-task-71"), 1)
         self.assertEqual(events.count("prepare"), 1)
         self.assertEqual(events.count("release-ack"), 1)
         deferred = events.index("journal:project_release_deferred_busy")
         second_heartbeat = events.index("heartbeat:2")
-        close = events.index("close:mft-task-71")
+        close = events.index("close:fea-task-71")
         prepare = events.index("prepare")
         ack = events.index("release-ack")
         self.assertLess(deferred, second_heartbeat)
@@ -10935,12 +10935,12 @@ class SessionHostTests(unittest.TestCase):
     def test_release_prepares_only_exact_project_directories(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             host = self._release_test_host(root)
-            workspace = Path(root) / "mft-17009"
-            project = workspace / "mft-task-17-lease-9"
+            workspace = Path(root) / "fea-17009"
+            project = workspace / "fea-task-17-lease-9"
             outside = workspace / "unrelated-project"
             foreign_cache = (
                 project
-                / "mft-task-17-lease-9.aedtresults"
+                / "fea-task-17-lease-9.aedtresults"
                 / "maxwell_matrix.results"
                 / "OperationDataCache.tmp"
             )
@@ -10961,8 +10961,8 @@ class SessionHostTests(unittest.TestCase):
                     "id": 9,
                     "task_id": 17009,
                     "protocol_version": 2,
-                    "project_namespace": "mft",
-                    "project_name": "mft-task-17-lease-9",
+                    "project_namespace": "fea",
+                    "project_name": "fea-task-17-lease-9",
                     "workspace_path": str(workspace),
                 })
 
@@ -10974,10 +10974,10 @@ class SessionHostTests(unittest.TestCase):
                 set(prepared),
                 {
                     str(project),
-                    str(project / "mft-task-17-lease-9.aedtresults"),
+                    str(project / "fea-task-17-lease-9.aedtresults"),
                     str(
                         project
-                        / "mft-task-17-lease-9.aedtresults"
+                        / "fea-task-17-lease-9.aedtresults"
                         / "maxwell_matrix.results"
                     ),
                     str(foreign_cache),
@@ -10994,7 +10994,7 @@ class SessionHostTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "unexpected owner"):
             AedtSessionHost._prepare_plain_directory_for_cross_account_delete(
-                "/shared/mft/project/cache",
+                "/shared/fea/project/cache",
                 metadata,
                 host_uid=7002,
                 lease_owner_uid=7003,
@@ -11005,7 +11005,7 @@ class SessionHostTests(unittest.TestCase):
         )
         self.assertFalse(
             AedtSessionHost._prepare_plain_directory_for_cross_account_delete(
-                "/shared/mft/project/client-owned",
+                "/shared/fea/project/client-owned",
                 lease_owned,
                 host_uid=7002,
                 lease_owner_uid=7003,
@@ -11049,7 +11049,7 @@ class SessionHostTests(unittest.TestCase):
         ):
             changed = (
                 AedtSessionHost._prepare_plain_directory_for_cross_account_delete(
-                    "/shared/mft/project/OperationDataCache.tmp",
+                    "/shared/fea/project/OperationDataCache.tmp",
                     metadata,
                     host_uid=7002,
                     lease_owner_uid=7003,
@@ -11067,14 +11067,14 @@ class SessionHostTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as root:
             host = self._release_test_host(root)
-            workspace = Path(root) / "mft-10"
+            workspace = Path(root) / "fea-10"
             workspace.mkdir()
             with self.assertRaisesRegex(RuntimeError, "lease identity"):
                 host._prepare_released_project_workspace({
                     "protocol_version": 2,
                     "task_id": 10,
-                    "project_namespace": "mft",
-                    "project_name": "mft-case-no-lease",
+                    "project_namespace": "fea",
+                    "project_name": "fea-case-no-lease",
                     "workspace_path": str(workspace),
                 })
             with self.assertRaisesRegex(RuntimeError, "unsafe.*project name"):
@@ -11082,18 +11082,18 @@ class SessionHostTests(unittest.TestCase):
                     "id": 10,
                     "task_id": 10,
                     "protocol_version": 2,
-                    "project_namespace": "mft",
+                    "project_namespace": "fea",
                     "project_name": "../outside",
                     "workspace_path": str(workspace),
                 })
-            motor_workspace = Path(root) / "ipmsm-11-deadbeef"
+            motor_workspace = Path(root) / "fea_b-11-deadbeef"
             motor_workspace.mkdir()
             result = host._prepare_released_project_workspace({
                 "id": 11,
                 "task_id": 11,
                 "protocol_version": 2,
-                "project_namespace": "pyaedt_motor",
-                "project_name": "ipmsm-case-1",
+                "project_namespace": "example_fea_b",
+                "project_name": "fea_b-case-1",
                 "workspace_path": str(motor_workspace),
             })
             self.assertEqual(result["state"], "absent")
@@ -11109,15 +11109,15 @@ class SessionHostTests(unittest.TestCase):
                     "id": lease_id,
                     "task_id": task_id,
                     "protocol_version": 2,
-                    "project_namespace": "mft",
-                    "project_name": f"mft-project-{lease_id}",
+                    "project_namespace": "fea",
+                    "project_name": f"fea-project-{lease_id}",
                     "workspace_path": str(workspace),
                 })
 
             for lease_id, task_id, leaf in (
-                (21, 40121, "mft-40121"),
-                (22, 40122, "ipmsm-40122"),
-                (23, 40123, "ipmsm-40123-deadbeef"),
+                (21, 40121, "fea-40121"),
+                (22, 40122, "fea_b-40122"),
+                (23, 40123, "fea_b-40123-deadbeef"),
             ):
                 with self.subTest(leaf=leaf):
                     self.assertEqual(
@@ -11130,12 +11130,12 @@ class SessionHostTests(unittest.TestCase):
                     )
 
             with self.assertRaisesRegex(RuntimeError, "exact task id token"):
-                prepare(allowed_root / "mft-140124", 40124, lease_id=24)
+                prepare(allowed_root / "fea-140124", 40124, lease_id=24)
             with self.assertRaisesRegex(RuntimeError, "exact task id token"):
-                prepare(allowed_root / "mft-401250", 40125, lease_id=25)
+                prepare(allowed_root / "fea-401250", 40125, lease_id=25)
             with self.assertRaisesRegex(RuntimeError, "direct child"):
                 prepare(
-                    allowed_root / "nested" / "mft-40126",
+                    allowed_root / "nested" / "fea-40126",
                     40126,
                     lease_id=26,
                 )
@@ -11146,23 +11146,23 @@ class SessionHostTests(unittest.TestCase):
                     "id": 27,
                     "task_id": 40127,
                     "protocol_version": 2,
-                    "project_name": "mft-project-27",
+                    "project_name": "fea-project-27",
                     "workspace_path": str(artifact_root),
                 })
-            artifact_child = artifact_root / "mft-40128"
+            artifact_child = artifact_root / "fea-40128"
             artifact_child.mkdir()
             with self.assertRaisesRegex(RuntimeError, "overlaps host artifacts"):
                 host._prepare_released_project_workspace({
                     "id": 28,
                     "task_id": 40128,
                     "protocol_version": 2,
-                    "project_name": "mft-project-28",
+                    "project_name": "fea-project-28",
                     "workspace_path": str(artifact_child),
                 })
 
     def test_release_workspace_fails_without_artifact_or_task_identity(self) -> None:
         with tempfile.TemporaryDirectory() as root:
-            workspace = Path(root) / "mft-40131"
+            workspace = Path(root) / "fea-40131"
             workspace.mkdir()
             no_artifact_host = AedtSessionHost(
                 FakeHostControlPlane([]),
@@ -11174,7 +11174,7 @@ class SessionHostTests(unittest.TestCase):
                     "id": 31,
                     "task_id": 40131,
                     "protocol_version": 2,
-                    "project_name": "mft-project-31",
+                    "project_name": "fea-project-31",
                     "workspace_path": str(workspace),
                 })
             missing_artifact_host = AedtSessionHost(
@@ -11188,7 +11188,7 @@ class SessionHostTests(unittest.TestCase):
                     "id": 33,
                     "task_id": 40131,
                     "protocol_version": 2,
-                    "project_name": "mft-project-33",
+                    "project_name": "fea-project-33",
                     "workspace_path": str(workspace),
                 })
 
@@ -11198,15 +11198,15 @@ class SessionHostTests(unittest.TestCase):
                     "id": 32,
                     "task_id": 0,
                     "protocol_version": 2,
-                    "project_name": "mft-project-32",
+                    "project_name": "fea-project-32",
                     "workspace_path": str(workspace),
                 })
 
     def test_release_workspace_never_follows_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             host = self._release_test_host(root)
-            workspace = Path(root) / "mft-12"
-            project = workspace / "mft-case-1"
+            workspace = Path(root) / "fea-12"
+            project = workspace / "fea-case-1"
             outside = Path(root) / "outside"
             project.mkdir(parents=True)
             outside.mkdir()
@@ -11221,8 +11221,8 @@ class SessionHostTests(unittest.TestCase):
                     "id": 12,
                     "task_id": 12,
                     "protocol_version": 2,
-                    "project_namespace": "mft",
-                    "project_name": "mft-case-1",
+                    "project_namespace": "fea",
+                    "project_name": "fea-case-1",
                     "workspace_path": str(workspace),
                 })
             self.assertTrue(outside.is_dir())

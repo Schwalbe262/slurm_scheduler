@@ -211,7 +211,7 @@ RELAY_SCRIPT = textwrap.dedent(
         daemon_threads = True
 
         def __init__(self, *args, **kwargs):
-            # Sized for a full pooled campaign: hundreds of thin clients
+            # Sized for a full pooled workload: hundreds of thin clients
             # heartbeat/poll concurrently and a 64-slot cap answered "503
             # relay busy" to registering session hosts, killing whole waves.
             self._connection_slots = threading.BoundedSemaphore(256)
@@ -603,7 +603,7 @@ class ControlPlaneRelay:
     @property
     def _probe_timeout(self) -> float:
         # The probe traverses login-node relay -> SSH tunnel -> web worker;
-        # under campaign load the web alone can take >10s, and a timed-out
+        # under workload load the web alone can take >10s, and a timed-out
         # probe used to trigger a tunnel rebuild (a real outage).
         return float(max(1, min(30, 3 * self.interval_seconds)))
 

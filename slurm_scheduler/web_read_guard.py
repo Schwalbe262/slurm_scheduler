@@ -32,7 +32,7 @@ class WebReadGuardMiddleware:
     """
 
     _CACHEABLE_PATHS = frozenset(
-        {"/", "/api/tasks", "/api/mft-pipeline/status"}
+        {"/", "/api/tasks"}
     )
 
     def __init__(

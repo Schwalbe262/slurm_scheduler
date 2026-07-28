@@ -43,10 +43,6 @@ class AppConfig:
     database_path: str = "data/slurm_scheduler.db"
     sqlite_journal_mode: str = "wal"
     accounts_path: str = "config/accounts.yaml"
-    # Empty uses the exact LOCALAPPDATA path shared by the MFT feeder and its
-    # monitoring UI.  Tests and unusual service accounts may override it.
-    mft_campaign_mutation_lock_path: str = ""
-    mft_campaign_mutation_lock_timeout_seconds: int = 900
     poll_interval_seconds: int = 30
     project_max_active_tasks_ceiling: int = 300
     bind_host: str = "127.0.0.1"
@@ -133,7 +129,7 @@ class AppConfig:
     fea_adaptive_memory_margin_percent: float = 5.0
     fea_adaptive_memory_max_attach_per_tick: int = 1
     # Bound physical standalone AEDT Desktops independently from a project's
-    # logical queued+attaching+running campaign target.  A configured project
+    # logical queued+attaching+running task target.  A configured project
     # may therefore keep a deep refill queue without launching more than this
     # many standalone FEA workers at once.
     standalone_aedt_max_running_by_project: dict[str, int] = field(
@@ -164,6 +160,7 @@ class AppConfig:
     aedt_pool_host_artifact_root: str = ""
     aedt_pool_host_dso_profile: str = ""
     aedt_pool_host_session_profile: str = ""
+    aedt_pool_terminal_workspace_root: str = "/gpfs/tmp_cpu2/aedt_pool"
     # Optional login-node bridge that makes the local HTTP control plane
     # reachable from compute nodes.  It remains inert unless explicitly
     # enabled and supplied with an account and remote deployment path.
@@ -213,14 +210,9 @@ class AppConfig:
     license_admission_enabled: bool = False
     license_admission_snapshot_max_age_seconds: int = 120
     license_admission_settlement_seconds: int = 300
-    license_admission_reserve_by_feature: dict[str, int] = field(
-        default_factory=lambda: {"electronics_desktop": 32}
-    )
+    license_admission_reserve_by_feature: dict[str, int] = field(default_factory=dict)
     license_admission_persistent_cost_by_project: dict[str, dict[str, int]] = field(
-        default_factory=lambda: {
-            "MFT_1MW_2026v1": {"electronics_desktop": 1},
-            "PYAEDT_MOTOR_IPMSM_V2": {"electronics_desktop": 1},
-        }
+        default_factory=dict
     )
     license_admission_reserve_exempt_projects: list[str] = field(default_factory=list)
     license_admission_unknown_fea_project_policy: str = "block"
@@ -393,6 +385,7 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
             "host_artifact_root": "aedt_pool_host_artifact_root",
             "host_dso_profile": "aedt_pool_host_dso_profile",
             "host_session_profile": "aedt_pool_host_session_profile",
+            "terminal_workspace_root": "aedt_pool_terminal_workspace_root",
         }
         for source, target in mapping.items():
             if source in aedt_pool:

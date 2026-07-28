@@ -119,13 +119,13 @@ class SlurmParsingTests(unittest.TestCase):
             path = Path(tmpdir) / "app.yaml"
             path.write_text(
                 "standalone_aedt_max_running_by_project:\n"
-                "  MFT_1MW_2026v1: 100\n",
+                "  example_fea_project_a: 100\n",
                 encoding="utf-8",
             )
             config = load_app_config(path)
         self.assertEqual(
             config.standalone_aedt_max_running_by_project,
-            {"MFT_1MW_2026v1": 100},
+            {"example_fea_project_a": 100},
         )
 
     def test_load_app_config_parses_exact_standalone_aedt_running_lanes(self) -> None:
@@ -135,14 +135,14 @@ class SlurmParsingTests(unittest.TestCase):
                 "\n".join(
                     [
                         "standalone_aedt_running_lanes:",
-                        "  mft_data:",
-                        "    project: MFT_1MW_2026v1",
-                        "    name_prefix: mft-camp-",
+                        "  fea_data:",
+                        "    project: example_fea_project_a",
+                        "    name_prefix: fea-camp-",
                         "    aedt_backend: standalone",
                         "    max_running: 100",
-                        "  mft_nsga_fea_validation:",
-                        "    project: MFT_1MW_2026v1",
-                        "    name_prefix: mft-nsgafea-",
+                        "  fea_secondary_validation:",
+                        "    project: example_fea_project_a",
+                        "    name_prefix: fea-validation-",
                         "    aedt_backend: standalone",
                         "    max_running: 8",
                     ]
@@ -153,15 +153,15 @@ class SlurmParsingTests(unittest.TestCase):
         self.assertEqual(
             config.standalone_aedt_running_lanes,
             {
-                "mft_data": {
-                    "project": "MFT_1MW_2026v1",
-                    "name_prefix": "mft-camp-",
+                "fea_data": {
+                    "project": "example_fea_project_a",
+                    "name_prefix": "fea-camp-",
                     "aedt_backend": "standalone",
                     "max_running": 100,
                 },
-                "mft_nsga_fea_validation": {
-                    "project": "MFT_1MW_2026v1",
-                    "name_prefix": "mft-nsgafea-",
+                "fea_secondary_validation": {
+                    "project": "example_fea_project_a",
+                    "name_prefix": "fea-validation-",
                     "aedt_backend": "standalone",
                     "max_running": 8,
                 },
@@ -176,12 +176,12 @@ class SlurmParsingTests(unittest.TestCase):
                     [
                         "standalone_aedt_running_lanes:",
                         "  broad:",
-                        "    project: MFT_1MW_2026v1",
-                        "    name_prefix: mft-",
+                        "    project: example_fea_project_a",
+                        "    name_prefix: fea-",
                         "    max_running: 100",
                         "  nested:",
-                        "    project: MFT_1MW_2026v1",
-                        "    name_prefix: mft-nsgafea-",
+                        "    project: example_fea_project_a",
+                        "    name_prefix: fea-validation-",
                         "    max_running: 8",
                     ]
                 ),
@@ -271,7 +271,7 @@ class SlurmParsingTests(unittest.TestCase):
                         "      electronics_desktop: 32",
                         "    reserve_exempt_projects: ['_aedt_pool_hosts']",
                         "    persistent_cost_by_project:",
-                        "      MFT_1MW_2026v1:",
+                        "      example_fea_project_a:",
                         "        electronics_desktop: 1",
                         "    unknown_fea_project_policy: block",
                     ]
@@ -290,7 +290,7 @@ class SlurmParsingTests(unittest.TestCase):
         )
         self.assertEqual(
             config.license_admission_persistent_cost_by_project,
-            {"MFT_1MW_2026v1": {"electronics_desktop": 1}},
+            {"example_fea_project_a": {"electronics_desktop": 1}},
         )
         self.assertEqual(config.license_admission_unknown_fea_project_policy, "block")
 
@@ -804,24 +804,24 @@ class SlurmParsingTests(unittest.TestCase):
         pooled = build_task_script(
             {"remote_cwd": "~/case", "command": "true", "aedt_backend": "pooled"}
         )
-        self.assertIn("export MFT_AEDT_BACKEND=standalone", standalone)
-        self.assertIn("export MFT_AEDT_BACKEND=pooled", pooled)
+        self.assertIn("export SLURM_AEDT_BACKEND=standalone", standalone)
+        self.assertIn("export SLURM_AEDT_BACKEND=pooled", pooled)
 
     def test_task_script_reasserts_backend_after_user_environment(self) -> None:
         script = build_task_script(
             {
                 "remote_cwd": "~/case",
-                "env_setup": "export MFT_AEDT_BACKEND=standalone",
+                "env_setup": "export SLURM_AEDT_BACKEND=standalone",
                 "command": "python run.py",
                 "aedt_backend": "pooled",
             }
         )
         self.assertLess(
-            script.rfind("export MFT_AEDT_BACKEND=standalone"),
-            script.rfind("export MFT_AEDT_BACKEND=pooled"),
+            script.rfind("export SLURM_AEDT_BACKEND=standalone"),
+            script.rfind("export SLURM_AEDT_BACKEND=pooled"),
         )
         self.assertLess(
-            script.rfind("export MFT_AEDT_BACKEND=pooled"),
+            script.rfind("export SLURM_AEDT_BACKEND=pooled"),
             script.rfind("python run.py"),
         )
 
@@ -2125,7 +2125,7 @@ class SchedulerTests(unittest.TestCase):
                             f"global-match-{52 - (index // 3):03d}",
                             "~/work",
                             "run",
-                            project="mft",
+                            project="fea",
                         )
                     )
                 )
@@ -2142,13 +2142,13 @@ class SchedulerTests(unittest.TestCase):
         filtered_total = self.db.count_filtered_tasks(
             statuses=[TaskStatus.QUEUED.value],
             name_contains="global-match",
-            project="mft",
+            project="fea",
         )
         page = self.db.list_filtered_tasks(
             limit=100,
             statuses=[TaskStatus.QUEUED.value],
             name_contains="global-match",
-            project="mft",
+            project="fea",
             sort_by="name",
             sort_order="asc",
         )
@@ -2200,23 +2200,23 @@ class SchedulerTests(unittest.TestCase):
 
     def test_list_tasks_applies_project_and_prefix_filters_before_limit(self) -> None:
         matching_ids = [
-            self.db.create_task(TaskCreate(f"campaign-job-{index}", "~/work", "run", project="motor"))
+            self.db.create_task(TaskCreate(f"workload-job-{index}", "~/work", "run", project="motor"))
             for index in range(3)
         ]
-        self.db.create_task(TaskCreate("campaign-job-other-project", "~/work", "run", project="other"))
+        self.db.create_task(TaskCreate("workload-job-other-project", "~/work", "run", project="other"))
         for index in range(5):
             self.db.create_task(TaskCreate(f"newer-noise-{index}", "~/work", "run", project="motor"))
 
-        rows = self.db.list_tasks(limit=2, project="motor", name_prefix="campaign-job-")
+        rows = self.db.list_tasks(limit=2, project="motor", name_prefix="workload-job-")
 
         self.assertEqual([int(row["id"]) for row in rows], list(reversed(matching_ids[-2:])))
         self.assertEqual({row["project"] for row in rows}, {"motor"})
 
     def test_list_tasks_name_prefix_escapes_sql_wildcards(self) -> None:
-        literal_id = self.db.create_task(TaskCreate("campaign_100%-literal", "~/work", "run"))
-        self.db.create_task(TaskCreate("campaignX100Y-lookalike", "~/work", "run"))
+        literal_id = self.db.create_task(TaskCreate("workload_100%-literal", "~/work", "run"))
+        self.db.create_task(TaskCreate("workloadX100Y-lookalike", "~/work", "run"))
 
-        rows = self.db.list_tasks(limit=10, name_prefix="campaign_100%")
+        rows = self.db.list_tasks(limit=10, name_prefix="workload_100%")
 
         self.assertEqual([int(row["id"]) for row in rows], [literal_id])
 
@@ -2240,30 +2240,30 @@ class SchedulerTests(unittest.TestCase):
     def test_compact_task_inventory_pages_every_matching_task_by_id(self) -> None:
         matching_ids = [
             self.db.create_task(
-                TaskCreate(f"campaign-page-{index}", "~/work", "run", project="motor")
+                TaskCreate(f"workload-page-{index}", "~/work", "run", project="motor")
             )
             for index in range(5)
         ]
         self.db.create_task(
-            TaskCreate("campaign-page-foreign", "~/work", "run", project="other")
+            TaskCreate("workload-page-foreign", "~/work", "run", project="other")
         )
         self.db.create_task(TaskCreate("unrelated-newer", "~/work", "run", project="motor"))
         started_at = "2026-07-16T01:23:45+00:00"
         self.db.update_task(matching_ids[-1], started_at=started_at)
 
         first = self.db.list_task_inventory(
-            limit=2, project="motor", name_prefix="campaign-page-"
+            limit=2, project="motor", name_prefix="workload-page-"
         )
         second = self.db.list_task_inventory(
             limit=2,
             project="motor",
-            name_prefix="campaign-page-",
+            name_prefix="workload-page-",
             before_id=min(int(row["id"]) for row in first),
         )
         third = self.db.list_task_inventory(
             limit=2,
             project="motor",
-            name_prefix="campaign-page-",
+            name_prefix="workload-page-",
             before_id=min(int(row["id"]) for row in second),
         )
 
@@ -2286,18 +2286,18 @@ class SchedulerTests(unittest.TestCase):
             self.db.update_task(task_id, status=TaskStatus.COMPLETED.value)
         match_ids = []
         for index in range(3):
-            task_id = self.db.create_task(TaskCreate(f"ipmsm-finished-{index}", "~/work", "run"))
+            task_id = self.db.create_task(TaskCreate(f"fea_b-finished-{index}", "~/work", "run"))
             self.db.update_task(task_id, status=TaskStatus.COMPLETED.value)
             match_ids.append(task_id)
 
         visible = self.db.list_tasks_by_statuses(
             [TaskStatus.COMPLETED.value],
             limit=50,
-            name_contains="ipmsm",
+            name_contains="fea_b",
         )
 
         self.assertEqual({int(item["id"]) for item in visible}, set(match_ids))
-        self.assertEqual(self.db.count_tasks_by_statuses([TaskStatus.COMPLETED.value], name_contains="ipmsm"), 3)
+        self.assertEqual(self.db.count_tasks_by_statuses([TaskStatus.COMPLETED.value], name_contains="fea_b"), 3)
 
     def test_choose_account_prefers_freer_account(self) -> None:
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient)
@@ -2802,7 +2802,7 @@ class SchedulerTests(unittest.TestCase):
                 "~/case",
                 "run",
                 cpus=4,
-                project="MFT_1MW_2026v1",
+                project="example_fea_project_a",
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 aedt_backend="pooled",
                 requested_allocation_id=91,
@@ -3770,7 +3770,7 @@ class SchedulerTests(unittest.TestCase):
         )
 
     def test_standalone_aedt_project_cap_holds_queue_and_reports_diagnostic(self) -> None:
-        project = "MFT_1MW_2026v1"
+        project = "example_fea_project_a"
         active_id = self.db.create_task(
             TaskCreate(
                 "active-standalone",
@@ -3821,7 +3821,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(diagnostics["queue_state"], "blocked")
         self.assertEqual(
             diagnostics["queue_reason"],
-            "standalone AEDT running cap reached for MFT_1MW_2026v1: "
+            "standalone AEDT running cap reached for example_fea_project_a: "
             "1/1 attaching+running standalone FEA",
         )
         self.assertEqual(diagnostics["standalone_aedt_active"], 1)
@@ -3829,7 +3829,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(diagnostics["standalone_aedt_available"], 0)
 
     def test_standalone_aedt_project_count_excludes_queue_pool_and_infra(self) -> None:
-        project = "MFT_1MW_2026v1"
+        project = "example_fea_project_a"
 
         def make_task(
             name: str,
@@ -3873,7 +3873,7 @@ class SchedulerTests(unittest.TestCase):
         )
 
     def test_exact_standalone_aedt_lanes_are_independent_with_shared_project(self) -> None:
-        project = "MFT_1MW_2026v1"
+        project = "example_fea_project_a"
 
         def make_task(name: str, status: str, backend: str = "standalone") -> int:
             task_id = self.db.create_task(
@@ -3889,18 +3889,18 @@ class SchedulerTests(unittest.TestCase):
             self.db.update_task(task_id, status=status)
             return task_id
 
-        make_task("mft-camp-active", TaskStatus.RUNNING.value)
-        make_task("mft-nsgafea-active", TaskStatus.ATTACHING.value)
+        make_task("fea-camp-active", TaskStatus.RUNNING.value)
+        make_task("fea-validation-active", TaskStatus.ATTACHING.value)
         # Neither queue nor a same-prefix pooled client consumes a lane seat.
-        make_task("mft-nsgafea-queued", TaskStatus.QUEUED.value)
+        make_task("fea-validation-queued", TaskStatus.QUEUED.value)
         make_task(
-            "mft-nsgafea-pooled",
+            "fea-validation-pooled",
             TaskStatus.RUNNING.value,
             backend=AedtBackend.POOLED.value,
         )
-        data_queued_id = make_task("mft-camp-next", TaskStatus.QUEUED.value)
+        data_queued_id = make_task("fea-camp-next", TaskStatus.QUEUED.value)
         validation_queued_id = make_task(
-            "mft-nsgafea-next", TaskStatus.QUEUED.value
+            "fea-validation-next", TaskStatus.QUEUED.value
         )
         scheduler = Scheduler(
             self.db,
@@ -3909,15 +3909,15 @@ class SchedulerTests(unittest.TestCase):
             client_factory=FakeClient,
             standalone_aedt_max_running_by_project={project: 100},
             standalone_aedt_running_lanes={
-                "mft_data": {
+                "fea_data": {
                     "project": project,
-                    "name_prefix": "mft-camp-",
+                    "name_prefix": "fea-camp-",
                     "aedt_backend": "standalone",
                     "max_running": 1,
                 },
-                "mft_nsga_fea_validation": {
+                "fea_secondary_validation": {
                     "project": project,
-                    "name_prefix": "mft-nsgafea-",
+                    "name_prefix": "fea-validation-",
                     "aedt_backend": "standalone",
                     "max_running": 8,
                 },
@@ -3937,7 +3937,7 @@ class SchedulerTests(unittest.TestCase):
             (1, 8),
         )
         self.assertIn(
-            "lane mft_data",
+            "lane fea_data",
             scheduler.standalone_aedt_running_cap_reason(
                 self.db.get_task(data_queued_id)
             ),
@@ -3951,19 +3951,19 @@ class SchedulerTests(unittest.TestCase):
         diagnostics = scheduler.task_queue_diagnostics(
             self.db.get_task(data_queued_id)
         )
-        self.assertEqual(diagnostics["standalone_aedt_lane"], "mft_data")
+        self.assertEqual(diagnostics["standalone_aedt_lane"], "fea_data")
         self.assertEqual(
-            diagnostics["standalone_aedt_name_prefix"], "mft-camp-"
+            diagnostics["standalone_aedt_name_prefix"], "fea-camp-"
         )
         self.assertEqual(
             self.db.count_active_standalone_fea_tasks_by_scope(
-                project, name_prefix="mft-nsgafea-"
+                project, name_prefix="fea-validation-"
             ),
             1,
         )
 
     def test_concurrent_standalone_aedt_last_project_seat_is_claimed_once(self) -> None:
-        project = "MFT_1MW_2026v1"
+        project = "example_fea_project_a"
         allocation_id = self.db.create_allocation(
             account_name="a",
             partition="cpu1",
@@ -13358,7 +13358,7 @@ class SchedulerTests(unittest.TestCase):
             "cpus": 4,
             "memory_mb": 32768,
             "scheduling_profile": SchedulingProfile.FEA_BURSTY.value,
-            "project": "MFT_1MW_2026v1",
+            "project": "example_fea_project_a",
         }
         self.assertEqual(scheduler.fea_node_cpu_cap_remaining(allocation, ordinary_solver), 0)
         self.assertEqual(scheduler.fit_slots_for_allocation(allocation, ordinary_solver), 0)
@@ -13425,7 +13425,7 @@ class SchedulerTests(unittest.TestCase):
                 memory_mb=6144,
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 aedt_backend="pooled",
-                project="MFT_1MW_2026v1",
+                project="example_fea_project_a",
                 requested_allocation_id=allocation_id,
             )
         )
@@ -13580,12 +13580,12 @@ class SchedulerTests(unittest.TestCase):
 
     def test_count_tasks_grouped_by_status_with_prefix(self) -> None:
         for index in range(3):
-            self.db.create_task(TaskCreate(f"mft-camp-w1-{index}", "~/case", "run"))
+            self.db.create_task(TaskCreate(f"fea-camp-w1-{index}", "~/case", "run"))
         other = self.db.create_task(TaskCreate("other-job", "~/case", "run"))
         self.db.update_task(other, status=TaskStatus.COMPLETED.value)
-        done = self.db.create_task(TaskCreate("mft-camp-w1-done", "~/case", "run"))
+        done = self.db.create_task(TaskCreate("fea-camp-w1-done", "~/case", "run"))
         self.db.update_task(done, status=TaskStatus.COMPLETED.value)
-        counts = self.db.count_tasks_grouped_by_status(name_prefix="mft-camp-w1")
+        counts = self.db.count_tasks_grouped_by_status(name_prefix="fea-camp-w1")
         self.assertEqual(counts, {"queued": 3, "completed": 1})
         all_counts = self.db.count_tasks_grouped_by_status()
         self.assertEqual(all_counts["completed"], 2)
@@ -14675,15 +14675,6 @@ class ProjectApiTests(unittest.TestCase):
         self.patch_project_cap = self._route_endpoint(
             "/api/projects/{name}/max-active-tasks", "PATCH"
         )
-        self.get_simulation_policy = self._route_endpoint(
-            "/api/projects/{name}/simulation-policy", "GET"
-        )
-        self.patch_simulation_policy = self._route_endpoint(
-            "/api/projects/{name}/simulation-policy", "PATCH"
-        )
-        self.patch_simulation_validation = self._route_endpoint(
-            "/api/projects/{name}/simulation-policy/validation", "PATCH"
-        )
         self.list_tasks = self._route_endpoint("/api/tasks", "GET")
         self.get_task = self._route_endpoint("/api/tasks/{task_id}", "GET")
         self.create_task = self._route_endpoint("/api/tasks", "POST")
@@ -14729,111 +14720,6 @@ class ProjectApiTests(unittest.TestCase):
             and "PATCH" in getattr(route, "methods", set())
         ]
         self.assertEqual(len(routes), 1)
-
-    def test_simulation_validation_is_bootstrap_authenticated_and_fail_closed(self) -> None:
-        from fastapi import HTTPException
-        from slurm_scheduler.app import create_app
-
-        created = self._post_project({"name": "MFT-auth", "max_active_tasks": 10})
-        revision = created["simulation_policy"]["policy_revision"]
-        body = {
-            "validated_concurrency_limit": 2,
-            "expected_revision": revision,
-        }
-        for headers in ({}, {"x-aedt-bootstrap-token": "wrong-token"}):
-            with self.assertRaises(HTTPException) as denied:
-                asyncio.run(
-                    self.patch_simulation_validation(
-                        "MFT-auth", self._request(body, headers=headers)
-                    )
-                )
-            self.assertEqual(denied.exception.status_code, 403)
-
-        with mock.patch.dict(
-            os.environ,
-            {"SLURM_AEDT_POOL_BOOTSTRAP_TOKEN": ""},
-        ):
-            unconfigured_app = create_app(str(self.config_path))
-        unconfigured_app.router.on_startup.clear()
-        unconfigured_app.router.on_shutdown.clear()
-        endpoint = self._route_endpoint(
-            "/api/projects/{name}/simulation-policy/validation",
-            "PATCH",
-            app=unconfigured_app,
-        )
-        with self.assertRaises(HTTPException) as unavailable:
-            asyncio.run(
-                endpoint(
-                    "MFT-auth",
-                    self._request(
-                        body,
-                        headers={"x-aedt-bootstrap-token": self.validation_token},
-                    ),
-                )
-            )
-        self.assertEqual(unavailable.exception.status_code, 503)
-
-    def test_simulation_policy_is_cas_guarded_and_validation_is_separate(self) -> None:
-        from fastapi import HTTPException
-
-        created = self._post_project(
-            {"name": "MFT_1MW_2026v1", "max_active_tasks": 300}
-        )
-        self.assertEqual(created["max_active_tasks"], 500)
-        initial = created["simulation_policy"]
-        self.assertEqual(initial["desired_simulations"], 1)
-        self.assertEqual(initial["validated_concurrency_limit"], 1)
-        self.assertEqual(initial["active_count"], 0)
-        self.assertEqual(initial["logical_active_count"], 0)
-
-        validated = asyncio.run(
-            self.patch_simulation_validation(
-                "MFT_1MW_2026v1",
-                self._request(
-                    {
-                        "validated_concurrency_limit": 500,
-                        "expected_revision": initial["policy_revision"],
-                    }
-                ),
-            )
-        )
-        self.assertEqual(validated["validated_concurrency_limit"], 500)
-        self.assertEqual(validated["desired_simulations"], 1)
-        self.assertEqual(
-            self.get_project("MFT_1MW_2026v1")["max_active_tasks"], 500
-        )
-
-        updated = asyncio.run(
-            self.patch_simulation_policy(
-                "MFT_1MW_2026v1",
-                self._request(
-                    {
-                        "desired_simulations": 500,
-                        "expected_revision": validated["policy_revision"],
-                        "scale_down_mode": "drain",
-                    }
-                ),
-            )
-        )
-        self.assertEqual(updated["effective_simulations"], 500)
-        self.assertEqual(updated["max_desired_simulations"], 500)
-        self.assertEqual(
-            self.get_project("MFT_1MW_2026v1")["max_active_tasks"], 500
-        )
-        with self.assertRaises(HTTPException) as conflict:
-            asyncio.run(
-                self.patch_simulation_policy(
-                    "MFT_1MW_2026v1",
-                    self._request(
-                        {
-                            "desired_simulations": 10,
-                            "expected_revision": validated["policy_revision"],
-                            "scale_down_mode": "drain",
-                        }
-                    ),
-                )
-            )
-        self.assertEqual(conflict.exception.status_code, 409)
 
     def test_project_api_round_trips_and_updates_max_active_tasks(self) -> None:
         created = self._post_project({"name": "motor", "max_active_tasks": 9})
@@ -15045,7 +14931,7 @@ class ProjectApiTests(unittest.TestCase):
             self.create_task(
                 self._request(
                     {
-                        "name": "campaign-task",
+                        "name": "workload-task",
                         "project": "motor",
                         "remote_cwd": "~/w",
                         "command": "true",
@@ -15087,99 +14973,6 @@ class ProjectApiTests(unittest.TestCase):
             diagnostics["queue_reason"],
             "AEDT backend: AEDT pooled backend is not operational",
         )
-
-    def test_operational_pool_rejects_incomplete_worker_attach_contract(self) -> None:
-        from types import SimpleNamespace
-        from slurm_scheduler.aedt_session_host import EXPECTED_SESSION_PROFILE_JSON
-
-        scheduler = self.app.state.scheduler
-        config = self.app.state.config
-        object.__setattr__(
-            config, "aedt_pool_scheduler_url", "http://scheduler.internal:18790"
-        )
-        object.__setattr__(
-            config,
-            "aedt_pool_client_token_file",
-            "/work/secrets/aedt-pool-client.token",
-        )
-        required = {
-            "MFT_AEDT_SCHEDULER_URL": "http://scheduler.internal:18790",
-            "SLURM_AEDT_POOL_CLIENT_TOKEN_FILE": (
-                "/work/secrets/aedt-pool-client.token"
-            ),
-            "MFT_AEDT_SESSION_PROFILE": EXPECTED_SESSION_PROFILE_JSON,
-            "MFT_AEDT_ISOLATION_POLICY": "family",
-            "MFT_AEDT_WORKSPACE_PATH": "/work/projects/mft/case-77",
-        }
-
-        def task_with(values: dict[str, str]) -> dict:
-            return {
-                "id": 77,
-                "status": "queued",
-                "aedt_backend": "pooled",
-                "scheduling_profile": "fea_bursty",
-                "command": "python run_simulation.py",
-                "env_setup": "\n".join(
-                    f"export {key}='{value}'" for key, value in values.items()
-                ),
-            }
-
-        expected_fragments = {
-            "MFT_AEDT_SCHEDULER_URL": "MFT_AEDT_SCHEDULER_URL",
-            "SLURM_AEDT_POOL_CLIENT_TOKEN_FILE": (
-                "SLURM_AEDT_POOL_CLIENT_TOKEN_FILE"
-            ),
-            "MFT_AEDT_SESSION_PROFILE": "MFT_AEDT_SESSION_PROFILE",
-            "MFT_AEDT_ISOLATION_POLICY": "MFT_AEDT_ISOLATION_POLICY",
-            "MFT_AEDT_WORKSPACE_PATH": "MFT_AEDT_WORKSPACE_PATH",
-        }
-        operational = SimpleNamespace(operational=True, control_plane_url="")
-        with mock.patch.object(
-            self.app.state.aedt_pool, "config", return_value=operational
-        ):
-            for missing, expected in expected_fragments.items():
-                with self.subTest(missing=missing):
-                    incomplete = dict(required)
-                    incomplete.pop(missing)
-                    reason = scheduler.aedt_backend_block_reason(
-                        task_with(incomplete)
-                    )
-                    self.assertIn(expected, reason)
-            self.assertEqual(
-                scheduler.aedt_backend_block_reason(task_with(required)), ""
-            )
-
-            # Unified feeders preserve submission_env as literal leading
-            # exports in command (not env_setup) and historically use the
-            # POOL_WORKSPACE name.  Admission must validate that real shape.
-            command_contract = dict(required)
-            command_contract.pop("MFT_AEDT_WORKSPACE_PATH")
-            command_contract["MFT_AEDT_POOL_WORKSPACE"] = (
-                "/work/projects/mft/mft-${SLURM_SCHED_TASK_ID}"
-            )
-            command_contract["MFT_AEDT_SESSION_VERSION"] = "2025.2"
-            command_task = task_with({})
-            command_task["command"] = " ".join(
-                f"export {key}='{value}';"
-                for key, value in command_contract.items()
-            ) + " python run_simulation.py"
-            self.assertEqual(
-                scheduler.aedt_backend_block_reason(command_task), ""
-            )
-
-            embedded = dict(required)
-            embedded["SLURM_AEDT_POOL_CLIENT_TOKEN"] = "secret-in-command-env"
-            self.assertIn(
-                "must not embed",
-                scheduler.aedt_backend_block_reason(task_with(embedded)),
-            )
-
-            overridden = dict(required)
-            overridden["MFT_AEDT_BACKEND"] = "standalone"
-            self.assertIn(
-                "overrides MFT_AEDT_BACKEND",
-                scheduler.aedt_backend_block_reason(task_with(overridden)),
-            )
 
     def test_project_api_rejects_invalid_max_active_tasks(self) -> None:
         from fastapi import HTTPException
@@ -15251,7 +15044,6 @@ class ProjectApiTests(unittest.TestCase):
         self.assertEqual(updates[0][0], int(before["id"]))
         self.assertEqual(updates[0][1]["max_active_tasks"], 275)
         self.assertNotIn("desired_simulations", updates[0][1])
-        self.assertNotIn("validated_concurrency_limit", updates[0][1])
         for key in (
             "id",
             "name",
@@ -15348,11 +15140,6 @@ class ProjectApiTests(unittest.TestCase):
             "PATCH",
             app=configured_app,
         )
-        configured_validate = self._route_endpoint(
-            "/api/projects/{name}/simulation-policy/validation",
-            "PATCH",
-            app=configured_app,
-        )
 
         created = asyncio.run(
             configured_create(
@@ -15371,18 +15158,6 @@ class ProjectApiTests(unittest.TestCase):
             "max_active_tasks must be an integer between 0 and 600",
         )
 
-        current_motor = configured_app.state.db.get_project_by_name("motor")
-        asyncio.run(
-            configured_validate(
-                "motor",
-                self._request(
-                    {
-                        "validated_concurrency_limit": 500,
-                        "expected_revision": current_motor["policy_revision"],
-                    }
-                ),
-            )
-        )
         accepted = asyncio.run(
             configured_patch("motor", self._request({"max_active_tasks": 500}))
         )
@@ -15445,12 +15220,12 @@ class ProjectApiTests(unittest.TestCase):
             "task_queue_diagnostics",
             return_value=dict(diagnostics),
         ) as queue:
-            payload = self.task_capacity(project="MFT_1MW_2026v1")
+            payload = self.task_capacity(project="example_fea_project_a")
 
         fit_task = fit.call_args.args[0]
         queue_task = queue.call_args.args[0]
-        self.assertEqual(fit_task["project"], "MFT_1MW_2026v1")
-        self.assertEqual(queue_task["project"], "MFT_1MW_2026v1")
+        self.assertEqual(fit_task["project"], "example_fea_project_a")
+        self.assertEqual(queue_task["project"], "example_fea_project_a")
         self.assertEqual(payload["queue_state"], "ready")
         openapi_parameters = self.app.openapi()["paths"]["/api/task-capacity"]["get"]["parameters"]
         self.assertIn("project", {item["name"] for item in openapi_parameters})
@@ -15458,11 +15233,11 @@ class ProjectApiTests(unittest.TestCase):
     def test_task_list_api_filters_before_limit_and_isolates_project(self) -> None:
         matching_ids = [
             self.app.state.db.create_task(
-                TaskCreate(f"api-campaign-{index}", "~/case", "run", project="motor")
+                TaskCreate(f"api-workload-{index}", "~/case", "run", project="motor")
             )
             for index in range(3)
         ]
-        self.app.state.db.create_task(TaskCreate("api-campaign-other", "~/case", "run", project="other"))
+        self.app.state.db.create_task(TaskCreate("api-workload-other", "~/case", "run", project="other"))
         for index in range(4):
             self.app.state.db.create_task(TaskCreate(f"api-noise-{index}", "~/case", "run", project="motor"))
 
@@ -15470,7 +15245,7 @@ class ProjectApiTests(unittest.TestCase):
             include_diagnostics=False,
             limit=2,
             project="motor",
-            name_prefix="api-campaign-",
+            name_prefix="api-workload-",
             status=None,
         )
 
@@ -15902,8 +15677,8 @@ class LicenseMonitorTests(unittest.TestCase):
 
 
 class LicenseAdmissionTests(unittest.TestCase):
-    MFT = "MFT_1MW_2026v1"
-    IPMSM = "PYAEDT_MOTOR_IPMSM_V2"
+    FEA = "example_fea_project_a"
+    FEA_B = "example_fea_project_b"
     FEATURE = "electronics_desktop"
 
     def setUp(self) -> None:
@@ -15958,15 +15733,15 @@ class LicenseAdmissionTests(unittest.TestCase):
             license_admission_reserve_by_feature={self.FEATURE: 32},
             license_admission_persistent_cost_by_project={
                 "_aedt_pool_hosts": {self.FEATURE: 1},
-                self.MFT: {self.FEATURE: 1},
-                self.IPMSM: {self.FEATURE: 1},
+                self.FEA: {self.FEATURE: 1},
+                self.FEA_B: {self.FEATURE: 1},
             },
             license_admission_unknown_fea_project_policy=unknown_policy,
         )
 
     def make_task(
         self,
-        project: str = MFT,
+        project: str = FEA,
         *,
         name: str = "licensed-fea",
         fea: bool = True,
@@ -16256,23 +16031,23 @@ class LicenseAdmissionTests(unittest.TestCase):
         scheduler = self.make_scheduler()
         self.set_snapshot(scheduler, used=100)
         unknown = self.make_task("AAA_UNKNOWN", name="unknown")
-        known = self.make_task(self.MFT, name="known")
+        known = self.make_task(self.FEA, name="known")
         scheduler.assign_ready_fea_tasks()
         self.assertEqual(self.db.get_task(unknown)["status"], TaskStatus.QUEUED.value)
         self.assertEqual(self.db.get_task(known)["status"], TaskStatus.RUNNING.value)
-        self.assertEqual(scheduler._fea_project_last_claim[0], self.MFT)
+        self.assertEqual(scheduler._fea_project_last_claim[0], self.FEA)
 
     def test_two_seats_follow_persisted_project_fair_order(self) -> None:
         scheduler = self.make_scheduler()
         self.set_snapshot(scheduler, used=516)
-        mft_first = self.make_task(self.MFT, name="mft-first")
-        ipmsm = self.make_task(self.IPMSM, name="ipmsm")
-        mft_second = self.make_task(self.MFT, name="mft-second")
+        fea_first = self.make_task(self.FEA, name="fea-first")
+        fea_b = self.make_task(self.FEA_B, name="fea_b")
+        fea_second = self.make_task(self.FEA, name="fea-second")
         scheduler.assign_ready_fea_tasks()
-        self.assertEqual(self.db.get_task(mft_first)["status"], TaskStatus.RUNNING.value)
-        self.assertEqual(self.db.get_task(ipmsm)["status"], TaskStatus.RUNNING.value)
-        self.assertEqual(self.db.get_task(mft_second)["status"], TaskStatus.QUEUED.value)
-        self.assertEqual(scheduler._fea_project_last_claim[0], self.IPMSM)
+        self.assertEqual(self.db.get_task(fea_first)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(self.db.get_task(fea_b)["status"], TaskStatus.RUNNING.value)
+        self.assertEqual(self.db.get_task(fea_second)["status"], TaskStatus.QUEUED.value)
+        self.assertEqual(scheduler._fea_project_last_claim[0], self.FEA_B)
 
     def test_unprofiled_standard_task_is_not_held_by_fea_policy(self) -> None:
         scheduler = self.make_scheduler()

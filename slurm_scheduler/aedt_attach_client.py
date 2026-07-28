@@ -30,7 +30,7 @@ DEFAULT_CONTROL_PLANE_OUTAGE_SECONDS = 1200.0
 CONTROL_PLANE_OUTAGE_ENV = "AEDT_POOL_CONTROL_PLANE_OUTAGE_SECONDS"
 DEFAULT_POOL_FILL_TIMEOUT_SECONDS = 900.0
 MAX_POOL_FILL_TIMEOUT_SECONDS = 7200.0
-POOL_FILL_TIMEOUT_ENV = "MFT_AEDT_POOL_FILL_TIMEOUT_SECONDS"
+POOL_FILL_TIMEOUT_ENV = "SLURM_AEDT_POOL_FILL_TIMEOUT_SECONDS"
 TRANSIENT_HTTP_STATUSES = {408, 425, 429}
 
 
@@ -94,7 +94,7 @@ class _NonOwningDesktopAtexitProxy:
 def _pyaedt_desktop_types(desktop_factory: Any) -> tuple[type, ...]:
     """Find PyAEDT Desktop in a custom factory's MRO.
 
-    MFT deliberately passes a ``Desktop`` subclass to disable autosave, so
+    FEA deliberately passes a ``Desktop`` subclass to disable autosave, so
     checking only ``desktop_factory.__module__`` would miss the production
     attach path.
     """
@@ -950,7 +950,7 @@ class AedtProjectLease:
             or self._automation_lock.path != self.automation_lock_path
         ):
             raw_timeout = os.environ.get(
-                # One valid MFT thermal field-summary extraction has been
+                # One valid FEA thermal field-summary extraction has been
                 # observed at ~1950s.  After the native-pipeline barrier, up
                 # to three such Desktop-global postprocessors serialize, so a
                 # 1800s contender timeout rejects healthy work.  Keep the

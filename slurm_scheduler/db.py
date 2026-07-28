@@ -310,14 +310,6 @@ CREATE TABLE IF NOT EXISTS projects (
     sim_subdir TEXT NOT NULL DEFAULT 'simulation',
     auto_pull INTEGER NOT NULL DEFAULT 0,
     max_active_tasks INTEGER NOT NULL DEFAULT 0,
-    desired_simulations INTEGER NOT NULL DEFAULT 0,
-    policy_revision INTEGER NOT NULL DEFAULT 1,
-    validated_concurrency_limit INTEGER NOT NULL DEFAULT 0,
-    scale_down_mode TEXT NOT NULL DEFAULT 'drain',
-    campaign_total_simulations INTEGER NOT NULL DEFAULT 0,
-    campaign_demand_revision INTEGER NOT NULL DEFAULT 1,
-    campaign_demand_updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    campaign_demand_updated_by TEXT NOT NULL DEFAULT 'system',
     aedt_backend TEXT NOT NULL DEFAULT 'standalone',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -1620,90 +1612,14 @@ class Database:
             "projects": {
                 "output_globs": "TEXT NOT NULL DEFAULT ''",
                 "max_active_tasks": "INTEGER NOT NULL DEFAULT 0",
-                "desired_simulations": "INTEGER NOT NULL DEFAULT 0",
-                "policy_revision": "INTEGER NOT NULL DEFAULT 1",
-                "validated_concurrency_limit": "INTEGER NOT NULL DEFAULT 0",
-                "scale_down_mode": "TEXT NOT NULL DEFAULT 'drain'",
-                "campaign_total_simulations": "INTEGER NOT NULL DEFAULT 0",
-                "campaign_demand_revision": "INTEGER NOT NULL DEFAULT 1",
-                "campaign_demand_updated_at": "TEXT NOT NULL DEFAULT ''",
-                "campaign_demand_updated_by": "TEXT NOT NULL DEFAULT 'system'",
                 "aedt_backend": f"TEXT NOT NULL DEFAULT '{AedtBackend.STANDALONE.value}'",
             },
-        }
-        project_columns_before = {
-            row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()
         }
         for table, columns in table_columns.items():
             existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             for name, ddl in columns.items():
                 if name not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
-        if "campaign_total_simulations" not in project_columns_before:
-            # Existing installations receive the requested q22 campaign
-            # default exactly once.  A later intentional decrease to zero is
-            # never overwritten by subsequent scheduler startups.
-            conn.execute(
-                """
-                UPDATE projects
-                SET campaign_total_simulations = 500,
-                    campaign_demand_revision = 1,
-                    campaign_demand_updated_at = CURRENT_TIMESTAMP,
-                    campaign_demand_updated_by = 'migration:q22-default'
-                WHERE name = 'MFT_1MW_2026v1'
-                """
-            )
-        conn.execute(
-            """
-            UPDATE projects
-            SET campaign_demand_revision = MAX(1, campaign_demand_revision),
-                campaign_demand_updated_at = CASE
-                    WHEN campaign_demand_updated_at = '' THEN CURRENT_TIMESTAMP
-                    ELSE campaign_demand_updated_at END,
-                campaign_demand_updated_by = CASE
-                    WHEN campaign_demand_updated_by = '' THEN 'system'
-                    ELSE campaign_demand_updated_by END
-            """
-        )
-        conn.execute(
-            """
-            UPDATE projects
-            SET desired_simulations = CASE
-                    WHEN LOWER(name) LIKE 'mft%' THEN 1
-                    ELSE max_active_tasks END,
-                validated_concurrency_limit = CASE
-                    WHEN LOWER(name) LIKE 'mft%' THEN 1
-                    ELSE max_active_tasks END,
-                max_active_tasks = CASE
-                    WHEN LOWER(name) LIKE 'mft%' THEN 500
-                    ELSE max_active_tasks END,
-                policy_revision = MAX(1, policy_revision),
-                scale_down_mode = 'drain'
-            WHERE desired_simulations = 0
-              AND validated_concurrency_limit = 0
-              AND max_active_tasks > 0
-            """
-        )
-        conn.execute(
-            """
-            UPDATE projects SET max_active_tasks = 500
-            WHERE LOWER(name) LIKE 'mft%' AND max_active_tasks != 500
-            """
-        )
-        conn.execute(
-            """
-            UPDATE projects
-            SET desired_simulations = MIN(desired_simulations, 500),
-                validated_concurrency_limit = MIN(validated_concurrency_limit, 500),
-                max_active_tasks = MIN(max_active_tasks, 500)
-            WHERE LOWER(name) LIKE 'mft%'
-              AND (
-                  desired_simulations > 500
-                  OR validated_concurrency_limit > 500
-                  OR max_active_tasks > 500
-              )
-            """
-        )
 
     def create_job(self, job: JobCreate) -> int:
         with self.connect() as conn:
@@ -1862,7 +1778,7 @@ class Database:
     ) -> list[dict[str, Any]]:
         """Return a compact, cursor-pageable task inventory.
 
-        Campaign controllers only need identity, ownership, and state when
+        Workload controllers only need identity, ownership, and state when
         reconciling reserved outputs.  Selecting those columns directly keeps
         large inventory reads independent of task payload/log-path size.  The
         descending ``before_id`` cursor lets clients reconcile every matching
@@ -2053,7 +1969,7 @@ class Database:
         """Page active dashboard rows in their displayed status order.
 
         Running, attaching, and queued rows used to be loaded with independent
-        high limits and combined in Python.  At campaign scale that made every
+        high limits and combined in Python.  At large-task scale that made every
         dashboard request render thousands of rows.  Keeping the ordering in
         SQL makes the same population available through bounded pages.
         """
@@ -2867,22 +2783,24 @@ class Database:
         aedt_backend: str = AedtBackend.STANDALONE.value,
     ) -> int:
         requested_limit = max(0, int(max_active_tasks))
-        is_mft = str(name or "").strip().lower().startswith("mft")
-        initial_campaign_total = 500 if str(name or "").strip() == "MFT_1MW_2026v1" else 0
-        hard_scheduler_limit = 500 if is_mft else requested_limit
-        initial_policy_limit = 1 if is_mft else requested_limit
         with self.connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO projects (
                     name, repos, setup, entrypoints, cleanup_globs, output_globs, sim_subdir, auto_pull,
-                    max_active_tasks, desired_simulations, policy_revision,
-                    validated_concurrency_limit, scale_down_mode,
-                    campaign_total_simulations, campaign_demand_revision,
-                    campaign_demand_updated_at, campaign_demand_updated_by,
-                    aedt_backend
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'drain', ?, 1,
-                          CURRENT_TIMESTAMP, 'create-project', ?)
+                    max_active_tasks, aedt_backend
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    repos = excluded.repos,
+                    setup = excluded.setup,
+                    entrypoints = excluded.entrypoints,
+                    cleanup_globs = excluded.cleanup_globs,
+                    output_globs = excluded.output_globs,
+                    sim_subdir = excluded.sim_subdir,
+                    auto_pull = excluded.auto_pull,
+                    max_active_tasks = excluded.max_active_tasks,
+                    aedt_backend = excluded.aedt_backend,
+                    updated_at = CURRENT_TIMESTAMP
                 """,
                 (
                     name,
@@ -2893,14 +2811,14 @@ class Database:
                     output_globs,
                     sim_subdir,
                     1 if auto_pull else 0,
-                    hard_scheduler_limit,
-                    initial_policy_limit,
-                    initial_policy_limit,
-                    initial_campaign_total,
+                    requested_limit,
                     normalize_aedt_backend(aedt_backend),
                 ),
             )
-            return int(cursor.lastrowid)
+            row = conn.execute(
+                "SELECT id FROM projects WHERE name = ?", (name,)
+            ).fetchone()
+            return int(row["id"])
 
     def update_project(self, project_id: int, **fields: Any) -> None:
         self._update_row("projects", project_id, fields)
@@ -2914,168 +2832,6 @@ class Database:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM projects WHERE name = ?", (name,)).fetchone()
             return dict(row) if row else None
-
-    def update_project_simulation_policy(
-        self,
-        name: str,
-        *,
-        desired_simulations: int,
-        expected_revision: int,
-        scale_down_mode: str = "drain",
-    ) -> tuple[str, dict[str, Any] | None]:
-        """CAS-update desired work without changing the hard scheduler guard."""
-
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            project = conn.execute(
-                "SELECT * FROM projects WHERE name = ?", (name,)
-            ).fetchone()
-            if not project:
-                return "not_found", None
-            if int(project["policy_revision"] or 1) != int(expected_revision):
-                return "conflict", dict(project)
-            cursor = conn.execute(
-                """
-                UPDATE projects
-                SET desired_simulations = ?, scale_down_mode = ?,
-                    policy_revision = policy_revision + 1,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND policy_revision = ?
-                """,
-                (
-                    max(0, int(desired_simulations)),
-                    scale_down_mode,
-                    int(project["id"]),
-                    int(expected_revision),
-                ),
-            )
-            if cursor.rowcount != 1:
-                current = conn.execute(
-                    "SELECT * FROM projects WHERE id = ?", (int(project["id"]),)
-                ).fetchone()
-                return "conflict", dict(current) if current else None
-            updated = conn.execute(
-                "SELECT * FROM projects WHERE id = ?", (int(project["id"]),)
-            ).fetchone()
-            return "updated", dict(updated)
-
-    def update_project_validation_limit(
-        self,
-        name: str,
-        *,
-        validated_concurrency_limit: int,
-        expected_revision: int,
-    ) -> tuple[str, dict[str, Any] | None]:
-        """CAS-update the separately controlled rollout/validation ceiling."""
-
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            project = conn.execute(
-                "SELECT * FROM projects WHERE name = ?", (name,)
-            ).fetchone()
-            if not project:
-                return "not_found", None
-            if int(project["policy_revision"] or 1) != int(expected_revision):
-                return "conflict", dict(project)
-            validated = max(0, int(validated_concurrency_limit))
-            desired = min(max(0, int(project["desired_simulations"] or 0)), validated)
-            cursor = conn.execute(
-                """
-                UPDATE projects
-                SET validated_concurrency_limit = ?, desired_simulations = ?,
-                    policy_revision = policy_revision + 1,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND policy_revision = ?
-                """,
-                (
-                    validated,
-                    desired,
-                    int(project["id"]),
-                    int(expected_revision),
-                ),
-            )
-            if cursor.rowcount != 1:
-                current = conn.execute(
-                    "SELECT * FROM projects WHERE id = ?", (int(project["id"]),)
-                ).fetchone()
-                return "conflict", dict(current) if current else None
-            updated = conn.execute(
-                "SELECT * FROM projects WHERE id = ?", (int(project["id"]),)
-            ).fetchone()
-            return "updated", dict(updated)
-
-    def update_project_campaign_demand(
-        self,
-        name: str,
-        *,
-        total_simulations: int,
-        expected_revision: int,
-        updated_by: str,
-    ) -> tuple[str, dict[str, Any] | None]:
-        """CAS-update an absolute feeder budget without touching any task row.
-
-        Setting the same value at the current revision is a true no-op.  This
-        gives clients an idempotent absolute-target operation while stale
-        revisions still fail closed.
-        """
-
-        total = max(0, int(total_simulations))
-        actor = str(updated_by or "api").strip()[:256] or "api"
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            project = conn.execute(
-                "SELECT * FROM projects WHERE name = ?", (name,)
-            ).fetchone()
-            if not project:
-                return "not_found", None
-            current_revision = int(project["campaign_demand_revision"] or 1)
-            if current_revision != int(expected_revision):
-                return "conflict", dict(project)
-            previous_total = max(0, int(project["campaign_total_simulations"] or 0))
-            if previous_total == total:
-                return "unchanged", dict(project)
-            cursor = conn.execute(
-                """
-                UPDATE projects
-                SET campaign_total_simulations = ?,
-                    campaign_demand_revision = campaign_demand_revision + 1,
-                    campaign_demand_updated_at = CURRENT_TIMESTAMP,
-                    campaign_demand_updated_by = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND campaign_demand_revision = ?
-                """,
-                (total, actor, int(project["id"]), int(expected_revision)),
-            )
-            if cursor.rowcount != 1:
-                current = conn.execute(
-                    "SELECT * FROM projects WHERE id = ?", (int(project["id"]),)
-                ).fetchone()
-                return "conflict", dict(current) if current else None
-            updated = conn.execute(
-                "SELECT * FROM projects WHERE id = ?", (int(project["id"]),)
-            ).fetchone()
-            conn.execute(
-                """
-                INSERT INTO scheduler_events(
-                    kind, entity_type, entity_id, message
-                ) VALUES('project_campaign_demand_updated', 'project', ?, ?)
-                """,
-                (
-                    str(project["id"]),
-                    json_dumps(
-                        {
-                            "project": name,
-                            "previous_total_simulations": previous_total,
-                            "total_simulations": total,
-                            "demand_revision": int(expected_revision) + 1,
-                            "updated_by": actor,
-                            "scale_down_mode": "drain",
-                            "tasks_cancelled": 0,
-                        }
-                    ),
-                ),
-            )
-            return "updated", dict(updated)
 
     def count_tasks_by_project(self, project: str, statuses: list[str] | None = None) -> int:
         if not project:
@@ -3094,7 +2850,7 @@ class Database:
     def count_active_standalone_fea_tasks_by_project(self, project: str) -> int:
         """Count physical standalone AEDT workers consuming a project cap.
 
-        Queued work deliberately remains outside this count so a campaign can
+        Queued work deliberately remains outside this count so a workload can
         maintain a deeper logical pool.  Legacy empty backend values are
         standalone; pooled clients and the internal session-host project are
         never physical standalone project Desktops.
@@ -3142,56 +2898,6 @@ class Database:
                 params,
             ).fetchone()
             return int(row[0]) if row else 0
-
-    def standalone_campaign_activity_summary(
-        self,
-        project: str,
-        *,
-        name_prefix: str = "mft-camp-",
-    ) -> dict[str, int]:
-        """Return the logical standalone campaign population in one query.
-
-        Validation jobs use the same MFT project but a different name prefix,
-        while the AEDT attach soak shares ``mft-camp-`` and is marked pooled.
-        Filtering both dimensions makes this the 100-AEDT/400-simulation lane
-        rather than a project-wide approximation.
-        """
-
-        normalized_project = str(project or "").strip()
-        normalized_prefix = str(name_prefix or "").strip()
-        if not normalized_project or not normalized_prefix:
-            return {"active": 0, "running": 0, "attaching": 0, "queued": 0}
-        escaped_prefix = (
-            normalized_prefix.replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT
-                    COUNT(*) AS active,
-                    COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running,
-                    COALESCE(SUM(CASE WHEN status = 'attaching' THEN 1 ELSE 0 END), 0) AS attaching,
-                    COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued
-                FROM tasks
-                WHERE project = ?
-                  AND name LIKE ? ESCAPE '\\'
-                  AND status IN ('queued', 'attaching', 'running')
-                  AND LOWER(TRIM(COALESCE(scheduling_profile, ''))) = ?
-                  AND LOWER(TRIM(COALESCE(aedt_backend, 'standalone')))
-                      IN ('', 'standalone')
-                """,
-                (
-                    normalized_project,
-                    f"{escaped_prefix}%",
-                    SchedulingProfile.FEA_BURSTY.value,
-                ),
-            ).fetchone()
-        return {
-            key: int(row[key] or 0)
-            for key in ("active", "running", "attaching", "queued")
-        }
 
     def list_projects(self) -> list[dict[str, Any]]:
         with self.connect() as conn:

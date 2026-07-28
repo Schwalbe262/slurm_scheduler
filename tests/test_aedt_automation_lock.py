@@ -25,9 +25,9 @@ def test_host_lock_creation_rejects_blank_path(blank) -> None:
 
 def test_remote_posix_lock_path_survives_windows_control_plane() -> None:
     assert automation_lock_path(
-        "/gpfs/tmp_cpu2/mft_pool/aedt_session_logs/session-505"
+        "/gpfs/tmp_cpu2/aedt_pool/aedt_session_logs/session-505"
     ) == (
-        "/gpfs/tmp_cpu2/mft_pool/aedt_session_logs/session-505/"
+        "/gpfs/tmp_cpu2/aedt_pool/aedt_session_logs/session-505/"
         "desktop-automation.lock"
     )
 

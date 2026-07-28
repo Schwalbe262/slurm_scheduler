@@ -221,20 +221,20 @@ def create_aedt_pool_router(service: AedtPoolService) -> APIRouter:
     def create_mixed_canary_admission(
         payload: dict[str, Any] = Body(...),
     ) -> dict[str, Any]:
-        allowed = {"session_id", "mft_projects", "ipmsm_projects", "ttl_seconds"}
+        allowed = {"session_id", "family_a_projects", "family_b_projects", "ttl_seconds"}
         if not payload or set(payload) - allowed:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    "only session_id, mft_projects, ipmsm_projects, and "
+                    "only session_id, family_a_projects, family_b_projects, and "
                     "ttl_seconds are accepted"
                 ),
             )
         try:
             return service.create_mixed_canary_admission(
                 session_id=payload.get("session_id"),
-                mft_projects=payload.get("mft_projects", 2),
-                ipmsm_projects=payload.get("ipmsm_projects", 1),
+                family_a_projects=payload.get("family_a_projects", 2),
+                family_b_projects=payload.get("family_b_projects", 1),
                 ttl_seconds=payload.get("ttl_seconds", 1800),
             )
         except (TypeError, ValueError) as exc:

@@ -2,10 +2,6 @@ database_path: "data/slurm_scheduler.db"
 # WARNING: use delete when database_path is on a network filesystem — WAL is unsupported there.
 sqlite_journal_mode: "wal"
 accounts_path: "config/accounts.yaml"
-# Empty uses %LOCALAPPDATA%/MFT_1MW_2026/campaign-mutation.lock, exactly the
-# same host-wide lock as the feeder and monitoring UI.
-mft_campaign_mutation_lock_path: ""
-mft_campaign_mutation_lock_timeout_seconds: 900
 poll_interval_seconds: 30
 # Administrative ceiling for each project's max_active_tasks setting. Raising
 # this does not bypass enabled license-admission feature headroom (including
@@ -84,29 +80,26 @@ fea_bursty:
   shared_memory_min_estimate_mb: 8192
   overload_scale_out_load_factor: 2.0
   overload_scale_out_seconds: 300
-  # Three-stage MFT runs can reach their late Thermal memory peak after
+  # Three-stage FEA runs can reach their late Thermal memory peak after
   # roughly 48-53 minutes. Keep shared RAM growth reserved for the first hour.
   footprint_maturity_seconds: 3600
   # CPU declarations need only bridge the delay until load/sstat observes a
   # newly attached worker; do not double-count CPU for the full RAM window.
   cpu_footprint_maturity_seconds: 120
-# Keep the logical MFT refill pool deep while limiting the physical standalone
-# AEDT Desktops (running+attaching) to 100. Pooled clients and the internal
-# _aedt_pool_hosts project are not counted by this limit.
+# Limit physical standalone AEDT Desktops (running+attaching) by project.
+# Pooled clients and the internal _aedt_pool_hosts project are not counted.
 standalone_aedt_max_running_by_project:
-  MFT_1MW_2026v1: 100
-# Exact lanes override the broad project fallback for matching standalone FEA
-# tasks. This keeps the 100-worker data lane and 8-worker NSGA validation lane
-# active concurrently even though both use the same scheduler project.
+  example_fea_project_a: 100
+# Exact lanes override the broad project fallback for matching standalone tasks.
 standalone_aedt_running_lanes:
-  mft_data:
-    project: MFT_1MW_2026v1
-    name_prefix: "mft-camp-"
+  project_a_primary:
+    project: example_fea_project_a
+    name_prefix: "primary-"
     aedt_backend: standalone
     max_running: 100
-  mft_nsga_fea_validation:
-    project: MFT_1MW_2026v1
-    name_prefix: "mft-nsgafea-"
+  project_b_validation:
+    project: example_fea_project_b
+    name_prefix: "validation-"
     aedt_backend: standalone
     max_running: 8
 license_monitor:
@@ -127,9 +120,9 @@ license_monitor:
       # Required for license-gated AEDT pool demand and warm-spare hosts.
       _aedt_pool_hosts:
         electronics_desktop: 1
-      MFT_1MW_2026v1:
+      example_fea_project_a:
         electronics_desktop: 1
-      PYAEDT_MOTOR_IPMSM_V2:
+      example_fea_project_b:
         electronics_desktop: 1
     unknown_fea_project_policy: block
 # The central pool allows 1..3 projects per AEDT session. The original validated
@@ -150,6 +143,7 @@ aedt_pool:
   host_artifact_root: ""
   host_dso_profile: "maxwell-2d3d-icepak-4c1e"
   host_session_profile: '{"profile_version":2,"aedt_version":"2025.2","python_environment":"pyaedt2026v1","pyaedt_version":"0.22.0","filesystem":"gpfs-shared-v1","desktop_dso":{"config_name":"pyaedt_config","designs":{"Icepak":{"cores":4,"tasks":1,"gpus":0,"use_auto_settings":false},"Maxwell 2D":{"cores":4,"tasks":1,"gpus":0,"use_auto_settings":true},"Maxwell 3D":{"cores":4,"tasks":1,"gpus":0,"use_auto_settings":true}}}}'
+  terminal_workspace_root: "/gpfs/tmp_cpu2/aedt_pool"
 # Optional login-node relay for compute nodes that cannot reach this scheduler
 # directly. It is a strict no-op until enabled and fully configured.
 control_plane_relay:

@@ -64,3 +64,5 @@ note.md rules:
 
 \- At closeout, append one concise entry only.
 
+- 2026-07-28 21:45:14 +09:00 | MFT campaign removal | Removed pipeline/campaign APIs, persistence, UI, defaults, contracts, and repair artifacts; neutralized keeper AEDT pool labels; added configurable generic terminal workspace root. Validation: compileall clean, pytest 880 passed/3 known pilot failures/2 skipped, required grep and diff check clean. Token usage unavailable. Next: orchestrator review.
+

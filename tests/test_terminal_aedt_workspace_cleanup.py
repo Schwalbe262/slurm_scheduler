@@ -64,11 +64,11 @@ class TerminalAedtWorkspaceCleanupTests(unittest.TestCase):
         self.scheduler.stop()
         self.tmp.cleanup()
 
-    def make_task(self, name: str = "mft-cleanup") -> int:
+    def make_task(self, name: str = "fea-cleanup") -> int:
         task_id = self.db.create_task(
             TaskCreate(
                 name,
-                "/work/mft",
+                "/work/fea",
                 "run",
                 account_name="a",
                 aedt_backend=AedtBackend.POOLED.value,
@@ -90,7 +90,7 @@ class TerminalAedtWorkspaceCleanupTests(unittest.TestCase):
         workspace_path: str | None = None,
         request_key: str | None = None,
     ) -> int:
-        path = workspace_path or f"/gpfs/tmp_cpu2/mft_pool/mft-{task_id}"
+        path = workspace_path or f"/gpfs/tmp_cpu2/aedt_pool/aedt-{task_id}"
         with self.db.connect() as conn:
             cursor = conn.execute(
                 """
@@ -103,7 +103,7 @@ class TerminalAedtWorkspaceCleanupTests(unittest.TestCase):
                 """,
                 (
                     request_key or f"request-{task_id}",
-                    f"mft-project-{task_id}",
+                    f"fea-project-{task_id}",
                     path,
                     int(task_id),
                     state,
@@ -145,12 +145,12 @@ class TerminalAedtWorkspaceCleanupTests(unittest.TestCase):
         self.assertEqual(after["workspace_cleanup_attempts"], 1)
         self.assertEqual(
             after["workspace_path"],
-            f"/gpfs/tmp_cpu2/mft_pool/mft-{task_id}",
+            f"/gpfs/tmp_cpu2/aedt_pool/aedt-{task_id}",
         )
         self.assertEqual(FakeSSHSession.accounts, ["a"])
         self.assertEqual(len(FakeSSHSession.commands), 1)
         command = FakeSSHSession.commands[0]
-        self.assertIn(f"mft-{task_id}", command)
+        self.assertIn(f"aedt-{task_id}", command)
         self.assertIn("readlink -f", command)
         self.assertIn("stat -c %u", command)
         self.assertIn("find -P", command)
@@ -183,7 +183,7 @@ class TerminalAedtWorkspaceCleanupTests(unittest.TestCase):
         self.assertIn("cross-account", failed["workspace_cleanup_error"])
         self.assertEqual(
             failed["workspace_path"],
-            f"/gpfs/tmp_cpu2/mft_pool/mft-{task_id}",
+            f"/gpfs/tmp_cpu2/aedt_pool/aedt-{task_id}",
         )
 
         with self.db.connect() as conn:
@@ -247,7 +247,7 @@ class TerminalAedtWorkspaceCleanupTests(unittest.TestCase):
         other_task_id = self.db.create_task(
             TaskCreate(
                 "live-reference",
-                "/work/mft",
+                "/work/fea",
                 "run",
                 account_name="a",
                 aedt_backend=AedtBackend.POOLED.value,
@@ -261,13 +261,13 @@ class TerminalAedtWorkspaceCleanupTests(unittest.TestCase):
         self.add_lease(
             other_task_id,
             state="active",
-            workspace_path=f"/gpfs/tmp_cpu2/mft_pool/mft-{task_id}",
+            workspace_path=f"/gpfs/tmp_cpu2/aedt_pool/aedt-{task_id}",
             request_key="active-shared-reference",
         )
         self.assertFalse(
             self.db.claim_terminal_aedt_workspace_cleanup(
                 task_id,
-                f"/gpfs/tmp_cpu2/mft_pool/mft-{task_id}",
+                f"/gpfs/tmp_cpu2/aedt_pool/aedt-{task_id}",
                 retry_before="9999-12-31 23:59:59",
                 stale_claim_before="9999-12-31 23:59:59",
                 claimed_at="2026-07-16 00:00:00",
@@ -276,7 +276,7 @@ class TerminalAedtWorkspaceCleanupTests(unittest.TestCase):
 
     def test_non_exact_path_is_rejected_without_ssh(self) -> None:
         task_id = self.make_task("invalid-path")
-        path = f"/gpfs/tmp_cpu2/mft_pool/mft-{task_id}/nested"
+        path = f"/gpfs/tmp_cpu2/aedt_pool/aedt-{task_id}/nested"
         lease_id = self.add_lease(task_id, workspace_path=path)
 
         with patch(
@@ -326,7 +326,7 @@ class TerminalAedtWorkspaceCleanupTests(unittest.TestCase):
             terminal_task = db.create_task(
                 TaskCreate(
                     "legacy-terminal",
-                    "/work/mft",
+                    "/work/fea",
                     "run",
                     aedt_backend=AedtBackend.POOLED.value,
                 )
@@ -334,7 +334,7 @@ class TerminalAedtWorkspaceCleanupTests(unittest.TestCase):
             live_task = db.create_task(
                 TaskCreate(
                     "legacy-live",
-                    "/work/mft",
+                    "/work/fea",
                     "run",
                     aedt_backend=AedtBackend.POOLED.value,
                 )
@@ -357,8 +357,8 @@ class TerminalAedtWorkspaceCleanupTests(unittest.TestCase):
                         """,
                         (
                             f"legacy-{task_id}",
-                            f"mft-project-{task_id}",
-                            f"/gpfs/tmp_cpu2/mft_pool/mft-{task_id}",
+                            f"fea-project-{task_id}",
+                            f"/gpfs/tmp_cpu2/aedt_pool/aedt-{task_id}",
                             task_id,
                             state,
                         ),
