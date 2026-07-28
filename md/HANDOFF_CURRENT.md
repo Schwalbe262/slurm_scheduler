@@ -1,132 +1,29 @@
-\# Current Handoff
+# Current Handoff
 
+## Current status
 
+- 2026-07-28: 순수 스케줄러 복원 + AEDT 통합 작업 시작 (`docs/consolidation_index_20260728.md`).
+- 기준: `experiment/aedt-attach-1to2-20260713` @ `620a301`, 백업 태그 `backup/pre-consolidation-20260728`.
+- 베이스라인: `tests.test_core` 342 OK, `tests/test_aedt_pool*` 37 passed, compileall clean.
 
-\## Current status
+## Current objective
 
+- Phase 1: AEDT 브랜치 전수 서베이 → base head + cherry-pick 리스트 확정 (`docs/aedt_branch_survey_20260728.md`).
+- Phase 2: MFT 디커플링 (config.py/scheduler.py/app.example.yaml/dashboard.html의 MFT 하드코딩 제거).
 
+## Active branch / part
 
-\- <현재 상태 3-7줄>
+- Branch: `experiment/aedt-attach-1to2-20260713` → `integration/aedt-consolidated-20260728` (예정)
+- Part: consolidation Phase 0-1
 
+## Token/context policy
 
+- Start from this file. Do not read `note.md`/`insight.md` in full. Targeted `rg` only.
+- Update this file in 10 lines or fewer at closeout.
 
-\## Current objective
+## Risks and gotchas
 
-
-
-\- <지금 part의 목표>
-
-
-
-\## Active branch / part
-
-
-
-\- Branch:
-
-\- Part:
-
-
-
-\## Important files
-
-
-
-\- `<file>`: <왜 중요한지>
-
-\- `<file>`: <왜 중요한지>
-
-
-
-\## Last validation
-
-
-
-\- <마지막 테스트/검증>
-
-\- <결과>
-
-\- <로그 경로, 필요 시>
-
-
-
-\## Current blocker
-
-
-
-\- <현재 막힌 점>
-
-\- <원인 추정>
-
-\- <확인된 증거>
-
-
-
-\## Next steps
-
-
-
-1\. <구체적 다음 작업>
-
-2\. <구체적 다음 작업>
-
-3\. <구체적 다음 작업>
-
-4\. <선택적>
-
-5\. <선택적>
-
-
-
-\## Token/context policy
-
-
-
-\- Start from this file.
-
-\- Do not read `note.md` or `insight.md` in full.
-
-\- Search archive docs only with targeted `rg`.
-
-\- Do not paste full logs, JSON/JSONL, test output, or git diff.
-
-\- Update this file in 10 lines or fewer at closeout.
-
-
-
-\## Archive/search policy
-
-
-
-\- `note.md`: chronological loop archive.
-
-\- `insight.md`: confirmed reusable improvements.
-
-\- Old handoffs/logs/traces: search-only.
-
-
-
-\## Recent changes
-
-
-
-\- <최대 10개 bullet>
-
-
-
-\## Risks and gotchas
-
-## 2026-07-12 exclusive allocation fix
-- `exclusive_node` allocation scripts now emit `#SBATCH --exclusive`.
-- Task/allocation exclusivity must match exactly; exclusive shapes reject mixed/busy nodes on every CPU partition.
-- Focused regressions passed 6/6; the full `tests.test_core` suite passed 331/331.
-- Commit `d0100a0` is live after a native-service restart; running FEA task 28739 stayed attached.
-- Unscoped smoke 28774 was cancelled and project-scoped 28808 correctly waited for an idle node; 28808 was then cancelled before execution to release the 100-task cap to IPMSM Stage2.
-- Physical-exclusive runtime proof remains pending until the Stage2 campaign releases capacity.
-
-
-
-\- <주의점>
-
-\- <주의점>
-
+- MFT 캠페인 전용 요소(`mft_pipeline_status`, `campaign_mutation_lock`, `/api/mft-pipeline`,
+  `MFT_AEDT_*` contract)는 07-17 브랜치 통합 시 배제할 것.
+- AEDT 풀은 `enabled=0`/`adapter_ready=0` 유지; 라이브 1:2 gate 통과 전 활성화 금지.
+- 다른 worktree가 체크아웃한 브랜치는 checkout 불가 — merge/cherry-pick은 통합 브랜치에서.

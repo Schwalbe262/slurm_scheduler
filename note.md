@@ -411,3 +411,13 @@ Remaining verification:
 - Metrics/result: focused regressions 6/6 and full `tests.test_core` 331/331 passed; commit `d0100a0` is live after restart and running FEA task 28739 remained attached.
 - Failure reason: system Python lacked dependencies; validation succeeded with the repository `.venv`.
 - Next action: after IPMSM Stage2 releases its 100-task cap, submit a fresh project-scoped smoke and prove `OverSubscribe=EXCLUSIVE`; 28774/28808 were cancelled before execution.
+
+## 2026-07-28 consolidation Phase 0 (Claude orchestrator)
+- Part: pure-scheduler restore + AEDT branch consolidation kickoff.
+- Goal: MFT decoupling, ~40-branch AEDT survey, 1:2 attach verification.
+- Actions: backup tag `backup/pre-consolidation-20260728`; baseline `tests.test_core` 342 OK,
+  `tests/test_aedt_pool*` 37 passed (pytest installed into .venv), compileall clean;
+  created `integration/aedt-consolidated-20260728`; scaffolded
+  `docs/consolidation_index_20260728.md`; rewrote `md/HANDOFF_CURRENT.md` with real state.
+- Result: baseline green; survey of AEDT branches delegated to codex/codex2.
+- Next: Phase 1 survey report -> base head decision; Phase 2 MFT decoupling.
