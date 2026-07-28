@@ -18,6 +18,19 @@
   `tests/test_aedt_pool*` 37 passed (pytest), `compileall` clean.
 - 통합 브랜치(예정): `integration/aedt-consolidated-20260728` (Phase 1 서베이로 base 확정 후)
 
+## Phase 1 결과 (2026-07-28)
+
+- 서베이: `docs/aedt_branch_survey_20260728.md` — base = `fix/attached-task-cpu-contract-260725`
+  @ `1559a7c`, cherry-pick 5건(`61b95c7`,`6c3df6d`,`64d0f05`,`d30acf0`,`4facdfe`).
+- 통합 브랜치 재구성 완료. 전체 스위트 924 passed / 4 failed →
+  `test_task_refresh_fairness` 1건은 base의 비동기 취소 설계에 맞춰 테스트 갱신으로 해결.
+- **알려진 실패(Phase 4 대상, base 자체 결함):** pilot loopback 3건 —
+  `test_aedt_pool_1to1_pilot::test_loopback_pilot_performs_exclusive_attach_and_close_ack`,
+  `test_aedt_pool_1to2_pilot::test_shared_loopback_closes_aborted_project_without_stopping_sibling`,
+  `test_aedt_pool_1to2_pilot::test_shared_loopback_timeout_quarantines_then_recycles_after_sibling`.
+  증상: `state.session["endpoint"]`가 빈 문자열(세션 호스트 endpoint 등록 실패). 순수
+  `1559a7c`에서도 동일 재현 — 260725 라인의 aedt_pool.py 진화가 pilot 프로토콜과 어긋남.
+
 ## 시도 (attempts)
 
 - (추가 예정)

@@ -421,3 +421,14 @@ Remaining verification:
   `docs/consolidation_index_20260728.md`; rewrote `md/HANDOFF_CURRENT.md` with real state.
 - Result: baseline green; survey of AEDT branches delegated to codex/codex2.
 - Next: Phase 1 survey report -> base head decision; Phase 2 MFT decoupling.
+
+## 2026-07-28 consolidation Phase 1 (Claude orchestrator + codex/codex2 survey)
+- Part: 40-branch AEDT survey and integration branch rebuild.
+- Result: base = fix/attached-task-cpu-contract-260725 @ 1559a7c (supersedes
+  codex/aedt-integration-260717; aedt_pool.py +1945/-135 richer). Cherry-picked
+  61b95c7, 6c3df6d (synthesized onto async timeout-cancel design), 64d0f05,
+  d30acf0, 4facdfe. Survey: docs/aedt_branch_survey_20260728.md.
+- Validation: full pytest 924 passed / 4 failed; fairness test updated for the
+  async design (now green); 3 pilot loopback failures are pre-existing on pure
+  1559a7c (endpoint registration) -> Phase 4 fix list.
+- Next: Phase 2 MFT decoupling (incl. campaign layer now present in base).

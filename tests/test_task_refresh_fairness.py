@@ -72,8 +72,14 @@ def test_expired_fea_is_cancelled_outside_probe_sample() -> None:
     scheduler.task_timed_out = lambda task: bool(task.get("expired"))
     scheduler._timestamp = lambda _value: None
     scheduler._now = lambda: 0
+    # The consolidated scheduler cancels timed-out tasks asynchronously via
+    # ``_schedule_timed_out_task_cancellation``; the hoisted-out-of-sample
+    # property under test is unchanged.
+    scheduler._timed_out_task_cancellations = {}
     cancelled: list[int] = []
-    scheduler.cancel_timed_out_task = lambda task: cancelled.append(int(task["id"]))
+    scheduler._schedule_timed_out_task_cancellation = (
+        lambda task: cancelled.append(int(task["id"])) or True
+    )
     scheduler._fan_out_by_account = lambda _items, _callback: {}
     scheduler.recalculate_allocation_capacity = lambda: None
 
