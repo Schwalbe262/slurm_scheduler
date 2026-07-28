@@ -31,13 +31,33 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from slurm_scheduler.aedt_automation_lock import (  # noqa: E402
+    automation_lock_path,
+)
 from slurm_scheduler.aedt_session_host import (  # noqa: E402
     AedtSessionHost,
     ControlPlaneClient,
+    EXPECTED_AEDT_VERSION,
+    EXPECTED_SESSION_PROFILE_JSON,
+    SUPPORTED_DSO_PROFILE,
+    canonical_expected_session_profile,
 )
 
 
 TERMINAL_LEASE_STATES = {"released", "failed", "cancelled", "expired"}
+SESSION_LIVE_LEASE_STATES = {
+    "offered",
+    "leased",
+    "attaching",
+    "active",
+    "releasing",
+}
+SESSION_COMMAND_LIVE_LEASE_STATES = {
+    "offered",
+    "leased",
+    "attaching",
+    "active",
+}
 
 
 def _now() -> str:
@@ -50,18 +70,30 @@ class PilotControlPlane:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.bootstrap_token = secrets.token_urlsafe(24)
-        self.host_token = secrets.token_urlsafe(24)
-        self.client_token = secrets.token_urlsafe(24)
+        self.host_token = ""
+        self.client_token = ""
         self.session = {
             "id": 1,
+            "session_key": "pilot-session-1",
+            "generation": 1,
             "state": "starting",
             "host_id": "",
             "endpoint": "",
             "process_id": "",
+            "slots_total": 1,
+            "session_profile": EXPECTED_SESSION_PROFILE_JSON,
+            "artifact_dir": "",
+            "error_log_path": "",
+            "journal_path": "",
+            "runtime_metadata": {},
         }
         self.lease: dict[str, Any] | None = None
         self.project_close_ack = False
         self.closed_ack = False
+        self.quarantine_reason = ""
+        self.solve_permit_generation = 0
+        self.host_heartbeat_count = 0
+        self.lease_heartbeat_count = 0
         self.events: list[dict[str, Any]] = []
 
     def event(self, name: str, **values: Any) -> None:
@@ -73,13 +105,112 @@ class PilotControlPlane:
             if self.lease and self.lease["state"] not in TERMINAL_LEASE_STATES:
                 self.lease["state"] = "releasing"
                 self.lease["failure_message"] = reason
+                self.lease["fault_kind"] = "pilot_force_drain"
             self.session["state"] = "draining"
             self.event("pilot_force_drain", reason=reason)
+
+    def _offer_lease(self) -> None:
+        if self.lease is None or self.lease["state"] != "queued":
+            return
+        if (
+            self.session["state"] not in {"ready", "busy"}
+            or not self.session["endpoint"]
+            or not self.session["process_id"]
+            or not self.session["artifact_dir"]
+        ):
+            return
+        self.lease.update({
+            "state": "offered",
+            "endpoint": self.session["endpoint"],
+            "session_id": int(self.session["id"]),
+            "slot_index": 0,
+        })
+        self.session["state"] = "busy"
+        self.event("lease_offered", lease_id=1)
+
+    def _grant_solve_permit(self) -> None:
+        if self.lease is None or self.lease["state"] != "active":
+            return
+        if self.lease.get("solve_permit_granted"):
+            return
+        self.solve_permit_generation += 1
+        self.lease.update({
+            "solve_permit_granted": True,
+            "solve_permit_generation": self.solve_permit_generation,
+        })
+        self.event(
+            "solve_permit_granted",
+            lease_id=1,
+            generation=self.solve_permit_generation,
+        )
 
     def _public_lease(self) -> dict[str, Any]:
         if self.lease is None:
             raise KeyError("lease")
-        return dict(self.lease)
+        item = dict(self.lease)
+        assigned = int(item.get("session_id") or 0) == int(self.session["id"])
+        generation = int(item.get("solve_permit_generation") or 0)
+        cohort = (
+            [self.lease]
+            if generation > 0
+            and int(self.lease.get("solve_permit_generation") or 0) == generation
+            and bool(self.lease.get("solve_permit_granted"))
+            else []
+        )
+        completed_count = sum(
+            bool(lease.get("native_pipeline_completed")) for lease in cohort
+        )
+        broken_count = sum(
+            not bool(lease.get("native_pipeline_completed"))
+            and lease["state"] != "active"
+            for lease in cohort
+        )
+        native_completed = bool(item.get("native_pipeline_completed"))
+        item.update({
+            "legacy_state": (
+                "leased"
+                if item["state"] in {"offered", "attaching"}
+                else item["state"]
+            ),
+            "session_key": self.session["session_key"] if assigned else "",
+            "session_generation": (
+                int(self.session["generation"]) if assigned else 0
+            ),
+            "session_process_id": (
+                str(self.session["process_id"]) if assigned else ""
+            ),
+            "expected_aedt_version": (
+                EXPECTED_AEDT_VERSION if assigned else ""
+            ),
+            "automation_lock_path": (
+                automation_lock_path(str(self.session["artifact_dir"]))
+                if assigned
+                else ""
+            ),
+            "session_slots_total": int(self.session["slots_total"]),
+            "session_live_lease_count": int(
+                self.lease["state"] in SESSION_LIVE_LEASE_STATES
+            ),
+            "session_active_lease_count": int(
+                self.lease["state"] == "active"
+            ),
+            "solve_permit_required": bool(
+                self.lease["state"] == "active"
+                and not self.lease.get("solve_permit_granted")
+            ),
+            "native_pipeline_completed": native_completed,
+            "native_pipeline_expected_count": len(cohort),
+            "native_pipeline_completed_count": completed_count,
+            "native_pipeline_barrier_granted": bool(
+                native_completed
+                and cohort
+                and completed_count == len(cohort)
+            ),
+            "native_pipeline_barrier_broken": bool(
+                cohort and completed_count != len(cohort) and broken_count
+            ),
+        })
+        return item
 
     def dispatch(
         self,
@@ -94,18 +225,95 @@ class PilotControlPlane:
                     return 409, {"detail": "pilot permits exactly one lease"}
                 if payload.get("exclusive_session") is not True:
                     return 422, {"detail": "pilot requires exclusive_session=true"}
+                if type(payload.get("protocol_version")) is not int \
+                        or int(payload["protocol_version"]) != 2:
+                    return 422, {"detail": "pilot requires protocol_version=2"}
+                try:
+                    session_profile = canonical_expected_session_profile(
+                        payload.get("session_profile")
+                    )
+                except (TypeError, ValueError) as exc:
+                    return 422, {"detail": str(exc)}
+                workload_family = str(
+                    payload.get("workload_family") or ""
+                ).strip()
+                if not workload_family:
+                    return 422, {
+                        "detail": "protocol-v2 workload_family is required"
+                    }
+                workspace_path = str(
+                    payload.get("workspace_path") or ""
+                ).strip()
+                if not workspace_path or not os.path.isabs(workspace_path):
+                    return 422, {
+                        "detail": (
+                            "protocol-v2 workspace_path must be an absolute path"
+                        )
+                    }
+                task_id = int(payload.get("task_id") or 0)
+                if task_id <= 0:
+                    return 422, {
+                        "detail": "protocol-v2 task_id must be positive"
+                    }
+                isolation_policy = str(
+                    payload.get("isolation_policy") or ""
+                ).strip().lower()
+                if isolation_policy != "exclusive":
+                    return 422, {
+                        "detail": "1:1 pilot requires isolation_policy=exclusive"
+                    }
+                self.client_token = str(
+                    payload.get("client_token") or secrets.token_urlsafe(32)
+                )
                 self.lease = {
                     "id": 1,
                     "state": (
-                        "leased"
+                        "offered"
                         if self.session["state"] in {"ready", "busy"}
+                        and bool(self.session["endpoint"])
                         else "queued"
                     ),
-                    "endpoint": self.session["endpoint"],
+                    "endpoint": (
+                        self.session["endpoint"]
+                        if self.session["state"] in {"ready", "busy"}
+                        else ""
+                    ),
+                    "request_key": str(payload.get("request_key") or ""),
                     "project_name": str(payload.get("project_name") or ""),
                     "exclusive_session": 1,
+                    "protocol_version": 2,
+                    "task_id": task_id,
+                    "workload_family": workload_family,
+                    "session_profile": session_profile,
+                    "project_namespace": str(
+                        payload.get("project_namespace") or ""
+                    ).strip(),
+                    "isolation_policy": isolation_policy,
+                    "workspace_path": workspace_path,
+                    "requested_session_id": int(
+                        payload.get("requested_session_id") or 0
+                    ),
+                    "requested_session_generation": 0,
+                    "session_id": (
+                        int(self.session["id"])
+                        if self.session["state"] in {"ready", "busy"}
+                        and bool(self.session["endpoint"])
+                        else 0
+                    ),
+                    "slot_index": (
+                        0
+                        if self.session["state"] in {"ready", "busy"}
+                        and bool(self.session["endpoint"])
+                        else None
+                    ),
                     "failure_message": "",
+                    "fault_kind": "",
+                    "solve_permit_granted": False,
+                    "solve_permit_generation": 0,
+                    "native_pipeline_completed": False,
                 }
+                if self.lease["state"] == "offered":
+                    self.session["state"] = "busy"
                 self.event("lease_created", exclusive_session=True)
                 return 200, {
                     "lease": self._public_lease(),
@@ -115,7 +323,24 @@ class PilotControlPlane:
             if method == "POST" and path == "/api/aedt-pool/hosts/claim-start":
                 if headers.get("X-AEDT-Bootstrap-Token", "") != self.bootstrap_token:
                     return 403, {"detail": "invalid bootstrap token"}
-                self.session["host_id"] = str(payload.get("host_id") or "")
+                host_id = str(payload.get("host_id") or "").strip()
+                if not host_id:
+                    return 422, {"detail": "host_id is required"}
+                if int(payload.get("allocation_id") or 0) != 1:
+                    return 409, {"detail": "unexpected pilot allocation"}
+                if self.session["host_id"] and self.session["host_id"] != host_id:
+                    return 409, {"detail": "session already has another host"}
+                self.session.update({
+                    "host_id": host_id,
+                    "node_name": str(payload.get("node_name") or ""),
+                    "actual_node_name": str(
+                        payload.get("actual_node_name") or ""
+                    ),
+                    "slurm_job_id": str(payload.get("slurm_job_id") or ""),
+                    "host_process_id": str(
+                        payload.get("host_process_id") or ""
+                    ),
+                })
                 self.event("host_claimed")
                 return 200, {"session": dict(self.session)}
 
@@ -127,21 +352,99 @@ class PilotControlPlane:
                     self.session["state"] = "failed"
                     self.event("host_start_failed", message=payload.get("failure_message"))
                     return 200, dict(self.session)
+                if (
+                    not self.session["host_id"]
+                    or str(payload.get("host_id") or "")
+                    != self.session["host_id"]
+                ):
+                    return 409, {"detail": "registration host_id does not own claim"}
+                registration_token = str(
+                    headers.get("X-AEDT-Host-Token", "") or ""
+                ).strip()
+                if not registration_token:
+                    return 422, {
+                        "detail": "registration host token is required"
+                    }
+                try:
+                    session_profile = canonical_expected_session_profile(
+                        payload.get("session_profile")
+                    )
+                except (TypeError, ValueError) as exc:
+                    return 422, {"detail": str(exc)}
+                endpoint = str(payload.get("endpoint") or "").strip()
+                try:
+                    _machine, port_text = endpoint.rsplit(":", 1)
+                    port = int(port_text)
+                except (TypeError, ValueError):
+                    port = 0
+                process_id = str(payload.get("process_id") or "").strip()
+                try:
+                    process_id_valid = int(process_id) > 0
+                except ValueError:
+                    process_id_valid = False
+                if not endpoint or port <= 0:
+                    return 422, {"detail": "registered endpoint is invalid"}
+                if not process_id_valid:
+                    return 422, {"detail": "registered process_id is invalid"}
+                artifact_dir = str(payload.get("artifact_dir") or "").strip()
+                lock_path = automation_lock_path(artifact_dir)
+                if (
+                    not artifact_dir
+                    or not os.path.isabs(artifact_dir)
+                    or not Path(artifact_dir).is_dir()
+                    or not lock_path
+                    or not Path(lock_path).is_file()
+                ):
+                    return 422, {
+                        "detail": "registered host automation artifact is invalid"
+                    }
+                runtime_metadata = payload.get("runtime_metadata")
+                if not isinstance(runtime_metadata, dict):
+                    return 422, {"detail": "runtime_metadata must be an object"}
+                if (
+                    str(runtime_metadata.get("automation_lock_path") or "")
+                    != lock_path
+                    or str(runtime_metadata.get("session_profile") or "")
+                    != session_profile
+                ):
+                    return 422, {
+                        "detail": "runtime metadata does not match registration"
+                    }
+                if self.session["endpoint"]:
+                    replay = bool(
+                        self.host_token == registration_token
+                        and self.session["endpoint"] == endpoint
+                        and self.session["process_id"] == process_id
+                        and self.session["artifact_dir"] == artifact_dir
+                        and self.session["session_profile"] == session_profile
+                    )
+                    if not replay:
+                        return 409, {
+                            "detail": "conflicting session registration replay"
+                        }
+                    return 200, {
+                        "session": dict(self.session),
+                        "host_token": self.host_token,
+                    }
+                self.host_token = registration_token
                 self.session.update({
                     "state": "ready",
-                    "endpoint": str(payload.get("endpoint") or ""),
-                    "process_id": str(payload.get("process_id") or ""),
+                    "endpoint": endpoint,
+                    "process_id": process_id,
+                    "artifact_dir": artifact_dir,
+                    "error_log_path": str(
+                        payload.get("error_log_path") or ""
+                    ),
+                    "journal_path": str(payload.get("journal_path") or ""),
+                    "session_profile": session_profile,
+                    "runtime_metadata": dict(runtime_metadata),
                 })
-                if self.lease and self.lease["state"] == "queued":
-                    self.lease.update({
-                        "state": "leased",
-                        "endpoint": self.session["endpoint"],
-                    })
-                    self.session["state"] = "busy"
+                self._offer_lease()
                 self.event(
                     "host_registered",
                     endpoint=self.session["endpoint"],
                     process_id=self.session["process_id"],
+                    automation_lock_path=lock_path,
                 )
                 return 200, {
                     "session": dict(self.session),
@@ -157,36 +460,102 @@ class PilotControlPlane:
                 if method == "GET" and suffix == "":
                     return 200, self._public_lease()
                 if method == "POST" and suffix == "/heartbeat":
-                    if self.lease["state"] == "queued" and self.session["endpoint"]:
-                        self.lease.update({
-                            "state": "leased",
-                            "endpoint": self.session["endpoint"],
-                        })
-                    if self.lease["state"] == "leased":
-                        self.lease["state"] = "active"
-                        self.session["state"] = "busy"
+                    if self.lease["state"] in TERMINAL_LEASE_STATES:
+                        return 409, {"detail": f"lease is {self.lease['state']}"}
+                    self.lease_heartbeat_count += 1
+                    self._offer_lease()
+                    return 200, self._public_lease()
+                if method == "POST" and suffix == "/accept":
+                    if self.lease["state"] == "offered":
+                        self.lease["state"] = "attaching"
+                        self.event("lease_accepted", lease_id=1)
+                    elif self.lease["state"] not in {"attaching", "active"}:
+                        return 409, {
+                            "detail": f"lease is {self.lease['state']}"
+                        }
                     return 200, self._public_lease()
                 if method == "PATCH" and suffix == "/project-name":
                     self.lease["project_name"] = str(
                         payload.get("project_name") or ""
                     )
+                    if not self.lease["project_name"].strip():
+                        return 422, {"detail": "project_name is required"}
                     self.event(
                         "project_bound",
                         project_name=self.lease["project_name"],
                     )
                     return 200, self._public_lease()
-                if method == "POST" and suffix == "/release":
-                    if self.lease["state"] not in TERMINAL_LEASE_STATES:
+                if method == "POST" and suffix == "/activate":
+                    if self.lease["state"] == "attaching":
+                        self.lease["state"] = "active"
+                        self.event("lease_activated", lease_id=1)
+                        self._grant_solve_permit()
+                    elif self.lease["state"] != "active":
+                        return 409, {
+                            "detail": f"lease is {self.lease['state']}"
+                        }
+                    return 200, self._public_lease()
+                if method == "POST" and suffix == "/solve-permit":
+                    if self.lease["state"] != "active":
+                        return 409, {
+                            "detail": f"lease is {self.lease['state']}"
+                        }
+                    self._grant_solve_permit()
+                    return 200, self._public_lease()
+                if method == "POST" and suffix == "/native-pipeline-complete":
+                    generation = payload.get("solve_permit_generation")
+                    if (
+                        self.lease["state"] != "active"
+                        or not self.lease.get("solve_permit_granted")
+                        or type(generation) is not int
+                        or int(generation)
+                        != int(self.lease.get("solve_permit_generation") or 0)
+                    ):
+                        return 409, {
+                            "detail": "native pipeline generation is not authorized"
+                        }
+                    self.lease["native_pipeline_completed"] = True
+                    self.event(
+                        "native_pipeline_completed",
+                        lease_id=1,
+                        generation=int(generation),
+                    )
+                    return 200, self._public_lease()
+                if method == "POST" and suffix in {"/cancel", "/release"}:
+                    if self.lease["state"] in {"attaching", "active", "releasing"}:
                         self.lease["state"] = "releasing"
-                    self.event("release_requested")
+                        self.lease["failure_message"] = str(
+                            payload.get("reason") or "client released lease"
+                        )
+                    elif self.lease["state"] not in TERMINAL_LEASE_STATES:
+                        self.lease["state"] = "cancelled"
+                    self.event(
+                        "release_requested",
+                        route=suffix,
+                    )
                     return 200, self._public_lease()
                 if method == "POST" and suffix == "/fault":
-                    kind = str(payload.get("fault_kind") or "")
-                    self.lease["state"] = "releasing"
+                    kind = str(payload.get("fault_kind") or "").strip().lower()
+                    if not kind:
+                        return 422, {"detail": "fault_kind is required"}
+                    if self.lease["state"] in {
+                        "attaching",
+                        "active",
+                        "releasing",
+                    }:
+                        self.lease["state"] = "releasing"
+                    else:
+                        self.lease["state"] = "cancelled"
+                    self.lease["fault_kind"] = kind
                     self.lease["failure_message"] = str(
                         payload.get("failure_message") or kind
                     )
-                    self.session["state"] = "draining"
+                    if kind in {
+                        "solver_timeout",
+                        "aedt_death",
+                    }:
+                        self.quarantine_reason = kind
+                        self.session["state"] = "draining"
                     self.event("fault_reported", kind=kind)
                     return 200, self._public_lease()
 
@@ -195,26 +564,69 @@ class PilotControlPlane:
                     return 403, {"detail": "invalid host token"}
                 suffix = path.removeprefix("/api/aedt-pool/sessions/1")
                 if method == "POST" and suffix == "/heartbeat":
+                    endpoint_port = int(
+                        str(self.session["endpoint"]).rsplit(":", 1)[1]
+                    )
+                    if payload.get("liveness_confirmed") is not True:
+                        return 409, {"detail": "liveness confirmation is required"}
+                    if str(payload.get("process_id") or "") != str(
+                        self.session["process_id"]
+                    ):
+                        return 409, {"detail": "heartbeat process_id mismatch"}
+                    if int(payload.get("port") or 0) != endpoint_port:
+                        return 409, {"detail": "heartbeat port mismatch"}
+                    if str(payload.get("native_probe") or "") not in {
+                        "",
+                        "GetVersion",
+                    }:
+                        return 422, {"detail": "unsupported native probe"}
+                    self.host_heartbeat_count += 1
+                    self.session["last_native_probe_outcome"] = str(
+                        payload.get("native_probe_outcome") or ""
+                    )
+                    return 200, dict(self.session)
+                if method == "POST" and suffix == "/fault":
+                    kind = str(payload.get("kind") or "").strip().lower()
+                    if not kind:
+                        return 422, {"detail": "session fault kind is required"}
+                    self.quarantine_reason = kind
+                    self.session["state"] = "unhealthy"
+                    self.session["failure_message"] = str(
+                        payload.get("failure_message") or kind
+                    )
+                    self.event("session_fault_reported", kind=kind)
                     return 200, dict(self.session)
                 if method == "GET" and suffix == "/commands":
                     close_projects = []
-                    global_stop = False
+                    deferred_projects = []
                     if self.lease and self.lease["state"] == "releasing":
-                        faulted = bool(self.lease.get("failure_message"))
-                        if faulted:
-                            global_stop = True
+                        if self.lease.get("fault_kind") == "solver_timeout":
+                            deferred_projects = [self._public_lease()]
                         else:
                             close_projects = [self._public_lease()]
+                    sibling_live_count = int(
+                        bool(
+                            self.lease
+                            and self.lease["state"]
+                            in SESSION_COMMAND_LIVE_LEASE_STATES
+                        )
+                    )
+                    global_stop = bool(
+                        self.quarantine_reason and sibling_live_count == 0
+                    )
                     drain = bool(
                         self.project_close_ack
-                        or self.session["state"] in {"draining", "failed"}
+                        or self.session["state"]
+                        in {"draining", "failed", "unhealthy"}
                     )
                     return 200, {
                         "close_projects": close_projects,
-                        "deferred_projects": [],
+                        "deferred_projects": deferred_projects,
                         "drain": drain,
-                        "sibling_live_count": 0,
+                        "quarantine_reason": self.quarantine_reason,
+                        "sibling_live_count": sibling_live_count,
                         "global_stop_allowed": global_stop,
+                        "recycle_after_global_stop": global_stop,
                     }
                 release_match = re.fullmatch(
                     r"/leases/1/release-complete", suffix
@@ -228,6 +640,21 @@ class PilotControlPlane:
                     return 200, self._public_lease()
                 if method == "POST" and suffix == "/closed":
                     success = payload.get("success") is True
+                    if not success and payload.get("requeue_siblings") is True:
+                        if (
+                            self.lease
+                            and self.lease["state"]
+                            not in TERMINAL_LEASE_STATES
+                        ):
+                            self.lease.update({
+                                "state": "queued",
+                                "endpoint": "",
+                                "session_id": 0,
+                                "slot_index": None,
+                                "solve_permit_granted": False,
+                                "solve_permit_generation": 0,
+                                "native_pipeline_completed": False,
+                            })
                     self.session["state"] = "closed" if success else "failed"
                     if self.lease and self.lease["state"] not in TERMINAL_LEASE_STATES:
                         self.lease["state"] = "failed"
@@ -430,6 +857,15 @@ def main(argv: list[str] | None = None) -> int:
         }
         params_path = output / "pilot_params.json"
         params_path.write_text(json.dumps(params, indent=2), encoding="utf-8")
+        task_id_text = str(os.environ.get("SLURM_SCHED_TASK_ID") or "").strip()
+        pilot_task_id = (
+            int(task_id_text)
+            if task_id_text.isdigit() and int(task_id_text) > 0
+            else 1
+        )
+        workspace = work / f"aedt-task-{pilot_task_id}"
+        workspace.mkdir()
+        artifact_root = work / "host-artifacts"
         before = output / "lmstat_before.txt"
         license_records.append(
             _lmstat_snapshot(args.lmutil, args.license_server, before)
@@ -444,6 +880,10 @@ def main(argv: list[str] | None = None) -> int:
             allocation_id=1,
             node_name=socket.gethostname(),
             heartbeat_seconds=5,
+            aedt_version=EXPECTED_AEDT_VERSION,
+            artifact_root=str(artifact_root),
+            dso_profile=SUPPORTED_DSO_PROFILE,
+            session_profile=EXPECTED_SESSION_PROFILE_JSON,
         )
 
         def run_host() -> None:
@@ -465,13 +905,19 @@ def main(argv: list[str] | None = None) -> int:
 
         env = os.environ.copy()
         env.update({
-            "MFT_AEDT_BACKEND": "pooled",
-            "MFT_AEDT_EXCLUSIVE_1TO1": "1",
-            "MFT_AEDT_SCHEDULER_URL": scheduler_url,
+            "SLURM_AEDT_BACKEND": "pooled",
+            "SLURM_AEDT_EXCLUSIVE_1TO1": "1",
+            "SLURM_AEDT_SCHEDULER_URL": scheduler_url,
+            "SLURM_AEDT_LEASE_WAIT_SECONDS": "300",
+            "SLURM_AEDT_RELEASE_WAIT_SECONDS": "300",
+            "SLURM_AEDT_PROTOCOL_VERSION": "2",
+            "SLURM_AEDT_SESSION_PROFILE": EXPECTED_SESSION_PROFILE_JSON,
+            "SLURM_AEDT_WORKLOAD_FAMILY": "mft",
+            "SLURM_AEDT_ISOLATION_POLICY": "exclusive",
+            "SLURM_AEDT_POOL_WORKSPACE": str(workspace),
+            "SLURM_SCHED_TASK_ID": str(pilot_task_id),
             "MFT_SLURM_SCHEDULER_ROOT": str(ROOT),
             "MFT_PYAEDT_LIBRARY_ROOT": str(library),
-            "MFT_AEDT_LEASE_WAIT_SECONDS": "300",
-            "MFT_AEDT_RELEASE_WAIT_SECONDS": "300",
         })
         command = [
             sys.executable,
@@ -559,7 +1005,7 @@ def main(argv: list[str] | None = None) -> int:
         if process_alive(str(state.session.get("process_id") or "")):
             failures.append("desktop_process_still_alive")
         project_name = str(result.get("project_name") or "")
-        project_dir = mft / "simulation" / project_name
+        project_dir = workspace / project_name
         if not project_name or project_dir.exists():
             failures.append("project_workspace_not_cleaned")
 

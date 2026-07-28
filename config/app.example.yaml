@@ -128,6 +128,8 @@ license_monitor:
 # The central pool allows 1..3 projects per AEDT session. The original validated
 # contract was 1:2; 3 projects per session was operator-accepted on 2026-07-14.
 aedt_pool:
+  # The pooled AEDT backend is optional and disabled by default.
+  module_enabled: false
   session_host_enabled: false
   scheduler_url: ""
   # Compute-node-readable file containing the limited lease-creation token.

@@ -393,6 +393,8 @@ class AedtPoolGateTests(AedtPoolTestCase):
                     "reconcile_on_start: false",
                     "backup_enabled: false",
                     "web_listener_watchdog_enabled: false",
+                    "aedt_pool:",
+                    "  module_enabled: true",
                 ]
             ),
             encoding="utf-8",

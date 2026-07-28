@@ -1023,19 +1023,25 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     aedt_pool_client_token = os.environ.get(
         "SLURM_AEDT_POOL_CLIENT_TOKEN", ""
     ).strip()
-    aedt_pool = AedtPoolService(
-        db,
-        bootstrap_token=aedt_pool_bootstrap_token,
-        lease_client_token=aedt_pool_client_token,
-    )
-    aedt_pool.init()
-    aedt_pool.set_warm_spare_admission_checker(
-        scheduler.aedt_pool_warm_spare_admission
-    )
-    aedt_pool.set_dead_session_process_checker(
-        scheduler.aedt_session_processes_absent
-    )
+    aedt_pool = None
+    aedt_pool_runtime = None
+    control_plane_relay = None
+    if config.aedt_pool_module_enabled:
+        aedt_pool = AedtPoolService(
+            db,
+            bootstrap_token=aedt_pool_bootstrap_token,
+            lease_client_token=aedt_pool_client_token,
+        )
+        aedt_pool.init()
+        aedt_pool.set_warm_spare_admission_checker(
+            scheduler.aedt_pool_warm_spare_admission
+        )
+        aedt_pool.set_dead_session_process_checker(
+            scheduler.aedt_session_processes_absent
+        )
+
     def aedt_backend_admission(task) -> tuple[bool, str]:
+        assert aedt_pool is not None
         pool_config = aedt_pool.config()
         if pool_config.operational:
             if (
@@ -1049,6 +1055,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     def prepare_aedt_backend_task(task) -> tuple[bool, str]:
         """Acquire an exact healthy session slot before launching a client."""
 
+        assert aedt_pool is not None
         values = _literal_task_environment(task)
         profile = values.get("SLURM_AEDT_SESSION_PROFILE", "")
         isolation_policy = values.get("SLURM_AEDT_ISOLATION_POLICY", "family")
@@ -1071,6 +1078,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     def select_aedt_pool_demand_account(task: dict) -> str:
         """Mirror the scheduler's real account choice for unplaced pool demand."""
 
+        assert aedt_pool is not None
         normalized_task = dict(task)
         if not normalized_task.get("id") and normalized_task.get("task_id"):
             normalized_task["id"] = normalized_task["task_id"]
@@ -1094,6 +1102,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         session_capacity: list[dict],
         projects_per_session: int,
     ) -> tuple[dict[int, str], dict[int, str]]:
+        assert aedt_pool is not None
         pool_config = aedt_pool.config()
         return _plan_aedt_pool_demand_accounts(
             scheduler,
@@ -1105,10 +1114,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             pool_env_profile=pool_config.env_profile,
         )
 
-    scheduler.set_aedt_backend_admission_checker(aedt_backend_admission)
-    scheduler.set_aedt_backend_task_preparer(prepare_aedt_backend_task)
-    aedt_pool.set_task_account_selector(select_aedt_pool_demand_account)
-    aedt_pool.set_task_account_batch_selector(select_aedt_pool_demand_accounts)
+    if aedt_pool is not None:
+        scheduler.set_aedt_backend_admission_checker(aedt_backend_admission)
+        scheduler.set_aedt_backend_task_preparer(prepare_aedt_backend_task)
+        aedt_pool.set_task_account_selector(select_aedt_pool_demand_account)
+        aedt_pool.set_task_account_batch_selector(select_aedt_pool_demand_accounts)
     relay_account = scheduler.account_by_name(config.control_plane_relay_account.strip())
     relay_bind_host = config.bind_host.strip() or "127.0.0.1"
     if relay_bind_host == "0.0.0.0":
@@ -1117,19 +1127,21 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         relay_bind_host = "::1"
     elif relay_bind_host.startswith("[") and relay_bind_host.endswith("]"):
         relay_bind_host = relay_bind_host[1:-1]
-    control_plane_relay = ControlPlaneRelay(
-        enabled=config.control_plane_relay_enabled,
-        account=relay_account,
-        relay_port=config.control_plane_relay_port,
-        remote_path=config.control_plane_relay_remote_path,
-        allowed_prefixes=config.control_plane_relay_allowed_prefixes,
-        local_host=relay_bind_host,
-        local_port=config.bind_port,
-        interval_seconds=config.poll_interval_seconds,
-        publish_url=aedt_pool.set_control_plane_url,
-    )
+    if aedt_pool is not None:
+        control_plane_relay = ControlPlaneRelay(
+            enabled=config.control_plane_relay_enabled,
+            account=relay_account,
+            relay_port=config.control_plane_relay_port,
+            remote_path=config.control_plane_relay_remote_path,
+            allowed_prefixes=config.control_plane_relay_allowed_prefixes,
+            local_host=relay_bind_host,
+            local_port=config.bind_port,
+            interval_seconds=config.poll_interval_seconds,
+            publish_url=aedt_pool.set_control_plane_url,
+        )
     control_plane_relay_configured = bool(
-        control_plane_relay.enabled
+        control_plane_relay is not None
+        and control_plane_relay.enabled
         and control_plane_relay.account is not None
         and control_plane_relay.remote_path
         and 1 <= control_plane_relay.relay_port <= 65535
@@ -1163,28 +1175,32 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     # every live session, so only the explicitly marked service owner may do
     # that.  Imports by diagnostics, tests, or CLI helpers commonly have no
     # deployment tokens and must remain read-only with respect to live state.
-    if aedt_adapter_configured or scheduler_service_process:
+    if aedt_pool is not None and (
+        aedt_adapter_configured or scheduler_service_process
+    ):
         aedt_pool.set_adapter_ready(aedt_adapter_configured)
     app.state.scheduler_service_process = scheduler_service_process
-    aedt_pool_runtime = AedtPoolRuntime(
-        aedt_pool,
-        scheduler,
-        interval_seconds=config.poll_interval_seconds,
-        scheduler_url=config.aedt_pool_scheduler_url,
-        host_remote_cwd=config.aedt_pool_host_remote_cwd,
-        host_python=config.aedt_pool_host_python,
-        host_env_setup=config.aedt_pool_host_env_setup,
-        host_bootstrap_token_file=config.aedt_pool_host_bootstrap_token_file,
-        host_task_memory_mb=config.aedt_pool_host_task_memory_mb,
-        host_artifact_root=config.aedt_pool_host_artifact_root,
-        host_dso_profile=config.aedt_pool_host_dso_profile,
-        host_session_profile=config.aedt_pool_host_session_profile,
-        require_published_control_plane_url=config.control_plane_relay_enabled,
-    )
+    if aedt_pool is not None:
+        aedt_pool_runtime = AedtPoolRuntime(
+            aedt_pool,
+            scheduler,
+            interval_seconds=config.poll_interval_seconds,
+            scheduler_url=config.aedt_pool_scheduler_url,
+            host_remote_cwd=config.aedt_pool_host_remote_cwd,
+            host_python=config.aedt_pool_host_python,
+            host_env_setup=config.aedt_pool_host_env_setup,
+            host_bootstrap_token_file=config.aedt_pool_host_bootstrap_token_file,
+            host_task_memory_mb=config.aedt_pool_host_task_memory_mb,
+            host_artifact_root=config.aedt_pool_host_artifact_root,
+            host_dso_profile=config.aedt_pool_host_dso_profile,
+            host_session_profile=config.aedt_pool_host_session_profile,
+            require_published_control_plane_url=config.control_plane_relay_enabled,
+        )
     app.state.aedt_pool = aedt_pool
     app.state.aedt_pool_runtime = aedt_pool_runtime
     app.state.control_plane_relay = control_plane_relay
-    app.include_router(create_aedt_pool_router(aedt_pool))
+    if aedt_pool is not None:
+        app.include_router(create_aedt_pool_router(aedt_pool))
     env_sync_manager = CondaEnvSyncManager(db, accounts)
     app.state.env_sync_manager = env_sync_manager
     project_env_manager = ProjectEnvManager(
@@ -1725,6 +1741,15 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
 
     def create_task_record(payload: dict) -> tuple[int, bool]:
         payload = apply_project_to_payload(payload)
+        parsed_aedt_backend = parse_aedt_backend(payload.get("aedt_backend"))
+        if (
+            parsed_aedt_backend == AedtBackend.POOLED.value
+            and not config.aedt_pool_module_enabled
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="AEDT pooled backend module is disabled",
+            )
         node_name = str(payload.get("node_name") or "").strip()
         node_name_policy = validate_node_name_policy(
             node_name, payload.get("node_name_policy")
@@ -1772,7 +1797,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             cpus=max(1, int(payload.get("cpus") or 1)),
             memory_mb=max(1, int(payload.get("memory_mb") or 4096)),
             scheduling_profile=normalize_scheduling_profile(str(payload.get("scheduling_profile") or "")),
-            aedt_backend=parse_aedt_backend(payload.get("aedt_backend")),
+            aedt_backend=parsed_aedt_backend,
             gpus=max(0, int(payload.get("gpus") or 0)),
             gpu_model=str(payload.get("gpu_model") or ""),
             partition=str(payload.get("partition") or "auto"),
@@ -1798,6 +1823,18 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             maybe_assign_same_node_task(task_id)
         return task_id, False
 
+    def require_enabled_aedt_backend(value: object) -> str:
+        backend = parse_aedt_backend(value)
+        if (
+            backend == AedtBackend.POOLED.value
+            and not config.aedt_pool_module_enabled
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="AEDT pooled backend module is disabled",
+            )
+        return backend
+
     @app.on_event("startup")
     async def _grow_sync_endpoint_threadpool() -> None:
         # Most endpoints are sync `def` handlers and share anyio's default
@@ -1814,13 +1851,17 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     def _startup() -> None:
         cleanup_local_temp_artifacts()
         scheduler.start()
-        control_plane_relay.start()
-        aedt_pool_runtime.start()
+        if control_plane_relay is not None:
+            control_plane_relay.start()
+        if aedt_pool_runtime is not None:
+            aedt_pool_runtime.start()
 
     @app.on_event("shutdown")
     def _shutdown() -> None:
-        aedt_pool_runtime.stop()
-        control_plane_relay.stop()
+        if aedt_pool_runtime is not None:
+            aedt_pool_runtime.stop()
+        if control_plane_relay is not None:
+            control_plane_relay.stop()
         scheduler.stop()
 
     @app.get("/", response_class=HTMLResponse)
@@ -1889,7 +1930,20 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             sort_by=task_sort_key,
             sort_order=task_sort_direction,
         )
-        aedt_dashboard_summary = aedt_pool.summary()
+        aedt_dashboard_summary = (
+            aedt_pool.summary()
+            if aedt_pool is not None
+            else {
+                "config": {
+                    "max_aedt_sessions": 0,
+                    "target_project_concurrency": 0,
+                },
+                "plan": {
+                    "active_session_count": 0,
+                    "live_projects": 0,
+                },
+            }
+        )
         # Queue reasons are shown on the task detail page only; computing them
         # for the dashboard list was the most expensive part of the render.
         queued_diagnostics_remaining = 0
@@ -2222,7 +2276,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 cpus=max(1, cpus),
                 memory_mb=max(1, memory_mb),
                 scheduling_profile=normalize_scheduling_profile(scheduling_profile),
-                aedt_backend=parse_aedt_backend(aedt_backend),
+                aedt_backend=require_enabled_aedt_backend(aedt_backend),
                 gpus=max(0, gpus),
                 gpu_model=gpu_model,
                 partition=partition,
@@ -2278,7 +2332,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 cpus=max(1, cpus),
                 memory_mb=max(1, parse_memory_mb(memory)),
                 scheduling_profile=normalize_scheduling_profile(scheduling_profile),
-                aedt_backend=parse_aedt_backend(aedt_backend),
+                aedt_backend=require_enabled_aedt_backend(aedt_backend),
                 gpus=max(0, gpus),
                 gpu_model=gpu_model,
                 partition=partition,
@@ -2863,6 +2917,12 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
 
     @app.get("/api/control-plane-relay")
     def api_control_plane_relay() -> dict:
+        if control_plane_relay is None:
+            return {
+                "enabled": False,
+                "running": False,
+                "message": "AEDT pooled backend module is disabled",
+            }
         return control_plane_relay.status()
 
     @app.get("/api/health")

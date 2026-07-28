@@ -146,6 +146,7 @@ class AppConfig:
     # Experimental pooled AEDT backend.  The operator-facing limit lives in
     # scheduler_settings; these fields configure the separately deployed
     # node-side session-host adapter.  Disabled is the production default.
+    aedt_pool_module_enabled: bool = False
     aedt_pool_session_host_enabled: bool = False
     aedt_pool_scheduler_url: str = ""
     # Node-visible file containing only the lease-creation credential.  It is
@@ -374,6 +375,7 @@ def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
     aedt_pool = data.pop("aedt_pool", None)
     if isinstance(aedt_pool, dict):
         mapping = {
+            "module_enabled": "aedt_pool_module_enabled",
             "session_host_enabled": "aedt_pool_session_host_enabled",
             "scheduler_url": "aedt_pool_scheduler_url",
             "client_token_file": "aedt_pool_client_token_file",

@@ -610,6 +610,7 @@ accounts_path: {str(accounts_path).replace(os.sep, '/')}
 bind_host: 0.0.0.0
 bind_port: 8123
 aedt_pool:
+  module_enabled: true
   session_host_enabled: true
   client_token_file: /shared/aedt-client-token
   host_remote_cwd: /work/aedt
