@@ -11,6 +11,7 @@ import pytest
 from scripts.aedt_pool_1to1_pilot import start_control_plane
 from scripts.aedt_pool_1to2_pilot import (
     SharedPilotControlPlane,
+    _run_host,
     _valid_matrix_result,
 )
 from slurm_scheduler.aedt_attach_client import (
@@ -20,9 +21,11 @@ from slurm_scheduler.aedt_attach_client import (
 from slurm_scheduler.aedt_session_host import (
     AedtSessionHost,
     ControlPlaneClient,
+    EXPECTED_AEDT_VERSION,
     EXPECTED_PYAEDT_VERSION,
     EXPECTED_SESSION_PROFILE,
     EXPECTED_SESSION_PROFILE_JSON,
+    SUPPORTED_DSO_PROFILE,
 )
 
 
@@ -89,6 +92,73 @@ def _wait(predicate, seconds=3):
             return
         time.sleep(0.01)
     raise AssertionError("condition did not become true")
+
+
+def test_run_host_supplies_v2_registration_contract(monkeypatch, tmp_path):
+    _install_attested_runtime(monkeypatch)
+    state = SharedPilotControlPlane()
+    server, server_thread, scheduler_url = start_control_plane(state)
+    desktop = FakeDesktop()
+    initialized_dso_profiles = []
+    original_host_init = AedtSessionHost.__init__
+
+    def initialize_fast_host(host, *args, **kwargs):
+        original_host_init(host, *args, **kwargs)
+        host.heartbeat_seconds = 0.05
+
+    monkeypatch.setattr(AedtSessionHost, "__init__", initialize_fast_host)
+    monkeypatch.setattr(AedtSessionHost, "_start_desktop", lambda _host: desktop)
+    monkeypatch.setattr(
+        AedtSessionHost,
+        "_initialize_dso_configuration",
+        lambda host: initialized_dso_profiles.append(host.dso_profile),
+    )
+    monkeypatch.setattr(
+        AedtSessionHost,
+        "_desktop_process_listener_liveness_proof",
+        lambda _host: (True, ""),
+    )
+
+    def close_desktop(host, *, global_stop, timeout_seconds=30):
+        host.desktop = None
+        return True
+
+    monkeypatch.setattr(AedtSessionHost, "_bounded_close_desktop", close_desktop)
+    artifact_root = tmp_path / "host-artifacts"
+    host = None
+    host_thread = None
+    try:
+        host, host_thread, host_result = _run_host(
+            state,
+            scheduler_url,
+            artifact_root,
+        )
+
+        assert state.session["endpoint"]
+        assert host.aedt_version == EXPECTED_AEDT_VERSION
+        assert host.artifact_root == str(artifact_root.resolve())
+        assert host.dso_profile == SUPPORTED_DSO_PROFILE
+        assert host.session_profile == EXPECTED_SESSION_PROFILE_JSON
+        assert initialized_dso_profiles == [SUPPORTED_DSO_PROFILE]
+        assert host.automation_lock_path
+        assert host.runtime_metadata["automation_lock_path"] == (
+            host.automation_lock_path
+        )
+        assert host.runtime_metadata["session_profile"] == (
+            EXPECTED_SESSION_PROFILE_JSON
+        )
+        assert state.session["artifact_dir"] == host.artifact_dir
+        assert state.session["runtime_metadata"] == host.runtime_metadata
+    finally:
+        if host_thread is not None and host_thread.is_alive():
+            monkeypatch.setattr(state, "_all_projects_closed", lambda: True)
+            state.force_drain("unit test cleanup")
+            host_thread.join(timeout=3)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=3)
+
+    assert host_result == [0]
 
 
 def test_shared_loopback_closes_aborted_project_without_stopping_sibling(

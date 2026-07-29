@@ -1110,19 +1110,40 @@ def _cleanup_project_workspaces(case_result: dict[str, Any]) -> list[str]:
     return failures
 
 
-def _run_host(state: SharedPilotControlPlane, scheduler_url: str) -> tuple[AedtSessionHost, threading.Thread, list[int]]:
+def _run_host(
+    state: SharedPilotControlPlane,
+    scheduler_url: str,
+    artifact_root: Path,
+) -> tuple[AedtSessionHost, threading.Thread, list[int]]:
     host = AedtSessionHost(
         ControlPlaneClient(scheduler_url, bootstrap_token=state.bootstrap_token),
         allocation_id=1,
         node_name=socket.gethostname(),
         heartbeat_seconds=5,
+        aedt_version=EXPECTED_AEDT_VERSION,
+        artifact_root=str(artifact_root.resolve()),
+        dso_profile=SUPPORTED_DSO_PROFILE,
+        session_profile=EXPECTED_SESSION_PROFILE_JSON,
     )
     result: list[int] = []
     thread = threading.Thread(target=lambda: result.append(host.run()), daemon=True)
     thread.start()
     deadline = time.monotonic() + 300
     while not state.session["endpoint"] and time.monotonic() < deadline:
-        time.sleep(1)
+        thread.join(timeout=1)
+        if not thread.is_alive():
+            failure = next(
+                (
+                    str(event.get("message") or "")
+                    for event in reversed(state.events)
+                    if event.get("event") == "host_start_failed"
+                ),
+                "",
+            )
+            detail = f": {failure}" if failure else ""
+            raise RuntimeError(
+                f"session host exited before registration with result {result!r}{detail}"
+            )
     if not state.session["endpoint"]:
         raise RuntimeError("session host did not register within 300 seconds")
     return host, thread, result
@@ -1173,7 +1194,11 @@ def main(argv: list[str] | None = None) -> int:
             state = SharedPilotControlPlane()
             case_states.append(state)
             server, _server_thread, scheduler_url = start_control_plane(state)
-            host, host_thread, host_result = _run_host(state, scheduler_url)
+            host, host_thread, host_result = _run_host(
+                state,
+                scheduler_url,
+                output / "host-artifacts" / case,
+            )
             desktop_pid = int(state.session["process_id"])
             case_result = _run_case(
                 case=case,

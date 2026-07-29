@@ -73,6 +73,10 @@
   r1jae262 / allocation 8478 / n108 / Slurm 848062에서 실행.
 - 판정 근거는 `pilot_evidence.json` 단독 — 결과는
   `docs/mft_aedt_attach_1to2_result_20260729.md`에 기록 예정.
+- **시도 1 (task 30475): FAIL** — AEDT 2025.2는 gRPC 40239로 정상 기동했으나
+  `RuntimeError: session host did not register within 300 seconds` (~5.5분 만에 종료,
+  Desktop은 정상 release). fake 테스트는 통과하나 실제 Desktop 경로의 v2 등록 흐름 결함 —
+  직전 성공 라이브(30445 @ `620a3019`) 이후 등록 경로 변경분을 diff 추적해 수정 중.
 - 발견: form `/tasks` 엔드포인트가 `project`/`timeout_seconds`/`dedupe_key`를 무시(JSON
   `/api/tasks`는 정상) — 개선 후보. `apply_project_to_payload`의 env_setup 중복 prepend도
   개선 후보.
