@@ -63,7 +63,21 @@
 - 2026-07-28 Phase 2: MFT 디커플링 (`docs/improvement_mft_decoupling_20260728.md`)
 - 2026-07-28~29 Phase 3/4a: 모듈 게이팅 + pilot v2 수리 (Y: 사고로 salvage `2e30e8d` 경유)
 
+## Phase 4b (라이브 1:2 pilot, 2026-07-29)
+
+- 프라이머리 배포(`C:\Users\peets\NEC\slurm_scheduler`, 07-13부터 다운)를 `5d9c2e7`로
+  갱신·재기동 (기존 작업 WIP `7ba1935` + DB 백업 보전). 기동 시 module flag off →
+  `/aedt-pool` 404 게이팅 실증.
+- pilot task **30475** 제출 (`mft-aedt-1to2-pilot-20260729-013829`): 30445 payload 미러 +
+  scheduler SHA `5d9c2e7` 핀. MFT `fd3b02c2`, library `e6b9b9d2` (30445와 동일 조합).
+  r1jae262 / allocation 8478 / n108 / Slurm 848062에서 실행.
+- 판정 근거는 `pilot_evidence.json` 단독 — 결과는
+  `docs/mft_aedt_attach_1to2_result_20260729.md`에 기록 예정.
+- 발견: form `/tasks` 엔드포인트가 `project`/`timeout_seconds`/`dedupe_key`를 무시(JSON
+  `/api/tasks`는 정상) — 개선 후보. `apply_project_to_payload`의 env_setup 중복 prepend도
+  개선 후보.
+
 ## 개선 (improvements)
 
 - MFT 디커플링: `docs/improvement_mft_decoupling_20260728.md` (+ insight.md 항목)
-- AEDT 모듈 flag 게이팅 + pilot harness v2 정합: 이 문서 Phase 3/4a 절 참조
+- AEDT 통합 + 옵션 모듈화: `docs/improvement_aedt_consolidation_20260729.md`

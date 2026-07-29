@@ -6,6 +6,15 @@
 > AEDT process until the host adapter is configured and the mandatory live A/B
 > validation passes.
 
+> **Update (2026-07-29): the pool is now an optional module.** With the default
+> `aedt_pool.module_enabled: false` the scheduler creates no pool service,
+> routes, thread, or database tables (`/aedt-pool` and `/api/aedt-pool` return
+> 404) and pooled task submissions are rejected with an explicit 422. Enabling
+> the module restores the behavior below, still behind the triple runtime gate
+> (`enabled` AND `adapter_ready` AND `validation_passed`). See
+> `tests/test_aedt_pool_module_flag.py` and
+> `docs/consolidation_index_20260728.md`.
+
 > **Source-of-truth note:** build and test this experiment in a dedicated clean
 > clone, never in the dirty live scheduler tree.  Deployment must use an
 > identified GitHub branch and exact commit SHA on cluster-local storage.
