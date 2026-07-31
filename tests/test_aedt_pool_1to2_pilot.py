@@ -14,6 +14,7 @@ from scripts.aedt_pool_1to2_pilot import (
     _run_host,
     _valid_matrix_result,
 )
+from scripts.aedt_pool_1to2_runner import acquire_pinned_mft_lease
 from slurm_scheduler.aedt_attach_client import (
     AedtPoolHttpClient,
     acquire_project_lease,
@@ -94,7 +95,7 @@ def _wait(predicate, seconds=3):
     raise AssertionError("condition did not become true")
 
 
-def test_run_host_supplies_v2_registration_contract(monkeypatch, tmp_path):
+def test_run_host_and_pinned_runner_share_v2_http_contract(monkeypatch, tmp_path):
     _install_attested_runtime(monkeypatch)
     state = SharedPilotControlPlane()
     server, server_thread, scheduler_url = start_control_plane(state)
@@ -127,6 +128,7 @@ def test_run_host_supplies_v2_registration_contract(monkeypatch, tmp_path):
     artifact_root = tmp_path / "host-artifacts"
     host = None
     host_thread = None
+    runner_lease = None
     try:
         host, host_thread, host_result = _run_host(
             state,
@@ -149,7 +151,56 @@ def test_run_host_supplies_v2_registration_contract(monkeypatch, tmp_path):
         )
         assert state.session["artifact_dir"] == host.artifact_dir
         assert state.session["runtime_metadata"] == host.runtime_metadata
+
+        _wait(lambda: state.host_heartbeat_count > 0)
+        commands = host.client.request(
+            "GET",
+            "/api/aedt-pool/sessions/1/commands",
+            host_token=host.host_token,
+        )
+        assert commands["sibling_live_count"] == 0
+        assert server_thread.is_alive()
+
+        runner_task_id = 304781
+        runner_workspace = tmp_path / f"aedt-normal-{runner_task_id}-a"
+        runner_workspace.mkdir()
+        monkeypatch.setenv("MFT_AEDT_BACKEND", "pooled")
+        monkeypatch.setenv("MFT_AEDT_SHARED_1TO2_PILOT", "1")
+        monkeypatch.setenv("MFT_AEDT_SCHEDULER_URL", scheduler_url)
+        monkeypatch.setenv("MFT_AEDT_PILOT_CLIENT_LABEL", "A")
+        monkeypatch.setenv(
+            "MFT_AEDT_PILOT_WORKSPACE", str(runner_workspace.resolve())
+        )
+        monkeypatch.setenv("SLURM_SCHED_TASK_ID", str(runner_task_id))
+        with pytest.raises(urllib.error.HTTPError) as unbridged:
+            acquire_project_lease(
+                scheduler_url,
+                f"mft-pending-{runner_task_id}-unbridged",
+                request_key=f"mft-1to2:{runner_task_id}:unbridged",
+                task_id=runner_task_id,
+                exclusive_session=False,
+            )
+        assert unbridged.value.code == 422
+
+        # Match the pinned fd3b02c MFT adapter: it passes no v2 profile,
+        # workload, isolation, or workspace keyword arguments.
+        runner_lease = acquire_pinned_mft_lease(
+            acquire_project_lease,
+            scheduler_url,
+            f"mft-pending-{runner_task_id}-unit",
+            request_key=f"mft-1to2:{runner_task_id}:unit",
+            task_id=runner_task_id,
+            exclusive_session=False,
+        )
+        assert runner_lease.protocol_version == 2
+        assert runner_lease.workload_family == "mft"
+        assert runner_lease.session_profile == EXPECTED_SESSION_PROFILE_JSON
+        assert runner_lease.workspace_path == str(runner_workspace.resolve())
+        assert runner_lease.project_namespace == "mft-1to2-a"
+        assert server_thread.is_alive()
     finally:
+        if runner_lease is not None:
+            runner_lease.stop_heartbeat()
         if host_thread is not None and host_thread.is_alive():
             monkeypatch.setattr(state, "_all_projects_closed", lambda: True)
             state.force_drain("unit test cleanup")

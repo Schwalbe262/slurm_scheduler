@@ -80,6 +80,43 @@
 - 발견: form `/tasks` 엔드포인트가 `project`/`timeout_seconds`/`dedupe_key`를 무시(JSON
   `/api/tasks`는 정상) — 개선 후보. `apply_project_to_payload`의 env_setup 중복 prepend도
   개선 후보.
+- **시도 1 수정 (`b98ec2a`)**: 근본 원인 = `_run_host`가 v2 등록 필수 필드 4종
+  (aedt_version/artifact_root/dso_profile/session_profile)을 누락 → 첫 게이트에서 422 →
+  죽은 host 스레드를 300초 대기. launcher가 canonical 필드 공급 + host 사망 즉시 감지,
+  `_run_host` 자체를 검증하는 회귀 테스트 추가 (fakes가 우회했던 경로).
+- **시도 2 (task 30476, `b98ec2a` 핀): FAIL** — 등록 게이트는 통과(수정 유효), 케이스 셋업의
+  MFT per-case clone에서 `git checkout --detach fd3b02c2` exit 128. 원인: 07-13 이후 MFT repo
+  히스토리 이동으로 `fd3b02c2`가 advertised refs에서 도달 불가 → clone에 미포함.
+  `pilot_evidence.json`: `passed=false`, `cases=[]`. 교훈: 모니터링 루프가 조용히 죽어 이틀
+  방치 — 이후 시도부터 폴링 + 40분 heartbeat 이중화.
+- **시도 3 (task 30477, 2026-07-31): FAIL (스케줄러 인프라)** — MFT SHA는 GitHub 브랜치
+  `pilot/aedt-1to2-fd3b02c2` push로 해결됐고 pilot 스크립트/등록 결함 아님. 실패 원인:
+  allocation 8479의 백킹 Slurm job 850189이 이미 만료됐는데 스케줄러가 `warm`으로 유지한 채
+  attach 시도 → `srun: Unable to confirm allocation ... Invalid job id`. **stale allocation
+  감지 결함(코어 스케줄러 개선 후보)** — 만료 job의 allocation이 reap되지 않고 신규 attach를
+  받는 hazard. 실패 후에도 8479가 warm으로 남는 것 확인.
+- **시도 4 (task 30478, 2026-07-31): FAIL — 그러나 최심부 도달.** stale 8479를
+  `POST /api/allocations/8479/close`로 정리하자 warm-pool 최소치가 1틱 만에 새 allocation
+  8480(Slurm 852275, n115)을 개설(코어 scale-out 정상 동작 증명). task는 14초 만에 정상
+  attach·실행. **세션 호스트 완전 동작**: AEDT 2025.2 기동, state=ready 등록(endpoint
+  nib115.hpc:52993/60299), native probe ok, host 아티팩트 생성. 실패 지점: control-plane
+  커맨드 폴링/lease 경로가 ~6분 내내 `[Errno 111] Connection refused` → lease 0,
+  solve 0, evidence `passed=false` (실패 20항목 완전 기록). 등록은 성공했는데 커맨드
+  폴링만 거부되는 비대칭 — pilot 내부 control-plane 서버 수명/바인딩 결함으로 진단,
+  수정 중. AEDT·라이선스(lmstat 26회 rc=0)·스케줄러 attach는 모두 무결.
+- **시도 4 확정 원인·수정**: ECONNREFUSED는 2차 증상(이전 케이스의 고아 host가 닫힌 포트
+  폴링). 진짜 원인 = 핀 고정된 MFT 어댑터(fd3b02c2)가 lease 요청에 `task_id`/
+  `exclusive_session`만 실어 v2 게이트(session_profile/workload_family/workspace)에서
+  **422 전원 거절** → lease 0 → host drain 불가 → 300초 후 서버만 닫힘 → 고아 host.
+  수정(harness 한정): `scripts/aedt_pool_1to2_runner.py` fail-closed 브리지(핀 어댑터에
+  v2 필드 주입), 케이스별 host-release 호환 workspace 매핑, teardown 순서 교정(host
+  join 후 서버 close), 실HTTP 회귀 테스트(register→commands→비브리지 422→브리지 성공).
+  게이트 304 passed. 기존 테스트가 못 잡은 이유: `_v2_lease_fields()`를 직접 주입해 핀
+  어댑터 계약을 우회했기 때문.
+- **시도 5**: 위 수정 커밋/push 후 동일 payload 재제출 (dedupe `:v5`), 이중 모니터링.
+- **운영 참고**: 사용자가 본 "빈 스케줄러 + MFT UI"는 별개 인스턴스였음 — 8002는
+  `slurm_scheduler_runtime\deployments\724d38d`의 다른 스케줄러(dcs2026 작업), 8010은 MFT
+  프로젝트 자체 모니터(`regression_260707.monitoring.app`). 정리된 스케줄러는 8000.
 
 ## 개선 (improvements)
 

@@ -899,9 +899,28 @@ def _run_case(
         encoding="utf-8",
     )
     runners: dict[str, dict[str, Any]] = {}
+    task_id_text = str(os.environ.get("SLURM_SCHED_TASK_ID") or "").strip()
+    pilot_task_id = (
+        int(task_id_text)
+        if task_id_text.isdigit() and int(task_id_text) > 0
+        else 1
+    )
+    workspace_root = output / "host-artifacts"
+    workspace_root.mkdir(parents=True, exist_ok=True)
     for label in ("A", "B"):
         mft = case_dir / f"MFT_{label}"
         _clone_exact(mft_repo_url, mft_revision, mft)
+        workspace = (
+            workspace_root
+            / f"aedt-{case}-{pilot_task_id}-{label.lower()}"
+        )
+        workspace.mkdir()
+        simulation_link = mft / "simulation"
+        if os.path.lexists(simulation_link):
+            raise RuntimeError(
+                f"pinned MFT clone unexpectedly contains {simulation_link}"
+            )
+        simulation_link.symlink_to(workspace, target_is_directory=True)
         env = os.environ.copy()
         env.update({
             "MFT_AEDT_BACKEND": "pooled",
@@ -912,6 +931,8 @@ def _run_case(
             "MFT_AEDT_LEASE_WAIT_SECONDS": "300",
             "MFT_AEDT_RELEASE_WAIT_SECONDS": "300",
             "MFT_AEDT_PILOT_CLIENT_LABEL": label,
+            "MFT_AEDT_PILOT_WORKSPACE": str(workspace.resolve()),
+            "SLURM_SCHED_TASK_ID": str(pilot_task_id),
         })
         marker = case_dir / "A_pre_solve_ready.json"
         if case == "abort" and label == "A":
@@ -926,7 +947,8 @@ def _run_case(
         run = subprocess.Popen(
             [
                 sys.executable,
-                "run_simulation_260706.py",
+                str(ROOT / "scripts" / "aedt_pool_1to2_runner.py"),
+                str(mft / "run_simulation_260706.py"),
                 "--fixed",
                 "--params",
                 str(params_path),
@@ -1187,13 +1209,14 @@ def main(argv: list[str] | None = None) -> int:
     cases = []
     case_states = []
     server = None
+    server_thread = None
     host = None
     host_thread = None
     try:
         for case in selected_cases:
             state = SharedPilotControlPlane()
             case_states.append(state)
-            server, _server_thread, scheduler_url = start_control_plane(state)
+            server, server_thread, scheduler_url = start_control_plane(state)
             host, host_thread, host_result = _run_host(
                 state,
                 scheduler_url,
@@ -1214,9 +1237,18 @@ def main(argv: list[str] | None = None) -> int:
                 solver_feature=args.solver_license_feature,
                 desktop_pid=desktop_pid,
             )
-            host_thread.join(timeout=300)
+            if case_result["failures"] and host_thread.is_alive():
+                state.force_drain(
+                    f"1:2 {case} pilot runner failed; stopping disposable host"
+                )
+                host.request_stop()
+            host_thread.join(
+                timeout=60 if case_result["failures"] else 300
+            )
             if host_thread.is_alive():
                 case_result["failures"].append("session_host_did_not_exit")
+                host.request_stop()
+                host_thread.join(timeout=40)
             expected_host_result = [2] if case == "timeout" else [0]
             if host_result != expected_host_result:
                 case_result["failures"].append(f"session_host_exit={host_result!r}")
@@ -1328,9 +1360,18 @@ def main(argv: list[str] | None = None) -> int:
             all_failures.extend(
                 f"{case}:{failure}" for failure in case_result["failures"]
             )
+            if host_thread.is_alive():
+                raise RuntimeError(
+                    "session host remained alive after stop request; "
+                    "refusing to close its control plane or start another case"
+                )
             server.shutdown()
             server.server_close()
+            server_thread.join(timeout=10)
+            if server_thread.is_alive():
+                raise RuntimeError("control-plane server thread did not exit")
             server = None
+            server_thread = None
             host = None
             host_thread = None
 
@@ -1381,13 +1422,18 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if host_thread and host_thread.is_alive() and case_states:
             case_states[-1].force_drain("pilot finalizer requested disposable drain")
+            if host is not None:
+                host.request_stop()
             host_thread.join(timeout=60)
-        if host_thread and host_thread.is_alive() and host is not None:
-            host.request_stop()
-            host_thread.join(timeout=40)
-        if server is not None:
+            if host_thread.is_alive():
+                host_thread.join(timeout=40)
+        if server is not None and not (
+            host_thread is not None and host_thread.is_alive()
+        ):
             server.shutdown()
             server.server_close()
+            if server_thread is not None:
+                server_thread.join(timeout=10)
 
 
 if __name__ == "__main__":
