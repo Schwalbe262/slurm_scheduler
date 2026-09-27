@@ -59,6 +59,6 @@ lease.release(wait_seconds=300)                 # 종료: 반드시 release (clo
 
 ## 참고 구현
 
-- 실전 어댑터 패턴: MFT의 `module/aedt_pool_adapter.py` (env 기반 opt-in, 표준/풀 모드 겸용)
+- 실제 workload 어댑터는 프로젝트별 lease 획득·binding·release와 shared Desktop 생존 계약을 검증한 뒤 연결합니다.
 - 최소 E2E 예제: `scripts/aedt_pool_central_pilot.py` (lease→attach→작업→release+증거 JSON)
 - 클라이언트 라이브러리 전체: `slurm_scheduler/aedt_attach_client.py`

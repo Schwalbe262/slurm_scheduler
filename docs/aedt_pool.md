@@ -12,20 +12,16 @@
 > 404) and pooled task submissions are rejected with an explicit 422. Enabling
 > the module restores the behavior below, still behind the triple runtime gate
 > (`enabled` AND `adapter_ready` AND `validation_passed`). See
-> `tests/test_aedt_pool_module_flag.py` and
-> `docs/consolidation_index_20260728.md`.
+> `tests/test_aedt_pool_module_flag.py`.
 
 > **Source-of-truth note:** build and test this experiment in a dedicated clean
 > clone, never in the dirty live scheduler tree.  Deployment must use an
 > identified GitHub branch and exact commit SHA on cluster-local storage.
 
-> **Current integration gate:** exclusive 1:1 passed in task 30089. The
-> corrected shared 1:2 normal and pre-solve-abort cases passed in task 30445,
-> as recorded in
-> See the [shared-session validation runbook](aedt_pool_runbook.md). Active
-> solve timeout/recycle, cancel/crash recovery, and the complete baseline
-> parity/runtime/license contract remain open. The task 30445 result does not
-> authorize the 250/500 target.
+> **Current integration gate:** Local 1:N isolation tests pass, but live
+> AEDT output, failure recovery, runtime, and license parity remain open.
+> See the [shared-session validation runbook](aedt_pool_runbook.md). No
+> production project-density target is authorized by loopback tests alone.
 
 > **Historical note (2026-07-14):** Operators retired the scheduler-managed
 > node-local AEDT canary and unified pooled work on the central AEDT pool. New

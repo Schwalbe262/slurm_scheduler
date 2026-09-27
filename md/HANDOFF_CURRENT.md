@@ -1,4 +1,15 @@
 # Current Handoff
+- 2026-09-27 generic scheduler cleanup: the main working copy has removed
+  workload-specific AEDT pilot runners and stale campaign API/config docs.
+  Generic 1:N loopback tests now use thread heartbeat fixtures; 11 focused
+  tests passed in a hidden process. `docs/USAGE_ko.md` is the current usage
+  guide. Do not reactivate the removed workload-specific adapters.
+- Generic AEDT family/canary refactor is in the separate worktree
+  `C:\Users\peets\work\slurm_scheduler_generic_aedt_20260927`; it was
+  interrupted before commit. Review and validate it before integration.
+- The local `main` has additional documentation and pilot-cleanup commits
+  after the pushed `5ef11bf`; verify tests and push after the PowerShell
+  window issue is resolved. The live 8002 service remains unchanged.
 - 2026-09-27 operability pass is on `improve/operability-20260927` from
   `01326ab`: task form uses the API's project/dedupe expansion, stale inventory
   is visible, and Slurm-confirmed missing allocation jobs are closed without
