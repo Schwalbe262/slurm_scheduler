@@ -82,8 +82,6 @@ def _create_model(desktop: Any, project_path: Path, index: int, lease: Any = Non
     name = str(project.GetName() or "")
     if not name:
         raise RuntimeError("AEDT did not create a project")
-    if lease is not None:
-        lease.bind_project_name(name)
     project.Rename(str(project_path), False)
     name = str(project.GetName() or "")
     if name != project_path.stem:
