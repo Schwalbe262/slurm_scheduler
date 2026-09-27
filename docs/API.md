@@ -207,7 +207,7 @@ Estimates how many currently owned allocation slots can run a task shape.
 curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=16&memory_mb=32768&gpus=0&required_capability=conda:flight-searcher"
 curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=4&memory_mb=32768&gpus=1&gpu_model=a6000"
 curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=4&memory_mb=32768&scheduling_profile=fea_bursty"
-curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=4&memory_mb=32768&scheduling_profile=fea_bursty&project=MFT_1MW_2026v1"
+curl -sS "$SCHEDULER_URL/api/task-capacity?cpus=4&memory_mb=32768&scheduling_profile=fea_bursty&project=example_project"
 ```
 
 The response includes total ready `fit_slots`, `ready_fit_slots`, `pending_fit_slots`, `inflight_fit_slots`, `queue_state`, `queue_reason`, `preferred_node_relaxed`, `memory_pressure_state`, and per-allocation free CPU, memory, GPU, and fit slots. For `scheduling_profile=fea_bursty`, `memory_pressure_state` is `ok`, `soft_blocked`, or `hard_pressure`.
@@ -376,7 +376,7 @@ The response is capped by `web_remote_file_default_max_bytes` unless `max_bytes`
 ```bash
 curl -sS "$SCHEDULER_URL/api/tasks"
 curl -sS "$SCHEDULER_URL/api/tasks?include_diagnostics=true"
-curl -sS "$SCHEDULER_URL/api/tasks?paged=true&page=1&page_size=100&name_contains=mft&status=running,queued&sort_by=name&sort_order=asc"
+curl -sS "$SCHEDULER_URL/api/tasks?paged=true&page=1&page_size=100&name_contains=example&status=running,queued&sort_by=name&sort_order=asc"
 ```
 
 By default this endpoint returns lightweight task metadata suitable for frequent polling. Use `include_diagnostics=true` only when you need queued capacity fields such as `queue_reason`, `ready_fit_slots`, `pending_fit_slots`, and `inflight_fit_slots`; that mode performs scheduler fit checks and is intentionally heavier.
@@ -523,11 +523,11 @@ curl -sS -X POST "$SCHEDULER_URL/api/tasks/cancel?task_ids=101,102,103"
 Counts by status, optionally scoped to a campaign name prefix. Use this for progress polling instead of listing every task.
 
 ```bash
-curl -sS "$SCHEDULER_URL/api/tasks/summary?name_prefix=mft-camp-w1"
+curl -sS "$SCHEDULER_URL/api/tasks/summary?name_prefix=example-batch"
 ```
 
 ```json
-{"name_prefix": "mft-camp-w1", "total": 400, "statuses": {"queued": 120, "running": 40, "completed": 235, "failed": 5}}
+{"name_prefix": "example-batch", "total": 400, "statuses": {"queued": 120, "running": 40, "completed": 235, "failed": 5}}
 ```
 
 `GET /api/tasks` also accepts `limit` and `name_prefix` query parameters for bounded campaign harvesting.
@@ -584,44 +584,6 @@ Task states:
 - `running`: remote wrapper is still running.
 - `completed`: command exited with code `0`.
 - `failed`: command exited nonzero or attach failed.
-
-## Project Campaign Demand
-
-`MFT_1MW_2026v1` supports up to `500` rolling active simulations through its
-simulation policy. A continuous feeder can ignore the legacy absolute campaign
-demand and refill completed work indefinitely. Setting desired concurrency to
-`0` is the durable stop control: it stops refill and lets existing work drain
-without cancellation.
-
-### `GET /api/projects/{name}/campaign-demand`
-
-```bash
-curl -sS "$SCHEDULER_URL/api/projects/MFT_1MW_2026v1/campaign-demand"
-```
-
-The response contains `total_simulations`, monotonic `demand_revision`, audit
-fields `updated_at`/`updated_by`, and an ETag derived from the revision.
-`accepted_simulations` and `remaining_simulations` are `null` because the
-crash-safe feeder manifest owns accepted progress.
-
-### `PATCH /api/projects/{name}/campaign-demand`
-
-The PATCH is an absolute, versioned CAS operation:
-
-```bash
-curl -sS -X PATCH \
-  "$SCHEDULER_URL/api/projects/MFT_1MW_2026v1/campaign-demand" \
-  -H "Content-Type: application/json" \
-  -H "X-Operator-Identity: operator-name" \
-  -d '{"total_simulations":750,"expected_revision":1}'
-```
-
-A stale revision returns `409` with `detail.current`. Repeating the current
-absolute value at the current revision is a no-op and does not consume another
-revision. The update commits under the host-wide MFT campaign mutation lock.
-Increasing the target lets the feeder extend its manifest idempotently;
-decreasing it stops future submissions only. This endpoint never cancels or
-rewrites queued, attaching, or running tasks, which drain naturally.
 
 ## Token Usage
 

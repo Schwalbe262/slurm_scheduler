@@ -22,7 +22,7 @@
 > **Current integration gate:** exclusive 1:1 passed in task 30089. The
 > corrected shared 1:2 normal and pre-solve-abort cases passed in task 30445,
 > as recorded in
-> [MFT shared AEDT 1:2 result](mft_aedt_attach_1to2_result_30445.md). Active
+> See the [shared-session validation runbook](aedt_pool_runbook.md). Active
 > solve timeout/recycle, cancel/crash recovery, and the complete baseline
 > parity/runtime/license contract remain open. The task 30445 result does not
 > authorize the 250/500 target.
@@ -100,7 +100,7 @@ attach하고 `release_desktop(close_desktop=True)`를 호출하지 않는다. �
 Validation/A-B task는 API의 기존 `priority` 필드에 10000을 명시한다. priority는 queued attach
 ordering에만 관여하며 running production task를 선점하거나 취소하지 않는다.
 
-전용 allocation만 사용한다. `drain_reason`이 `AEDT pool`로 시작하지 않는 기존 FEA/MFT
+전용 allocation만 사용한다. `drain_reason`이 `AEDT pool`로 시작하지 않는 기존 작업의
 allocation에는 session을 배치하지 않는다.
 
 node shape는 `requested_cpus=8` 같은 micro-allocation을 만들지 않고 scheduler의 기존
@@ -257,26 +257,12 @@ DB에 평문으로 넣지 않고 scheduler 환경 변수와 compute node의 권�
 
 자세한 절차와 rollback은 [AEDT pool runbook](aedt_pool_runbook.md)을 따른다.
 
-## MFT / pyaedt_library integration audit
+## Client integration contract
 
-현재 `MFT_1MW_2026/run_simulation_260706.py`의 production 경로는 pooled mode와 의도적으로
-연결하지 않았다.
-
-- `_create_simulation_session()`은 `pyDesktop(new_desktop=True, close_on_exit=True)`를 호출한다.
-- `run_one_loop()` finally는 `release_desktop(close_projects=True, close_on_exit=True)`를 호출한다.
-- 같은 finally의 descendant cleanup은 해당 Python이 만든 AEDT/solver tree를 정리한다.
-
-이 세 동작은 shared Desktop에서는 sibling을 종료할 수 있으므로 그대로 재사용할 수 없다.
-반면 `pyaedt_library/src/pyaedt_module/core/pydesktop.py`는 이미 `machine`, `port`,
-`new_desktop=False`, `close_on_exit=False` 인자를 전달할 수 있고, `pydesign.py`도 주입된
-Desktop의 PID/port/machine을 solver class에 넘긴다. 따라서 pilot integration cut은 다음이다.
-
-1. `MFT_AEDT_BACKEND=pooled`일 때만 `acquire_project_lease()`를 호출한다.
-2. `lease.connect_desktop(desktop_factory=pyDesktop)`로 기존 wrapper를 remote port에 붙인다.
-3. 실제 `sim.PROJECT_NAME` 생성 후 `lease.bind_project_name()`을 호출한다.
-4. pooled finally에서는 Desktop release/kill/descendant tree cleanup을 하지 않는다.
-5. `sim.close_project()` 완료 후 `lease.release()`만 호출하고 host ACK를 기다린다.
-6. solver timeout은 client `report_fault("solver_timeout")`으로 quarantine을 요청한다.
-
-이 branch를 production script에 넣는 작업은 isolated 1:2 pilot이 통과한 뒤 별도 revision/feature
-flag로 진행한다. 현재 300개 standalone 캠페인에는 import나 behavior change가 없다.
+A pooled client acquires a project lease before attaching to the host Desktop,
+binds the exact project name after creating it, and closes only that project
+before releasing its lease. The client must not stop the shared Desktop or kill
+its process tree while sibling projects remain. A solve timeout reports a
+project-local fault to the host, which quarantines the Desktop until the
+surviving siblings finish. Validate this contract with the actual workload
+adapter before enabling pooling for that workload.
