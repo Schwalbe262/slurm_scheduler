@@ -357,30 +357,40 @@ SQLITE_JOURNAL_MODES = frozenset({"delete", "truncate", "persist", "memory", "wa
 
 
 class Database:
-    def __init__(self, path: str, journal_mode: str = "wal"):
+    def __init__(self, path: str, journal_mode: str = "wal", *, read_only: bool = False):
         self.path = path
+        self.read_only = bool(read_only)
         self.journal_mode = str(journal_mode).strip().lower()
         if self.journal_mode not in SQLITE_JOURNAL_MODES:
             supported = ", ".join(sorted(SQLITE_JOURNAL_MODES))
             raise ValueError(
                 f"unsupported SQLite journal mode {journal_mode!r}; expected one of: {supported}"
             )
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        if self.read_only:
+            if not Path(path).is_file():
+                raise FileNotFoundError(f"observer database does not exist: {path}")
+        else:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
 
     @contextmanager
     def connect(self, *, busy_timeout_ms: int = 30000) -> Iterator[sqlite3.Connection]:
         timeout_ms = max(1, int(busy_timeout_ms))
-        conn = sqlite3.connect(self.path, timeout=timeout_ms / 1000.0)
+        target = f"{Path(self.path).resolve().as_uri()}?mode=ro" if self.read_only else self.path
+        conn = sqlite3.connect(target, timeout=timeout_ms / 1000.0, uri=self.read_only)
         try:
             conn.row_factory = sqlite3.Row
             conn.execute(f"PRAGMA busy_timeout = {timeout_ms}")
             conn.execute("PRAGMA foreign_keys = ON")
+            if self.read_only:
+                conn.execute("PRAGMA query_only = ON")
             yield conn
             conn.commit()
         finally:
             conn.close()
 
     def init(self) -> None:
+        if self.read_only:
+            raise RuntimeError("cannot initialize a read-only database")
         # Journal negotiation can acquire an exclusive lock.  Do it once at
         # process/database initialization, never on each of 500 concurrent
         # heartbeat connections.

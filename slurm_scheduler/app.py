@@ -47,6 +47,7 @@ from .models import (
     normalize_node_name_policy,
     normalize_scheduling_profile,
 )
+from .observer_guard import ObserverGuardMiddleware
 from .inventory import partition_rank
 from .inventory_freshness import summarize_freshness
 from .pestat import PestatNode, plan_dynamic_allocations
@@ -818,8 +819,16 @@ def last_json_object(text: str) -> object | None:
 def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     config = load_app_config(config_path)
     accounts = load_accounts(config.accounts_path)
-    db = Database(config.database_path, journal_mode=config.sqlite_journal_mode)
-    db.init()
+    db = Database(
+        config.database_path,
+        journal_mode=config.sqlite_journal_mode,
+        read_only=config.observer_mode,
+    )
+    if config.observer_mode:
+        with db.connect():
+            pass
+    else:
+        db.init()
     client_factory = lambda account: SlurmAccountClient(
         account,
         config.git_credentials,
@@ -951,6 +960,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         max_bulk_concurrency=4,
         max_task_detail_concurrency=16,
     )
+    if config.observer_mode:
+        app.add_middleware(ObserverGuardMiddleware)
     app.state.config = config
     app.state.db = db
     app.state.scheduler = scheduler
@@ -967,7 +978,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
             bootstrap_token=aedt_pool_bootstrap_token,
             lease_client_token=aedt_pool_client_token,
         )
-        aedt_pool.init()
+        if not config.observer_mode:
+            aedt_pool.init()
         aedt_pool.set_warm_spare_admission_checker(
             scheduler.aedt_pool_warm_spare_admission
         )
@@ -1110,12 +1122,12 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     # every live session, so only the explicitly marked service owner may do
     # that.  Imports by diagnostics, tests, or CLI helpers commonly have no
     # deployment tokens and must remain read-only with respect to live state.
-    if aedt_pool is not None and (
+    if aedt_pool is not None and not config.observer_mode and (
         aedt_adapter_configured or scheduler_service_process
     ):
         aedt_pool.set_adapter_ready(aedt_adapter_configured)
     app.state.scheduler_service_process = scheduler_service_process
-    if aedt_pool is not None:
+    if aedt_pool is not None and not config.observer_mode:
         aedt_pool_runtime = AedtPoolRuntime(
             aedt_pool,
             scheduler,
@@ -1784,6 +1796,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
 
     @app.on_event("startup")
     def _startup() -> None:
+        if config.observer_mode:
+            return
         cleanup_local_temp_artifacts()
         scheduler.start()
         if control_plane_relay is not None:
@@ -1793,6 +1807,8 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
 
     @app.on_event("shutdown")
     def _shutdown() -> None:
+        if config.observer_mode:
+            return
         if aedt_pool_runtime is not None:
             aedt_pool_runtime.stop()
         if control_plane_relay is not None:
@@ -2875,6 +2891,15 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
 
     @app.get("/api/health")
     def api_health(response: Response) -> dict:
+        if config.observer_mode:
+            return {
+                "ok": True,
+                "observer_mode": True,
+                "accounts": len(accounts),
+                "jobs": len(db.list_jobs()),
+                "tasks": len(db.list_tasks()),
+                "allocations": len(db.list_allocations()),
+            }
         health = scheduler.health_status()
         ok = bool(health.get("scheduler_ok"))
         if not ok:

@@ -41,6 +41,7 @@ class AccountConfig:
 @dataclass(frozen=True)
 class AppConfig:
     database_path: str = "data/slurm_scheduler.db"
+    observer_mode: bool = False
     sqlite_journal_mode: str = "wal"
     accounts_path: str = "config/accounts.yaml"
     poll_interval_seconds: int = 30
@@ -235,6 +236,8 @@ def _read_yaml(path: str | Path) -> dict[str, Any]:
 
 def load_app_config(path: str | Path = "config/app.yaml") -> AppConfig:
     data = _read_yaml(path)
+    if "observer_mode" in data and type(data["observer_mode"]) is not bool:
+        raise ValueError("observer_mode must be a YAML boolean")
     standalone_caps = data.get("standalone_aedt_max_running_by_project", {})
     if standalone_caps is None:
         standalone_caps = {}

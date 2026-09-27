@@ -22,6 +22,7 @@ Important fields:
 
 ```yaml
 database_path: "data/slurm_scheduler.db"
+observer_mode: false
 sqlite_journal_mode: "wal"
 accounts_path: "config/accounts.yaml"
 poll_interval_seconds: 30
@@ -83,6 +84,35 @@ git_credentials:
     source_private_key_path: "~/.ssh/private_project_deploy"
     strict_host_key_checking: "accept-new"
 ```
+
+For an HTTP observer, set `observer_mode: true` in a separate app config and
+point `database_path` at an existing **local copy** of the scheduler database.
+Do not point the observer at the active database, especially across a network
+filesystem. Copy SQLite consistently (for example with SQLite's backup API)
+and refresh that copy outside the observer when a newer snapshot is needed.
+The observer opens
+SQLite in read-only mode, does not start scheduler ticks, backups, cleanup,
+the AEDT pool worker, or the control-plane relay, and returns HTTP 403 for
+all requests other than GET, HEAD, and OPTIONS. `/healthz` and `/api/health`
+remain available; `/api/health` reports `observer_mode: true` instead of
+claiming that a scheduler loop is healthy. Use a separate bind port for a
+side-by-side observer. The database must already have the schema expected by
+this version; observer mode never migrates it. Inventory and task views show
+the database's last recorded state because the observer does not poll Slurm.
+
+For example, use a separate `observer-app.yaml`:
+
+```yaml
+database_path: "C:/scheduler-observer/snapshot.db"
+accounts_path: "C:/scheduler-observer/accounts.yaml"
+observer_mode: true
+bind_host: "127.0.0.1"
+bind_port: 8003
+```
+
+Set `SLURM_SCHEDULER_CONFIG` to that file and run `python -m slurm_scheduler`.
+The accounts file is still required to label account and capability views;
+the observer's scheduler loop never uses it to submit work.
 
 Field meanings:
 
