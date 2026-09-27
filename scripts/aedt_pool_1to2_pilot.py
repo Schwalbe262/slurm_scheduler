@@ -865,6 +865,47 @@ def _valid_matrix_result(result: dict[str, Any]) -> list[str]:
     return failures
 
 
+def _validate_project_evidence(
+    results: dict[str, dict[str, Any]],
+    leases: dict[int, dict[str, Any]],
+    expected_label_lease_ids: dict[str, int],
+) -> list[str]:
+    """Tie every successful project result to its own bound lease.
+
+    This is deliberately independent of cohort size so an N-project pilot
+    cannot pass by replaying another project's successful terminal output.
+    """
+    failures: list[str] = []
+    if set(results) != set(expected_label_lease_ids):
+        failures.append(f"terminal_result_labels={sorted(results)!r}")
+    seen_lease_ids: set[int] = set()
+    seen_project_names: set[str] = set()
+    for label, result in results.items():
+        failures.extend(
+            f"runner_{label}_{failure}"
+            for failure in _valid_matrix_result(result)
+        )
+        try:
+            lease_id = int(result.get("aedt_lease_id") or 0)
+        except (TypeError, ValueError):
+            lease_id = 0
+        if lease_id <= 0 or lease_id not in leases:
+            failures.append(f"runner_{label}_lease_id_invalid")
+            continue
+        if lease_id != expected_label_lease_ids.get(label):
+            failures.append(f"runner_{label}_lease_id_mismatch")
+        if lease_id in seen_lease_ids:
+            failures.append(f"runner_{label}_lease_id_duplicate")
+        seen_lease_ids.add(lease_id)
+        project_name = str(result.get("project_name") or "").strip()
+        if project_name != str(leases[lease_id].get("project_name") or "").strip():
+            failures.append(f"runner_{label}_project_lease_mismatch")
+        if project_name in seen_project_names:
+            failures.append(f"runner_{label}_project_name_duplicate")
+        seen_project_names.add(project_name)
+    return failures
+
+
 def _terminate(run: subprocess.Popen[Any]) -> None:
     if run.poll() is not None:
         return
@@ -925,6 +966,7 @@ def _run_case(
         env.update({
             "MFT_AEDT_BACKEND": "pooled",
             "MFT_AEDT_SHARED_1TO2_PILOT": "1",
+            "SLURM_AEDT_SHARED_SESSION": "1",
             "MFT_AEDT_SCHEDULER_URL": scheduler_url,
             "MFT_SLURM_SCHEDULER_ROOT": str(ROOT),
             "MFT_PYAEDT_LIBRARY_ROOT": str(library),
@@ -1063,29 +1105,26 @@ def _run_case(
             failures.append(f"runner_{label}_terminal:{exc}")
             continue
         results[label] = result
-        failures.extend(
-            f"runner_{label}_{failure}" for failure in _valid_matrix_result(result)
-        )
+
+    expected_label_lease_ids = (
+        {"B": 2} if case in {"abort", "timeout"} else {"A": 1, "B": 2}
+    )
+    failures.extend(_validate_project_evidence(
+        results, state.leases, expected_label_lease_ids
+    ))
 
     if case == "normal":
         lease_ids = {int(result.get("aedt_lease_id") or 0) for result in results.values()}
-        project_names = {str(result.get("project_name") or "") for result in results.values()}
         if lease_ids != {1, 2}:
             failures.append(f"normal_lease_ids={sorted(lease_ids)}")
-        if len(project_names) != 2:
-            failures.append("normal_project_names_not_distinct")
         if solver_peak < 2:
             failures.append(f"maxwell_solver_peak={solver_peak}<2")
     elif case == "abort":
         if not injected or aborted_lease_id is None:
             failures.append("pre_solve_abort_not_injected")
-        if set(results) != {"B"}:
-            failures.append(f"abort_terminal_result_labels={sorted(results)}")
     else:
         if not injected or aborted_lease_id is None:
             failures.append("solver_timeout_not_injected")
-        if set(results) != {"B"}:
-            failures.append(f"timeout_terminal_result_labels={sorted(results)}")
 
     return {
         "case": case,

@@ -36,7 +36,7 @@
 ## 목적과 범위
 
 기존 backend는 프로젝트 한 개가 AEDT Desktop 한 개를 열고 소유한다. 새 pooled backend는
-Desktop 라이선스가 먼저 포화되는 환경에서 AEDT 하나에 최대 두 프로젝트를 붙이는 opt-in
+Desktop 라이선스가 먼저 포화되는 환경에서 AEDT 하나에 여러 프로젝트를 붙이는 opt-in
 경로다. 기존 standalone task와 현재 캠페인은 그대로 유지한다.
 
 WEB UI에서 사용자는 AEDT session 상한, 전체 project 병렬 상한,
@@ -46,7 +46,7 @@ disabled이고 완전히 drain된 경우에만 허용된다.
 
 ```text
 max_aedt_sessions = 250
-projects_per_aedt = 2 (validation contract)
+projects_per_aedt = 2 (default validation contract; configurable 1–8)
 target_project_concurrency = 500
 ```
 
@@ -176,7 +176,7 @@ gRPC 호출이 성공해도 terminal artifact 세 항목 중 하나라도 없으
 
 프로젝트별 solver PID를 정확히 골라 죽이는 방법은 production 가정이 아니다. 별도 명시적
 fault-injection 실험에서만 시험하며, sibling completion evidence가 없으면 pooled backend는
-활성화되지 않는다. blast radius는 `projects_per_aedt=2`로 고정한다.
+활성화되지 않는다. 기본 blast radius는 `projects_per_aedt=2`이며, 3–8로 늘릴 때는 해당 동시 프로젝트 수로 별도 검증해야 한다. 각 프로젝트의 terminal output, data row, field solution을 `project_results`에 남기고 baseline 대비 Desktop checkout 절감과 실행 시간 기준을 함께 통과해야 한다.
 
 ## 데이터베이스
 

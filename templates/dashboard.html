@@ -177,6 +177,11 @@
         </div>
 
         <div>
+          <label for="task_arguments">엔트리포인트 인자</label>
+          <input id="task_arguments" name="arguments" placeholder="--case case001">
+        </div>
+
+        <div>
           <label for="remote_cwd">Remote working directory</label>
           <input id="remote_cwd" name="remote_cwd" placeholder="~/project (프로젝트 사용 시 자동)">
         </div>
@@ -268,6 +273,16 @@
         <div>
           <label for="task_priority">Priority</label>
           <input id="task_priority" name="priority" type="number" value="0" title="높을수록 먼저 배정됩니다. 같은 값이면 먼저 제출한 순서.">
+        </div>
+
+        <div>
+          <label for="task_timeout_seconds">Task timeout (seconds)</label>
+          <input id="task_timeout_seconds" name="timeout_seconds" type="number" min="0" value="0" title="0이면 별도 task 시간 제한을 두지 않습니다.">
+        </div>
+
+        <div>
+          <label for="task_dedupe_key">Duplicate prevention key</label>
+          <input id="task_dedupe_key" name="dedupe_key" placeholder="optional stable request key" title="같은 키의 활성 작업이 있으면 새 작업을 만들지 않습니다.">
         </div>
 
         <div>
@@ -1479,6 +1494,12 @@
 <section class="panel">
   <h2>Partition Ranking</h2>
   <div class="two-column-grid">
+    {% if inventory_freshness.stale or pestat_freshness.stale %}
+    <p class="error" style="grid-column: 1 / -1;">Cluster capacity data is stale:
+      inventory {{ inventory_freshness.age_seconds if inventory_freshness.age_seconds is not none else "missing" }}s,
+      pestat {{ pestat_freshness.age_seconds if pestat_freshness.age_seconds is not none else "missing" }}s.
+      Check the scheduler events and account connection before submitting work.</p>
+    {% endif %}
     <div>
       <h2>CPU</h2>
       <div class="table-scroll">

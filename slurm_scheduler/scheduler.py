@@ -3045,6 +3045,23 @@ class Scheduler:
                 continue
             for allocation in by_account[account_name]:
                 info = outcome.get(str(allocation["slurm_job_id"]))
+                if info is not None and info.missing:
+                    # A formerly running allocation cannot accept another step
+                    # after Slurm confirms that its backing job no longer exists.
+                    # Do not issue scancel: there is no job left to cancel.
+                    self.db.update_allocation(
+                        allocation["id"],
+                        state=AllocationStatus.CLOSED.value,
+                        closed_at="CURRENT_TIMESTAMP",
+                    )
+                    self.record_event(
+                        "allocation_closed",
+                        f"slurm job {allocation.get('slurm_job_id')} no longer exists",
+                        entity_type="allocation",
+                        entity_id=allocation["id"],
+                        account_name=account_name,
+                    )
+                    continue
                 if info is None:
                     # A CLOSING allocation's scancel was already issued; when
                     # Slurm no longer reports the job at all (fell out of

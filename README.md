@@ -332,12 +332,14 @@ cp config/accounts.example.yaml config/accounts.yaml
 - [docs/llm-operator-guide.md](docs/llm-operator-guide.md): LLM agent가 API로 운영할 때의 짧은 가이드
 - [docs/ROADMAP.md](docs/ROADMAP.md): 다음 개선 후보
 
+작업 등록 화면의 원격 경로 폼은 프로젝트 설정, 시간 제한, 중복 방지 키를 JSON task API와 동일하게 처리합니다. `/api/inventory/freshness`와 대시보드의 경고로 캐시된 클러스터 용량 정보가 오래됐는지 확인할 수 있습니다.
+
 ## 테스트
 
-로컬 단위 테스트:
+로컬 회귀 테스트:
 
 ```bash
-python3 -m unittest tests.test_core
+python3 -m pytest -q tests
 ```
 
 추가 정적 확인:

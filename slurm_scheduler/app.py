@@ -48,11 +48,13 @@ from .models import (
     normalize_scheduling_profile,
 )
 from .inventory import partition_rank
+from .inventory_freshness import summarize_freshness
 from .pestat import PestatNode, plan_dynamic_allocations
 from .project_env import ProjectEnvManager, repo_dir_name
 from .scheduler import Scheduler
 from .slurm import SlurmAccountClient, SSHSession
 from .task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, build_git_task_command
+from .task_payload import prepend_setup_once
 from .web_read_guard import WebReadGuardMiddleware
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -1726,7 +1728,7 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 parts.append(f'git -C "$HOME/"{shlex.quote(repo_rel)} pull -q --ff-only || true')
         generated_setup = "\n".join(parts)
         existing_setup = str(payload.get("env_setup") or "").strip()
-        merged_setup = generated_setup if not existing_setup else f"{generated_setup}\n{existing_setup}"
+        merged_setup = prepend_setup_once(generated_setup, existing_setup)
         updated = {**payload, "env_setup": merged_setup}
         if not str(payload.get("aedt_backend") or "").strip():
             updated["aedt_backend"] = normalize_aedt_backend(project.get("aedt_backend") or "")
@@ -2037,6 +2039,12 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
                 "token_chart": build_token_chart(db.list_token_usage()),
                 "cpu_partitions": partition_rank(db.list_node_inventory(), needs_gpu=False),
                 "gpu_partitions": partition_rank(db.list_node_inventory(), needs_gpu=True),
+                "inventory_freshness": summarize_freshness(
+                    db.list_node_inventory(), config.cluster_refresh_interval_seconds
+                ),
+                "pestat_freshness": summarize_freshness(
+                    db.list_pestat_nodes(), config.cluster_refresh_interval_seconds
+                ),
                 "gpu_capacity": scheduler.gpu_capacity_summary(),
                 "account_names": [account.name for account in accounts],
                 "capabilities": capabilities,
@@ -2244,8 +2252,11 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     @app.post("/tasks")
     def create_task(
         name: str = Form("remote-task"),
-        remote_cwd: str = Form(...),
-        command: str = Form(...),
+        remote_cwd: str = Form(""),
+        command: str = Form(""),
+        project: str = Form(""),
+        entrypoint: str = Form(""),
+        arguments: str = Form(""),
         env_setup: str = Form(""),
         required_capability: str = Form(""),
         env_profile: str = Form(""),
@@ -2262,35 +2273,39 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
         exclusive_node: bool = Form(False),
         same_node_as_task_id: int = Form(0),
         priority: int = Form(0),
+        timeout_seconds: int = Form(0),
+        dedupe_key: str = Form(""),
         cleanup_globs: str = Form(""),
     ) -> Response:
-        task_id = db.create_task(
-            TaskCreate(
-                name=name,
-                remote_cwd=remote_cwd,
-                command=command,
-                env_setup=env_setup,
-                required_capability=required_capability,
-                env_profile=env_profile,
-                account_name=account_name,
-                cpus=max(1, cpus),
-                memory_mb=max(1, memory_mb),
-                scheduling_profile=normalize_scheduling_profile(scheduling_profile),
-                aedt_backend=require_enabled_aedt_backend(aedt_backend),
-                gpus=max(0, gpus),
-                gpu_model=gpu_model,
-                partition=partition,
-                node_name=str(node_name or "").strip(),
-                node_name_policy=validate_node_name_policy(
-                    node_name, node_name_policy
-                ),
-                exclusive_node=exclusive_node,
-                same_node_as_task_id=max(0, same_node_as_task_id),
-                priority=priority,
-                cleanup_globs=normalize_cleanup_globs(cleanup_globs),
-            )
+        task_id, _deduped = create_task_record(
+            {
+                "name": name,
+                "remote_cwd": remote_cwd,
+                "command": command,
+                "project": project,
+                "entrypoint": entrypoint,
+                "arguments": arguments,
+                "env_setup": env_setup,
+                "required_capability": required_capability,
+                "env_profile": env_profile,
+                "account_name": account_name,
+                "cpus": cpus,
+                "memory_mb": memory_mb,
+                "scheduling_profile": scheduling_profile,
+                "aedt_backend": aedt_backend,
+                "gpus": gpus,
+                "gpu_model": gpu_model,
+                "partition": partition,
+                "node_name": node_name,
+                "node_name_policy": node_name_policy,
+                "exclusive_node": exclusive_node,
+                "same_node_as_task_id": same_node_as_task_id,
+                "priority": priority,
+                "timeout_seconds": timeout_seconds,
+                "dedupe_key": dedupe_key,
+                "cleanup_globs": cleanup_globs,
+            }
         )
-        maybe_assign_same_node_task(task_id)
         return RedirectResponse("/", status_code=303)
 
     @app.post("/tasks/git")
@@ -2943,6 +2958,17 @@ def create_app(config_path: str = "config/app.yaml") -> FastAPI:
     @app.get("/api/events")
     def api_events(limit: int = 200) -> list[dict]:
         return db.list_events(limit=max(1, min(1000, limit)))
+
+    @app.get("/api/inventory/freshness")
+    def api_inventory_freshness() -> dict:
+        return {
+            "inventory": summarize_freshness(
+                db.list_node_inventory(), config.cluster_refresh_interval_seconds
+            ),
+            "pestat": summarize_freshness(
+                db.list_pestat_nodes(), config.cluster_refresh_interval_seconds
+            ),
+        }
 
     @app.post("/api/placement/dry-run")
     def api_placement_dry_run(

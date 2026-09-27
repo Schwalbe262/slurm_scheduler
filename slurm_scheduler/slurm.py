@@ -191,6 +191,7 @@ class JobStateInfo:
     pending_reason: str = ""
     node_name: str = ""
     partition: str = ""
+    missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -1485,8 +1486,8 @@ class SlurmAccountClient:
         """Resolve state/reason/node for many jobs with one squeue and chunked sacct.
 
         squeue is user-scoped rather than `-j id,...` because one purged id makes
-        squeue fail for the whole list on common Slurm versions. Jobs missing from
-        both squeue and sacct stay SUBMITTED, matching state().
+        squeue fail for the whole list on common Slurm versions. Confirm jobs
+        missing from both sources with scontrol before treating them as gone.
         """
         ids = [str(job_id).strip() for job_id in slurm_job_ids if str(job_id or "").strip()]
         if not ids:
@@ -1519,6 +1520,21 @@ class SlurmAccountClient:
                 for job_id in chunk:
                     if job_id in states:
                         out[job_id] = JobStateInfo(status=map_slurm_state(states[job_id]), raw_state=states[job_id])
+            for job_id in ids:
+                if job_id in out:
+                    continue
+                probe = ssh.run(f"scontrol show job {shlex.quote(job_id)} -o")
+                if probe.exit_code == 0:
+                    match = re.search(r"\bJobState=(\S+)", probe.stdout)
+                    if match:
+                        out[job_id] = JobStateInfo(
+                            status=map_slurm_state(match.group(1)),
+                            raw_state=match.group(1),
+                        )
+                elif "invalid job id" in (probe.stderr or "").lower():
+                    out[job_id] = JobStateInfo(
+                        status=JobStatus.SUBMITTED, missing=True
+                    )
         for job_id in ids:
             out.setdefault(job_id, JobStateInfo(status=JobStatus.SUBMITTED))
         return out

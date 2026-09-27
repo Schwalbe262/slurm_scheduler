@@ -302,9 +302,30 @@ class AedtPoolTestCase(unittest.TestCase):
         )
         return allocation_id
 
-    def make_operational(self) -> None:
-        validation = self.service.record_validation(PASSING_EVIDENCE)
+    def record_topology_validation(self, slots: int) -> None:
+        slots = max(2, slots)
+        evidence = {
+            **PASSING_EVIDENCE,
+            "baseline_desktops": slots,
+            "baseline_projects": slots,
+            "pooled_projects": slots,
+            "desktop_license_delta": 1 - slots,
+        }
+        if slots > 2:
+            evidence["project_results"] = [
+                {
+                    "project": f"project-{index}",
+                    "terminal_output_passed": True,
+                    "data_rows_passed": True,
+                    "field_solution_passed": True,
+                }
+                for index in range(slots)
+            ]
+        validation = self.service.record_validation(evidence)
         self.assertEqual(validation["status"], "passed")
+
+    def make_operational(self) -> None:
+        self.record_topology_validation(self.service.config().projects_per_session)
         self.service.set_adapter_ready(True)
         self.service.set_enabled(True)
 
@@ -1682,15 +1703,15 @@ class AedtPoolGateTests(AedtPoolTestCase):
         self.assertEqual(config.projects_per_session, 3)
         self.assertEqual(self.service.summary()["plan"]["sessions_per_new_node"], 4)
         with self.assertRaisesRegex(ValueError, "projects_per_aedt"):
-            self.service.set_operator_limits(projects_per_session=4)
+            self.service.set_operator_limits(projects_per_session=9)
         with self.assertRaisesRegex(ValueError, "cannot exceed"):
             self.service.set_operator_limits(
                 max_sessions=100,
                 target_projects=301,
                 projects_per_session=3,
             )
-        with self.assertRaisesRegex(ValueError, "between 0 and 1650"):
-            self.service.set_operator_limits(target_projects=1651)
+        with self.assertRaisesRegex(ValueError, "between 0 and 4400"):
+            self.service.set_operator_limits(target_projects=4401)
 
     def test_activation_requires_adapter_and_fault_injection_validation(self) -> None:
         with self.assertRaisesRegex(ValueError, "validation"):
@@ -1703,6 +1724,34 @@ class AedtPoolGateTests(AedtPoolTestCase):
         with self.assertRaisesRegex(ValueError, "adapter"):
             self.service.set_enabled(True)
         self.service.set_adapter_ready(True)
+        self.assertTrue(self.service.set_enabled(True).operational)
+
+    def test_higher_project_density_requires_its_own_validation(self) -> None:
+        self.service.record_validation(PASSING_EVIDENCE)
+        self.service.set_adapter_ready(True)
+        self.service.set_operator_limits(
+            max_sessions=1, target_projects=4, projects_per_session=4
+        )
+        with self.assertRaisesRegex(ValueError, "1-AEDT:4-project"):
+            self.service.set_enabled(True)
+        evidence = {
+            **PASSING_EVIDENCE,
+            "baseline_desktops": 4,
+            "baseline_projects": 4,
+            "pooled_projects": 4,
+            "desktop_license_delta": -3,
+        }
+        self.assertEqual(self.service.record_validation(evidence)["status"], "failed")
+        evidence["project_results"] = [
+            {
+                "project": f"case-{index}",
+                "terminal_output_passed": True,
+                "data_rows_passed": True,
+                "field_solution_passed": True,
+            }
+            for index in range(4)
+        ]
+        self.assertEqual(self.service.record_validation(evidence)["status"], "passed")
         self.assertTrue(self.service.set_enabled(True).operational)
 
     def test_false_positive_reopen_probe_pid_and_grpc_without_artifacts_fails_gate(self) -> None:
@@ -3608,6 +3657,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         # Exercise the production ceiling, not only the historical 1:2 default.
         self.service.set_enabled(False)
         self.service.set_operator_limits(projects_per_session=3)
+        self.make_operational()
         self.service.set_enabled(True)
         leases = [
             self.service.request_lease(
@@ -3786,6 +3836,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.service.set_operator_limits(min_idle_sessions=0)
         self.allocation_id = self.add_dedicated_allocation()
         self.make_operational()
+        self.record_topology_validation(3)
 
     def make_dead_reap_candidate(
         self, *, empty: bool = True
@@ -4023,6 +4074,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             target_projects=6,
             projects_per_session=3,
         )
+        self.record_topology_validation(3)
         self.service.set_enabled(True)
         self.service.reconcile(execute=True)
         starts = self.service.starting_sessions()
@@ -4211,6 +4263,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
     def test_summary_enriches_session_operator_details(self) -> None:
         self.service.set_enabled(False)
         self.service.set_operator_limits(projects_per_session=3)
+        self.make_operational()
         self.service.set_enabled(True)
         lease_specs = [
             (35447, "simulation_741449"),
@@ -5716,6 +5769,7 @@ class AedtExactSessionReservationTests(AedtPoolTestCase):
         super().setUp()
         self.allocation_id = self.add_dedicated_allocation()
         self.make_operational()
+        self.record_topology_validation(3)
         self.service.set_enabled(False)
         self.service.set_operator_limits(
             max_sessions=2,
@@ -5723,6 +5777,7 @@ class AedtExactSessionReservationTests(AedtPoolTestCase):
             target_projects=6,
             projects_per_session=3,
         )
+        self.record_topology_validation(3)
         self.service.set_enabled(True)
         self.service.reconcile(execute=True)
         starts = self.service.starting_sessions()

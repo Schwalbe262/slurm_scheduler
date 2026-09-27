@@ -13,6 +13,7 @@ from scripts.aedt_pool_1to2_pilot import (
     SharedPilotControlPlane,
     _run_host,
     _valid_matrix_result,
+    _validate_project_evidence,
 )
 from scripts.aedt_pool_1to2_runner import acquire_pinned_mft_lease
 from slurm_scheduler.aedt_attach_client import (
@@ -472,3 +473,269 @@ def test_terminal_validator_accepts_complete_matrix_result():
         "Llt": 27.5,
         "project_name": "simulation_B",
     }) == []
+
+
+def test_n_project_evidence_rejects_replayed_or_misattributed_result():
+    leases = {
+        lease_id: {"project_name": f"simulation_{lease_id}"}
+        for lease_id in range(1, 5)
+    }
+    results = {
+        str(lease_id): {
+            "aedt_lease_id": lease_id,
+            "project_name": f"simulation_{lease_id}",
+            "result_valid_em": 1,
+            "aedt_backend": "pooled",
+            "aedt_exclusive_session": 0,
+            "matrix_solve_attempts": 1,
+            "matrix_solution_queries": 1,
+            "Llt": 27.5 + lease_id,
+        }
+        for lease_id in leases
+    }
+    expected = {str(lease_id): lease_id for lease_id in leases}
+    assert _validate_project_evidence(results, leases, expected) == []
+
+    replayed = {label: dict(result) for label, result in results.items()}
+    replayed["4"] = dict(replayed["3"])
+    failures = _validate_project_evidence(replayed, leases, expected)
+    assert "runner_4_lease_id_duplicate" in failures
+    assert "runner_4_lease_id_mismatch" in failures
+    assert "runner_4_project_name_duplicate" in failures
+
+    swapped = {label: dict(result) for label, result in results.items()}
+    swapped["3"], swapped["4"] = swapped["4"], swapped["3"]
+    failures = _validate_project_evidence(swapped, leases, expected)
+    assert "runner_3_lease_id_mismatch" in failures
+    assert "runner_4_lease_id_mismatch" in failures
+
+    misattributed = {label: dict(result) for label, result in results.items()}
+    misattributed["4"]["project_name"] = "wrong_project"
+    failures = _validate_project_evidence(misattributed, leases, expected)
+    assert "runner_4_project_lease_mismatch" in failures
+
+    missing = {label: result for label, result in results.items() if label != "4"}
+    assert any(
+        failure.startswith("terminal_result_labels=")
+        for failure in _validate_project_evidence(missing, leases, expected)
+    )
+
+
+@pytest.mark.parametrize("break_cohort", [False, True])
+def test_n_project_native_pipeline_barrier_is_exact(tmp_path, break_cohort):
+    state = SharedPilotControlPlane(max_projects=4)
+    state.session.update({
+        "state": "ready",
+        "endpoint": "127.0.0.1:50052",
+        "process_id": "987654322",
+        "artifact_dir": str(tmp_path),
+    })
+    headers = {}
+    for lease_id in range(1, 5):
+        status, created = state.dispatch(
+            "POST",
+            "/api/aedt-pool/leases",
+            {
+                "project_name": f"pending-{lease_id}",
+                "exclusive_session": False,
+                **_v2_lease_fields(tmp_path, lease_id),
+            },
+            {},
+        )
+        assert status == 200
+        assert created["lease"]["id"] == lease_id
+        headers[lease_id] = {"X-AEDT-Lease-Token": created["client_token"]}
+        for method, suffix, payload in (
+            ("POST", "/accept", {}),
+            ("PATCH", "/project-name", {"project_name": f"simulation_{lease_id}"}),
+            ("POST", "/activate", {}),
+        ):
+            status, _ = state.dispatch(
+                method, f"/api/aedt-pool/leases/{lease_id}{suffix}",
+                payload, headers[lease_id],
+            )
+            assert status == 200
+
+    generations = {lease["solve_permit_generation"] for lease in state.leases.values()}
+    assert len(generations) == 1
+    generation = generations.pop()
+    assert generation > 0
+    for lease_id in range(1, 4):
+        status, response = state.dispatch(
+            "POST", f"/api/aedt-pool/leases/{lease_id}/native-pipeline-complete",
+            {"solve_permit_generation": generation}, headers[lease_id],
+        )
+        assert status == 200
+        assert response["native_pipeline_expected_count"] == 4
+        assert response["native_pipeline_barrier_granted"] is False
+
+    if break_cohort:
+        status, _ = state.dispatch(
+            "POST", "/api/aedt-pool/leases/4/fault",
+            {"fault_kind": "script_error", "failure_message": "injected"},
+            headers[4],
+        )
+        assert status == 200
+        assert state._public_lease(1)["native_pipeline_barrier_broken"] is True
+    else:
+        status, response = state.dispatch(
+            "POST", "/api/aedt-pool/leases/4/native-pipeline-complete",
+            {"solve_permit_generation": generation}, headers[4],
+        )
+        assert status == 200
+        assert response["native_pipeline_barrier_granted"] is True
+        assert all(
+            state._public_lease(lease_id)["native_pipeline_barrier_granted"]
+            for lease_id in range(1, 5)
+        )
+
+
+@pytest.mark.parametrize("project_count", [3, 4])
+@pytest.mark.parametrize("fault_kind", ["pre_solve", "solver_timeout"])
+def test_shared_loopback_n_projects_isolates_one_fault(
+    monkeypatch, tmp_path, project_count, fault_kind
+):
+    """A failed project must not close or invalidate any live sibling."""
+    _install_attested_runtime(monkeypatch)
+    state = SharedPilotControlPlane(max_projects=project_count)
+    server, server_thread, scheduler_url = start_control_plane(state)
+    desktop = FakeDesktop()
+    host = AedtSessionHost(
+        ControlPlaneClient(scheduler_url, bootstrap_token=state.bootstrap_token),
+        allocation_id=1,
+        node_name="node-test",
+        heartbeat_seconds=5,
+        artifact_root=str(tmp_path / "host-artifacts"),
+        session_profile=EXPECTED_SESSION_PROFILE_JSON,
+    )
+    host.heartbeat_seconds = 0.05
+    monkeypatch.setattr(host, "_start_desktop", lambda: desktop)
+    monkeypatch.setattr(
+        host,
+        "_desktop_process_listener_liveness_proof",
+        lambda: (True, ""),
+    )
+    bounded_close_calls = []
+
+    def close_desktop(*, global_stop, timeout_seconds=30):
+        bounded_close_calls.append(global_stop)
+        host.desktop = None
+        return True
+
+    monkeypatch.setattr(host, "_bounded_close_desktop", close_desktop)
+    host_result: list[int] = []
+    host_thread = threading.Thread(target=lambda: host_result.append(host.run()))
+    host_thread.start()
+    leases = []
+    try:
+        _wait(lambda: bool(state.session["endpoint"]))
+        for task_id in range(1, project_count + 1):
+            label = chr(ord("A") + task_id - 1)
+            lease = acquire_project_lease(
+                scheduler_url,
+                f"pending-{label}",
+                request_key=f"unit-n-{fault_kind}-{label}",
+                exclusive_session=False,
+                **_v2_lease_fields(tmp_path, task_id),
+            )
+            lease.wait_until_leased(timeout_seconds=3, heartbeat_seconds=5)
+            lease.bind_project_name(f"simulation_{label}")
+            desktop.projects.append(f"simulation_{label}")
+            leases.append(lease)
+
+        for lease in leases:
+            _activate_without_solve_wait(lease)
+
+        assert state.session["slots_total"] == project_count
+        assert {lease["slot_index"] for lease in state.leases.values()} == set(
+            range(project_count)
+        )
+        assert all(
+            lease["solve_permit_granted"] for lease in state.leases.values()
+        )
+        assert len({
+            lease["solve_permit_generation"] for lease in state.leases.values()
+        }) == 1
+
+        leases[0].report_fault(
+            fault_kind,
+            failure_message=f"injected {fault_kind}",
+            **({"sibling_grace_seconds": 60} if fault_kind == "solver_timeout" else {}),
+        )
+        _wait(lambda: state.leases[1]["state"] == "releasing"
+              or state.leases[1]["state"] == "released")
+        assert all(
+            state.leases[lease_id]["state"] == "active"
+            for lease_id in range(2, project_count + 1)
+        )
+        assert host_thread.is_alive()
+        assert bounded_close_calls == []
+
+        if fault_kind == "pre_solve":
+            _wait(lambda: state.project_close_acks.get(1) is True)
+            assert desktop.closed == ["simulation_A"]
+            assert desktop.projects == [
+                f"simulation_{chr(ord('A') + index)}"
+                for index in range(1, project_count)
+            ]
+        else:
+            assert state.quarantine_reason == "solver_timeout"
+            assert desktop.closed == []
+            assert not state.project_close_acks
+            with pytest.raises(urllib.error.HTTPError) as rejected:
+                AedtPoolHttpClient(scheduler_url).request(
+                    "POST",
+                    "/api/aedt-pool/leases",
+                    {
+                        "request_key": "unit-n-quarantined-extra",
+                        "project_name": "simulation_extra",
+                        "exclusive_session": False,
+                        **_v2_lease_fields(tmp_path, project_count + 1),
+                    },
+                )
+            assert rejected.value.code == 409
+
+        for lease_id in range(2, project_count + 1):
+            released = leases[lease_id - 1].release(wait_seconds=5)
+            assert released["state"] == "released"
+            if lease_id < project_count:
+                assert host_thread.is_alive()
+                assert bounded_close_calls == []
+
+        host_thread.join(timeout=3)
+        assert not host_thread.is_alive()
+        assert host_result == ([2] if fault_kind == "solver_timeout" else [0])
+        expected_acks = set(range(2, project_count + 1))
+        if fault_kind == "pre_solve":
+            expected_acks.add(1)
+        assert set(state.project_close_acks) == expected_acks
+        assert all(state.project_close_acks.values())
+        assert state.closed_ack is True
+        if fault_kind == "solver_timeout":
+            assert state.requeued_lease_ids == [1]
+            assert "simulation_A" not in desktop.closed
+            assert bounded_close_calls == [True]
+            events = [event["event"] for event in state.events]
+            assert events.index("global_stop_allowed") > max(
+                index for index, event in enumerate(state.events)
+                if event["event"] == "release_requested"
+                and event.get("lease_id") == project_count
+            )
+        else:
+            assert state.requeued_lease_ids == []
+            assert bounded_close_calls == [False]
+            assert set(desktop.closed) == {
+                f"simulation_{chr(ord('A') + index)}"
+                for index in range(project_count)
+            }
+    finally:
+        for lease in leases:
+            lease.stop_heartbeat()
+        if host_thread.is_alive():
+            state.force_drain("unit test cleanup")
+            host.request_stop()
+            host_thread.join(timeout=3)
+        if not host_thread.is_alive():
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=3)

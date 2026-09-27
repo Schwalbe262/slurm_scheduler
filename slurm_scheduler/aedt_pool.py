@@ -984,8 +984,13 @@ class AedtPoolService:
                         ).fetchall()
                     }
                 )
+                required_projects = max(
+                    2, int(settings["aedt_pool_projects_per_session"])
+                )
                 validation = conn.execute(
-                    "SELECT status FROM aedt_pool_validations ORDER BY id DESC LIMIT 1"
+                    "SELECT status FROM aedt_pool_validations "
+                    "WHERE pooled_projects = ? ORDER BY id DESC LIMIT 1",
+                    (required_projects,),
                 ).fetchone()
 
             def setting(key: str) -> str:
@@ -1064,19 +1069,17 @@ class AedtPoolService:
             raise ValueError("min_idle_aedt_sessions must be an integer between 0 and 550")
         if requested_min_idle > requested_max:
             raise ValueError("min_idle_aedt_sessions cannot exceed max_aedt_sessions")
-        if type(requested_slots) is not int or not 1 <= requested_slots <= 3:
+        if type(requested_slots) is not int or not 1 <= requested_slots <= 8:
             raise ValueError(
-                "projects_per_aedt must be an integer between 1 and 3; "
-                "3 was operator-accepted on 2026-07-14 after the original "
-                "validated 1:2 contract"
+                "projects_per_aedt must be an integer between 1 and 8"
             )
         if target_projects is None:
             requested_target = requested_max * requested_slots
         else:
             requested_target = target_projects
-        if type(requested_target) is not int or not 0 <= requested_target <= 1650:
+        if type(requested_target) is not int or not 0 <= requested_target <= 4400:
             raise ValueError(
-                "target_project_concurrency must be an integer between 0 and 1650"
+                "target_project_concurrency must be an integer between 0 and 4400"
             )
         physical_ceiling = requested_max * requested_slots
         if requested_target > physical_ceiling:
@@ -1241,7 +1244,10 @@ class AedtPoolService:
     def set_enabled(self, enabled: bool) -> AedtPoolConfig:
         current = self.config()
         if enabled and not current.validation_passed:
-            raise ValueError("1-AEDT:2-project validation has not passed")
+            raise ValueError(
+                f"1-AEDT:{max(2, current.projects_per_session)}-project "
+                "validation has not passed"
+            )
         if enabled and not current.adapter_ready:
             raise ValueError("AEDT session-host adapter is not ready")
         self.db.set_setting("aedt_pool_enabled", "1" if enabled else "0")
@@ -1294,7 +1300,7 @@ class AedtPoolService:
         )
 
     def record_validation(self, evidence: dict[str, Any]) -> dict[str, Any]:
-        """Evaluate the mandatory 2x standalone vs 1x pooled A/B contract."""
+        """Evaluate the topology-specific standalone vs pooled contract."""
         required_bools = (
             "output_parity_passed",
             "cancellation_isolation_passed",
@@ -1322,14 +1328,34 @@ class AedtPoolService:
             and bool(evidence.get("mixed_family_isolation_passed"))
         )
         failures: list[str] = []
-        if (baseline_desktops, baseline_projects) != (2, 2):
-            failures.append("baseline must be 2 Desktops running 2 projects")
-        if (pooled_desktops, pooled_projects) != (1, 2):
-            failures.append("pooled treatment must be 1 Desktop running 2 projects")
+        if not 2 <= pooled_projects <= 8:
+            failures.append("pooled_projects must be between 2 and 8")
+        if (baseline_desktops, baseline_projects) != (pooled_projects, pooled_projects):
+            failures.append("baseline must use one Desktop per project")
+        if pooled_desktops != 1:
+            failures.append("pooled treatment must use one Desktop")
         if not 0 < runtime_ratio <= 1.20:
             failures.append("pooled runtime must be positive and no more than 1.20x baseline")
-        if desktop_license_delta > -1:
-            failures.append("pooled treatment must reduce Desktop checkout by at least one")
+        if desktop_license_delta > 1 - pooled_projects:
+            failures.append("pooled treatment must save one Desktop checkout per shared project")
+        if pooled_projects > 2:
+            project_results = evidence.get("project_results")
+            if (
+                not isinstance(project_results, list)
+                or len(project_results) != pooled_projects
+                or len({str(row.get("project") or "") for row in project_results if isinstance(row, dict)})
+                != pooled_projects
+                or any(
+                    not isinstance(row, dict)
+                    or not str(row.get("project") or "").strip()
+                    or any(
+                        row.get(key) is not True
+                        for key in ("terminal_output_passed", "data_rows_passed", "field_solution_passed")
+                    )
+                    for row in project_results
+                )
+            ):
+                failures.append("project_results must prove every distinct pooled project")
         for key, passed in checks.items():
             if not passed:
                 failures.append(key)

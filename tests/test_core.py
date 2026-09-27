@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import threading
@@ -3301,6 +3302,25 @@ class SchedulerTests(unittest.TestCase):
         scheduler.refresh_allocations()
         allocation = self.db.list_allocations()[0]
         self.assertEqual(allocation["state"], AllocationStatus.WARM.value)
+
+    def test_confirmed_missing_warm_job_is_closed_before_another_attach(self) -> None:
+        class MissingJobClient(FakeClient):
+            def job_states(self, slurm_job_ids: list[str]) -> dict[str, JobStateInfo]:
+                return {
+                    job_id: JobStateInfo(status=JobStatus.SUBMITTED, missing=True)
+                    for job_id in slurm_job_ids
+                }
+
+        scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, allocation_cpus=8)
+        scheduler.maintain_allocation_pool()
+        scheduler.refresh_allocations()
+        allocation = self.db.list_allocations()[0]
+        self.assertEqual(allocation["state"], AllocationStatus.WARM.value)
+
+        stale_scheduler = Scheduler(self.db, self.accounts, 30, client_factory=MissingJobClient, allocation_cpus=8)
+        stale_scheduler.refresh_allocations()
+        self.assertEqual(self.db.get_allocation(allocation["id"])["state"], AllocationStatus.CLOSED.value)
+        self.assertEqual(FakeClient.cancelled, [])
 
     def test_pending_allocation_reason_is_recorded(self) -> None:
         scheduler = Scheduler(self.db, self.accounts, 30, client_factory=FakeClient, allocation_cpus=8)
@@ -15188,6 +15208,30 @@ class ProjectApiTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.status_code, 404)
         self.assertIsNone(self.app.state.db.get_project_by_name("missing"))
+
+    def test_task_form_uses_project_expansion_and_dedupe_contract(self) -> None:
+        self._post_project({"name": "motor", "setup": "module load ansys"})
+        form = self._route_endpoint("/tasks", "POST")
+        kwargs = {
+            name: parameter.default.default
+            for name, parameter in inspect.signature(form).parameters.items()
+        }
+        kwargs.update(
+            name="project-task",
+            project="motor",
+            remote_cwd="",
+            command="true",
+            timeout_seconds=60,
+            dedupe_key="project-task-once",
+        )
+        self.assertEqual(form(**kwargs).status_code, 303)
+        self.assertEqual(form(**kwargs).status_code, 303)
+        rows = self.app.state.db.list_tasks()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["project"], "motor")
+        self.assertEqual(rows[0]["timeout_seconds"], 60)
+        self.assertEqual(rows[0]["dedupe_key"], "project-task-once")
+        self.assertEqual(rows[0]["env_setup"].count("module load ansys"), 1)
 
     def test_task_api_exposes_project_and_entrypoint(self) -> None:
         task_id = self.app.state.db.create_task(

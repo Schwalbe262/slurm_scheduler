@@ -127,6 +127,8 @@ Acceptance:
 - treatment runtime / baseline runtime `<= 1.20`
 - solver features가 기대한 개수로 checkout되고 서로의 design/project를 덮어쓰지 않음
 
+Desktop당 프로젝트 수를 3–8로 올릴 때는 pool을 disable하고 완전히 drain한 뒤 새 수로 설정한다. 같은 수의 standalone Desktop과 프로젝트를 baseline으로 실행하고, 한 Desktop에서 같은 수의 프로젝트를 동시에 실행한다. `pooled_projects`를 설정값과 일치시키고 `project_results`에 각 프로젝트의 고유 이름과 `terminal_output_passed`, `data_rows_passed`, `field_solution_passed`를 기록한다. 해당 수의 validation이 `passed`가 되기 전에는 enable이 거부된다. 1:2 통과 기록만으로 1:3 이상을 승인하지 않는다.
+
 ## 4. Required failure injection
 
 다음은 별도 disposable output 경로에서 수행한다.
