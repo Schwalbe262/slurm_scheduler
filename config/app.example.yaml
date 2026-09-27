@@ -80,28 +80,17 @@ fea_bursty:
   shared_memory_min_estimate_mb: 8192
   overload_scale_out_load_factor: 2.0
   overload_scale_out_seconds: 300
-  # Three-stage FEA runs can reach their late Thermal memory peak after
-  # roughly 48-53 minutes. Keep shared RAM growth reserved for the first hour.
+  # Set this from measured time-to-peak memory for the workload using this
+  # opt-in profile; the value below is a conservative example.
   footprint_maturity_seconds: 3600
   # CPU declarations need only bridge the delay until load/sstat observes a
   # newly attached worker; do not double-count CPU for the full RAM window.
   cpu_footprint_maturity_seconds: 120
 # Limit physical standalone AEDT Desktops (running+attaching) by project.
 # Pooled clients and the internal _aedt_pool_hosts project are not counted.
-standalone_aedt_max_running_by_project:
-  example_fea_project_a: 100
+standalone_aedt_max_running_by_project: {}
 # Exact lanes override the broad project fallback for matching standalone tasks.
-standalone_aedt_running_lanes:
-  project_a_primary:
-    project: example_fea_project_a
-    name_prefix: "primary-"
-    aedt_backend: standalone
-    max_running: 100
-  project_b_validation:
-    project: example_fea_project_b
-    name_prefix: "validation-"
-    aedt_backend: standalone
-    max_running: 8
+standalone_aedt_running_lanes: {}
 license_monitor:
   enabled: false
   account: "account_a"
@@ -120,13 +109,9 @@ license_monitor:
       # Required for license-gated AEDT pool demand and warm-spare hosts.
       _aedt_pool_hosts:
         electronics_desktop: 1
-      example_fea_project_a:
-        electronics_desktop: 1
-      example_fea_project_b:
-        electronics_desktop: 1
     unknown_fea_project_policy: block
-# The central pool allows 1..3 projects per AEDT session. The original validated
-# contract was 1:2; 3 projects per session was operator-accepted on 2026-07-14.
+# The central pool allows 1..8 projects per AEDT session, but each project
+# count needs its own live output, failure-isolation, runtime and license proof.
 aedt_pool:
   # The pooled AEDT backend is optional and disabled by default.
   module_enabled: false

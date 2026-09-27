@@ -40,6 +40,24 @@ or swapped project results. The pooled run must finish within the configured
 runtime ratio gate and reduce Desktop checkout from N to one. A successful
 loopback test is useful regression evidence but is not live license evidence.
 
+For a mixed-family isolation canary, reserve an empty session whose slot count
+equals the sum of the explicitly listed projects. Names and counts are inputs,
+not inferred from project spelling:
+
+```bash
+curl -sS -X POST "$SCHEDULER_URL/api/aedt-pool/mixed-canary-admissions" \
+  -H "X-AEDT-Bootstrap-Token: $AEDT_BOOTSTRAP_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id":123,"families":[
+        {"workload_family":"family_a","project_namespace":"project_a","projects":2},
+        {"workload_family":"family_b","project_namespace":"project_b","projects":1}
+      ]}'
+```
+
+This creates only a one-shot canary reservation. Native solves remain serial;
+the `validated_parallel` compatibility mode does not authorize concurrent
+native solves without a separate per-family live evidence contract.
+
 ## Activation
 
 Submit the measured evidence through the pool validation API and verify the
