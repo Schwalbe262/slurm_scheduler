@@ -8,26 +8,18 @@ from types import ModuleType
 
 import pytest
 
-from scripts.aedt_pool_1to1_pilot import start_control_plane
-from scripts.aedt_pool_1to2_pilot import (
-    SharedPilotControlPlane,
-    _run_host,
-    _valid_matrix_result,
-    _validate_project_evidence,
-)
-from scripts.aedt_pool_1to2_runner import acquire_pinned_mft_lease
+from scripts.aedt_pool_loopback import SharedControlPlane, start_control_plane
 from slurm_scheduler.aedt_attach_client import (
+    AedtProjectLease,
     AedtPoolHttpClient,
     acquire_project_lease,
 )
 from slurm_scheduler.aedt_session_host import (
     AedtSessionHost,
     ControlPlaneClient,
-    EXPECTED_AEDT_VERSION,
     EXPECTED_PYAEDT_VERSION,
     EXPECTED_SESSION_PROFILE,
     EXPECTED_SESSION_PROFILE_JSON,
-    SUPPORTED_DSO_PROFILE,
 )
 
 
@@ -51,6 +43,18 @@ class FakeDesktop:
         self.closed.append(project_name)
         if project_name in self.projects:
             self.projects.remove(project_name)
+
+
+@pytest.fixture(autouse=True)
+def _thread_only_keepalive(monkeypatch):
+    """Loopback tests need lease heartbeats without spawning a console."""
+    monkeypatch.setattr(
+        AedtProjectLease,
+        "start_process_keepalive",
+        lambda lease, heartbeat_seconds=20: lease.start_heartbeat(
+            heartbeat_seconds=heartbeat_seconds
+        ),
+    )
 
 
 def _v2_lease_fields(tmp_path, task_id):
@@ -96,128 +100,11 @@ def _wait(predicate, seconds=3):
     raise AssertionError("condition did not become true")
 
 
-def test_run_host_and_pinned_runner_share_v2_http_contract(monkeypatch, tmp_path):
-    _install_attested_runtime(monkeypatch)
-    state = SharedPilotControlPlane()
-    server, server_thread, scheduler_url = start_control_plane(state)
-    desktop = FakeDesktop()
-    initialized_dso_profiles = []
-    original_host_init = AedtSessionHost.__init__
-
-    def initialize_fast_host(host, *args, **kwargs):
-        original_host_init(host, *args, **kwargs)
-        host.heartbeat_seconds = 0.05
-
-    monkeypatch.setattr(AedtSessionHost, "__init__", initialize_fast_host)
-    monkeypatch.setattr(AedtSessionHost, "_start_desktop", lambda _host: desktop)
-    monkeypatch.setattr(
-        AedtSessionHost,
-        "_initialize_dso_configuration",
-        lambda host: initialized_dso_profiles.append(host.dso_profile),
-    )
-    monkeypatch.setattr(
-        AedtSessionHost,
-        "_desktop_process_listener_liveness_proof",
-        lambda _host: (True, ""),
-    )
-
-    def close_desktop(host, *, global_stop, timeout_seconds=30):
-        host.desktop = None
-        return True
-
-    monkeypatch.setattr(AedtSessionHost, "_bounded_close_desktop", close_desktop)
-    artifact_root = tmp_path / "host-artifacts"
-    host = None
-    host_thread = None
-    runner_lease = None
-    try:
-        host, host_thread, host_result = _run_host(
-            state,
-            scheduler_url,
-            artifact_root,
-        )
-
-        assert state.session["endpoint"]
-        assert host.aedt_version == EXPECTED_AEDT_VERSION
-        assert host.artifact_root == str(artifact_root.resolve())
-        assert host.dso_profile == SUPPORTED_DSO_PROFILE
-        assert host.session_profile == EXPECTED_SESSION_PROFILE_JSON
-        assert initialized_dso_profiles == [SUPPORTED_DSO_PROFILE]
-        assert host.automation_lock_path
-        assert host.runtime_metadata["automation_lock_path"] == (
-            host.automation_lock_path
-        )
-        assert host.runtime_metadata["session_profile"] == (
-            EXPECTED_SESSION_PROFILE_JSON
-        )
-        assert state.session["artifact_dir"] == host.artifact_dir
-        assert state.session["runtime_metadata"] == host.runtime_metadata
-
-        _wait(lambda: state.host_heartbeat_count > 0)
-        commands = host.client.request(
-            "GET",
-            "/api/aedt-pool/sessions/1/commands",
-            host_token=host.host_token,
-        )
-        assert commands["sibling_live_count"] == 0
-        assert server_thread.is_alive()
-
-        runner_task_id = 304781
-        runner_workspace = tmp_path / f"aedt-normal-{runner_task_id}-a"
-        runner_workspace.mkdir()
-        monkeypatch.setenv("MFT_AEDT_BACKEND", "pooled")
-        monkeypatch.setenv("MFT_AEDT_SHARED_1TO2_PILOT", "1")
-        monkeypatch.setenv("MFT_AEDT_SCHEDULER_URL", scheduler_url)
-        monkeypatch.setenv("MFT_AEDT_PILOT_CLIENT_LABEL", "A")
-        monkeypatch.setenv(
-            "MFT_AEDT_PILOT_WORKSPACE", str(runner_workspace.resolve())
-        )
-        monkeypatch.setenv("SLURM_SCHED_TASK_ID", str(runner_task_id))
-        with pytest.raises(urllib.error.HTTPError) as unbridged:
-            acquire_project_lease(
-                scheduler_url,
-                f"mft-pending-{runner_task_id}-unbridged",
-                request_key=f"mft-1to2:{runner_task_id}:unbridged",
-                task_id=runner_task_id,
-                exclusive_session=False,
-            )
-        assert unbridged.value.code == 422
-
-        # Match the pinned fd3b02c MFT adapter: it passes no v2 profile,
-        # workload, isolation, or workspace keyword arguments.
-        runner_lease = acquire_pinned_mft_lease(
-            acquire_project_lease,
-            scheduler_url,
-            f"mft-pending-{runner_task_id}-unit",
-            request_key=f"mft-1to2:{runner_task_id}:unit",
-            task_id=runner_task_id,
-            exclusive_session=False,
-        )
-        assert runner_lease.protocol_version == 2
-        assert runner_lease.workload_family == "mft"
-        assert runner_lease.session_profile == EXPECTED_SESSION_PROFILE_JSON
-        assert runner_lease.workspace_path == str(runner_workspace.resolve())
-        assert runner_lease.project_namespace == "mft-1to2-a"
-        assert server_thread.is_alive()
-    finally:
-        if runner_lease is not None:
-            runner_lease.stop_heartbeat()
-        if host_thread is not None and host_thread.is_alive():
-            monkeypatch.setattr(state, "_all_projects_closed", lambda: True)
-            state.force_drain("unit test cleanup")
-            host_thread.join(timeout=3)
-        server.shutdown()
-        server.server_close()
-        server_thread.join(timeout=3)
-
-    assert host_result == [0]
-
-
 def test_shared_loopback_closes_aborted_project_without_stopping_sibling(
     monkeypatch, tmp_path
 ):
     _install_attested_runtime(monkeypatch)
-    state = SharedPilotControlPlane()
+    state = SharedControlPlane()
     server, server_thread, scheduler_url = start_control_plane(state)
     desktop = FakeDesktop()
     host = AedtSessionHost(
@@ -302,7 +189,7 @@ def test_shared_loopback_timeout_quarantines_then_recycles_after_sibling(
     monkeypatch, tmp_path
 ):
     _install_attested_runtime(monkeypatch)
-    state = SharedPilotControlPlane()
+    state = SharedControlPlane()
     server, server_thread, scheduler_url = start_control_plane(state)
     desktop = FakeDesktop()
     host = AedtSessionHost(
@@ -399,7 +286,7 @@ def test_shared_loopback_timeout_quarantines_then_recycles_after_sibling(
 
 
 def test_shared_loopback_rejects_exclusive_or_third_lease(tmp_path):
-    state = SharedPilotControlPlane()
+    state = SharedControlPlane()
     server, server_thread, scheduler_url = start_control_plane(state)
     try:
         http = AedtPoolHttpClient(scheduler_url)
@@ -444,86 +331,9 @@ def test_shared_loopback_rejects_exclusive_or_third_lease(tmp_path):
         server_thread.join(timeout=3)
 
 
-def test_terminal_validator_rejects_prior_pid_grpc_false_positive():
-    invalid = {
-        "result_valid_em": 0,
-        "aedt_backend": "pooled",
-        "aedt_exclusive_session": 0,
-        "matrix_solve_attempts": 1,
-        "matrix_solution_queries": 0,
-        "Llt": None,
-        "project_name": "simulation_B",
-        "sibling_pid_survived": True,
-        "grpc_survived": True,
-    }
-    failures = _valid_matrix_result(invalid)
-    assert failures
-    assert any(item.startswith("result_valid_em") for item in failures)
-    assert "matrix_solution_queries<1" in failures
-    assert "Llt_missing" in failures
-
-
-def test_terminal_validator_accepts_complete_matrix_result():
-    assert _valid_matrix_result({
-        "result_valid_em": 1,
-        "aedt_backend": "pooled",
-        "aedt_exclusive_session": 0,
-        "matrix_solve_attempts": 1,
-        "matrix_solution_queries": 1,
-        "Llt": 27.5,
-        "project_name": "simulation_B",
-    }) == []
-
-
-def test_n_project_evidence_rejects_replayed_or_misattributed_result():
-    leases = {
-        lease_id: {"project_name": f"simulation_{lease_id}"}
-        for lease_id in range(1, 5)
-    }
-    results = {
-        str(lease_id): {
-            "aedt_lease_id": lease_id,
-            "project_name": f"simulation_{lease_id}",
-            "result_valid_em": 1,
-            "aedt_backend": "pooled",
-            "aedt_exclusive_session": 0,
-            "matrix_solve_attempts": 1,
-            "matrix_solution_queries": 1,
-            "Llt": 27.5 + lease_id,
-        }
-        for lease_id in leases
-    }
-    expected = {str(lease_id): lease_id for lease_id in leases}
-    assert _validate_project_evidence(results, leases, expected) == []
-
-    replayed = {label: dict(result) for label, result in results.items()}
-    replayed["4"] = dict(replayed["3"])
-    failures = _validate_project_evidence(replayed, leases, expected)
-    assert "runner_4_lease_id_duplicate" in failures
-    assert "runner_4_lease_id_mismatch" in failures
-    assert "runner_4_project_name_duplicate" in failures
-
-    swapped = {label: dict(result) for label, result in results.items()}
-    swapped["3"], swapped["4"] = swapped["4"], swapped["3"]
-    failures = _validate_project_evidence(swapped, leases, expected)
-    assert "runner_3_lease_id_mismatch" in failures
-    assert "runner_4_lease_id_mismatch" in failures
-
-    misattributed = {label: dict(result) for label, result in results.items()}
-    misattributed["4"]["project_name"] = "wrong_project"
-    failures = _validate_project_evidence(misattributed, leases, expected)
-    assert "runner_4_project_lease_mismatch" in failures
-
-    missing = {label: result for label, result in results.items() if label != "4"}
-    assert any(
-        failure.startswith("terminal_result_labels=")
-        for failure in _validate_project_evidence(missing, leases, expected)
-    )
-
-
 @pytest.mark.parametrize("break_cohort", [False, True])
 def test_n_project_native_pipeline_barrier_is_exact(tmp_path, break_cohort):
-    state = SharedPilotControlPlane(max_projects=4)
+    state = SharedControlPlane(max_projects=4)
     state.session.update({
         "state": "ready",
         "endpoint": "127.0.0.1:50052",
@@ -597,7 +407,7 @@ def test_shared_loopback_n_projects_isolates_one_fault(
 ):
     """A failed project must not close or invalidate any live sibling."""
     _install_attested_runtime(monkeypatch)
-    state = SharedPilotControlPlane(max_projects=project_count)
+    state = SharedControlPlane(max_projects=project_count)
     server, server_thread, scheduler_url = start_control_plane(state)
     desktop = FakeDesktop()
     host = AedtSessionHost(

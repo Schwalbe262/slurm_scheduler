@@ -9,13 +9,12 @@ import urllib.error
 
 import pytest
 
-from scripts.aedt_pool_1to1_pilot import (
-    PilotControlPlane,
-    _feature_local_pids,
-    parse_result_json,
+from scripts.aedt_pool_loopback import (
+    ExclusiveControlPlane,
     start_control_plane,
 )
 from slurm_scheduler.aedt_attach_client import (
+    AedtProjectLease,
     AedtPoolHttpClient,
     acquire_project_lease,
 )
@@ -50,10 +49,22 @@ class FakeDesktop:
             self.projects.remove(project_name)
 
 
+@pytest.fixture(autouse=True)
+def _thread_only_keepalive(monkeypatch):
+    """Loopback tests need lease heartbeats without spawning a console."""
+    monkeypatch.setattr(
+        AedtProjectLease,
+        "start_process_keepalive",
+        lambda lease, heartbeat_seconds=20: lease.start_heartbeat(
+            heartbeat_seconds=heartbeat_seconds
+        ),
+    )
+
+
 def test_loopback_pilot_performs_exclusive_attach_and_close_ack(
     monkeypatch, tmp_path
 ):
-    state = PilotControlPlane()
+    state = ExclusiveControlPlane()
     server, server_thread, scheduler_url = start_control_plane(state)
     desktop = FakeDesktop(port=int(server.server_address[1]))
     ansys_module = types.ModuleType("ansys")
@@ -109,7 +120,7 @@ def test_loopback_pilot_performs_exclusive_attach_and_close_ack(
             request_key="unit-exclusive",
             task_id=1,
             exclusive_session=True,
-            workload_family="mft",
+            workload_family="unit-exclusive",
             session_profile=EXPECTED_SESSION_PROFILE_JSON,
             isolation_policy="exclusive",
             workspace_path=str(workspace),
@@ -153,7 +164,7 @@ def test_loopback_pilot_performs_exclusive_attach_and_close_ack(
 
 
 def test_loopback_pilot_rejects_nonexclusive_lease(tmp_path):
-    state = PilotControlPlane()
+    state = ExclusiveControlPlane()
     server, server_thread, scheduler_url = start_control_plane(state)
     workspace = tmp_path / "aedt-task-2"
     workspace.mkdir()
@@ -168,7 +179,7 @@ def test_loopback_pilot_rejects_nonexclusive_lease(tmp_path):
                     "task_id": 2,
                     "exclusive_session": False,
                     "protocol_version": 2,
-                    "workload_family": "mft",
+                    "workload_family": "unit-exclusive",
                     "session_profile": EXPECTED_SESSION_PROFILE_JSON,
                     "isolation_policy": "exclusive",
                     "workspace_path": str(workspace),
@@ -179,23 +190,3 @@ def test_loopback_pilot_rejects_nonexclusive_lease(tmp_path):
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=3)
-
-
-def test_license_parser_matches_desktop_pid_on_node_alias():
-    lmstat = """
-Users of electronics_desktop:  (Total of 550 licenses issued;  Total of 2 licenses in use)
-    user1 nib040.hpc n040.hpc 1278977 (v2025.0506) (server/1055 1), start Mon 7/13 3:35
-    user1 nib040.hpc n040.hpc 1278999 (v2025.0506) (server/1055 2), start Mon 7/13 3:35
-Users of another_feature:  (Total of 1 license issued;  Total of 0 licenses in use)
-"""
-    assert _feature_local_pids(
-        lmstat, "electronics_desktop", "user1", "n040.hpc"
-    ) == {1278977, 1278999}
-
-
-def test_parse_result_json_requires_one_terminal_record():
-    assert parse_result_json('noise\nRESULT_JSON {"result_valid_em": 1}\n') == {
-        "result_valid_em": 1
-    }
-    with pytest.raises(RuntimeError, match="found 0"):
-        parse_result_json("noise only")
