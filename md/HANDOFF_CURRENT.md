@@ -1,37 +1,34 @@
 # Current Handoff
-- 2026-09-27 generic scheduler cleanup: the main working copy has removed
-  workload-specific AEDT pilot runners and stale campaign API/config docs.
-  Generic 1:N loopback tests now use thread heartbeat fixtures; 11 focused
-  tests passed in a hidden process. `docs/USAGE_ko.md` is the current usage
-  guide. Do not reactivate the removed workload-specific adapters.
-- Generic AEDT family/canary refactor is in the separate worktree
-  `C:\Users\peets\work\slurm_scheduler_generic_aedt_20260927`; it was
-  interrupted before commit. Review and validate it before integration.
-- The local `main` has additional documentation and pilot-cleanup commits
-  after the pushed `5ef11bf`; verify tests and push after the PowerShell
-  window issue is resolved. The live 8002 service remains unchanged.
-- 2026-09-27 operability pass is on `improve/operability-20260927` from
-  `01326ab`: task form uses the API's project/dedupe expansion, stale inventory
-  is visible, and Slurm-confirmed missing allocation jobs are closed without
-  cancelling any unrelated job. AEDT 1:N configuration is gated by evidence
-  for the exact project count; offline 3/4-project host isolation tests pass.
-  The production pool remains disabled until real AEDT/license validation.
-- Current live port 8002 uses a separate pinned deployment (`724d38d`) and
-  database. Do not replace it with this branch without a schema/config
-  migration and rollback trial on a copy of that database. Port 8000 has no
-  local 8001 target listener, and starting its old DB would run a second
-  scheduler against shared accounts.
-- The six FEA commits unique to `main` by hash were already ported into this
-  integration line as `1ed9d42`, `0e30fb6`, `11d6b9a`, `66b1e02`,
-  `029336a`, and `9274a39`; do not cherry-pick duplicate behavior.
-- 2026-07-29: Phase 3 (module-flag gating) + Phase 4a (pilot v2 harness) complete on
-  `integration/aedt-consolidated-20260728`; canonical working copy is the local clone
-  `C:\Users\peets\work\slurm_scheduler` (Y: RaiDrive is unstable — reference only).
-- `aedt_pool.module_enabled=false` (default) now fully disables the pool: no service/
-  router/thread/tables; pooled submissions 422. Regression: tests/test_aedt_pool_module_flag.py.
-- Pilot loopback failures were harness drift vs v2 attestation/protocol gates — fixed in the
-  two pilot test files + salvaged script updates; production modules untouched.
-- Validation: focused suite 303 passed; full suite green expected (run before commit).
-- Remaining: Phase 4b live 1:2 pilot (needs cluster SSH + license server + repo SHAs from
-  user; runbook draft in session scratchpad), then Phase 5 finalize (README/docs, main-merge
-  decision). Pool stays enabled=0/adapter_ready=0 until the live gate passes.
+
+- 2026-09-27 generic scheduler main is `880c6df13ac526b588172242aa3311055433d5df`.
+  It is pushed to GitHub `main` and fast-forwarded in `Y:\git\slurm_scheduler`.
+  The canonical development clone is `C:\Users\peets\work\slurm_scheduler`.
+- Full local test run on that main: **893 passed, 2 skipped**, no failures,
+  `python -m pytest -q --disable-warnings -x` (375.79 s). Generic AEDT
+  loopback tests also passed separately (11 tests). The live AEDT 1:N
+  output/runtime/license gate remains open; the pool stays disabled.
+- Scheduler fixes in main: web task form uses the same project/dedupe expansion
+  as the API, stale inventory is visible, Slurm-confirmed missing allocation
+  jobs close without cancelling another job, and AEDT project-density evidence
+  is specific to the requested N (2–8). AEDT family placement, canary input,
+  and native solve order no longer infer workload from project names. Native
+  solves remain serial until per-family live parallel evidence exists.
+- MFT-specific pilot runners and stale campaign API/config documentation were
+  removed. General usage is documented in `docs/USAGE_ko.md`; AEDT validation
+  and rollback are in `docs/aedt_pool_runbook.md`.
+- The active service on port 8002 is a separate pinned deployment (`724d38d`)
+  with an active DB and workload-specific campaign API. It was not restarted or
+  changed. Current generic main is not a drop-in replacement: a copied-DB
+  trial found schema and behavior differences. Port 8000 has no local 8001
+  listener; starting its old DB against the same accounts would create a
+  second active scheduler. Do not deploy either route without isolation and
+  a compatibility/rollback trial.
+- Branch/worktree history is preserved in verified Git bundles under
+  `C:\Users\peets\work\slurm_scheduler_archive_20260927`. Remote GitHub has
+  only `main`. The local C clone has only one worktree and branch. A separate
+  Y feature worktree with local config/data was deliberately retained.
+- Current remaining work: generic real-AEDT 1:N pilot and license proof;
+  deployment isolation/compatibility path; review any externally rejected
+  orphan clone/temp-copy cleanup. Never cancel jobs submitted by other
+  projects; only test jobs created and recorded by this improvement work may
+  be cancelled.
