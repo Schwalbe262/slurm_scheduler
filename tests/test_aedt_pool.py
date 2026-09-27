@@ -469,7 +469,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                     remote_cwd=f"/work/backlog/{index}",
                     command="true",
                     aedt_backend="pooled",
-                    project="FEA_1MW_2026v1",
+                    project="generic_fe_project",
                 )
             )
         self.make_operational()
@@ -501,7 +501,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                         command="true",
                         account_name=account,
                         aedt_backend="pooled",
-                        project="FEA_1MW_2026v1",
+                        project="generic_fe_project",
                     )
                 )
         self.make_operational()
@@ -677,7 +677,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                     command="true",
                     account_name="b",
                     aedt_backend="pooled",
-                    project="FEA_1MW_2026v1",
+                    project="generic_fe_project",
                 )
             )
         self.make_operational()
@@ -727,7 +727,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 cpus=4,
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 aedt_backend="pooled",
-                project="FEA_1MW_2026v1",
+                project="generic_fe_project",
             )
         )
         remote_client_task_id = self.db.create_task(
@@ -738,7 +738,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 cpus=1,
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 aedt_backend="pooled",
-                project="FEA_1MW_2026v1",
+                project="generic_fe_project",
             )
         )
         for task_id, allocation_id in (
@@ -918,7 +918,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 command="true",
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 aedt_backend="pooled",
-                project="FEA_1MW_2026v1",
+                project="generic_fe_project",
             )
         )
         selected_task_ids: list[int] = []
@@ -971,7 +971,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 account_name="pinned-account",
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 aedt_backend="pooled",
-                project="FEA_1MW_2026v1",
+                project="generic_fe_project",
             )
         )
         reserved_allocation_id = self.db.create_allocation(
@@ -994,7 +994,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 command="true",
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 aedt_backend="pooled",
-                project="FEA_1MW_2026v1",
+                project="generic_fe_project",
             )
         )
         with self.db.connect() as conn:
@@ -1113,7 +1113,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                     env_setup=env_setup,
                     scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                     aedt_backend="pooled",
-                    project="FEA_1MW_2026v1",
+                    project="generic_fe_project",
                 )
             )
             for index in range(18)
@@ -1291,7 +1291,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                     remote_cwd=f"/work/cold/{index}",
                     command="true",
                     aedt_backend="pooled",
-                    project="FEA_1MW_2026v1",
+                    project="generic_fe_project",
                 )
             )
         calls = 0
@@ -1337,7 +1337,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
                 command="true",
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 aedt_backend="pooled",
-                project="FEA_1MW_2026v1",
+                project="generic_fe_project",
             )
         )
         call_count = 0
@@ -1385,7 +1385,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
         task = {
             "task_id": 101,
             "name": "batch-incompatible-busy",
-            "project": "FEA_1MW_2026v1",
+            "project": "generic_fe_project",
             "requested_account_name": "",
             "task_account_name": "",
             "required_capability": "",
@@ -1548,7 +1548,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
         flexible = {
             "task_id": 201,
             "name": "hard-pending-flexible",
-            "project": "FEA_1MW_2026v1",
+            "project": "generic_fe_project",
             "requested_account_name": "",
             "task_account_name": "",
             "required_capability": "",
@@ -4544,7 +4544,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
                 account_name="blocked-account",
                 scheduling_profile=SchedulingProfile.FEA_BURSTY.value,
                 aedt_backend="pooled",
-                project="FEA_1MW_2026v1",
+                project="generic_fe_project",
             )
         )
         now = self.clock.now().strftime("%Y-%m-%d %H:%M:%S")

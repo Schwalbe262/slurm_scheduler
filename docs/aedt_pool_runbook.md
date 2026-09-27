@@ -1,5 +1,9 @@
 # AEDT shared-session validation and rollback
 
+The independent Maxwell 3D A/B workload and license-checkout verifier are in
+[the generic live pilot](aedt_pool_live_pilot.md). Use this runbook for the
+remaining isolation, activation, and rollback checks.
+
 The AEDT pool is an optional Slurm resource-management feature. One AEDT Desktop
 may host several independent projects only after that exact project count has
 passed validation. The default remains disabled. Validation jobs must use a

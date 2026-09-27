@@ -1,34 +1,46 @@
 # Current Handoff
 
-- 2026-09-27 generic scheduler main is `880c6df13ac526b588172242aa3311055433d5df`.
-  It is pushed to GitHub `main` and fast-forwarded in `Y:\git\slurm_scheduler`.
-  The canonical development clone is `C:\Users\peets\work\slurm_scheduler`.
-- Full local test run on that main: **893 passed, 2 skipped**, no failures,
-  `python -m pytest -q --disable-warnings -x` (375.79 s). Generic AEDT
-  loopback tests also passed separately (11 tests). The live AEDT 1:N
-  output/runtime/license gate remains open; the pool stays disabled.
-- Scheduler fixes in main: web task form uses the same project/dedupe expansion
-  as the API, stale inventory is visible, Slurm-confirmed missing allocation
-  jobs close without cancelling another job, and AEDT project-density evidence
-  is specific to the requested N (2–8). AEDT family placement, canary input,
-  and native solve order no longer infer workload from project names. Native
-  solves remain serial until per-family live parallel evidence exists.
+- 2026-09-27: The canonical development clone is
+  `C:\Users\peets\work\slurm_scheduler`. Generic changes belong on `main`;
+  `Y:\git\slurm_scheduler` is the RaiDrive clone. GitHub has only remote `main`.
+- A full local run after the observer and live-pilot harness merge passed
+  **902 tests, with 2 skipped** (`python -m pytest -q --disable-warnings -x`,
+  288.71 s). The last test-fixture wording cleanup is verified separately.
+- The web task form and API share project/entrypoint/argument and dedupe
+  expansion. Inventory staleness is visible. A missing Slurm allocation is
+  confirmed through Slurm and closed locally without `scancel`. The default
+  scheduler remains standalone.
+- The optional AEDT pool is disabled by default. Density N=2..8 is gated by
+  live evidence for that exact N, including output identity and license
+  checkouts. Project names no longer imply workload family, placement, or
+  native solve order. Native solves stay serial until separate live parallel
+  evidence exists. Generic loopback tests pass, but no real 1:N AEDT run has
+  passed yet.
+- `scripts/aedt_pool_live_pilot.py` and `docs/aedt_pool_live_pilot.md` provide
+  an independent Maxwell 3D baseline-versus-pooled A/B workload, verifier,
+  and fault checks. This is preparation for a real trial, not proof of one.
+  A dedicated staging Slurm account/allocation, scheduler and host session,
+  bootstrap token, and raw license-server samples are still needed. Pool
+  activation remains blocked until the live runbook gates pass.
+- Read-only `observer_mode` can inspect a **copy** of the active SQLite DB on
+  a separate port without starting the scheduler, pool, relay, or maintenance
+  services. It rejects HTTP mutations. See `docs/CONFIG.md` and
+  `docs/USAGE_ko.md`.
 - MFT-specific pilot runners and stale campaign API/config documentation were
-  removed. General usage is documented in `docs/USAGE_ko.md`; AEDT validation
-  and rollback are in `docs/aedt_pool_runbook.md`.
-- The active service on port 8002 is a separate pinned deployment (`724d38d`)
-  with an active DB and workload-specific campaign API. It was not restarted or
-  changed. Current generic main is not a drop-in replacement: a copied-DB
-  trial found schema and behavior differences. Port 8000 has no local 8001
-  listener; starting its old DB against the same accounts would create a
-  second active scheduler. Do not deploy either route without isolation and
-  a compatibility/rollback trial.
+  removed from generic main. General usage is in `docs/USAGE_ko.md`; AEDT
+  validation and rollback are in `docs/aedt_pool_runbook.md`.
+- The active 8002 service is a separate pinned deployment (`724d38d`) with an
+  active DB and workload-specific campaign API. It was not restarted or
+  changed. Generic main is not a drop-in replacement: a copied-DB trial found
+  schema and behavior differences. Port 8000 has no local 8001 listener;
+  starting its old DB against the same accounts would create a second active
+  scheduler. An isolated compatibility/rollback trial is required before any
+  deployment.
 - Branch/worktree history is preserved in verified Git bundles under
-  `C:\Users\peets\work\slurm_scheduler_archive_20260927`. Remote GitHub has
-  only `main`. The local C clone has only one worktree and branch. A separate
-  Y feature worktree with local config/data was deliberately retained.
-- Current remaining work: generic real-AEDT 1:N pilot and license proof;
-  deployment isolation/compatibility path; review any externally rejected
-  orphan clone/temp-copy cleanup. Never cancel jobs submitted by other
-  projects; only test jobs created and recorded by this improvement work may
-  be cancelled.
+  `C:\Users\peets\work\slurm_scheduler_archive_20260927`. The separate
+  `C:\Users\peets\NEC\pe_worktree` has local config/data and was retained.
+  Two orphan standalone clones and temporary DB copies also remain after
+  automatic approval review rejected their removal.
+- Never cancel jobs submitted by other projects. Only test jobs created and
+  recorded by this scheduler-improvement work may be cancelled. No Slurm jobs
+  were submitted or cancelled in this change set.

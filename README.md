@@ -1,7 +1,8 @@
 # Slurm Scheduler
 
-Experimental features: [AEDT session pool architecture](docs/aedt_pool.md) and
-[pilot/rollback runbook](docs/aedt_pool_runbook.md). The pooled AEDT backend is an optional
+Experimental features: [AEDT session pool architecture](docs/aedt_pool.md),
+[validation/rollback runbook](docs/aedt_pool_runbook.md), and the
+[generic live 1:N pilot](docs/aedt_pool_live_pilot.md). The pooled AEDT backend is an optional
 module, fully disabled by default (`aedt_pool.module_enabled: false` — no pool service,
 routes, thread, or tables are created); enabling the module still leaves the pooled backend
 behind its live 1-AEDT:2-project validation gate. Standalone scheduling remains the default.

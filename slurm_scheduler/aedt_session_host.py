@@ -814,7 +814,7 @@ class AedtSessionHost:
         """Attest that PyAEDT returned the sole Desktop launched for this host.
 
         An explicit port alone is not an ownership boundary: another same-user
-        AEDT (for example the motor workload's standalone Desktop) may already
+        AEDT (for example another workload's standalone Desktop) may already
         exist.  Accept the proxy only when its reported PID is exactly the one
         newly-created current-user ``ansysedt -grpcsrv <port>`` process.
         """

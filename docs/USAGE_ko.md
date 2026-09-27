@@ -64,6 +64,8 @@ AEDT pool 모듈은 기본적으로 꺼져 있습니다. 일반 작업은 standa
 field solution, 장애 격리, 소요 시간, 라이선스 checkout 비교를 먼저 통과해야
 합니다. 로컬 loopback 통과만으로 운영 풀을 켜지 않습니다. 절차는
 [AEDT 검증·롤백 가이드](aedt_pool_runbook.md)에 있습니다.
+실제 라이선스와 출력 비교에 사용할 독립 모델 절차는
+[범용 AEDT 1:N 파일럿](aedt_pool_live_pilot.md)에 있습니다.
 
 ## 변경 배포와 복구
 
