@@ -30,6 +30,7 @@ from .aedt_session_host import (
     canonical_expected_session_profile,
 )
 from .aedt_automation_lock import automation_lock_path
+from .task_commands import literal_task_environment
 
 
 LOGGER = logging.getLogger(__name__)
@@ -148,10 +149,9 @@ def aedt_pool_pending_replan_reason(
     grace_seconds = max(60, configured_timeout)
     return reason if age_seconds >= grace_seconds else ""
 
-# Families for which a rolling build may enable concurrent native solves.  The
-# emergency ``serial`` mode ignores this allowlist; ``validated_parallel``
-# restores it without requiring another code rollout.
-PARALLEL_SAFE_NATIVE_SOLVE_FAMILIES = frozenset({"fea_validated_async"})
+# Retain the mode name for configuration compatibility. No workload family is
+# permitted to overlap native solves until a per-family validation contract
+# can authorize it durably.
 NATIVE_SOLVE_MODE_ENV = "SLURM_AEDT_POOL_NATIVE_SOLVE_MODE"
 NATIVE_SOLVE_MODE_SERIAL = "serial"
 NATIVE_SOLVE_MODE_VALIDATED_PARALLEL = "validated_parallel"
@@ -336,8 +336,9 @@ CREATE TABLE IF NOT EXISTS aedt_mixed_canary_admissions (
     session_id INTEGER NOT NULL,
     placement_group TEXT NOT NULL UNIQUE,
     session_profile TEXT NOT NULL,
-    expected_family_a_projects INTEGER NOT NULL,
-    expected_family_b_projects INTEGER NOT NULL,
+    expected_family_a_projects INTEGER NOT NULL DEFAULT 0,
+    expected_family_b_projects INTEGER NOT NULL DEFAULT 0,
+    expected_projects INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT 'open',
     expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -458,15 +459,9 @@ def _token_hash(token: str) -> str:
 
 
 def _derive_placement_group(project_name: str) -> str:
-    normalized = project_name.strip().lower()
-    if "fea_b" in normalized or "fea-b" in normalized:
-        return "fea_b"
-    if normalized.startswith(("fea", "simulation")):
-        return "fea"
-    token_end = 0
-    while token_end < len(normalized) and normalized[token_end].isalnum():
-        token_end += 1
-    return normalized[:token_end] or normalized
+    # Legacy callers without an explicit group may share only when they name
+    # the same project.  Prefixes are not evidence of workload compatibility.
+    return str(project_name or "").strip().lower()
 
 
 def canonical_workload_family(value: str, project_name: str) -> str:
@@ -475,10 +470,7 @@ def canonical_workload_family(value: str, project_name: str) -> str:
     explicit = str(value or "").strip().lower()
     if explicit:
         return explicit
-    normalized = str(project_name or "").strip().lower()
-    if "example_fea_b" in normalized:
-        return "fea_b"
-    return _derive_placement_group(normalized)
+    return _derive_placement_group(project_name)
 
 
 def _canonical_session_profile(value: Any) -> str:
@@ -581,12 +573,7 @@ class AedtPoolService:
                 f"{', '.join(sorted(NATIVE_SOLVE_MODES))}"
             )
         self.native_solve_mode = configured_native_solve_mode
-        self._parallel_safe_native_solve_families = (
-            PARALLEL_SAFE_NATIVE_SOLVE_FAMILIES
-            if configured_native_solve_mode
-            == NATIVE_SOLVE_MODE_VALIDATED_PARALLEL
-            else frozenset()
-        )
+        self._parallel_safe_native_solve_families: frozenset[str] = frozenset()
         self._lock = threading.RLock()
         # Reconcile intentionally holds _lock across one control-plane pass.
         # Config cache reads are independent and must not queue every HTTP
@@ -926,6 +913,22 @@ class AedtPoolService:
                     conn.execute(
                         f"ALTER TABLE aedt_pool_validations ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
                     )
+            admission_columns = {
+                str(row["name"])
+                for row in conn.execute(
+                    "PRAGMA table_info(aedt_mixed_canary_admissions)"
+                ).fetchall()
+            }
+            if "expected_projects" not in admission_columns:
+                conn.execute(
+                    "ALTER TABLE aedt_mixed_canary_admissions "
+                    "ADD COLUMN expected_projects INTEGER NOT NULL DEFAULT 0"
+                )
+                conn.execute(
+                    "UPDATE aedt_mixed_canary_admissions "
+                    "SET expected_projects = expected_family_a_projects "
+                    "+ expected_family_b_projects"
+                )
         self._invalidate_config()
 
     def _setting(self, key: str) -> str:
@@ -2713,11 +2716,10 @@ class AedtPoolService:
         self,
         *,
         session_id: int,
-        family_a_projects: int = 2,
-        family_b_projects: int = 1,
+        families: list[dict[str, Any]],
         ttl_seconds: int = 1800,
     ) -> dict[str, Any]:
-        """Reserve one empty 3-slot session for one operator-authorized mixed canary.
+        """Reserve an empty session for an explicit mixed-family canary.
 
         The returned dedupe keys are capabilities bound to scheduler task rows.
         Lease clients receive no bootstrap credential and cannot create another
@@ -2726,23 +2728,36 @@ class AedtPoolService:
 
         for value, name in (
             (session_id, "session_id"),
-            (family_a_projects, "family_a_projects"),
-            (family_b_projects, "family_b_projects"),
             (ttl_seconds, "ttl_seconds"),
         ):
             if type(value) is not int:
                 raise ValueError(f"{name} must be an integer")
         if session_id <= 0:
             raise ValueError("session_id must be positive")
-        if family_a_projects < 1 or family_b_projects < 1:
-            raise ValueError("mixed canary requires at least one FEA and one FEA-B project")
-        if family_a_projects + family_b_projects != 3:
-            raise ValueError("mixed canary must reserve exactly three projects")
+        if not isinstance(families, list) or not 2 <= len(families) <= 8:
+            raise ValueError("mixed canary requires two to eight explicit families")
+        cohort: list[tuple[str, str, int]] = []
+        for item in families:
+            if not isinstance(item, dict) or set(item) != {
+                "workload_family", "project_namespace", "projects"
+            }:
+                raise ValueError("each family needs workload_family, project_namespace, and projects")
+            family = str(item["workload_family"] or "").strip().lower()
+            namespace = str(item["project_namespace"] or "").strip()
+            count = item["projects"]
+            if not family or not namespace or type(count) is not int or count < 1:
+                raise ValueError("mixed canary family names and positive project counts are required")
+            cohort.append((family, namespace, count))
+        if len({family for family, _, _ in cohort}) != len(cohort):
+            raise ValueError("mixed canary workload families must be distinct")
+        if len({namespace for _, namespace, _ in cohort}) != len(cohort):
+            raise ValueError("mixed canary project namespaces must be distinct")
+        expected_projects = sum(count for _, _, count in cohort)
         if not 60 <= ttl_seconds <= 3600:
             raise ValueError("ttl_seconds must be between 60 and 3600")
         latest = self.latest_validation()
         if latest and bool(latest.get("mixed_family_isolation_passed")):
-            raise ValueError("mixed FEA/FEA-B isolation has already passed validation")
+            raise ValueError("mixed-family isolation has already passed validation")
 
         now_dt = self._now()
         now = _sql_time(now_dt)
@@ -2757,8 +2772,8 @@ class AedtPoolService:
                 raise ValueError("mixed canary session does not exist")
             if str(session["state"]) != "ready":
                 raise ValueError("mixed canary session must be ready")
-            if int(session["slots_total"] or 0) != 3:
-                raise ValueError("mixed canary session must have exactly three slots")
+            if int(session["slots_total"] or 0) != expected_projects:
+                raise ValueError("mixed canary project count must match session slots")
             if session["solve_batch_sealed_at"]:
                 raise ValueError("mixed canary session solve batch is already sealed")
             if session["drain_requested_at"]:
@@ -2803,15 +2818,15 @@ class AedtPoolService:
                 INSERT INTO aedt_mixed_canary_admissions (
                     session_id, placement_group, session_profile,
                     expected_family_a_projects, expected_family_b_projects,
+                    expected_projects,
                     state, expires_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?)
+                ) VALUES (?, ?, ?, 0, 0, ?, 'open', ?, ?, ?)
                 """,
                 (
                     session_id,
                     placement_group,
                     session_profile,
-                    family_a_projects,
-                    family_b_projects,
+                    expected_projects,
                     expires,
                     now,
                     now,
@@ -2819,10 +2834,7 @@ class AedtPoolService:
             )
             admission_id = int(cursor.lastrowid)
             slots: list[tuple[str, str, str]] = []
-            for family, namespace, count in (
-                ("fea", "fea", family_a_projects),
-                ("fea_b", "example_fea_b", family_b_projects),
-            ):
+            for family, namespace, count in cohort:
                 for index in range(count):
                     dedupe_key = (
                         f"aedt-mixed-canary:{admission_id}:{family}:{index}:"
@@ -2870,10 +2882,10 @@ class AedtPoolService:
         """Abort an incomplete one-shot canary without stranding its session.
 
         The admission TTL bounds the time to assemble and activate the exact
-        three-project batch; it is not a solve-runtime deadline.  Once a solve
+        reserved project batch; it is not a solve-runtime deadline. Once a solve
         permit exists, normal sibling completion semantics own the session.
         Before that point, an expired admission or a consumed slot that can no
-        longer participate makes the exact 2+1 experiment impossible.
+        longer participate makes the exact cohort impossible.
 
         Project-owning leases use the normal two-phase host release.  Queued
         and merely offered leases can be cancelled immediately.  The session
@@ -3005,9 +3017,7 @@ class AedtPoolService:
 
         admission = conn.execute(
             """
-            SELECT ca.id, ca.state,
-                   ca.expected_family_a_projects + ca.expected_family_b_projects
-                       AS expected_projects,
+            SELECT ca.id, ca.state, s.slots_total, ca.expected_projects,
                    COUNT(cs.id) AS reserved_projects,
                    SUM(
                        CASE
@@ -3017,6 +3027,7 @@ class AedtPoolService:
                        END
                    ) AS active_projects
             FROM aedt_mixed_canary_admissions ca
+            JOIN aedt_sessions s ON s.id = ca.session_id
             LEFT JOIN aedt_mixed_canary_slots cs ON cs.admission_id = ca.id
             LEFT JOIN aedt_project_leases l ON l.id = cs.lease_id
             WHERE ca.session_id = ?
@@ -3032,7 +3043,7 @@ class AedtPoolService:
         expected = int(admission["expected_projects"] or 0)
         return bool(
             str(admission["state"]) == "filled"
-            and expected == 3
+            and expected == int(admission["slots_total"] or 0)
             and int(admission["reserved_projects"] or 0) == expected
             and int(admission["active_projects"] or 0) == expected
         )
@@ -3081,7 +3092,7 @@ class AedtPoolService:
     ) -> dict[str, Any]:
         if task_id <= 0:
             raise ValueError(
-                "shared_if_compatible requires passed mixed FEA/FEA-B isolation "
+                "shared_if_compatible requires passed mixed-family isolation "
                 "validation or a bootstrap-issued canary task"
             )
         task = conn.execute(
@@ -3111,7 +3122,7 @@ class AedtPoolService:
         ).fetchone()
         if not slot:
             raise ValueError(
-                "shared_if_compatible requires passed mixed FEA/FEA-B isolation "
+                "shared_if_compatible requires passed mixed-family isolation "
                 "validation or a bootstrap-issued canary task"
             )
         if str(slot["admission_state"]) not in {"open", "filled"}:
@@ -3128,8 +3139,13 @@ class AedtPoolService:
         ).fetchone()
         if not session or str(session["state"]) not in {"ready", "busy"}:
             raise ValueError("mixed canary session is not ready")
-        if int(session["slots_total"] or 0) != 3:
-            raise ValueError("mixed canary session no longer has exactly three slots")
+        expected_count = int(conn.execute(
+            "SELECT expected_projects "
+            "FROM aedt_mixed_canary_admissions WHERE id = ?",
+            (int(slot["admission_id"]),),
+        ).fetchone()[0])
+        if int(session["slots_total"] or 0) != expected_count:
+            raise ValueError("mixed canary session slot count changed")
         if session["solve_batch_sealed_at"] or session["drain_requested_at"]:
             raise ValueError("mixed canary session is sealed or draining")
         if str(session["session_profile"] or "") != session_profile:
@@ -4287,12 +4303,9 @@ class AedtPoolService:
         for row in waiting:
             family = str(row["workload_family"] or "").strip().lower()
             families.setdefault(family, []).append(row)
-        # Keep mixed cohorts deterministic: finish FEA predecessors before the
-        # motor family, but issue only one native permit unless a family is
-        # explicitly restored to the proven-parallel allowlist above.
-        selected_family = (
-            "fea" if "fea" in families else sorted(families)[0]
-        )
+        # Give the oldest waiting family the next wave.  Workload names do not
+        # imply solve precedence or safety.
+        selected_family = next(iter(families))
         selected = families[selected_family]
         if selected_family not in self._parallel_safe_native_solve_families:
             selected = selected[:1]
@@ -6694,7 +6707,8 @@ class AedtPoolService:
                    s.node_name AS placement_node_name,
                    sa.partition AS placement_partition,
                    l.exclusive_session,
-                   l.placement_group, l.workload_family, l.isolation_policy,
+                   l.placement_group, l.workload_family, l.protocol_version,
+                   l.isolation_policy,
                    COALESCE(sa.account_name, ra.account_name, '') AS reserved_account,
                    t.name, t.project, t.requested_account_name,
                    t.account_name AS task_account_name,
@@ -6782,8 +6796,12 @@ class AedtPoolService:
             ]
         ] = []
         for row in live_project_rows:
+            # Legacy placement is keyed by the caller's explicit group;
+            # protocol-v2 placement is keyed by its workload family.
             family = str(
-                row["workload_family"] or row["placement_group"] or ""
+                (row["placement_group"] if int(row["protocol_version"] or 1) < 2
+                 else row["workload_family"])
+                or ""
             ).strip().lower()
             if not family:
                 family = f"__legacy_lease_{int(row['lease_id'])}"
@@ -6808,8 +6826,10 @@ class AedtPoolService:
         for row in queued_backlog_rows:
             family = str(row["reserved_family"] or "").strip().lower()
             if not family:
+                values = literal_task_environment(dict(row))
                 family = canonical_workload_family(
-                    "", str(row["project"] or row["name"] or "")
+                    values.get("SLURM_AEDT_WORKLOAD_FAMILY", ""),
+                    str(row["project"] or row["name"] or ""),
                 )
             account, durable_route, actionable_route = planned_account_route(row)
             strict_node, strict_partition = strict_route_for_row(row)
@@ -6958,7 +6978,7 @@ class AedtPoolService:
             """
             SELECT s.id AS session_id, a.account_name, s.node_name,
                    a.partition AS allocation_partition,
-                   l.workload_family, l.placement_group,
+                   l.workload_family, l.placement_group, l.protocol_version,
                    l.isolation_policy, l.exclusive_session
             FROM aedt_sessions s
             JOIN allocations a ON a.id = s.allocation_id
@@ -6991,7 +7011,9 @@ class AedtPoolService:
                 },
             )
             family = str(
-                row["workload_family"] or row["placement_group"] or ""
+                (row["placement_group"] if int(row["protocol_version"] or 1) < 2
+                 else row["workload_family"])
+                or ""
             ).strip().lower()
             if family:
                 contract["families"].add(family)

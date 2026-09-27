@@ -810,11 +810,11 @@ class AedtPoolGateTests(AedtPoolTestCase):
 
     def test_placement_group_derivation_and_explicit_override(self) -> None:
         cases = {
-            "fea-pending-39812-stage": "fea",
-            "simulation_745147_2759990": "fea",
-            "FEA-B_v2_stage3_001": "fea_b",
-            "motor-prototype-fea_b-stage": "fea_b",
-            "Alpha42-stage-7": "alpha42",
+            "fea-pending-39812-stage": "fea-pending-39812-stage",
+            "simulation_745147_2759990": "simulation_745147_2759990",
+            "FEA-B_v2_stage3_001": "fea-b_v2_stage3_001",
+            "motor-prototype-fea_b-stage": "motor-prototype-fea_b-stage",
+            "Alpha42-stage-7": "alpha42-stage-7",
         }
         for project_name, expected in cases.items():
             with self.subTest(project_name=project_name):
@@ -852,11 +852,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
             native_solve_mode="validated_parallel",
         )
         self.assertEqual(validated.native_solve_mode, "validated_parallel")
-        self.assertEqual(
-            validated._parallel_safe_native_solve_families,
-            frozenset({"fea_validated_async"}),
-        )
-        self.assertNotIn("fea", validated._parallel_safe_native_solve_families)
+        self.assertEqual(validated._parallel_safe_native_solve_families, frozenset())
         router = create_aedt_pool_router(validated)
         summary_endpoint = next(
             route.endpoint
@@ -867,7 +863,7 @@ class AedtPoolGateTests(AedtPoolTestCase):
         self.assertEqual(validated_config["native_solve_mode"], "validated_parallel")
         self.assertEqual(
             validated_config["parallel_safe_native_solve_families"],
-            ["fea_validated_async"],
+            [],
         )
         with self.assertRaisesRegex(ValueError, "must be one of"):
             AedtPoolService(self.db, native_solve_mode="unsafe")
@@ -2369,6 +2365,13 @@ class AedtSessionStartRaceTests(AedtPoolTestCase):
 
 
 class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
+    @staticmethod
+    def canary_families(a_count: int = 2, b_count: int = 1) -> list[dict]:
+        return [
+            {"workload_family": "group_beta", "project_namespace": "namespace_beta", "projects": a_count},
+            {"workload_family": "fea", "project_namespace": "namespace_fea", "projects": b_count},
+        ]
+
     def setUp(self) -> None:
         super().setUp()
         self.allocation_id = self.add_dedicated_allocation()
@@ -2440,8 +2443,7 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
     def activate_exact_cohort(self) -> tuple[list[dict], list[str]]:
         admission = self.service.create_mixed_canary_admission(
             session_id=int(self.session["id"]),
-            family_a_projects=2,
-            family_b_projects=1,
+            families=self.canary_families(),
         )
         leases = []
         tokens = []
@@ -2573,14 +2575,13 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
     def test_bootstrap_admission_forces_three_mixed_tasks_to_exact_empty_session(self) -> None:
         admission = self.service.create_mixed_canary_admission(
             session_id=int(self.session["id"]),
-            family_a_projects=2,
-            family_b_projects=1,
+            families=self.canary_families(),
         )
         self.assertEqual(admission["state"], "open")
         self.assertEqual(len(admission["slots"]), 3)
         self.assertEqual(
             {(slot["workload_family"], slot["project_namespace"]) for slot in admission["slots"]},
-            {("fea", "fea"), ("fea_b", "example_fea_b")},
+            {("group_beta", "namespace_beta"), ("fea", "namespace_fea")},
         )
 
         leases = []
@@ -2612,20 +2613,20 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         permitted = [
             self.service.get_lease(int(lease["id"])) for lease in leases
         ]
-        fea_permitted = [
+        first_family_permitted = [
+            lease for lease in permitted if lease["workload_family"] == "group_beta"
+        ]
+        fea_waiting = [
             lease for lease in permitted if lease["workload_family"] == "fea"
         ]
-        motor_waiting = [
-            lease for lease in permitted if lease["workload_family"] == "fea_b"
-        ]
         self.assertEqual(
-            sum(bool(lease["solve_permit_granted"]) for lease in fea_permitted),
+            sum(bool(lease["solve_permit_granted"]) for lease in first_family_permitted),
             1,
         )
-        self.assertEqual(len(motor_waiting), 1)
-        self.assertFalse(motor_waiting[0]["solve_permit_granted"])
+        self.assertEqual(len(fea_waiting), 1)
+        self.assertFalse(fea_waiting[0]["solve_permit_granted"])
         self.assertEqual(
-            sorted(int(lease["solve_permit_generation"]) for lease in fea_permitted),
+            sorted(int(lease["solve_permit_generation"]) for lease in first_family_permitted),
             [0, 1],
         )
         self.assertTrue(
@@ -2642,6 +2643,7 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
     def test_underfilled_fallback_cannot_seal_open_mixed_admission(self) -> None:
         admission = self.service.create_mixed_canary_admission(
             session_id=int(self.session["id"]),
+            families=self.canary_families(),
         )
         first, first_token = self.activate_slot(
             admission["slots"][0],
@@ -2682,6 +2684,7 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
     def test_partial_admission_ttl_aborts_and_recovers_reserved_session(self) -> None:
         admission = self.service.create_mixed_canary_admission(
             session_id=int(self.session["id"]),
+            families=self.canary_families(),
             ttl_seconds=60,
         )
         lease, token = self.activate_slot(
@@ -2722,12 +2725,14 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         )
         replacement = self.service.create_mixed_canary_admission(
             session_id=int(self.session["id"]),
+            families=self.canary_families(),
         )
         self.assertEqual(replacement["state"], "open")
 
     def test_consumed_slot_cancellation_aborts_unstarted_exact_batch(self) -> None:
         admission = self.service.create_mixed_canary_admission(
             session_id=int(self.session["id"]),
+            families=self.canary_families(),
         )
         first, _first_token = self.activate_slot(
             admission["slots"][0],
@@ -2763,19 +2768,18 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
     def test_wrong_namespace_and_unreserved_clients_cannot_consume_canary(self) -> None:
         admission = self.service.create_mixed_canary_admission(
             session_id=int(self.session["id"]),
-            family_a_projects=1,
-            family_b_projects=2,
+            families=self.canary_families(1, 2),
         )
-        fea_b_slot = next(
-            slot for slot in admission["slots"] if slot["workload_family"] == "fea_b"
+        other_family_slot = next(
+            slot for slot in admission["slots"] if slot["workload_family"] == "fea"
         )
-        task_id = self.create_task_for_slot(fea_b_slot, "wrong-namespace")
+        task_id = self.create_task_for_slot(other_family_slot, "wrong-namespace")
         with self.assertRaisesRegex(ValueError, "project_namespace"):
             self.request_slot(
-                fea_b_slot,
+                other_family_slot,
                 task_id=task_id,
                 suffix="wrong-namespace",
-                namespace="fea",
+                namespace="wrong_namespace",
             )
 
         unreserved_task_id = self.db.create_task(
@@ -2819,6 +2823,7 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
     def test_legacy_protocol_cannot_bypass_exact_mixed_solve_barrier(self) -> None:
         admission = self.service.create_mixed_canary_admission(
             session_id=int(self.session["id"]),
+            families=self.canary_families(),
         )
         slot = admission["slots"][0]
         task_id = self.create_task_for_slot(slot, "legacy-protocol")
@@ -2854,7 +2859,109 @@ class AedtMixedCanaryAdmissionTests(AedtPoolTestCase):
         with self.assertRaisesRegex(ValueError, "must be ready"):
             self.service.create_mixed_canary_admission(
                 session_id=int(self.session["id"]),
+                families=self.canary_families(),
             )
+
+
+class AedtMixedCanaryVariableSizeTests(AedtPoolTestCase):
+    def test_legacy_canary_count_columns_migrate(self) -> None:
+        with self.db.connect() as conn:
+            conn.execute("DROP TABLE aedt_mixed_canary_admissions")
+            conn.execute(
+                """
+                CREATE TABLE aedt_mixed_canary_admissions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    placement_group TEXT NOT NULL UNIQUE,
+                    session_profile TEXT NOT NULL,
+                    expected_family_a_projects INTEGER NOT NULL,
+                    expected_family_b_projects INTEGER NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'open',
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    filled_at TEXT,
+                    finished_at TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO aedt_mixed_canary_admissions (
+                    session_id, placement_group, session_profile,
+                    expected_family_a_projects, expected_family_b_projects,
+                    state, expires_at
+                ) VALUES (1, 'legacy-canary', 'legacy-profile', 2, 1,
+                          'closed', '2026-07-14 00:00:00')
+                """
+            )
+        self.service.init()
+        with self.db.connect() as conn:
+            migrated = conn.execute(
+                "SELECT expected_projects FROM aedt_mixed_canary_admissions "
+                "WHERE placement_group = 'legacy-canary'"
+            ).fetchone()
+        self.assertEqual(int(migrated["expected_projects"]), 3)
+
+    def test_explicit_four_project_cohort_matches_session_size(self) -> None:
+        allocation_id = self.add_dedicated_allocation()
+        self.service.set_operator_limits(
+            max_sessions=1,
+            min_idle_sessions=1,
+            target_projects=4,
+            projects_per_session=4,
+        )
+        self.make_operational()
+        session, _host_token = self.start_one_session(allocation_id)
+        families = [
+            {"workload_family": "alpha", "project_namespace": "alpha_space", "projects": 2},
+            {"workload_family": "beta", "project_namespace": "beta_space", "projects": 1},
+            {"workload_family": "gamma", "project_namespace": "gamma_space", "projects": 1},
+        ]
+        admission = self.service.create_mixed_canary_admission(
+            session_id=int(session["id"]), families=families,
+        )
+        self.assertEqual(len(admission["slots"]), 4)
+        self.assertEqual(
+            [slot["workload_family"] for slot in admission["slots"]],
+            ["alpha", "alpha", "beta", "gamma"],
+        )
+        with self.assertRaisesRegex(ValueError, "must match session slots"):
+            self.service.create_mixed_canary_admission(
+                session_id=int(session["id"]),
+                families=[dict(families[0], projects=1), *families[1:]],
+            )
+        leases = []
+        for index, slot in enumerate(admission["slots"]):
+            task_id = self.db.create_task(TaskCreate(
+                name=f"mixed-four-{index}",
+                remote_cwd="/work",
+                command="true",
+                dedupe_key=str(slot["dedupe_key"]),
+                aedt_backend="pooled",
+            ))
+            self.db.update_task(task_id, status=TaskStatus.RUNNING.value)
+            lease, token = self.service.request_lease(
+                request_key=f"mixed-four-request-{index}",
+                project_name=f"project-{index}",
+                workload_family=str(slot["workload_family"]),
+                project_namespace=str(slot["project_namespace"]),
+                isolation_policy="shared_if_compatible",
+                workspace_path=f"/shared/mixed-four/{index}",
+                protocol_version=2,
+                session_profile=EXPECTED_SESSION_PROFILE_JSON,
+                task_id=task_id,
+                client_token=f"mixed-four-client-token-{index}",
+            )
+            self.service.accept_lease(int(lease["id"]), token)
+            leases.append((lease, token))
+        for lease, token in leases:
+            self.service.activate_lease(int(lease["id"]), token)
+        refreshed = [self.service.get_lease(int(lease["id"])) for lease, _ in leases]
+        self.assertEqual(sum(bool(lease["solve_permit_granted"]) for lease in refreshed), 1)
+        self.assertIsNotNone(
+            self.service.get_session(int(session["id"]))["solve_batch_sealed_at"]
+        )
 
 
 class AedtLeaseLifecycleTests(AedtPoolTestCase):
@@ -2993,7 +3100,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             "protocol_version": 2,
             "isolation_policy": "shared_if_compatible",
         }
-        with self.assertRaisesRegex(ValueError, "mixed FEA/FEA-B"):
+        with self.assertRaisesRegex(ValueError, "mixed-family"):
             self.service.request_lease(**request)
 
         mixed_validation = self.service.record_validation(
@@ -4053,7 +4160,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(evidence["present_process_ids"], ["23001"])
 
     def test_one_session_has_exactly_two_slots(self) -> None:
-        leases = [self.request(f"r{i}", allocation_id=self.allocation_id, node="cpu-01") for i in range(2)]
+        leases = [self.request(f"r{i}", allocation_id=self.allocation_id, node="cpu-01", placement_group="two-slot-test") for i in range(2)]
         session, host_token = self.start_one_session(self.allocation_id)
         for lease, _token in leases:
             current = self.service.get_lease(int(lease["id"]))
@@ -4112,24 +4219,28 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             allocation_id=self.allocation_id,
             node="cpu-01",
             project_name="fea-pending-39812-stage",
+            placement_group="fea",
         )
         simulation_fea, _ = self.request(
             "placement-fea-simulation",
             allocation_id=self.allocation_id,
             node="cpu-01",
             project_name="simulation_745147_2759990",
+            placement_group="fea",
         )
         fea_b, _ = self.request(
             "placement-fea_b",
             allocation_id=self.allocation_id,
             node="cpu-01",
             project_name="fea_b_v2_stage3_001",
+            placement_group="fea_b",
         )
         third_fea, _ = self.request(
             "placement-fea-third",
             allocation_id=self.allocation_id,
             node="cpu-01",
             project_name="fea-pending-39813-stage",
+            placement_group="fea",
         )
         for lease in (first_fea, simulation_fea, fea_b, third_fea):
             self.assertEqual(lease["state"], "queued")
@@ -4220,6 +4331,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             "rotation-new-placement",
             allocation_id=self.allocation_id,
             node="cpu-01",
+            placement_group="project-rotation-existing",
         )
         self.service.reconcile(execute=True)
 
@@ -4277,6 +4389,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
                 node="cpu-01",
                 task_id=task_id,
                 project_name=project_name,
+                placement_group="summary-simulation",
             )
             for index, (task_id, project_name) in enumerate(lease_specs)
         ]
@@ -5077,7 +5190,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             project_name="simulation_745147_2759990",
             exclusive_session=True,
         )
-        self.assertEqual(exclusive["placement_group"], "fea")
+        self.assertEqual(exclusive["placement_group"], "simulation_745147_2759990")
         self.assertEqual(exclusive["state"], "queued")
         with self.db.connect() as conn:
             live_on_session = conn.execute(
@@ -5123,10 +5236,10 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
 
     def test_release_is_two_phase_and_slot_is_not_reused_early(self) -> None:
         self.service.set_operator_limit(1)
-        first, first_token = self.request("first", allocation_id=self.allocation_id, node="cpu-01")
-        second, _ = self.request("second", allocation_id=self.allocation_id, node="cpu-01")
+        first, first_token = self.request("first", allocation_id=self.allocation_id, node="cpu-01", placement_group="release-test")
+        second, _ = self.request("second", allocation_id=self.allocation_id, node="cpu-01", placement_group="release-test")
         session, host_token = self.start_one_session(self.allocation_id)
-        third, _ = self.request("third", allocation_id=self.allocation_id, node="cpu-01")
+        third, _ = self.request("third", allocation_id=self.allocation_id, node="cpu-01", placement_group="release-test")
         self.assertEqual(self.service.get_lease(int(third["id"]))["state"], "queued")
         releasing = self.service.release_lease(int(first["id"]), first_token)
         self.assertEqual(releasing["state"], "releasing")
@@ -5453,11 +5566,13 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             "stale-never-active",
             allocation_id=self.allocation_id,
             node="cpu-01",
+            placement_group="stale-test",
         )
         sibling, sibling_token = self.request(
             "live-sibling",
             allocation_id=self.allocation_id,
             node="cpu-01",
+            placement_group="stale-test",
         )
         session, host_token = self.start_one_session(self.allocation_id)
         self.assertEqual(self.service.get_lease(int(stale["id"]))["state"], "leased")
@@ -5565,6 +5680,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
             allocation_id=self.allocation_id,
             node="cpu-01",
             project_name="fea-pending-39812-stage",
+            placement_group="fea",
         )
         self.assertEqual(lease["placement_group"], "fea")
         self.start_one_session(self.allocation_id)
@@ -5577,6 +5693,7 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         custom, custom_token = self.request(
             "custom-bind-stability",
             project_name="custom-pending-001",
+            placement_group="custom",
         )
         rebound = self.service.bind_lease_project_name(
             int(custom["id"]), custom_token, "simulation_999999_111111"
@@ -5614,8 +5731,8 @@ class AedtLeaseLifecycleTests(AedtPoolTestCase):
         self.assertEqual(expired["failure_message"], "lease request heartbeat expired")
 
     def test_solver_timeout_quarantines_session_and_preserves_sibling_grace(self) -> None:
-        first, first_token = self.request("timeout", allocation_id=self.allocation_id, node="cpu-01")
-        second, second_token = self.request("sibling", allocation_id=self.allocation_id, node="cpu-01")
+        first, first_token = self.request("timeout", allocation_id=self.allocation_id, node="cpu-01", placement_group="timeout-test")
+        second, second_token = self.request("sibling", allocation_id=self.allocation_id, node="cpu-01", placement_group="timeout-test")
         session, host_token = self.start_one_session(self.allocation_id)
         self.service.heartbeat_lease(int(first["id"]), first_token)
         self.service.heartbeat_lease(int(second["id"]), second_token)
@@ -7288,16 +7405,16 @@ class AedtPreadmissionTests(AedtExactSessionReservationTests):
             0,
         )
 
-    def test_app_preadmission_uses_motor_clients_canonical_fea_b_family(self) -> None:
+    def test_workload_family_fallback_preserves_exact_project_identity(self) -> None:
         from slurm_scheduler.aedt_pool import canonical_workload_family
 
         self.assertEqual(
             canonical_workload_family("", "example_fea_b workload"),
-            "fea_b",
+            "example_fea_b workload",
         )
         self.assertEqual(
             canonical_workload_family("", "FEA-B_v2_stage3_001"),
-            "fea_b",
+            "fea-b_v2_stage3_001",
         )
         self.assertEqual(
             canonical_workload_family("custom-motor", "example_fea_b workload"),
@@ -8278,7 +8395,7 @@ class AedtRuntimeCapacityTests(AedtPoolTestCase):
         )
         self.make_operational()
         for index in range(6):
-            self.request(f"two-session-deficit-{index}")
+            self.request(f"two-session-deficit-{index}", placement_group="two-session-deficit")
         fake = FakeRuntimeScheduler()
         runtime = AedtPoolRuntime(self.service, fake, interval_seconds=30)
 

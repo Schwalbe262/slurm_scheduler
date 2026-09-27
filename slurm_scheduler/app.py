@@ -53,7 +53,11 @@ from .pestat import PestatNode, plan_dynamic_allocations
 from .project_env import ProjectEnvManager, repo_dir_name
 from .scheduler import Scheduler
 from .slurm import SlurmAccountClient, SSHSession
-from .task_commands import ACCOUNT_WORKSPACE_PLACEHOLDER, build_git_task_command
+from .task_commands import (
+    ACCOUNT_WORKSPACE_PLACEHOLDER,
+    build_git_task_command,
+    literal_task_environment as _literal_task_environment,
+)
 from .task_payload import prepend_setup_once
 from .web_read_guard import WebReadGuardMiddleware
 
@@ -83,77 +87,6 @@ def validate_node_name_policy(node_name: object, value: object) -> str:
             detail="node_name is required when node_name_policy is strict",
         )
     return policy
-
-
-def _literal_shell_assignments(text: str, *, leading_only: bool) -> dict[str, str]:
-    result: dict[str, str] = {}
-    stop = False
-    for raw_line in str(text or "").splitlines():
-        if stop:
-            break
-        try:
-            lexer = shlex.shlex(
-                raw_line,
-                posix=True,
-                punctuation_chars=";",
-            )
-            lexer.whitespace_split = True
-            lexer.commenters = "#"
-            tokens = list(lexer)
-        except ValueError:
-            if leading_only:
-                break
-            continue
-        statements: list[list[str]] = [[]]
-        for token in tokens:
-            if token and set(token) == {";"}:
-                statements.extend([] for _ in token)
-            else:
-                statements[-1].append(token)
-        for statement in statements:
-            if not statement:
-                continue
-            if statement[0] == "export":
-                statement = statement[1:]
-            assignments: dict[str, str] = {}
-            for token in statement:
-                if "=" not in token:
-                    assignments = {}
-                    break
-                key, value = token.split("=", 1)
-                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-                    assignments = {}
-                    break
-                assignments[key] = value
-            if assignments:
-                result.update(assignments)
-                continue
-            if leading_only:
-                stop = True
-                break
-    return result
-
-
-def _literal_task_environment(task: dict) -> dict[str, str]:
-    """Read only literal shell assignments from a task's env_setup.
-
-    Admission must not execute or expand user shell.  Requiring literal values
-    also prevents a superficially valid contract from resolving to a missing
-    credential/profile only after the task reaches a compute node.
-    """
-
-    result = _literal_shell_assignments(
-        str(task.get("env_setup") or ""), leading_only=False
-    )
-    # Unified clients materialize submission_env as a safe leading
-    # series of ``export KEY=literal;`` statements in command.  Parse only that
-    # prefix; never inspect or execute the actual task command body.
-    result.update(
-        _literal_shell_assignments(
-            str(task.get("command") or ""), leading_only=True
-        )
-    )
-    return result
 
 
 def _plan_aedt_pool_demand_accounts(

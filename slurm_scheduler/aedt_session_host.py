@@ -1209,8 +1209,7 @@ class AedtSessionHost:
         namespace_text = str(lease.get("project_namespace") or "").strip()
         if namespace_text:
             # Namespace is a logical collision domain, not a required filename
-            # prefix (example_fea_b deliberately binds ``fea_b-*`` projects in
-            # the ``example_fea_b`` namespace).
+            # prefix.  Workloads can choose a namespace independent of names.
             self._released_project_component(
                 namespace_text, "project namespace"
             )
