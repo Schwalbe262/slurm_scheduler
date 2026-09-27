@@ -98,6 +98,11 @@ def test_loopback_pilot_performs_exclusive_attach_and_close_ack(
     )
     host.heartbeat_seconds = 0.05
     monkeypatch.setattr(host, "_start_desktop", lambda: desktop)
+    monkeypatch.setattr(
+        host,
+        "_desktop_process_listener_liveness_proof",
+        lambda: (True, ""),
+    )
 
     def close_desktop(*, global_stop, timeout_seconds=30):
         assert global_stop is False
