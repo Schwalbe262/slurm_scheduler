@@ -18,6 +18,13 @@ N. The pilot's PyAEDT profile is the host's pinned profile (currently AEDT
 2025.2 / PyAEDT 0.22.0); use the same environment for baseline and pooled
 workers.
 
+The current scheduler requires a passing validation record before it enables
+the pool or registers a ready host session. A fresh staging database therefore
+cannot run the pooled treatment yet. Establish an explicit, bounded pilot
+bootstrap path for a separate staging scheduler before following the pooled
+steps below. Do not insert invented validation evidence to bypass this gate,
+and do not use the active 8002 deployment as the staging scheduler.
+
 ## Baseline: N independent Desktops
 
 Create a fresh artifact root on the shared filesystem. Capture an idle
