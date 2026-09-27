@@ -94,6 +94,21 @@ def test_ab_verifier_rejects_swapped_field_and_extra_license(tmp_path):
     assert any("one additional pooled" in issue for issue in issues)
 
 
+def test_ab_verifier_requires_project_and_session_identity(tmp_path):
+    for mode in ("baseline", "pooled"):
+        for index in (1, 2):
+            _result(tmp_path, mode, index)
+    path = pilot._project_path(tmp_path, "pooled", 1).parent / "result.json"
+    item = json.loads(path.read_text(encoding="utf-8"))
+    item["mode"] = "baseline"
+    item["session_generation"] = None
+    path.write_text(json.dumps(item), encoding="utf-8")
+    assert _run_verify(tmp_path) == 1
+    issues = json.loads((tmp_path / "verification.json").read_text())["issues"]
+    assert any("project identity mismatch" in issue for issue in issues)
+    assert any("one Desktop and session generation" in issue for issue in issues)
+
+
 def test_fault_verifier_checks_surviving_sibling(tmp_path):
     faulted = _result(tmp_path, "pooled", 1, fault="pre_solve")
     faulted["expected_fault_observed"] = True

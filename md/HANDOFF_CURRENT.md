@@ -19,9 +19,17 @@
 - `scripts/aedt_pool_live_pilot.py` and `docs/aedt_pool_live_pilot.md` provide
   an independent Maxwell 3D baseline-versus-pooled A/B workload, verifier,
   and fault checks. This is preparation for a real trial, not proof of one.
-  A dedicated staging Slurm account/allocation, scheduler and host session,
+  The verifier's four focused tests pass. Cluster login and six Slurm accounts
+  are configured under the local/Y runtime `accounts.yaml`; the license
+  monitor uses `r1jae262` and `lmutil` on the cluster. A live account-status
+  query found idle accounts, but all six are also registered with the active
+  8002 service. An idle account is not a reserved staging allocation. A
+  separate scheduler DB, pilot-owned host allocation/session/task IDs,
   bootstrap token, and raw license-server samples are still needed. Pool
-  activation remains blocked until the live runbook gates pass.
+  activation remains blocked until the live runbook gates pass. The current
+  `set_enabled` gate requires prior passing validation, so an isolated live
+  pilot needs an explicit, bounded bootstrap path before starting its host;
+  do not insert fabricated validation evidence into an operating database.
 - Read-only `observer_mode` can inspect a **copy** of the active SQLite DB on
   a separate port without starting the scheduler, pool, relay, or maintenance
   services. It rejects HTTP mutations. See `docs/CONFIG.md` and

@@ -270,7 +270,12 @@ def verify(args: argparse.Namespace) -> int:
             item = json.loads(path.read_text(encoding="utf-8"))
             target.append(item)
             expected = _project_path(root, mode, index)
-            if item.get("project_path") != str(expected) or item.get("project_name") != expected.stem:
+            if (
+                item.get("mode") != mode
+                or item.get("index") != index
+                or item.get("project_path") != str(expected)
+                or item.get("project_name") != expected.stem
+            ):
                 issues.append(f"{mode}/{index}: project identity mismatch")
             if not item.get("ok") or item.get("fault") != "none":
                 issues.append(f"{mode}/{index}: unsuccessful normal run")
@@ -300,7 +305,12 @@ def verify(args: argparse.Namespace) -> int:
         pooled_sessions = {(item.get("session_id"), item.get("session_generation")) for item in pooled}
         if len(baseline_pids) != args.projects or None in baseline_pids:
             issues.append("baseline did not use N distinct Desktops")
-        if len(pooled_pids) != 1 or None in pooled_pids or len(pooled_sessions) != 1:
+        if (
+            len(pooled_pids) != 1
+            or None in pooled_pids
+            or len(pooled_sessions) != 1
+            or any(not session_id or not generation for session_id, generation in pooled_sessions)
+        ):
             issues.append("pooled projects did not share one Desktop and session generation")
         if len({item.get("lease_id") for item in pooled}) != args.projects:
             issues.append("pooled lease IDs are missing or repeated")
@@ -366,7 +376,12 @@ def verify_fault(args: argparse.Namespace) -> int:
             continue
         item = json.loads(path.read_text(encoding="utf-8"))
         items.append(item)
-        if item.get("index") != index or item.get("project_path") != str(project_path):
+        if (
+            item.get("mode") != "pooled"
+            or item.get("index") != index
+            or item.get("project_path") != str(project_path)
+            or item.get("project_name") != project_path.stem
+        ):
             issues.append(f"index {index}: project identity mismatch")
         if index == args.fault_index:
             if item.get("fault") != args.fault_kind or not item.get("expected_fault_observed"):
@@ -388,7 +403,8 @@ def verify_fault(args: argparse.Namespace) -> int:
     if len(items) == args.projects:
         if len({item.get("desktop_pid") for item in items}) != 1:
             issues.append("fault run did not use one Desktop")
-        if len({(item.get("session_id"), item.get("session_generation")) for item in items}) != 1:
+        sessions = {(item.get("session_id"), item.get("session_generation")) for item in items}
+        if len(sessions) != 1 or any(not session_id or not generation for session_id, generation in sessions):
             issues.append("fault run did not use one session generation")
         if len({item.get("lease_id") for item in items}) != args.projects:
             issues.append("fault run lease IDs are missing or repeated")
